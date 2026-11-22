@@ -235,11 +235,19 @@
     <string name="settings_issue_unreadable">The stored settings could not be read, so the defaults are in use. The old settings file has been kept.</string>
     <string name="settings_issue_partly_read">Some of the stored settings could not be read and were left out. The old settings file has been kept.</string>
 
-    <!-- Settings: system prompts -->
-    <string name="section_system_prompts">System prompts</string>
-    <string name="system_prompts_support">A system prompt is given to the model at the start of every conversation, before your first message. Each model has its own. Changes are saved as you type and apply from the next answer.</string>
+    <!-- Settings: each model's own settings -->
+    <string name="section_models">Models</string>
+    <string name="models_support">Each model has its own settings. Changes are saved as you type and apply from the next answer.</string>
+    <string name="invalid_not_saved">Not saved until valid.</string>
+    <string name="system_prompt_label">System prompt</string>
+    <string name="system_prompt_support">Given to the model at the start of every conversation, before your first message.</string>
     <string name="system_prompt_hint">None</string>
     <string name="system_prompt_unsupported">%1$s was trained without a system prompt, so there is none to set.</string>
+    <string name="temperature_label">Temperature</string>
+    <string name="temperature_support">0 always picks the most likely word; higher values make answers more varied. Default for this model: %1$s.</string>
+    <string name="temperature_support_greedy">0 always picks the most likely word; higher values make answers more varied. Default for this model: %1$s, so any value above 0 turns on sampling.</string>
+    <string name="temperature_invalid">Enter a number from 0 to 2.</string>
+    <string name="temperature_use_default">Use the model\'s default temperature</string>
 
     <!-- Settings: about -->
     <string name="section_about">About</string>

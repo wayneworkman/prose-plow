@@ -54,6 +54,9 @@ Chats:
   the new text. A request that failed can be tried again.
 - **A system prompt for each model**, in Settings, for the models that were trained with one
   (Qwen3.5 and Boris-2; Peacebell was trained without one and has none).
+- **A temperature for each model**, in Settings, from 0 to 2. Left empty, a model uses its own
+  reference value; 0 always picks the most likely word. It applies from the next answer and
+  switches with the model.
 - **Answers as Markdown**, with selectable text, a copy button on every message and on every
   block of code. Images are never loaded: the app shows their alternative text. A link is shown
   in full and is handed to another app only after you have confirmed it.
@@ -118,6 +121,7 @@ with the SHA-256 the converted file must have.
 | System prompt | yes | no | yes |
 
 The sampling values are each model's own reference settings, taken from its published files.
+The temperature can be changed for each model in Settings; the other values are fixed.
 The Qwen3.5 file leaves out the vision tower and the multi-token-prediction head of the
 checkpoint: the app is text only.
 
@@ -173,7 +177,7 @@ Everything is in the app's private storage.
 | --- | --- | --- |
 | `files/sessions/<id>.enc` | One chat: its messages, its draft, its model and title | Encrypted |
 | `files/session-index.enc` | The list of chats | Encrypted |
-| `files/settings.enc` | The settings: the system prompts | Encrypted |
+| `files/settings.enc` | The settings: the system prompt and the temperature of each model | Encrypted |
 | `files/kept/*.enc` | Exact copies of files that could not be read completely, kept before they are replaced | Encrypted, as the original was |
 | `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, the count and time of wrong passphrase attempts | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
 

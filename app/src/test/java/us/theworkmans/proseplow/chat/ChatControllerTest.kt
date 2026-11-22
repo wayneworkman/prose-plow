@@ -47,6 +47,7 @@ class ChatControllerTest {
 
     private val qwen = ModelCatalog.QWEN35_0_8B.id
     private val boris = ModelCatalog.BORIS_2_INSTRUCT.id
+    private val peacebell = ModelCatalog.PEACEBELL_V1_291M.id
     private val noStats = GenerationStats(promptTokens = 0, reusedPromptTokens = 0, generatedTokens = 0, promptMillis = 0, generationMillis = 0)
 
     private lateinit var app: SessionFixture
@@ -652,6 +653,120 @@ class ChatControllerTest {
         assertEquals("a new chat still names a model, for the day one is there", ModelCatalog.default.id, session.openSession.modelId)
         session.close()
         assertEquals("For later", app.stored(id)!!.draft)
+    }
+
+    // --- Sampling: what the engine is asked to generate with ------------------------------------
+
+    @Test
+    fun withoutATemperatureOfTheUsersTheEngineGetsTheModelsOwnSampling() = runTest {
+        val session = unlocked()
+
+        exchange(session, "Hello", "Hi.")
+
+        assertEquals(ModelCatalog.QWEN35_0_8B.sampling, app.engine.requests.single().sampling)
+    }
+
+    @Test
+    fun aTemperatureSetForTheModelReplacesTheTemperatureAndNothingElse() = runTest {
+        val session = unlocked()
+        val own = ModelCatalog.QWEN35_0_8B.sampling
+        session.settings.update { it.withTemperature(qwen, 0.3f) }
+
+        exchange(session, "Hello", "Hi.")
+
+        val sampling = app.engine.requests.single().sampling!!
+        assertEquals(own.copy(temperature = 0.3f), sampling)
+        assertEquals(0.3f, sampling.temperature)
+        assertEquals(
+            "everything else is the catalogue's",
+            listOf<Any?>(own.topK, own.topP, own.minP, own.repetitionPenalty, own.presencePenalty, own.frequencyPenalty, own.seed),
+            listOf<Any?>(sampling.topK, sampling.topP, sampling.minP, sampling.repetitionPenalty, sampling.presencePenalty, sampling.frequencyPenalty, sampling.seed),
+        )
+        assertFalse(sampling.isGreedy)
+    }
+
+    @Test
+    fun aTemperatureOfZeroAsksTheEngineForItsGreedyPath() = runTest {
+        val session = unlocked()
+        session.settings.update { it.withTemperature(qwen, 0f) }
+
+        exchange(session, "Hello", "Hi.")
+
+        val sampling = app.engine.requests.single().sampling!!
+        assertEquals(ModelCatalog.QWEN35_0_8B.sampling.copy(temperature = 0f), sampling)
+        assertTrue(sampling.isGreedy)
+    }
+
+    @Test
+    fun switchingTheModelMidChatSwitchesTheTemperatureWithIt() = runTest {
+        val session = unlocked()
+        val id = session.id
+        session.settings.update { it.withTemperature(qwen, 0.3f).withTemperature(boris, 1.5f) }
+
+        exchange(session, "Who are you?", "Qwen.")
+        assertEquals(ModelCatalog.QWEN35_0_8B.sampling.copy(temperature = 0.3f), app.engine.requests.last().sampling)
+
+        session.chat.selectModel(id, boris)
+        runCurrent()
+        exchange(session, "And now?", "Boris.")
+        assertEquals(boris, app.engine.requests.last().modelId)
+        assertEquals("the other model's own sampling with the other model's temperature", ModelCatalog.BORIS_2_INSTRUCT.sampling.copy(temperature = 1.5f), app.engine.requests.last().sampling)
+
+        // A model for which nothing was set samples as the catalogue says.
+        session.chat.selectModel(id, peacebell)
+        runCurrent()
+        exchange(session, "And you?", "Peacebell.")
+        assertEquals(ModelCatalog.PEACEBELL_V1_291M.sampling, app.engine.requests.last().sampling)
+
+        session.chat.selectModel(id, qwen)
+        runCurrent()
+        exchange(session, "Back again?", "Qwen.")
+        assertEquals(ModelCatalog.QWEN35_0_8B.sampling.copy(temperature = 0.3f), app.engine.requests.last().sampling)
+    }
+
+    @Test
+    fun aChangedTemperatureAppliesFromTheNextAnswerAlsoOneAskedForAgainOrContinued() = runTest {
+        val session = unlocked()
+        val id = session.id
+        val own = ModelCatalog.QWEN35_0_8B.sampling
+        exchange(session, "Tell me a story", "Once.")
+        assertEquals(own, app.engine.requests[0].sampling)
+
+        // "Answer again" after the value was changed in Settings.
+        session.settings.update { it.withTemperature(qwen, 1.2f) }
+        app.engine.enqueueReply(listOf("Once upon"), finishReason = FinishReason.LENGTH)
+        assertTrue(session.chat.regenerate(id, session.openSession.messages[1].id))
+        runCurrent()
+        assertEquals(own.copy(temperature = 1.2f), app.engine.requests[1].sampling)
+
+        // "Continue" after it was changed again.
+        session.settings.update { it.withTemperature(qwen, 0f) }
+        app.engine.enqueueReply(listOf(" a time."))
+        assertTrue(session.chat.continueReply(id, session.openSession.messages[1].id))
+        runCurrent()
+        assertTrue(app.engine.requests[2].continueFinalMessage)
+        assertEquals(own.copy(temperature = 0f), app.engine.requests[2].sampling)
+
+        // Taken back: the model's own again, from the next message on.
+        session.settings.update { it.withTemperature(qwen, null) }
+        exchange(session, "Another", "Twice.")
+        assertEquals(own, app.engine.requests[3].sampling)
+        assertEquals("the answers already written are not touched", "Once upon a time.", session.openSession.messages[1].text)
+    }
+
+    @Test
+    fun aTemperatureChangedWhileAReplyIsBeingWrittenLeavesThatReplyAlone() = runTest {
+        val session = unlocked()
+        app.engine.enqueueReply(listOf("Slow", "ly."), millisBetween = 500)
+        session.chat.send(session.id, "Take your time")
+        runCurrent()
+
+        session.settings.update { it.withTemperature(qwen, 1.9f) }
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals("one request, made with what was set when it began", listOf(ModelCatalog.QWEN35_0_8B.sampling), app.engine.requests.map { it.sampling })
+        assertEquals("Slowly.", session.openSession.messages.last().text)
     }
 
     // --- Chats ---------------------------------------------------------------------------------

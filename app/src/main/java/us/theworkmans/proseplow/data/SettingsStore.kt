@@ -7,11 +7,48 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import java.io.IOException
+
+/**
+ * What the user has set for one model in place of the model's own values. Every property is
+ * optional, and null means "as the catalogue has it": a model whose defaults improve in a later
+ * build then improves for everyone who never changed them.
+ *
+ * Another value the user may set per model (top-p, top-k, a repetition penalty, the length of a
+ * reply) is another nullable property here, another line in [applyTo] if it is a sampling value,
+ * and another field of the model's object in [SettingsCodec]. Nothing else changes shape.
+ *
+ * @property temperature the sampling temperature, from [MIN_TEMPERATURE] to [MAX_TEMPERATURE].
+ *   0 always takes the most likely token; higher values make the choice more varied.
+ */
+data class ModelOverrides(val temperature: Float? = null) {
+    init {
+        require(temperature == null || isValidTemperature(temperature)) { "A temperature is a number from $MIN_TEMPERATURE to $MAX_TEMPERATURE" }
+    }
+
+    /** True when nothing is set, so that there is nothing to store for the model. */
+    val isDefault: Boolean get() = temperature == null
+
+    /**
+     * The sampling a reply is generated with: [defaults], the model's own from the catalogue,
+     * with only what the user set replaced.
+     */
+    fun applyTo(defaults: SamplingParams): SamplingParams = if (temperature == null) defaults else defaults.copy(temperature = temperature)
+
+    companion object {
+        const val MIN_TEMPERATURE: Float = 0f
+        const val MAX_TEMPERATURE: Float = 2f
+
+        fun isValidTemperature(value: Float): Boolean = value.isFinite() && value >= MIN_TEMPERATURE && value <= MAX_TEMPERATURE
+    }
+}
 
 /**
  * The settings that are stored encrypted, which is all of them except the lock's own (those must
@@ -24,8 +61,13 @@ import java.io.IOException
  *
  * @property systemPrompts the system prompt of each model that has one, by model id. A model
  *   without an entry has none.
+ * @property modelOverrides what the user set in place of a model's own values, by model id. Only
+ *   models with something set have an entry.
  */
-data class AppSettings(val systemPrompts: Map<String, String> = emptyMap()) {
+data class AppSettings(
+    val systemPrompts: Map<String, String> = emptyMap(),
+    val modelOverrides: Map<String, ModelOverrides> = emptyMap(),
+) {
 
     /** The system prompt set for [modelId], or an empty string. */
     fun systemPrompt(modelId: String): String = systemPrompts[modelId].orEmpty()
@@ -34,21 +76,47 @@ data class AppSettings(val systemPrompts: Map<String, String> = emptyMap()) {
     fun withSystemPrompt(modelId: String, text: String): AppSettings =
         copy(systemPrompts = if (text.isEmpty()) systemPrompts - modelId else systemPrompts + (modelId to text))
 
+    /** What the user set for [modelId]; nothing, for a model without an entry. */
+    fun overrides(modelId: String): ModelOverrides = modelOverrides[modelId] ?: ModelOverrides()
+
+    /**
+     * These settings with [temperature] as the temperature of [modelId]; null goes back to the
+     * model's own. A model for which nothing is set any more loses its entry.
+     */
+    fun withTemperature(modelId: String, temperature: Float?): AppSettings {
+        val updated = overrides(modelId).copy(temperature = temperature)
+        return copy(modelOverrides = if (updated.isDefault) modelOverrides - modelId else modelOverrides + (modelId to updated))
+    }
+
+    /**
+     * The sampling a reply from [model] is generated with now: the catalogue's values for that
+     * model, with what the user set for it in their place.
+     */
+    fun sampling(model: ModelSpec): SamplingParams = overrides(model.id).applyTo(model.sampling)
+
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
-    override fun toString(): String = "AppSettings(systemPrompts for ${systemPrompts.keys})"
+    override fun toString(): String = "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides)"
 }
 
 /**
  * The stored form of [AppSettings]: JSON with a schema version next to the settings.
  *
  * ```
- * {"schemaVersion": 1, "settings": {"systemPrompts": {"<model id>": "<text>", ...}}}
+ * {"schemaVersion": 1, "settings": {
+ *     "systemPrompts": {"<model id>": "<text>", ...},
+ *     "models": {"<model id>": {"temperature": 0.7}, ...}}}
  * ```
  *
+ * `models` holds what the user set per model ([ModelOverrides]); a value that is not set is not
+ * written. It was added without a new schema version, because a file without it means exactly
+ * what it always meant: nothing set.
+ *
  * Reading is forgiving in the same way as for sessions: fields this version does not know are
- * ignored, a field of the wrong type takes its default, and a system prompt that is not text is
- * left out and counted. [decode] reports whether everything was read, so that the store can keep
- * a copy of the file before it writes over it.
+ * ignored, in the settings and in every model's object; a field of the wrong type takes its
+ * default; and a value that cannot be used (a system prompt that is not text, a temperature that
+ * is not a number or lies outside its range) is left out, which for a temperature means the
+ * model's own, and counted. [decode] reports whether everything was read, so that the store can
+ * keep a copy of the file before it writes over it.
  */
 object SettingsCodec {
 
@@ -78,6 +146,13 @@ object SettingsCodec {
             putJsonObject("systemPrompts") {
                 for ((modelId, text) in settings.systemPrompts) put(modelId, text)
             }
+            putJsonObject("models") {
+                for ((modelId, overrides) in settings.modelOverrides) {
+                    putJsonObject(modelId) {
+                        overrides.temperature?.let { put("temperature", it) }
+                    }
+                }
+            }
         }
     }.toString()
 
@@ -102,7 +177,29 @@ object SettingsCodec {
             }
             else -> skipped++
         }
-        return Decoded.Readable(AppSettings(systemPrompts = prompts), version, skipped)
+
+        val overrides = LinkedHashMap<String, ModelOverrides>()
+        when (val storedModels = stored["models"]) {
+            null -> Unit
+            is JsonObject -> for ((modelId, value) in storedModels) {
+                val model = value as? JsonObject
+                if (model == null) {
+                    skipped++
+                    continue
+                }
+                var temperature: Float? = null
+                val storedTemperature = model["temperature"]
+                if (storedTemperature != null) {
+                    temperature = (storedTemperature as? JsonPrimitive)?.takeUnless { it.isString }?.floatOrNull
+                        ?.takeIf(ModelOverrides::isValidTemperature)
+                    if (temperature == null) skipped++
+                }
+                val read = ModelOverrides(temperature = temperature)
+                if (!read.isDefault) overrides[modelId] = read
+            }
+            else -> skipped++
+        }
+        return Decoded.Readable(AppSettings(systemPrompts = prompts, modelOverrides = overrides), version, skipped)
     }
 }
 

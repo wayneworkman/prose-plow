@@ -34,6 +34,7 @@ import us.theworkmans.proseplow.core.engine.GenerationEvent
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import us.theworkmans.proseplow.data.CoalescingWriter
 import us.theworkmans.proseplow.data.SessionIndex
@@ -101,6 +102,18 @@ data class ChatState(
     fun offers(modelId: String): Boolean = models.any { it.id == modelId }
 }
 
+/**
+ * What a reply from one model is asked for with, apart from the conversation itself. It is the
+ * model's, not the chat's: a chat that switches models gets the other model's values with it.
+ *
+ * @property systemPrompt the system prompt set for the model, or null.
+ * @property sampling how the next token is chosen: the model's own values from the catalogue
+ *   with what the user set for this model in their place. It is always passed to the engine in
+ *   full, so that what a reply was generated with never depends on a second place that knows
+ *   the defaults.
+ */
+data class ModelRequestSettings(val systemPrompt: String?, val sampling: SamplingParams)
+
 /** Things that happened and are said once. */
 enum class ChatNotice {
     /** A reply that was being written in another chat was stopped because this chat asked for one. */
@@ -138,7 +151,9 @@ enum class ChatNotice {
  * the disk, so it is called off the main thread, when the session is opened.
  *
  * @param opened the index of chats as the store has just reconciled it.
- * @param systemPrompt the system prompt the settings hold for a model id, or null.
+ * @param requestSettings what the settings hold for a model right now. It is asked for every
+ *   reply when the reply is about to be generated, so a change in Settings applies from the next
+ *   answer, whether that is a new message, an answer asked for again or one that is continued.
  * @param models the models this build offers.
  */
 class ChatController(
@@ -147,7 +162,7 @@ class ChatController(
     private val engine: InferenceEngine,
     private val models: List<ModelSpec>,
     opened: SessionStore.Opened,
-    private val systemPrompt: (modelId: String) -> String?,
+    private val requestSettings: (model: ModelSpec) -> ModelRequestSettings,
     private val clock: Clock,
     private val ids: IdSource,
     private val mainDispatcher: CoroutineDispatcher,
@@ -591,7 +606,8 @@ class ChatController(
                 return
             }
             // Read again: the draft may have changed while the model was loading.
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(systemPrompt(spec.id))
+            val settings = requestSettings(spec)
+            val request = (sessions[reply.sessionId] ?: return).generationRequest(settings.systemPrompt, settings.sampling)
             engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
         } catch (e: CancellationException) {
             throw e

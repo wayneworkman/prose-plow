@@ -13,11 +13,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.DataLayout
+import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.BlobCipher
 import us.theworkmans.proseplow.security.Envelope
@@ -117,6 +119,108 @@ class SettingsStoreTest {
         val text = AppSettings(mapOf("qwen3.5-0.8b" to "My private instructions")).toString()
         assertFalse(text.contains("private"))
         assertTrue(text.contains("qwen3.5-0.8b"))
+    }
+
+    // --- The stored form: a temperature per model ---
+
+    private fun decoded(json: String) = SettingsCodec.decode(json) as SettingsCodec.Decoded.Readable
+
+    @Test
+    fun withoutATemperatureOfItsOwnAModelSamplesAsTheCatalogueSays() {
+        val settings = AppSettings()
+        assertEquals(ModelOverrides(), settings.overrides("qwen3.5-0.8b"))
+        assertNull(settings.overrides("qwen3.5-0.8b").temperature)
+        for (model in ModelCatalog.all) assertSame(model.id, model.sampling, settings.sampling(model))
+        assertFalse("what is not set is not written", SettingsCodec.encode(settings).contains("temperature"))
+    }
+
+    @Test
+    fun aTemperatureReplacesTheTemperatureOfItsModelAndNothingElse() {
+        val qwen = ModelCatalog.QWEN35_0_8B
+        val boris = ModelCatalog.BORIS_2_INSTRUCT
+        val settings = AppSettings().withTemperature(qwen.id, 0.3f)
+
+        val sampling = settings.sampling(qwen)
+
+        assertEquals(qwen.sampling.copy(temperature = 0.3f), sampling)
+        assertEquals(0.3f, sampling.temperature)
+        assertEquals(qwen.sampling.topK, sampling.topK)
+        assertEquals(qwen.sampling.presencePenalty, sampling.presencePenalty)
+        assertSame("another model keeps its own", boris.sampling, settings.sampling(boris))
+        assertTrue("0 is the greedy path", settings.withTemperature(qwen.id, 0f).sampling(qwen).isGreedy)
+    }
+
+    @Test
+    fun aTemperatureIsSetReplacedAndTakenBack() {
+        val one = AppSettings(systemPrompts = mapOf("a" to "kept")).withTemperature("a", 0.7f)
+        assertEquals(0.7f, one.overrides("a").temperature)
+        assertEquals("kept", one.systemPrompt("a"))
+        assertEquals(1.5f, one.withTemperature("a", 1.5f).overrides("a").temperature)
+        assertEquals("a model with nothing set has no entry", AppSettings(systemPrompts = mapOf("a" to "kept")), one.withTemperature("a", null))
+        assertEquals(one, one.withTemperature("b", null))
+    }
+
+    @Test
+    fun theRangeIsZeroToTwoWithBothEnds() {
+        assertEquals(0f, AppSettings().withTemperature("a", 0f).overrides("a").temperature)
+        assertEquals(2f, AppSettings().withTemperature("a", 2f).overrides("a").temperature)
+        for (outside in listOf(-0.01f, 2.01f, Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            assertFalse("$outside", ModelOverrides.isValidTemperature(outside))
+            assertThrows("$outside", IllegalArgumentException::class.java) { AppSettings().withTemperature("a", outside) }
+        }
+    }
+
+    @Test
+    fun temperaturesComeBackAsTheyWereEncoded() {
+        val settings = AppSettings(systemPrompts = mapOf("qwen3.5-0.8b" to "Answer briefly."))
+            .withTemperature("qwen3.5-0.8b", 0.7f)
+            .withTemperature("peacebell-v1-291m", 0f)
+            .withTemperature("boris-2-instruct", 2f)
+            .withTemperature("another", 1.25f)
+        assertEquals(SettingsCodec.Decoded.Readable(settings, schemaVersion = 1), SettingsCodec.decode(SettingsCodec.encode(settings)))
+    }
+
+    @Test
+    fun aFileFromBeforeThereWereTemperaturesReadsCompletely() {
+        val old = decoded("""{"schemaVersion":1,"settings":{"systemPrompts":{"a":"x"}}}""")
+        assertEquals(AppSettings(systemPrompts = mapOf("a" to "x")), old.settings)
+        assertTrue(old.complete)
+    }
+
+    @Test
+    fun theEndsOfTheRangeAreReadFromAFile() {
+        val ends = decoded("""{"schemaVersion":1,"settings":{"models":{"a":{"temperature":0},"b":{"temperature":2},"c":{"temperature":0.0},"d":{"temperature":2.0}}}}""")
+        assertEquals(listOf(0f, 2f, 0f, 2f), listOf("a", "b", "c", "d").map { ends.settings.overrides(it).temperature })
+        assertTrue(ends.complete)
+    }
+
+    @Test
+    fun aStoredTemperatureThatCannotBeUsedIsTreatedAsAbsentAndCounted() {
+        for (junk in listOf("\"warm\"", "\"0.7\"", "true", "null", "{}", "[0.7]", "-0.1", "-1", "2.01", "3", "1e9")) {
+            val read = decoded("""{"schemaVersion":1,"settings":{"models":{"a":{"temperature":$junk},"b":{"temperature":0.5}}}}""")
+            assertEquals(junk, AppSettings().withTemperature("b", 0.5f), read.settings)
+            assertNull(junk, read.settings.overrides("a").temperature)
+            assertEquals(junk, 1, read.skippedEntries)
+            assertFalse(junk, read.complete)
+        }
+    }
+
+    @Test
+    fun whatIsNotAModelsObjectIsLeftOutAndCounted() {
+        val mixed = decoded("""{"schemaVersion":1,"settings":{"models":{"a":0.7,"b":"x","c":null,"d":{"temperature":1}}}}""")
+        assertEquals(AppSettings().withTemperature("d", 1f), mixed.settings)
+        assertEquals(3, mixed.skippedEntries)
+
+        val wrongType = decoded("""{"schemaVersion":1,"settings":{"systemPrompts":{"a":"x"},"models":[{"temperature":1}]}}""")
+        assertEquals(AppSettings(systemPrompts = mapOf("a" to "x")), wrongType.settings)
+        assertFalse(wrongType.complete)
+    }
+
+    @Test
+    fun whatAModelsObjectHoldsBesidesIsIgnored() {
+        val later = decoded("""{"schemaVersion":1,"settings":{"models":{"a":{"temperature":0.7,"topP":0.9,"replyLength":256},"b":{"topK":40},"c":{}}}}""")
+        assertEquals(AppSettings().withTemperature("a", 0.7f), later.settings)
+        assertTrue(later.complete)
     }
 
     // --- The store ---
@@ -233,6 +337,39 @@ class SettingsStoreTest {
         assertEquals("changed", reopened.settings.value.systemPrompt("a"))
         assertNull("what this version wrote, it reads completely", reopened.loadIssue.value)
         assertEquals(1, keptCopies().size)
+    }
+
+    @Test
+    fun aTemperatureIsStoredEncryptedAndIsThereAtTheNextUnlock() = runTest {
+        val store = open()
+        store.update(urgent = true) { it.withSystemPrompt("qwen3.5-0.8b", "Be brief.").withTemperature("qwen3.5-0.8b", 0.35f) }
+        runCurrent()
+
+        assertFalse(String(layout.settings.readBytes(), Charsets.ISO_8859_1).contains("temperature"))
+        val reopened = open()
+        assertEquals(0.35f, reopened.settings.value.overrides("qwen3.5-0.8b").temperature)
+        assertEquals("Be brief.", reopened.settings.value.systemPrompt("qwen3.5-0.8b"))
+        assertNull(reopened.loadIssue.value)
+
+        // Taking it back is stored as well.
+        reopened.update(urgent = true) { it.withTemperature("qwen3.5-0.8b", null) }
+        runCurrent()
+        assertNull(open().settings.value.overrides("qwen3.5-0.8b").temperature)
+        assertEquals(emptyList<File>(), keptCopies())
+    }
+
+    @Test
+    fun aStoredTemperatureThatCannotBeUsedIsReportedLikeAnyFileReadInPart() = runTest {
+        plant("""{"schemaVersion":1,"settings":{"systemPrompts":{"a":"kept"},"models":{"m":{"temperature":7},"n":{"temperature":1.5}}}}""")
+        val original = layout.settings.readBytes()
+
+        val store = open()
+
+        assertNull("the model's own applies", store.settings.value.overrides("m").temperature)
+        assertEquals(1.5f, store.settings.value.overrides("n").temperature)
+        assertEquals("kept", store.settings.value.systemPrompt("a"))
+        assertEquals(SettingsStore.LoadIssue.PARTLY_READ, store.loadIssue.value)
+        assertArrayEquals(original, keptCopies().single().readBytes())
     }
 
     @Test

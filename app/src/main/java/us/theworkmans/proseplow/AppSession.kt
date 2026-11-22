@@ -15,6 +15,7 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import us.theworkmans.proseplow.chat.ChatController
+import us.theworkmans.proseplow.chat.ModelRequestSettings
 import us.theworkmans.proseplow.core.chat.Clock
 import us.theworkmans.proseplow.core.chat.IdSource
 import us.theworkmans.proseplow.core.chat.RandomIds
@@ -130,7 +131,10 @@ class AppSession(
                 engine = engine,
                 models = models,
                 opened = sessionStore.open(),
-                systemPrompt = { modelId -> settingsStore.settings.value.systemPrompt(modelId).ifEmpty { null } },
+                requestSettings = { model ->
+                    val current = settingsStore.settings.value
+                    ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model))
+                },
                 clock = clock,
                 ids = ids,
                 mainDispatcher = mainDispatcher,
