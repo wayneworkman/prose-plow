@@ -1,0 +1,160 @@
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -637,6 +637,10 @@ struct llama_file::impl {
+     FILE * fp{};
+     size_t size{};
+     bool owns_fp = true;
++
++    // see llama_file::set_mmap_window
++    size_t window_first = 0;
++    size_t window_last  = SIZE_MAX;
+ };
+ 
+ llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
+@@ -652,6 +656,16 @@ size_t llama_file::size() const { return pimpl->size; }
+ size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
+ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+ 
++void llama_file::set_mmap_window(size_t first, size_t last) {
++    pimpl->window_first = first;
++    pimpl->window_last  = last;
++}
++
++std::pair<size_t, size_t> llama_file::mmap_window() const {
++    const size_t last = std::min(pimpl->window_last, pimpl->size);
++    return { std::min(pimpl->window_first, last), last };
++}
++
+ int llama_file::file_id() const {
+ #ifdef _WIN32
+     return _fileno(pimpl->fp);
+@@ -705,29 +719,40 @@ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+ 
++    // The part of the file that is mapped, [map_first, map_last) in file offsets: the file's
++    // mmap window with its start rounded down to a page. `addr` stays the address that file
++    // offset 0 would have, so that callers keep addressing by file offset; only offsets inside
++    // the mapped part may be touched, and everything below is clamped to it.
++    size_t map_first = 0;
++    size_t map_last  = 0;
++
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         size = file->size();
+         int fd = file->file_id();
+         int flags = MAP_SHARED;
+         if (numa) { prefetch = 0; }
++        const size_t map_page = sysconf(_SC_PAGESIZE);
++        map_first = file->mmap_window().first & ~(map_page - 1);
++        map_last  = file->mmap_window().second;
+ #ifdef __linux__
+-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
++        if (posix_fadvise(fd, map_first, map_last - map_first, POSIX_FADV_SEQUENTIAL)) {
+             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                     strerror(errno));
+         }
+         // MAP_POPULATE would fault in the lazy ranges too
+         if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+ #endif
+-        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+-        if (addr == MAP_FAILED) {
++        void * base = mmap(NULL, map_last - map_first, PROT_READ, flags, fd, map_first);
++        if (base == MAP_FAILED) {
+             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+         }
++        addr = (void *) ((uintptr_t) base - map_first);
+ 
+-        // page-aligned madvise over [beg, end), clamped to the file
++        // page-aligned madvise over [beg, end), clamped to the mapped part of the file
+         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
+             const size_t page_size = sysconf(_SC_PAGESIZE);
+-            beg = beg & ~(page_size - 1);
+-            end = std::min((end + page_size - 1) & ~(page_size - 1), file->size());
++            beg = std::max(beg & ~(page_size - 1), map_first);
++            end = std::min((end + page_size - 1) & ~(page_size - 1), map_last);
+             if (beg >= end) {
+                 return;
+             }
+@@ -745,13 +770,13 @@ struct llama_mmap::impl {
+             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+         }
+         if (numa) {
+-            if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
++            if (posix_madvise(base, map_last - map_first, POSIX_MADV_RANDOM)) {
+                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                         strerror(errno));
+             }
+         }
+ 
+-        mapped_fragments.emplace_back(0, file->size());
++        mapped_fragments.emplace_back(map_first, map_last);
+     }
+ 
+     static void align_range(size_t * first, size_t * last, size_t page_size) {
+@@ -768,6 +793,12 @@ struct llama_mmap::impl {
+ 
+     void unmap_fragment(size_t first, size_t last) {
+         int page_size = sysconf(_SC_PAGESIZE);
++        // never outside the mapped part: those addresses belong to somebody else
++        first = std::max(first, map_first);
++        last  = std::min(last,  map_last);
++        if (last <= first) {
++            return;
++        }
+         align_range(&first, &last, page_size);
+         size_t len = last - first;
+ 
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -39,6 +39,13 @@ struct llama_file {
+ 
+     size_t read_alignment() const;
+     bool has_direct_io() const;
++
++    // The byte range [first, last) of the file that a mapping has to cover. The whole file
++    // unless set: a model embedded in a larger file (an asset inside an archive, several
++    // models in one file) sets it to its own tensor data, so that mapping one model neither
++    // maps nor reads ahead whatever else the file holds.
++    void set_mmap_window(size_t first, size_t last);
++    std::pair<size_t, size_t> mmap_window() const;
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -775,6 +775,8 @@ llama_model_loader::llama_model_loader(
+         // mmap places tensors at their file offsets, so an embedded GGUF must be aligned in the file too
+         const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+         if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
++            // not yet owned by `contexts`, which would free it
++            ggml_free(ctx);
+             throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
+                 __func__, gguf_get_data_offset(metadata), tensor_align));
+         }
+@@ -785,6 +787,10 @@ llama_model_loader::llama_model_loader(
+         files.emplace_back(new llama_file(file));
+         contexts.emplace_back(ctx);
+ 
++        // The stream may hold more than this model, before and after it. A mapping is limited
++        // to this model's tensor data, which ends where its last tensor ends.
++        size_t mmap_window_last = gguf_get_data_offset(metadata);
++
+         // Save tensors data offset info of the main file.
+         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+             std::string tensor_name = std::string(cur->name);
+@@ -794,8 +800,11 @@ llama_model_loader::llama_model_loader(
+             }
+             n_elements += ggml_nelements(cur);
+             n_bytes    += ggml_nbytes(cur);
+-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
++            const llama_tensor_weight weight(files.back().get(), 0, metadata, cur);
++            mmap_window_last = std::max(mmap_window_last, weight.offs + ggml_nbytes(cur));
++            weights_map.emplace(tensor_name, weight);
+         }
++        files.back()->set_mmap_window(gguf_get_data_offset(metadata), mmap_window_last);
+     } else {
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));

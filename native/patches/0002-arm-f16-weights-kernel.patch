@@ -1,0 +1,62 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -43,8 +43,13 @@
+ #include <omp.h>
+ #endif
+ 
++// The variants built for SVE or the int8 matrix instructions leave tinyBLAS out, because ggml's
++// own kernels serve the quantised types better there. They have no batch kernel for 16-bit
++// float weights, though, and tinyBLAS has one: for that one pair of types it stays in.
+ #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+-#undef GGML_USE_LLAMAFILE
++#ifdef GGML_USE_LLAMAFILE
++#define GGML_LLAMAFILE_F16_ONLY
++#endif
+ #endif
+ 
+ #ifdef GGML_USE_LLAMAFILE
+@@ -1343,7 +1348,13 @@ void ggml_compute_forward_mul_mat(
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
+-    if (!params->use_ref && src1_cont) {
++#ifdef GGML_LLAMAFILE_F16_ONLY
++    const bool llamafile_takes = src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32;
++#else
++    const bool llamafile_takes = true;
++#endif
++
++    if (!params->use_ref && src1_cont && llamafile_takes) {
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+             for (int64_t i12 = 0; i12 < ne12; i12++)
+                 if (!llamafile_sgemm(params,
+@@ -1421,7 +1432,7 @@ UseGgmlGemm1:;
+ 
+     ggml_barrier(params->threadpool);
+ 
+-#if GGML_USE_LLAMAFILE
++#if GGML_USE_LLAMAFILE && !defined(GGML_LLAMAFILE_F16_ONLY)
+     if (!params->use_ref && src1->type != vec_dot_type) {
+         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -4533,6 +4533,16 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             return tb.matmul(m, n);
+         }
+ #elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++        // F16 weights by F32 activations, the case of every F16 model file: the kernel of the
++        // plain NEON branch below, which the fp16 variants would otherwise never reach. It
++        // widens the weights and accumulates in F32, so no precision is given up for it.
++        if (Btype == GGML_TYPE_F32) {
++            tinyBLAS<4, float32x4_t, float32x4_t, ggml_fp16_t, float, float> tb{ params,
++                k, (const ggml_fp16_t *)A, lda,
++                (const float *)B, ldb,
++                (float *)C, ldc};
++            return tb.matmul(m, n);
++        }
+         if (n < 8)
+             return false;
+         if (Btype == GGML_TYPE_F16) {

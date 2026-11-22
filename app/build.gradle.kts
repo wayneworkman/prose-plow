@@ -68,6 +68,22 @@ android {
         includeInBundle = false
     }
 
+    // What the native code of :llama needs from the APK (native/README.md, "Models in the APK").
+    // A model is an asset named *.gguf.so that the app opens by file descriptor and maps in place,
+    // so it must be stored, not deflated, and must start on a page boundary. AGP puts stored
+    // entries named *.so on 16 KiB boundaries only while the native libraries themselves are
+    // stored and page-aligned, which is what useLegacyPackaging = false says (the default at this
+    // minSdk, stated because the models depend on it). The checks applied at the end of this file
+    // make the task that writes an APK fail if it comes out otherwise.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+    androidResources {
+        noCompress += "gguf.so"
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -244,3 +260,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.core)
 }
+
+// The checks on the finished APK that the native code depends on: models stored on 16 KiB
+// boundaries, native libraries built for 16 KB pages. They live with the module they protect.
+apply(from = "../llama/apk-checks.gradle.kts")

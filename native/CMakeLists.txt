@@ -102,3 +102,4 @@ if (PROSEPLOW_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+add_subdirectory(session)  # the generation session and its tests; after enable_testing() so that ctest sees them

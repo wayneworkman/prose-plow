@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- The test APK only. An empty activity that the model tests put in front while they
+             measure: Android confines a process without a visible activity to fewer cores (and
+             never the fastest one), which is not how the app runs a model. Not exported: only
+             the tests themselves start it. -->
+        <activity
+            android:name="us.theworkmans.proseplow.llama.ForegroundActivity"
+            android:exported="false" />
+    </application>
+
+</manifest>
