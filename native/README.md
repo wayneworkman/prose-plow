@@ -557,15 +557,16 @@ Three things happen that an ordinary library module does not have:
 A clean native build takes 45 seconds with 6 jobs. Gradle starts Ninja without a job limit,
 and Ninja then uses every processor; set `PROSEPLOW_JOBS` in the environment of the Gradle
 invocation to limit it (the limit is fixed when CMake configures, as a Ninja job pool). The
-native build tree is `llama/.cxx/`, 240 MB, and the prepared copy another 200 MB under
+native build tree is `llama/.cxx/`, about 160 MB, and the prepared copy another 200 MB under
 `llama/build`. `./gradlew clean` does not remove `llama/.cxx`: delete it, and `llama/build`, for
 a build from nothing.
 
 ### What is built
 
 Twelve libraries reach the APK, eleven built here and the C++ runtime. Sizes are for the
-stripped files a release APK contains; a debug APK carries them with debug information, about
-95 MB in all.
+stripped files that both a debug and a release APK contain. The app module strips them when it
+packages them, which needs the same `ndkVersion` there as here: without it the build still
+succeeds, prints "Unable to strip the following libraries", and every APK is about 80 MB larger.
 
 | Library | Bytes | What it is |
 | --- | --- | --- |
@@ -671,14 +672,17 @@ What packaging costs, measured for a debug build on a desktop with an SSD:
 
 | Bundled | Time of `:app:assembleDebug` after a build without it | APK | Under `app/build` and `llama/build` for it |
 | --- | --- | --- | --- |
-| nothing | | 131.8 MB | |
-| peacebell-v1-291m (583.7 MB) | 10 s | 715.5 MB | 2.9 GB |
-| qwen3.5-0.8b (1,516.7 MB) | 27 s | 1,648.6 MB | 7.4 GB |
+| nothing | | 50.2 MB | |
+| peacebell-v1-291m (583.7 MB) | 10 s | about 634 MB | 2.9 GB |
+| qwen3.5-0.8b (1,516.7 MB) | 27 s | about 1,567 MB | 7.4 GB |
+| all three (2,392.3 MB) | 65 s | 2,442.5 MB | 12 GB |
 
 AGP keeps four copies of an asset on its way into an APK (the generated directory, the merged
 assets of the library, those of the app, and a packaging intermediate) besides the APK itself:
-five times the model. A build that changes nothing takes 3 seconds; installing over USB took
-20 seconds for the 715 MB APK.
+five times the model. A build that changes nothing takes 3 seconds; installing the APK with all
+three models over USB took 70 to 77 seconds. The times and the disk use in the table were
+measured before the libraries were stripped; the APK sizes of the two single-model rows are
+computed from the stripped build, the other two were built.
 
 ## On the phone
 

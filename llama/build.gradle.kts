@@ -64,8 +64,7 @@ android {
                     // Optimised for every variant: an unoptimised llama.cpp is not usable for
                     // development. AGP takes the native build type from this argument, so the
                     // debug and the release variant share one native build and one set of
-                    // libraries (a debug APK carries them with their debug information, a
-                    // release APK stripped).
+                    // libraries, which the app module strips when it packages either variant.
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DPROSEPLOW_LLAMA_SRC=${llamaSource.get().asFile.absolutePath}",
                 )
