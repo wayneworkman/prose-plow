@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Debug builds only. A debug build installs beside a real one (its application id ends in
+         .debug), so its name says which of the two is on screen: in the launcher, on the lock
+         screen and on the fingerprint prompt. -->
+    <string name="app_name">Prose Plow (debug)</string>
+</resources>

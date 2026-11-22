@@ -18,8 +18,11 @@ class BuildConfigTest {
     }
 
     // The application id is permanent: installed copies, their data and F-Droid all key on it.
+    // A debug build is deliberately another app (".debug"), so that development on a phone never
+    // touches a real installation.
     @Test
-    fun applicationIdIsTheNamespace() {
-        assertEquals("us.theworkmans.proseplow", BuildConfig.APPLICATION_ID)
+    fun applicationIdIsTheNamespaceAndADebugBuildIsAnotherApp() {
+        val expected = if (BuildConfig.DEBUG) "us.theworkmans.proseplow.debug" else "us.theworkmans.proseplow"
+        assertEquals(expected, BuildConfig.APPLICATION_ID)
     }
 }

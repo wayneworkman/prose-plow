@@ -1,0 +1,264 @@
+package us.theworkmans.proseplow.lock
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import us.theworkmans.proseplow.security.AppFiles
+import us.theworkmans.proseplow.security.AppLock
+import us.theworkmans.proseplow.security.BiometricLauncher
+import us.theworkmans.proseplow.security.BiometricStatus
+import us.theworkmans.proseplow.security.FakeClock
+import us.theworkmans.proseplow.security.LockConfigStore
+import us.theworkmans.proseplow.security.LockManager
+import us.theworkmans.proseplow.security.LockState
+import us.theworkmans.proseplow.security.SoftwareKeyVault
+import us.theworkmans.proseplow.security.UnlockedSession
+import javax.crypto.Cipher
+
+/** The typed confirmation of a reset. */
+class ResetConfirmationTest {
+    @Test
+    fun theWordMustBeTypedGiveOrTakeCapitalsAndBlanks() {
+        for (typed in listOf("delete", "DELETE", "Delete", "  delete  ", "\tdeLeTe\n")) assertTrue(typed, ResetConfirmation.matches(typed, "delete"))
+        for (typed in listOf("", " ", "delet", "deleted", "de lete", "delete!", "reset", "yes")) assertFalse(typed, ResetConfirmation.matches(typed, "delete"))
+    }
+}
+
+/**
+ * The Security section's ViewModel over a real lock (software keys, virtual time): what each
+ * action leads to, and what the screen is told when it does not work.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+class SecurityViewModelTest {
+
+    @get:Rule
+    val temp = TemporaryFolder()
+
+    private val scheduler = TestCoroutineScheduler()
+    private val dispatcher = StandardTestDispatcher(scheduler)
+    private val vault = SoftwareKeyVault()
+    private val clock = FakeClock()
+    private val files by lazy { AppFiles(temp.newFolder("files"), temp.newFolder("cache")) }
+    private var biometric = BiometricStatus.NONE_ENROLLED
+    private var promptCipher: Cipher? = null
+
+    private val passphrase = "correct horse battery"
+    private val otherPassphrase = "a different one, longer"
+
+    private lateinit var lock: AppLock<UnlockedSession>
+    private lateinit var viewModel: SecurityViewModel
+
+    @Before
+    fun viewModelsRunOnTheTestDispatcher() = Dispatchers.setMain(dispatcher)
+
+    @After
+    fun restoreTheMainDispatcher() = Dispatchers.resetMain()
+
+    /** A set-up, unlocked app with the Security section open. */
+    private fun TestScope.unlockedApp() {
+        lock = AppLock(
+            manager = LockManager(LockConfigStore(files.lockConfig), vault, clock, iterations = 1_000, minIterations = 1, encryptedDataExists = files::encryptedDataExists),
+            files = files,
+            clock = clock,
+            openSession = {
+                object : UnlockedSession {
+                    override fun clearScreens() = Unit
+
+                    override suspend fun close() = Unit
+                }
+            },
+            biometricStatus = { biometric },
+            mainDispatcher = dispatcher,
+            ioDispatcher = dispatcher,
+        )
+        lock.attach(
+            BiometricLauncher { cipher, _ ->
+                promptCipher = cipher
+                true
+            },
+        )
+        runCurrent()
+        lock.setUp(passphrase.toCharArray(), passphrase.toCharArray())
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+        viewModel = SecurityViewModel(lock)
+    }
+
+    private fun TestScope.confirmWith(text: String) {
+        viewModel.submitCurrentPassphrase(text.toCharArray())
+        runCurrent()
+    }
+
+    private fun TestScope.unlocksWith(text: String): Boolean {
+        lock.lock()
+        runCurrent()
+        lock.unlockWithPassphrase(text.toCharArray())
+        runCurrent()
+        return lock.state.value is LockState.Unlocked
+    }
+
+    @Test
+    fun changingThePassphraseAsksForTheCurrentOneThenTheNewOneTwice() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.onChangePassphrase()
+        assertEquals(SecurityUiState(dialog = SecurityDialog.Confirm(ProtectedAction.CHANGE)), viewModel.state.value)
+
+        val wrong = "not the passphrase".toCharArray()
+        viewModel.submitCurrentPassphrase(wrong)
+        assertTrue(viewModel.state.value.busy)
+        runCurrent()
+        assertEquals(SecurityUiState(dialog = SecurityDialog.Confirm(ProtectedAction.CHANGE), error = SecurityError.WRONG), viewModel.state.value)
+        assertTrue("what was typed is wiped", wrong.all { it == '\u0000' })
+
+        confirmWith(passphrase)
+        assertTrue(viewModel.state.value.dialog is SecurityDialog.ChangePassphrase)
+        assertNull(viewModel.state.value.error)
+
+        // The two entries differ, then break the rules: nothing changes, the dialog stays.
+        viewModel.submitNewPassphrase(otherPassphrase.toCharArray(), passphrase.toCharArray())
+        assertEquals(SecurityError.MISMATCH, viewModel.state.value.error)
+        viewModel.submitNewPassphrase("1234567890".toCharArray(), "1234567890".toCharArray())
+        assertEquals(SecurityError.DIGITS_ONLY, viewModel.state.value.error)
+        viewModel.submitNewPassphrase("too short".toCharArray(), "too short".toCharArray())
+        assertEquals(SecurityError.TOO_SHORT, viewModel.state.value.error)
+        assertTrue(viewModel.state.value.dialog is SecurityDialog.ChangePassphrase)
+        assertEquals(1, vault.bindingKeys.size)
+
+        val first = otherPassphrase.toCharArray()
+        val second = otherPassphrase.toCharArray()
+        viewModel.submitNewPassphrase(first, second)
+        assertTrue(viewModel.state.value.busy)
+        viewModel.dismissDialog() // Not while the key is being secured.
+        assertTrue(viewModel.state.value.dialog is SecurityDialog.ChangePassphrase)
+        runCurrent()
+        assertEquals(SecurityUiState(passphraseChanged = true), viewModel.state.value)
+        assertTrue(first.all { it == '\u0000' } && second.all { it == '\u0000' })
+
+        assertFalse(unlocksWith(passphrase))
+        lock.unlockWithPassphrase(otherPassphrase.toCharArray())
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    @Test
+    fun tooManyWrongPassphrasesAreThrottledHereToo() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.onChangePassphrase()
+        repeat(5) {
+            confirmWith("not the passphrase")
+            assertEquals(SecurityError.WRONG, viewModel.state.value.error)
+        }
+        confirmWith(passphrase)
+        assertEquals(SecurityError.THROTTLED, viewModel.state.value.error)
+        assertTrue(viewModel.state.value.dialog is SecurityDialog.Confirm)
+
+        viewModel.submitCurrentPassphrase(CharArray(0))
+        runCurrent()
+        assertEquals(SecurityError.EMPTY, viewModel.state.value.error)
+    }
+
+    @Test
+    fun aNewPassphraseEnteredTooLateIsRefused() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.onChangePassphrase()
+        confirmWith(passphrase)
+        clock.advance(LockManager.PROOF_VALIDITY_MILLIS + 1)
+        viewModel.submitNewPassphrase(otherPassphrase.toCharArray(), otherPassphrase.toCharArray())
+        runCurrent()
+        assertEquals(SecurityUiState(error = SecurityError.EXPIRED), viewModel.state.value)
+        assertTrue("the old passphrase still is the passphrase", unlocksWith(passphrase))
+    }
+
+    @Test
+    fun fingerprintUnlockIsTurnedOnAndOffWithThePassphrase() = runTest(dispatcher) {
+        biometric = BiometricStatus.AVAILABLE
+        unlockedApp()
+        lock.declineFingerprintOffer()
+        assertTrue(viewModel.biometricAvailable())
+        assertFalse(viewModel.status.value.biometricEnabled)
+
+        viewModel.onFingerprintSwitch(true)
+        assertEquals(SecurityDialog.Confirm(ProtectedAction.FINGERPRINT_ON), viewModel.state.value.dialog)
+        confirmWith(passphrase)
+        assertEquals("the dialog gives way to the system's prompt", SecurityUiState(), viewModel.state.value)
+        lock.onBiometricSucceeded(promptCipher)
+        runCurrent()
+        assertTrue(viewModel.status.value.biometricEnabled)
+
+        viewModel.onFingerprintSwitch(false)
+        assertEquals(SecurityDialog.Confirm(ProtectedAction.FINGERPRINT_OFF), viewModel.state.value.dialog)
+        viewModel.dismissDialog()
+        assertTrue("dismissing changes nothing", viewModel.status.value.biometricEnabled)
+        viewModel.onFingerprintSwitch(false)
+        confirmWith(passphrase)
+        assertFalse(viewModel.status.value.biometricEnabled)
+        assertTrue(vault.biometricKeys.isEmpty())
+    }
+
+    @Test
+    fun theLockTimeoutIsSavedAndAFailureToSaveIsShown() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.setLockTimeout(300)
+        runCurrent()
+        assertEquals(300, viewModel.status.value.lockTimeoutSeconds)
+        assertNull(viewModel.state.value.error)
+
+        files.securityDir.setWritable(false)
+        try {
+            viewModel.setLockTimeout(0)
+            runCurrent()
+        } finally {
+            files.securityDir.setWritable(true)
+        }
+        assertEquals(SecurityError.FAILED, viewModel.state.value.error)
+        assertEquals("the stored value is what is shown", 300, viewModel.status.value.lockTimeoutSeconds)
+
+        viewModel.setLockTimeout(900)
+        runCurrent()
+        assertEquals(900, viewModel.status.value.lockTimeoutSeconds)
+        assertNull(viewModel.state.value.error)
+    }
+
+    @Test
+    fun lockNowLocks() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.lockNow()
+        assertTrue(lock.state.value is LockState.Locked)
+    }
+
+    @Test
+    fun resetGoesThroughTheTypedConfirmationAndThenTheLockDoesIt() = runTest(dispatcher) {
+        unlockedApp()
+        viewModel.confirmReset() // Not without the dialog having been opened.
+        assertTrue(lock.state.value is LockState.Unlocked)
+
+        viewModel.onReset()
+        assertEquals(SecurityUiState(dialog = SecurityDialog.Reset), viewModel.state.value)
+        viewModel.dismissDialog()
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertTrue(files.lockConfig.exists())
+
+        viewModel.onReset()
+        viewModel.confirmReset()
+        assertEquals("the screens are gone at once", LockState.Starting, lock.state.value)
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertFalse(files.lockConfig.exists())
+        assertTrue(vault.aliases.isEmpty())
+    }
+}

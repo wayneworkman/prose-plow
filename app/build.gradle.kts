@@ -41,9 +41,21 @@ android {
             //noinspection ChromeOsAbiSupport
             abiFilters += "arm64-v8a"
         }
+
+        // For the instrumented tests (src/androidTest), which need a phone: they exercise the real
+        // Android Keystore. They run with connectedDebugAndroidTest only and are not part of check.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
+        debug {
+            // A debug build is another app as far as the phone is concerned: its own package, its own
+            // data directory and its own Keystore keys. Development (installing, clearing data,
+            // uninstalling, the instrumented tests, which remove the app when they are done) can
+            // therefore never touch a real installation and the chats in it. Its launcher label
+            // differs too (src/debug/res).
+            applicationIdSuffix = ".debug"
+        }
         release {
             isMinifyEnabled = false
         }
@@ -224,4 +236,9 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+
+    // The instrumented tests: the runner, its JUnit 4 integration, and the application context.
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.core)
 }

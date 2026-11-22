@@ -1,4 +1,114 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Prose Plow</string>
+
+    <!-- Shared -->
+    <string name="cancel">Cancel</string>
+    <string name="ok">OK</string>
+    <string name="try_again">Try again</string>
+    <string name="not_now">Not now</string>
+    <string name="turn_on">Turn on</string>
+    <string name="use_fingerprint">Use fingerprint</string>
+    <string name="copied">Copied</string>
+    <string name="copy_failed">That could not be copied.</string>
+    <string name="error_detail">Something went wrong: %1$s</string>
+
+    <!-- Passphrases: rules and what is wrong with one -->
+    <string name="passphrase_rules">Use at least 10 characters, and not only digits.</string>
+    <string name="passphrase_new">New passphrase</string>
+    <string name="passphrase_repeat">Repeat the passphrase</string>
+    <string name="passphrase_mismatch">The passphrases do not match.</string>
+    <string name="passphrase_too_short">Use at least 10 characters.</string>
+    <string name="passphrase_digits_only">Use more than digits: a PIN is not allowed.</string>
+    <string name="passphrase_empty">Enter your passphrase.</string>
+    <string name="passphrase_too_long">That is longer than any passphrase can be (the limit is 1,024 characters).</string>
+    <string name="passphrase_working">Securing the key…</string>
+
+    <!-- First run: creating the passphrase -->
+    <string name="setup_title">Create your passphrase</string>
+    <string name="setup_message">%1$s encrypts everything it stores on this phone. Your passphrase unlocks it each time you open the app; without it nothing can be read.</string>
+    <string name="setup_no_recovery">A forgotten passphrase cannot be recovered. There is no reset link and no recovery key: the only way back in is to reset the app, which deletes all of its data.</string>
+    <string name="setup_create">Create passphrase</string>
+
+    <!-- Lock screen -->
+    <string name="lock_starting">Starting…</string>
+    <string name="lock_title">%1$s is locked</string>
+    <string name="lock_passphrase">Passphrase</string>
+    <string name="lock_unlock">Unlock</string>
+    <string name="lock_checking">Checking the passphrase…</string>
+    <string name="lock_wrong">Wrong passphrase.</string>
+    <string name="lock_retry_in">Too many wrong attempts. Try again in %1$s.</string>
+    <string name="lock_throttled">Too many wrong attempts. Wait a while, then try again.</string>
+
+    <!-- Reset app data: the lock screen, the error screens and Settings -->
+    <string name="reset_action">Reset app data</string>
+    <string name="reset_title">Reset app data?</string>
+    <string name="reset_message">This deletes everything %1$s has stored on this phone: every chat, every setting, your passphrase and fingerprint unlock. There is no recovery key and no way to get the data back. The app then starts again with first-time set-up.</string>
+    <string name="reset_confirm_message">Type %1$s to confirm.</string>
+    <string name="reset_word" translatable="false">delete</string>
+    <string name="reset_confirm_label">Confirmation</string>
+    <string name="reset_confirm_button">Delete everything</string>
+    <string name="reset_incomplete_title">The reset is not complete</string>
+    <string name="reset_incomplete_keys">Some of the app\'s keys could not be deleted from the phone\'s key store. The app tries again every time it starts.</string>
+    <string name="reset_incomplete_data">Some of the app\'s files could not be deleted. Reset again to retry.</string>
+    <string name="reset_incomplete_config">The lock configuration could not be deleted. Reset again to retry.</string>
+
+    <!-- When the data cannot be opened -->
+    <string name="unrecoverable_title">The app\'s data cannot be unlocked</string>
+    <string name="unrecoverable_config_unreadable">The lock configuration is damaged, so the key that encrypts the app\'s data cannot be recovered.</string>
+    <string name="unrecoverable_config_missing">Encrypted data exists, but its lock configuration is gone, so it cannot be decrypted.</string>
+    <string name="unrecoverable_key_lost">A key in the phone\'s secure key store that the app\'s data depends on is gone or unusable (for example after the key store was cleared).</string>
+    <string name="unrecoverable_hint">There is no recovery key. To use the app again, reset its data. Try again first if you think the problem is temporary.</string>
+    <string name="failed_title">Couldn\'t open the app\'s data</string>
+    <string name="failed_hint">Nothing has been deleted. Try again; if it keeps failing, resetting the app\'s data is the only other way on.</string>
+    <string name="failed_detail">Technical detail: %1$s</string>
+
+    <!-- Fingerprint: the system prompt and one-off messages -->
+    <string name="biometric_unlock_title">Unlock %1$s</string>
+    <string name="biometric_enroll_title">Turn on fingerprint unlock</string>
+    <string name="biometric_enroll_subtitle">Confirm with your fingerprint</string>
+    <string name="biometric_use_passphrase">Use passphrase</string>
+    <string name="biometric_unlock_failed">Fingerprint unlock did not work and was turned off. Use your passphrase.</string>
+    <string name="biometric_unlock_unavailable">Fingerprint unlock is not available right now. Use your passphrase; fingerprint unlock stays on.</string>
+    <string name="biometric_locked_out">Too many fingerprint attempts. Use your passphrase.</string>
+    <string name="biometric_enrolled">Fingerprint unlock is on.</string>
+    <string name="biometric_enroll_failed">Fingerprint unlock was not turned on.</string>
+    <string name="biometric_removed">Fingerprint unlock was turned off because no fingerprint is enrolled any more. Use your passphrase.</string>
+    <string name="offer_fingerprint_title">Also unlock with fingerprint?</string>
+    <string name="offer_fingerprint_message">Your fingerprint can unlock the app instead of the passphrase. The passphrase always works too, and is still needed after the fingerprints on this phone change.</string>
+    <string name="offer_fingerprint_again_title">Turn fingerprint unlock on again?</string>
+    <string name="offer_fingerprint_again_message">Fingerprint unlock was turned off because the fingerprints on this phone changed, or its key became unusable. Your passphrase still works.</string>
+
+    <!-- Settings: security -->
+    <string name="section_security">Security</string>
+    <string name="security_change_passphrase">Change passphrase</string>
+    <string name="security_passphrase_changed">The passphrase was changed.</string>
+    <string name="security_fingerprint">Unlock with fingerprint</string>
+    <string name="security_fingerprint_support">Your fingerprint unlocks the encryption key through the phone\'s secure hardware. Turning this on or off needs your passphrase.</string>
+    <string name="security_fingerprint_unavailable">No strong fingerprint (or other Class 3 biometric) is set up on this phone.</string>
+    <string name="security_lock_after">Lock after</string>
+    <string name="security_lock_after_support">Time in the background before the app locks. It is always locked after a restart.</string>
+    <string name="timeout_immediately">Immediately</string>
+    <string name="timeout_1_minute">1 minute</string>
+    <string name="timeout_5_minutes">5 minutes</string>
+    <string name="timeout_15_minutes">15 minutes</string>
+    <string name="security_lock_now">Lock now</string>
+    <string name="security_always_on">Screenshots are blocked, the app\'s content is hidden in the recent apps screen, and the keyboard is asked not to learn from what you type. These protections are always on.</string>
+    <string name="security_reset_support">Deletes every chat and setting and your passphrase, then starts again with first-time set-up.</string>
+    <string name="security_failed">That did not work: the phone\'s key store or storage reported an error.</string>
+    <string name="confirm_passphrase_title">Enter your passphrase</string>
+    <string name="confirm_change">Enter your current passphrase.</string>
+    <string name="confirm_fingerprint_on">Enter your passphrase to turn on fingerprint unlock.</string>
+    <string name="confirm_fingerprint_off">Enter your passphrase to turn off fingerprint unlock.</string>
+    <string name="passphrase_continue">Continue</string>
+    <string name="change_passphrase_title">New passphrase</string>
+    <string name="change_passphrase_no_recovery">A forgotten passphrase cannot be recovered.</string>
+    <string name="passphrase_save">Save</string>
+    <string name="passphrase_expired">Too much time has passed. Enter your passphrase again.</string>
+
+    <!-- The screen that stands in for the chat until it is written -->
+    <string name="placeholder_message">The app is unlocked. Chats will appear here.</string>
+    <string name="placeholder_sample">Sample text to copy</string>
+    <string name="placeholder_copy">Copy the sample text</string>
+    <string name="session_write_failed">Something could not be saved: %1$s</string>
 </resources>
