@@ -1,0 +1,3 @@
+# Copy to local.properties (git-ignored) and set the absolute path of your Android SDK.
+# Gradle does not expand ~ or environment variables here.
+sdk.dir=/absolute/path/to/Android/Sdk

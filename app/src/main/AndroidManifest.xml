@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- No <uses-permission> on purpose, and none may be added: the model runs on the device and
+         the app never uses the network. The few permissions that libraries merge in are held to an
+         allow-list by the verify*Manifest tasks in app/build.gradle.kts, which fail the build on
+         anything else (android.permission.INTERNET above all). -->
+
+    <application
+        android:name=".ProsePlowApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ProsePlow">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.ProsePlow">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Privacy: androidx.emoji2 (pulled in by Compose) registers EmojiCompatInitializer, which
+             asks the Google Play Services downloadable-fonts provider for an emoji font and can
+             cause a download from Google. That request is made by another process, so having no
+             INTERNET permission does not prevent it. The app must cause no network traffic at
+             all, so that initializer is removed; the other androidx.startup initializers stay.
+             MissingClass is ignored because androidx.startup is only a transitive runtime
+             dependency (not on the compile classpath lint checks); the class is in the APK. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:ignore="MissingClass"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+                tools:node="remove" />
+        </provider>
+    </application>
+
+</manifest>

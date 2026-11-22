@@ -1,0 +1,42 @@
+# Machine-specific paths (see local.properties.example)
+local.properties
+
+# Local scratch: research checkouts, Python virtualenvs, converted models, reports
+/work/
+
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+**/build/
+
+# Native build outputs
+.externalNativeBuild/
+.cxx/
+
+# Build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+
+# Model weights are never committed (converted at build time, see README)
+*.gguf
+*.safetensors
+
+# Signing material
+*.jks
+*.p12
+*.keystore
+keystore.properties
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store

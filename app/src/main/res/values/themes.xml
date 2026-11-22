@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Window theme only; all real styling is done in Compose (ui.theme). An AppCompat parent
+         because androidx.biometric shows an AppCompat dialog for fingerprints on some Android 9
+         devices, which needs an AppCompat theme. -->
+    <style name="Theme.ProsePlow" parent="Theme.AppCompat.Light.NoActionBar" />
+</resources>
