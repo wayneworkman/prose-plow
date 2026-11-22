@@ -19,6 +19,11 @@ android {
     compileSdk = 37
     // Pin to the installed build-tools; AGP's default (36.0.0) would otherwise be needed.
     buildToolsVersion = "37.0.0"
+    // The same NDK as :llama, which compiles the native code. This module compiles none, but it is
+    // the one that strips the native libraries when it packages them, and without this line AGP
+    // looks for its own default NDK, does not find it, and packages every library unstripped
+    // (about 80 MB more, and with symbols) while still reporting success.
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "us.theworkmans.proseplow"
