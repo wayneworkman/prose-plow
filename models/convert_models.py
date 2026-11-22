@@ -14,9 +14,10 @@ Before anything is converted, every source file of the model is hashed and compa
 manifest: a checkpoint that is not byte for byte the pinned one is refused. Next to each output
 a small record (<output>.json) says what it was made from and with which converter sources; a
 model whose record still matches is not converted again, so the script can be run as often as
-wanted. --also-f32 additionally writes <id>-f32.gguf, the file the validation tests compare
-with the stored weights; it is never shipped. A model whose checkpoint is not under --src is an
-error, unless --available says to convert only what is there.
+wanted. --also-f32 additionally writes <id>-f32.gguf for every model whose architecture is a
+port of ours: the file the validation tests compare with the stored weights; it is never
+shipped. A model whose checkpoint is not under --src is an error, unless --available says to
+convert only what is there.
 
 Conversion is deterministic, and the manifest pins the SHA-256 of each shipping file
 (output_sha256). A conversion that produces other bytes fails: either something on this machine
@@ -34,14 +35,36 @@ import os
 import subprocess
 import sys
 
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST = Path(__file__).resolve().parent / "manifest.json"
 
-# Converter name in the manifest -> the driver script that implements it.
+_DRIVERS = REPO / "native" / "convert"
+
+
+@dataclass(frozen=True)
+class Converter:
+    """One way of turning a checkpoint directory into a GGUF file.
+
+    Every driver takes --llama-src, --outtype, --outfile, --name and the checkpoint directory.
+    """
+    driver: Path
+    # True for an architecture this project ported: its F32 file is compared with the stored
+    # weights by the validation tests. An architecture that upstream llama.cpp already loads has
+    # nothing of ours to validate, and its F32 file would only cost disk space.
+    validation_f32: bool
+    # True when the driver must be told which files it may read (--file) and takes the entry's
+    # converter_args. The drivers of our own ports read a fixed set of files by name instead.
+    staged: bool = False
+
+
+# Converter name in the manifest -> how it is run.
 CONVERTERS = {
-    "peacebell": REPO / "native" / "convert" / "convert_peacebell.py",
+    "peacebell": Converter(_DRIVERS / "convert_peacebell.py", validation_f32=True),
+    "boris2": Converter(_DRIVERS / "convert_boris2.py", validation_f32=True),
+    "upstream": Converter(_DRIVERS / "convert_upstream.py", validation_f32=False, staged=True),
 }
 
 
@@ -104,7 +127,7 @@ def converter_key(entry: dict, llama_src: Path) -> str:
         raise ModelError(f"{llama_src} is not a prepared llama.cpp copy (run native/tools/prepare-llama-src.sh)")
     digest = hashlib.sha256()
     digest.update(stamp.read_bytes())
-    digest.update(CONVERTERS[entry["converter"]].read_bytes())
+    digest.update(CONVERTERS[entry["converter"]].driver.read_bytes())
     return digest.hexdigest()
 
 
@@ -113,8 +136,18 @@ def output_path(entry: dict, out: Path, ftype: str) -> Path:
     return out / entry["id"] / name
 
 
+def ftypes(entry: dict, also_f32: bool) -> list[str]:
+    """The float types converted for entry: the shipping one, then F32 where it validates a port."""
+    wanted = [entry["ftype"]]
+    if also_f32 and entry["ftype"] != "f32" and CONVERTERS[entry["converter"]].validation_f32:
+        wanted.append("f32")
+    return wanted
+
+
 def _record(entry: dict, ftype: str, key: str) -> dict:
-    return {"id": entry["id"], "revision": entry["revision"], "files": entry["files"], "ftype": ftype, "converter_key": key}
+    """Everything the bytes of an output depend on; an output whose record differs is stale."""
+    return {"id": entry["id"], "revision": entry["revision"], "files": entry["files"], "ftype": ftype, "converter_key": key,
+            "name": entry["name"], "converter_args": entry.get("converter_args", [])}
 
 
 def is_current(entry: dict, out: Path, llama_src: Path, ftype: str) -> bool:
@@ -134,6 +167,27 @@ def is_current(entry: dict, out: Path, llama_src: Path, ftype: str) -> bool:
             and (pinned is None or record.get("sha256") == pinned))
 
 
+def run_converter(entry: dict, src_dir: Path, path: Path, llama_src: Path, ftype: str) -> None:
+    """Runs the entry's converter on src_dir and writes path. Nothing is verified or recorded here."""
+    if entry.get("status") != "ready" or entry.get("converter") not in CONVERTERS:
+        raise ModelError(f"{entry['id']} is not convertible yet: {entry.get('note', 'no converter')}")
+    converter = CONVERTERS[entry["converter"]]
+    command = [sys.executable, str(converter.driver), "--llama-src", str(llama_src),
+               "--outtype", ftype, "--outfile", str(path), "--name", entry["name"]]
+    if converter.staged:
+        # The driver shows upstream's converter the pinned files and nothing else.
+        for name in entry["files"]:
+            command += ["--file", name]
+        command += [f"--converter-arg={arg}" for arg in entry.get("converter_args", [])]
+    elif entry.get("converter_args"):
+        raise ModelError(f"{entry['id']}: the {entry['converter']} converter takes no converter_args")
+    command.append(str(src_dir))
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="", TQDM_DISABLE="1")
+    result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        raise ModelError(f"the {entry['converter']} converter failed for {entry['id']}:\n{result.stdout}")
+
+
 def convert(entry: dict, src_dir: Path, out: Path, llama_src: Path, ftype: str, quiet: bool = False) -> Path:
     """Verifies the source files and converts unconditionally. Returns the output path."""
     if entry.get("status") != "ready" or entry.get("converter") not in CONVERTERS:
@@ -142,12 +196,7 @@ def convert(entry: dict, src_dir: Path, out: Path, llama_src: Path, ftype: str, 
     path = output_path(entry, out, ftype)
     record_path = path.with_name(path.name + ".json")
     record_path.unlink(missing_ok=True)
-    command = [sys.executable, str(CONVERTERS[entry["converter"]]), "--llama-src", str(llama_src),
-               "--outtype", ftype, "--outfile", str(path), "--name", entry["name"], str(src_dir)]
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="", TQDM_DISABLE="1")
-    result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if result.returncode != 0:
-        raise ModelError(f"the {entry['converter']} converter failed for {entry['id']}:\n{result.stdout}")
+    run_converter(entry, src_dir, path, llama_src, ftype)
     record = _record(entry, ftype, converter_key(entry, llama_src))
     record.update({"size": path.stat().st_size, "sha256": sha256_file(path)})
     pinned = entry.get("output_sha256") if ftype == entry["ftype"] else None
@@ -186,7 +235,7 @@ def main() -> int:
     parser.add_argument("--src", type=Path, default=_env_path("PROSEPLOW_MODEL_SRC"), help="directory of the downloaded checkpoints")
     parser.add_argument("--out", type=Path, default=_env_path("PROSEPLOW_MODEL_OUT"), help="directory for the GGUF files")
     parser.add_argument("--llama-src", type=Path, default=_env_path("PROSEPLOW_LLAMA_SRC"), help="the patched llama.cpp copy")
-    parser.add_argument("--also-f32", action="store_true", help="also write the F32 file used by the validation tests")
+    parser.add_argument("--also-f32", action="store_true", help="also write the F32 file of every ported architecture, used by the validation tests")
     parser.add_argument("--available", action="store_true", help="skip models whose checkpoint is not under --src instead of failing")
     parser.add_argument("--force", action="store_true", help="convert even when the output is current")
     parser.add_argument("--list", action="store_true", help="list the manifest and exit")
@@ -220,7 +269,7 @@ def main() -> int:
                       file=sys.stdout if args.available else sys.stderr)
                 failed = failed or not args.available
                 continue
-            for ftype in [entry["ftype"]] + (["f32"] if args.also_f32 and entry["ftype"] != "f32" else []):
+            for ftype in ftypes(entry, args.also_f32):
                 if not args.force and is_current(entry, args.out, args.llama_src, ftype):
                     print(f"{entry['id']}: {output_path(entry, args.out, ftype).name} is current")
                 else:

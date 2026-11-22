@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Writes the logit reference of one peacebell checkpoint from its PyTorch reference model.
+"""Writes the logit reference of one checkpoint from its PyTorch reference model.
 
-    gen_logit_ref.py --model-dir DIR --out FILE [--full] [--code-dir DIR] [--random-sequences N]
+    gen_logit_ref.py --model-dir DIR --out FILE [--full] [--code-dir DIR] [--random-sequences N] [--no-ngram-lookup]
 
-For a checkpoint with the SentencePiece tokenizer the sequences are fixed conversations: the
-ChatML prompt, the reference's greedy reply and the end marker. For a checkpoint without a
-usable chat tokenizer (the seeded random one that stands in for a family member that is not
-trained yet) --random-sequences N uses N seeded random token sequences instead.
+The architecture follows from config.json.
+
+peacebell: for a checkpoint with the SentencePiece tokenizer the sequences are fixed
+conversations: the ChatML prompt, the reference's greedy reply and the end marker. For a
+checkpoint without a usable chat tokenizer (the seeded random one that stands in for a family
+member that is not trained yet) --random-sequences N uses N seeded random token sequences
+instead.
+
+Boris-2: fixed conversations rendered by the chat template to plain text, each followed by the
+reference's greedy reply. The reference has no cache, so that reply is made by recomputing the
+whole prefix for every token; it ends with the tokens that spell the end marker, unless it
+reached the length limit first. --no-ngram-lookup gives every token the miss row of the n-gram
+table: the reference for a GGUF file without the lookup arrays, which isolates Canon and the
+memory it needs from the n-gram input.
 
 Without --full the file carries the top 20 logits at every position and the whole logit vector
 at the last prompt position of each sequence: small enough to commit. With --full it carries
@@ -30,8 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+import chatml_text  # noqa: E402
 import formats  # noqa: E402
 import reference  # noqa: E402
+import reference_boris2  # noqa: E402
 
 TOP_K = 20
 MAX_NEW_TOKENS = 96
@@ -46,6 +58,17 @@ CONVERSATIONS = [
      ("assistant", "The Battle of Midway was fought in June 1942."),
      ("user", "Explain that again, in more detail.")],
     [("user", "  Explain that again,\nwith two lines.  ")],
+]
+
+# The same for Boris-2, whose template trims the content: outer whitespace of several kinds
+# must vanish, inner newlines must stay. The short questions get replies that end with the end
+# marker inside the length limit, the open ones run into the limit.
+BORIS2_CONVERSATIONS = [
+    [("user", "What is the water cycle?")],
+    [("system", "Be brief."), ("user", "  What is 2 + 2?  "), ("assistant", "4.\n"), ("user", "And 3 + 3?")],
+    [("user", "Write a haiku.\nAbout rain."), ("assistant", "Soft rain on the roof"), ("user", "Another.")],
+    [("user", "What is the capital of France?")],
+    [("system", "Answer in one word."), ("user", "\u00a0Is water wet?\t\n")],
 ]
 
 
@@ -75,15 +98,31 @@ def main() -> int:
     parser.add_argument("--full", action="store_true", help="store the whole logit vector at every position")
     parser.add_argument("--random-sequences", type=int, default=0, help="use this many seeded random sequences instead of conversations")
     parser.add_argument("--seed", type=int, default=99)
+    parser.add_argument("--no-ngram-lookup", action="store_true", help="Boris-2 only: every token gets the miss row of the n-gram table")
     args = parser.parse_args()
 
-    model, config = reference.load_reference(args.model_dir, args.code_dir)
+    boris2 = reference_boris2.is_boris2(args.model_dir)
+    if boris2:
+        model, config = reference_boris2.load_reference(args.model_dir, ngram_lookup=not args.no_ngram_lookup)
+    else:
+        model, config = reference.load_reference(args.model_dir, args.code_dir)
     n_vocab = config.vocab_size
 
     prompts: list[list[int]] = []
     replies: list[list[int]] = []
     tails: list[list[int]] = []
-    if args.random_sequences > 0:
+    if boris2:
+        tokenizer = chatml_text.ChatTokenizer(args.model_dir)
+        eos = config.eos_token_id
+        for conversation in BORIS2_CONVERSATIONS:
+            prompt = tokenizer.encode(tokenizer.render(conversation, add_generation_prompt=True))
+            reply, _ = chatml_text.greedy_reply(model, tokenizer, prompt, eos, MAX_NEW_TOKENS)
+            # One conversation is one document for the port: the end-of-text token is never fed.
+            assert eos not in prompt + reply
+            prompts.append(prompt)
+            replies.append(reply)
+            tails.append([])
+    elif args.random_sequences > 0:
         # Random ids exercise every embedding row class, including the training pad, which may
         # appear in the input: only its output logit is masked.
         with open(args.model_dir / "config.json", encoding="utf-8") as f:

@@ -13,8 +13,10 @@ cmake==4.4.5
 ninja==1.13.2
 
 # The converters: llama.cpp's conversion framework imports torch and transformers; the peacebell
-# converter parses the SentencePiece model with sentencepiece and protobuf. The reference-data
-# generators run the PyTorch reference models with the same torch.
+# converter parses the SentencePiece model with sentencepiece and protobuf; the boris2 converter
+# reads tokenizer.json with tokenizers; upstream's converter, which converts Qwen, loads the
+# tokenizer through transformers (which files it reads, and so the output, depend on this
+# version). The reference-data generators run the PyTorch reference models with the same torch.
 numpy==2.5.5
 torch==2.15.0+cpu
 transformers==5.24.0
@@ -24,6 +26,9 @@ protobuf==7.36.2
 safetensors==0.8.0
 PyYAML==6.0.4
 tqdm==4.70.1
+# The reference for plain-text ChatML is transformers' own chat template renderer, which needs
+# Jinja2: the Boris-2 token vectors, logit and chat references are made with it.
+Jinja2==3.1.6
 
 # Everything the packages above pulled in, pinned so that a later install resolves to the same set.
 annotated-doc==0.0.7
@@ -38,7 +43,6 @@ httpcore2==2.16.2
 httpx2==2.16.2
 huggingface_hub==2.4.0
 idna==3.20
-Jinja2==3.1.6
 markdown-it-py==4.3.0
 MarkupSafe==3.0.4
 mdurl==0.1.2

@@ -3,6 +3,7 @@
 # It links libllama and nothing else from llama.cpp. Keep it free of host-only code: the same
 # sources are compiled for Android.
 add_library(proseplow_native STATIC
+    src/chatml_text.cpp
     src/peacebell_tokenizer.cpp)
 
 target_include_directories(proseplow_native PUBLIC include)

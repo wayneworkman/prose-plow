@@ -113,6 +113,11 @@ int main(int argc, char ** argv) {
         if (tok == nullptr) {
             return r.finish();
         }
+        // This model has marker tokens: the plain-text ChatML encoder must not take it.
+        const pp_chat_message hello = {"user", 4, "hi", 2};
+        llama_token unused[64];
+        r.check(!pp_chatml_text_supported(model.get()) && pp_chatml_text_tokenize(model.get(), &hello, 1, true, unused, 64, nullptr) == PP_ERROR,
+                "the plain-text ChatML encoder refuses this model");
         const llama_token im_start = pp_peacebell_chat_start_token(tok);
         const llama_token im_end = pp_peacebell_chat_end_token(tok);
         const auto has_marker = [&](const std::vector<llama_token> & ids) {

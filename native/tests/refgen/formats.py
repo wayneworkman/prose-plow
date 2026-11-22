@@ -1,7 +1,7 @@
-"""The two binary reference-data formats shared by the generators here and the C++ tests.
+"""The binary reference-data formats shared by the generators here and the C++ tests.
 
-Both are little-endian and deliberately trivial, so that the C++ side reads them with a few
-lines and no library (see native/tests/support/test_support.h, which must stay in step).
+All are little-endian and deliberately trivial, so that the C++ side reads them with a few
+lines and no library (see native/tests/support/, which must stay in step).
 
 Token vectors ("PPTOKV01"): texts with the token ids the reference tokenizer gives them.
 
@@ -32,6 +32,25 @@ Logit reference ("PPLOGIT1"): fixed token sequences with the reference model's l
 
 The committed files carry the whole vector at one position per sequence to stay small; the
 on-demand "full" files carry it at every position, which is what a KL divergence needs.
+
+Chat reference ("PPCHAT01"): a session of chat requests against a plain-text ChatML model, each
+with the reference's tokenisation of the rendered conversation and its greedy reply.
+
+    magic            8 bytes  "PPCHAT01"
+    tokenizer sha    64 bytes hex SHA-256 of the tokenizer file
+    max_new_tokens   u32      the length limit the replies were generated with
+    n_request        u32
+    n_request times:
+        n_messages   u32, per message role and content (u32 length + UTF-8 bytes each)
+        prompt       u32 count + i32 each   the conversation with the generation prompt, tokenised
+        reply        u32 count + i32 each   the greedy continuation; when ended, it finishes with
+                                            the tokens that complete the end marker in the text
+        ended        u8       1: the reply text contains the end marker; 0: cut by max_new_tokens
+        text         u32 length + UTF-8 bytes   the reply as text, up to the end marker
+
+The requests are in the order an application would send them, each a whole conversation: a new
+turn appended, the same conversation again (regenerate), an earlier message changed, another
+beginning. A request's expected reply never depends on what was sent before it.
 """
 from __future__ import annotations
 
@@ -44,6 +63,7 @@ import numpy as np
 
 TOKEN_MAGIC = b"PPTOKV01"
 LOGIT_MAGIC = b"PPLOGIT1"
+CHAT_MAGIC = b"PPCHAT01"
 
 
 @dataclass
@@ -153,3 +173,62 @@ def read_logit_reference(path: Path) -> tuple[int, int, list[LogitSequence]]:
         sequences.append(LogitSequence(ids, n_prompt, greedy, top_idx, top_val, full_pos, full))
     assert pos == len(data), f"{path} has trailing bytes"
     return n_vocab, top_k, sequences
+
+
+@dataclass
+class ChatRequest:
+    messages: list[tuple[str, str]]  # (role, content)
+    prompt: list[int]
+    reply: list[int]
+    ended: bool
+    text: str
+
+
+def write_chat_reference(path: Path, tokenizer_sha256: str, max_new_tokens: int, requests: list[ChatRequest]) -> None:
+    assert len(tokenizer_sha256) == 64
+    out = bytearray(CHAT_MAGIC + tokenizer_sha256.encode("ascii"))
+    out += struct.pack("<II", max_new_tokens, len(requests))
+    for r in requests:
+        out += struct.pack("<I", len(r.messages))
+        for role, content in r.messages:
+            _put_bytes(out, role.encode("utf-8"))
+            _put_bytes(out, content.encode("utf-8"))
+        for ids in (r.prompt, r.reply):
+            out += struct.pack("<I", len(ids)) + np.asarray(ids, dtype="<i4").tobytes()
+        out += b"\x01" if r.ended else b"\x00"
+        _put_bytes(out, r.text.encode("utf-8"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+
+
+def read_chat_reference(path: Path) -> tuple[str, int, list[ChatRequest]]:
+    data = path.read_bytes()
+    assert data[:8] == CHAT_MAGIC, f"{path} is not a chat reference"
+    sha = data[8:72].decode("ascii")
+    max_new_tokens, n_request = struct.unpack_from("<II", data, 72)
+    pos = 80
+
+    def take_bytes() -> bytes:
+        nonlocal pos
+        (n,) = struct.unpack_from("<I", data, pos)
+        pos += 4 + n
+        return data[pos - n:pos]
+
+    def take_ids() -> list[int]:
+        nonlocal pos
+        (n,) = struct.unpack_from("<I", data, pos)
+        ids = np.frombuffer(data, dtype="<i4", count=n, offset=pos + 4).tolist()
+        pos += 4 + 4 * n
+        return ids
+
+    requests = []
+    for _ in range(n_request):
+        (n_messages,) = struct.unpack_from("<I", data, pos)
+        pos += 4
+        messages = [(take_bytes().decode("utf-8"), take_bytes().decode("utf-8")) for _ in range(n_messages)]
+        prompt, reply = take_ids(), take_ids()
+        ended = data[pos] != 0
+        pos += 1
+        requests.append(ChatRequest(messages, prompt, reply, ended, take_bytes().decode("utf-8")))
+    assert pos == len(data), f"{path} has trailing bytes"
+    return sha, max_new_tokens, requests

@@ -1,7 +1,15 @@
 diff --git a/conversion/__init__.py b/conversion/__init__.py
 --- a/conversion/__init__.py
 +++ b/conversion/__init__.py
-@@ -101,6 +101,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+@@ -41,6 +41,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "BitNetForCausalLM": "bitnet",
+     "BloomForCausalLM": "bloom",
+     "BloomModel": "bloom",
++    "Boris2ForCausalLM": "boris2",
+     "CamembertModel": "bert",
+     "ChameleonForCausalLM": "chameleon",
+     "ChameleonForConditionalGeneration": "chameleon",
+@@ -101,6 +102,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
      "FishOmniModel": "drama3",
      "GPT2LMHeadModel": "gpt2",
      "GPTBigCodeForCausalLM": "starcoder",
@@ -12,23 +20,25 @@ diff --git a/conversion/__init__.py b/conversion/__init__.py
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
-@@ -788,6 +788,7 @@ class MODEL_ARCH(IntEnum):
+@@ -788,6 +788,8 @@ class MODEL_ARCH(IntEnum):
      INKLING2         = auto()
      INKLING2_LOOP    = auto()
      DOMYN_EDGE       = auto()
 +    PEACEBELL        = auto()
++    BORIS2           = auto()
  
  
  class VISION_PROJECTOR_TYPE(IntEnum):
-@@ -1804,6 +1805,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+@@ -1804,6 +1806,8 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
      MODEL_ARCH.INKLING2:         "inkling2",
      MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
      MODEL_ARCH.DOMYN_EDGE:       "domynedge",
 +    MODEL_ARCH.PEACEBELL:        "peacebell",
++    MODEL_ARCH.BORIS2:           "boris2",
  }
  
  VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
-@@ -7203,6 +7205,16 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+@@ -7203,6 +7207,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
          MODEL_TENSOR.FFN_GATE,
          MODEL_TENSOR.OUTPUT_NORM,
      ],
@@ -42,57 +52,113 @@ diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
 +        MODEL_TENSOR.FFN_UP,
 +        MODEL_TENSOR.FFN_DOWN,
 +    ],
++    MODEL_ARCH.BORIS2: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
++        MODEL_TENSOR.PER_LAYER_MODEL_PROJ,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_QKV,
++        MODEL_TENSOR.SHORTCONV_CONV,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.FFN_DOWN,
++    ],
  }
  
  # tensors that will not be serialized
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -187,6 +187,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+@@ -187,6 +187,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
      { LLM_ARCH_INKLING2,         "inkling2"         },
      { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
      { LLM_ARCH_DOMYN_EDGE,       "domynedge"        },
 +    { LLM_ARCH_PEACEBELL,        "peacebell"        },
++    { LLM_ARCH_BORIS2,           "boris2"           },
      { LLM_ARCH_UNKNOWN,          "(unknown)"        },
  };
  
+@@ -1482,6 +1484,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+         case LLM_ARCH_ZONOS3:
+         case LLM_ARCH_INKLING2:
+         case LLM_ARCH_INKLING2_LOOP:
++        case LLM_ARCH_BORIS2:
+             return true;
+         default:
+             return false;
+@@ -1603,6 +1606,7 @@ bool llama_arch_supports_save(llm_arch arch) {
+         case LLM_ARCH_CLEF: // the head tensors are not saved
+         case LLM_ARCH_INKLING2_LOOP: // the loop tensors are not saved and the cache slots are expanded at load
+         case LLM_ARCH_VLLM_DECISION2:
++        case LLM_ARCH_BORIS2: // the n-gram lookup arrays are not saved
+             return false;
+         default:
+             return true;
 diff --git a/src/llama-arch.h b/src/llama-arch.h
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
-@@ -191,6 +191,7 @@ enum llm_arch {
+@@ -191,6 +191,8 @@ enum llm_arch {
      LLM_ARCH_INKLING2,
      LLM_ARCH_INKLING2_LOOP,
      LLM_ARCH_DOMYN_EDGE,
 +    LLM_ARCH_PEACEBELL,
++    LLM_ARCH_BORIS2,
      LLM_ARCH_UNKNOWN,
  };
  
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2004,7 +2004,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+ 
+ bool llama_kv_cache::has_cell_ext() const {
+     // M-RoPE needs the 2D position, the PLE / Engram n-gram hashes need the token id
+-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
++    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || model.arch == LLM_ARCH_BORIS2;
+ }
+ 
+ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -400,6 +400,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+@@ -400,6 +400,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
              return new llama_model_kolibri1(params);
          case LLM_ARCH_DOMYN_EDGE:
              return new llama_model_domyn_edge(params);
 +        case LLM_ARCH_PEACEBELL:
 +            return new llama_model_peacebell(params);
++        case LLM_ARCH_BORIS2:
++            return new llama_model_boris2(params);
          default:
              throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
      }
-@@ -3958,6 +3960,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -3433,7 +3437,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         filter_idx = [&](uint32_t il) {
+                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                         };
+-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
++                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1 || arch == LLM_ARCH_BORIS2) {
+                         filter_attn = [&](uint32_t) { return true; };
+                         filter_recr = [&](uint32_t) { return true; };
+                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+@@ -3958,6 +3962,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_BEAM:
          case LLM_ARCH_KOLIBRI1:
          case LLM_ARCH_DOMYN_EDGE:
 +        case LLM_ARCH_PEACEBELL:
++        case LLM_ARCH_BORIS2:
              return LLAMA_ROPE_TYPE_NEOX;
  
          case LLM_ARCH_DFLASH:
 diff --git a/src/models/models.h b/src/models/models.h
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -3420,3 +3420,5 @@ struct llama_model_domyn_edge : public llama_model_base {
+@@ -3420,3 +3420,6 @@ struct llama_model_domyn_edge : public llama_model_base {
  
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
  };
 +
 +#include "peacebell.h"
++#include "boris2.h"

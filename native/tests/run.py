@@ -20,11 +20,14 @@ Tests:
     convert-determinism  two conversions of the same checkpoint give the same bytes
     gguf-f32             the F32 file equals the checkpoint byte for byte, metadata included
     gguf-f16             the F16 file is the rounded checkpoint; types and subnormal share
-    tokenizer            the front-end against the committed token vectors
-    tokenizer-live       the front-end against the SentencePiece library, every symbol of the file
+    tokenizer            the tokenizer (and chat encoder) against the committed token vectors
+    tokenizer-live       the same against the reference library itself, on a larger corpus made at test time
     logits-f32           the F32 file against the committed reference logits
     logits-f16           the F16 file against reference logits at every position (KL, top-1)
-    random-bpe           all of the above for a seeded random byte-level BPE checkpoint
+    chat-f32, chat-f16   Boris-2: a chat session kept in one context against the reference's replies
+    no-ngram-lookup      Boris-2: the F32 file without its n-gram lookup arrays against the reference without the lookup
+    random-bpe           all of the peacebell checks for a seeded random byte-level BPE checkpoint
+    qwen-load-generate   the stock Qwen file loads, has the expected tokenizer and repeats a greedy reply
 """
 from __future__ import annotations
 
@@ -141,11 +144,12 @@ class Runner:
         scratch = self.work / "determinism" / entry["id"]
         shutil.rmtree(scratch, ignore_errors=True)
         problems = []
-        for ftype in ("f32", "f16"):
+        # F32 first where it exists (the ported architectures), then the file that ships.
+        for ftype in reversed(models.ftypes(entry, also_f32=True)):
             hashes = []
             for attempt in ("a", "b"):
                 path = scratch / f"{attempt}-{ftype}.gguf"
-                self.convert_to(model_dir, ftype, path, entry["name"])
+                models.run_converter(entry, model_dir, path, self.llama_src, ftype)
                 hashes.append(models.sha256_file(path))
                 size = path.stat().st_size
                 path.unlink()
@@ -168,22 +172,40 @@ class Runner:
 
         return fail(check_gguf.check_f16(self.llama_src, self.gguf(entry, "f16"), self.source(entry), self.gguf(entry, "f32")))
 
+    @staticmethod
+    def programs(entry: dict) -> dict:
+        """What differs between the architectures in the tests they share."""
+        if entry["converter"] == "boris2":
+            # llama.cpp's own tokenizer is exact for this model; the vectors belong to the checkpoint.
+            return {"tokenizer": "test_plain_tokenizer", "logits": "test_boris2_logits",
+                    "vectors": DATA / f"{entry['id']}-tokens.bin", "tokenizer_file": "tokenizer.json"}
+        # The two peacebell-v1 checkpoints share one tokenizer file and therefore one vector file.
+        return {"tokenizer": "test_peacebell_tokenizer", "logits": "test_peacebell_logits",
+                "vectors": DATA / "peacebell-v1-tokens.bin", "tokenizer_file": "sentencepiece.model"}
+
     def tokenizer(self, entry: dict) -> int:
-        return self.binary("test_peacebell_tokenizer", "--gguf", self.gguf(entry, entry["ftype"]), "--vectors", DATA / "peacebell-v1-tokens.bin")
+        programs = self.programs(entry)
+        return self.binary(programs["tokenizer"], "--gguf", self.gguf(entry, entry["ftype"]), "--vectors", programs["vectors"])
 
     def tokenizer_live(self, entry: dict) -> int:
+        programs = self.programs(entry)
         model_dir = self.source(entry)
         gguf = self.gguf(entry, entry["ftype"])
         stamp = (self.llama_src / ".proseplow-prepared").read_text()
         vectors = self.cached(
             self.work / "refdata" / f"{entry['id']}-tokens-live.bin",
-            [entry["files"]["sentencepiece.model"], self.generator_key(), stamp],
+            [entry["files"][programs["tokenizer_file"]], self.generator_key(), stamp],
             lambda: self.python(REFGEN / "gen_token_vectors.py", "--model-dir", model_dir, "--live", "--llama-src", self.llama_src,
                                 "--out", self.work / "refdata" / f"{entry['id']}-tokens-live.bin"))
-        return self.binary("test_peacebell_tokenizer", "--gguf", gguf, "--vectors", vectors)
+        return self.binary(programs["tokenizer"], "--gguf", gguf, "--vectors", vectors)
 
     def logits_f32(self, entry: dict) -> int:
-        return self.binary("test_peacebell_logits", "--gguf", self.gguf(entry, "f32"), "--ref", DATA / f"{entry['id']}-logits.bin", "--precision", "f32")
+        arguments = ("--gguf", self.gguf(entry, "f32"), "--ref", DATA / f"{entry['id']}-logits.bin", "--precision", "f32")
+        code = self.binary(self.programs(entry)["logits"], *arguments)
+        if entry["converter"] == "boris2":
+            # The graph must stop the process when the end-of-text token is fed; that takes a run of its own.
+            code = self.binary(self.programs(entry)["logits"], *arguments, "--mode", "refuse-eos") or code
+        return code
 
     def full_reference(self, entry: dict) -> Path:
         code_dir = self.reference_code(entry)
@@ -212,7 +234,37 @@ class Runner:
         print(f"{'ok  ' if ok else 'FAIL'}  regenerated reference vs committed reference: max |dlogit| {drift:.3g} (limit 1e-04)")
         if not ok:
             return fail(["the PyTorch reference drifted from the committed data: check the package versions"])
-        return self.binary("test_peacebell_logits", "--gguf", gguf, "--ref", full, "--precision", "f16")
+        return self.binary(self.programs(entry)["logits"], "--gguf", gguf, "--ref", full, "--precision", "f16")
+
+    def chat(self, entry: dict, precision: str) -> int:
+        return self.binary("test_boris2_chat", "--gguf", self.gguf(entry, precision), "--ref", DATA / f"{entry['id']}-chat.bin", "--precision", precision)
+
+    def no_ngram_lookup(self, entry: dict) -> int:
+        """Canon and the hybrid memory in isolation: a file without the lookup arrays gives every token the miss row."""
+        code_dir = self.reference_code(entry)
+        f32 = self.gguf(entry, "f32")
+        reference = self.work / "refdata" / f"{entry['id']}-logits-no-ngram-lookup.bin"
+        self.cached(reference, [entry["files"]["model.safetensors"], self.generator_key()],
+                    lambda: self.python(REFGEN / "gen_logit_ref.py", "--model-dir", code_dir, "--no-ngram-lookup", "--out", reference))
+        scratch = self.work / "no-ngram-lookup"
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+        stripped = scratch / f"{entry['id']}-f32-no-ngram-lookup.gguf"
+        # Upstream's own tool for copying a file with other metadata; the tensors are untouched.
+        command = [sys.executable, str(self.llama_src / "gguf-py" / "gguf" / "scripts" / "gguf_new_metadata.py"), str(f32), str(stripped), "--force"]
+        for key in ("bigram_keys", "bigram_rows", "trigram_keys", "trigram_rows"):
+            command += ["--remove-metadata", f"boris2.ngram.{key}"]
+        result = subprocess.run(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode != 0:
+            print(result.stdout)
+            return fail(["could not write the file without the lookup arrays"])
+        code = self.binary("test_boris2_logits", "--gguf", stripped, "--ref", reference, "--precision", "f32")
+        if code == 0:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return code
+
+    def qwen_load_generate(self, entry: dict) -> int:
+        return self.binary("test_qwen", "--gguf", self.gguf(entry, entry["ftype"]))
 
     def random_bpe(self) -> int:
         import check_gguf
@@ -223,7 +275,7 @@ class Runner:
         tokenizer_dir = models.source_dir(tokenizer_entry, self.src)
         if tokenizer_dir is None:
             skip(self.where(tokenizer_entry) + "; its tokenizer.json stands in for the byte-level BPE tokenizer of the family")
-        models.verify_files(tokenizer_dir, tokenizer_entry["reference_files"])
+        models.verify_files(tokenizer_dir, {"tokenizer.json": tokenizer_entry["files"]["tokenizer.json"]})
 
         scratch = self.work / "random-bpe"
         shutil.rmtree(scratch, ignore_errors=True)
@@ -282,6 +334,10 @@ def main() -> int:
             "tokenizer-live": runner.tokenizer_live,
             "logits-f32": runner.logits_f32,
             "logits-f16": runner.logits_f16,
+            "chat-f32": lambda entry: runner.chat(entry, "f32"),
+            "chat-f16": lambda entry: runner.chat(entry, "f16"),
+            "no-ngram-lookup": runner.no_ngram_lookup,
+            "qwen-load-generate": runner.qwen_load_generate,
         }
         if args.test not in tests or args.model is None:
             parser.error("unknown test, or no model id")

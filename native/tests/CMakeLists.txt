@@ -9,7 +9,7 @@
 find_program(PROSEPLOW_PYTHON NAMES python3 python REQUIRED)
 message(STATUS "Python for the tests: ${PROSEPLOW_PYTHON}")
 
-foreach (_test test_peacebell_logits test_peacebell_tokenizer test_plain_tokenizer)
+foreach (_test test_peacebell_logits test_peacebell_tokenizer test_plain_tokenizer test_qwen test_boris2_logits test_boris2_chat)
     add_executable(${_test} ${_test}.cpp)
     target_include_directories(${_test} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(${_test} PRIVATE proseplow_native llama)
@@ -48,3 +48,18 @@ proseplow_add_test(peacebell-v1-291m.tokenizer-live tokenizer-live peacebell-v1-
 # The byte-level BPE member of the family is not trained yet: a seeded random checkpoint with
 # its documented shape stands in for it.
 proseplow_add_test(peacebell-bpe-random random-bpe)
+
+# Boris-2: the same gates as peacebell (llama.cpp's own tokenizer is exact here, so the tokenizer
+# tests also cover the plain-text ChatML encoder of our library), then what its memory needs: a
+# chat session that keeps one context across requests through checkpoints of the recurrent
+# state, at both precisions, and the model without its n-gram lookup, which separates a fault
+# in Canon or the memory from a fault in the n-gram input.
+foreach (_test convert-determinism gguf-f32 gguf-f16 tokenizer tokenizer-live logits-f32 logits-f16 chat-f32 chat-f16 no-ngram-lookup)
+    proseplow_add_test(boris-2-instruct.${_test} ${_test} boris-2-instruct)
+endforeach()
+
+# A stock architecture: upstream's converter and upstream's graph. Nothing of ours is validated
+# against a reference; the tests pin that the conversion is reproducible and that the file is
+# what the app's prompt format assumes.
+proseplow_add_test(qwen3.5-0.8b.convert-determinism convert-determinism qwen3.5-0.8b)
+proseplow_add_test(qwen3.5-0.8b.load-generate       qwen-load-generate  qwen3.5-0.8b)

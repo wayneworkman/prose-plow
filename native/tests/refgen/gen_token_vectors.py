@@ -5,7 +5,9 @@
     gen_token_vectors.py --model-dir DIR --out FILE --live --llama-src D  on-demand vectors
 
 The tokenizer kind follows from the files in DIR: sentencepiece.model (the reference is the
-SentencePiece library) or tokenizer.json (the reference is the tokenizers library).
+SentencePiece library) or tokenizer.json (the reference is the tokenizers library). With
+tokenizer.json and a chat template (plain-text ChatML), the conversations are the template
+rendered by transformers and tokenised in one call.
 
 Every case carries two id lists. "exact" is the reference as it is. "safe" is the reference
 with its special tokens treated as ordinary text, which is how message content is tokenised in
@@ -29,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import chatml_text  # noqa: E402
 import corpus  # noqa: E402
 import formats  # noqa: E402
 
@@ -100,6 +103,12 @@ def main() -> int:
         source = bpe_file
         encode_exact, encode_safe = bpe_encoders(bpe_file)
         texts = corpus.live(args.llama_src, []) if args.live else corpus.committed()
+        if chatml_text.has_chat_template(args.model_dir):
+            renderer = chatml_text.ChatTokenizer(args.model_dir)
+            for conversation in corpus.text_chatml_conversations():
+                for add_generation_prompt in (True, False):
+                    rendered = renderer.render(conversation, add_generation_prompt)
+                    chats.append(formats.ChatCase(conversation, add_generation_prompt, encode_exact(rendered), encode_safe(rendered)))
     else:
         parser.error(f"{args.model_dir} has neither sentencepiece.model nor tokenizer.json")
 

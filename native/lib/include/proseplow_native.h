@@ -2,7 +2,8 @@
 //
 // Plain C interface, no JNI and nothing host-specific: the Android bridge will be a thin layer on
 // top of these functions. Today it holds the tokenizer front-end and the chat encoder of the
-// peacebell models; the generation session will be added here.
+// peacebell models and, in proseplow_chatml_text.h (included at the end of this file), the chat
+// encoder of the models whose ChatML is plain text; the generation session will be added here.
 //
 // Rules for every function in this file:
 // - Text is UTF-8 with an explicit byte length and need not be NUL-terminated. A caller coming
@@ -100,5 +101,8 @@ llama_token pp_peacebell_chat_end_token(const struct pp_peacebell_tokenizer * to
 #ifdef __cplusplus
 }
 #endif
+
+// Plain-text ChatML (Boris-2 and the byte-level BPE members of the peacebell family).
+#include "proseplow_chatml_text.h"
 
 #endif // PROSEPLOW_NATIVE_H
