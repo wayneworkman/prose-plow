@@ -202,6 +202,7 @@ androidComponents {
 
 dependencies {
     implementation(project(":core"))
+    implementation(project(":llama"))
 
     val composeBom = platform(libs.androidx.compose.bom)
     implementation(composeBom)
@@ -234,6 +235,7 @@ dependencies {
         }
     }
 
+    testImplementation(testFixtures(project(":core")))
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
 
