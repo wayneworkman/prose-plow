@@ -117,6 +117,34 @@ class SourceRulesTest {
         }
     }
 
+    /**
+     * A passphrase field must not hand the typed passphrase to accessibility services: the text
+     * it publishes to them is replaced by bullets, under both names the text field uses for it.
+     * Whether that works is checked on a phone (PassphraseFieldAccessibilityTest, which reads the
+     * field the way an accessibility service does); that test is not part of `check`, so this one
+     * fails the build as soon as the replacement is taken out or loses one of its two halves.
+     */
+    @Test
+    fun thePassphraseFieldReplacesWhatItTellsAccessibilityServices() {
+        val source = File(module, "$main/ui/SecureInput.kt").readText()
+        val field = source.substringAfter("fun PassphraseField(").substringBefore("\n}\n")
+        val override = Regex("""modifier = modifier\.semantics \{(.*?)\n\s*\},""", RegexOption.DOT_MATCHES_ALL).find(field)?.groupValues?.get(1)
+        assertTrue("PassphraseField no longer overrides its accessibility text", override != null)
+        val lines = override!!.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(
+            listOf(
+                "val obscured = obscuredForAccessibility(state.text.length)",
+                "editableText = obscured",
+                "inputText = obscured",
+            ),
+            lines,
+        )
+        // And every passphrase in the app is entered through that field: nothing else makes a secure text field.
+        for (file in sources(main).filterNot { it.name == "SecureInput.kt" }) {
+            assertTrue("${file.name} makes a secure text field of its own", !file.readText().contains("SecureTextField("))
+        }
+    }
+
     @Test
     fun aDebugBuildIsAnotherAppSoThatTestsNeverRunInsideARealInstallation() {
         val build = File(module, "build.gradle.kts").readText()

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Debug builds only. An empty activity in which an instrumented test can show one
+             composable on its own (a passphrase field, to look at it the way an accessibility
+             service does) without starting the app's own activity and its lock. Not exported and
+             without an intent filter: only the app itself, which the tests run inside, can start
+             it. A release build does not contain it. -->
+        <activity
+            android:name="androidx.activity.ComponentActivity"
+            android:exported="false" />
+    </application>
+
+</manifest>

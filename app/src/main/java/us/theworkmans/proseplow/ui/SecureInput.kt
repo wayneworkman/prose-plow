@@ -17,6 +17,10 @@ import androidx.compose.ui.platform.InterceptPlatformTextInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.PlatformTextInputInterceptor
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
+import androidx.compose.ui.semantics.editableText
+import androidx.compose.ui.semantics.inputText
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 
@@ -55,10 +59,12 @@ fun NoPersonalizedLearning(content: @Composable () -> Unit) {
  * from autofill, and its [state] is not saved in the instance state: callers make it with
  * `remember { TextFieldState() }`, never `rememberSaveable`.
  *
- * Not obscured: what the field tells the accessibility framework. The secure text field draws
- * bullets, but describes itself there with the text that was typed (marked as a password), so
- * an accessibility service the user has enabled can read the passphrase while it is in the
- * field. A platform password field would only hand it bullets.
+ * What it tells the accessibility framework is obscured as well. The secure text field draws
+ * bullets, but on its own it describes itself to that framework with the text that was typed
+ * (marked as a password), so any accessibility service the user has enabled could read the
+ * passphrase while it is in the field. A platform password field only hands out bullets, and so
+ * does this one: its description is replaced by [obscuredForAccessibility]. A screen reader
+ * still announces a password field and how much is in it.
  */
 @Composable
 fun PassphraseField(
@@ -76,7 +82,13 @@ fun PassphraseField(
     NoPersonalizedLearning {
         OutlinedSecureTextField(
             state = state,
-            modifier = modifier,
+            // The outermost semantics of the field's own node, so these values replace the ones
+            // the field sets itself (the typed text, under both names it is published as).
+            modifier = modifier.semantics {
+                val obscured = obscuredForAccessibility(state.text.length)
+                editableText = obscured
+                inputText = obscured
+            },
             enabled = enabled,
             label = { Text(label) },
             isError = isError,
@@ -92,6 +104,12 @@ fun PassphraseField(
         )
     }
 }
+
+/**
+ * What a passphrase field tells the accessibility framework in place of its content: one bullet
+ * for each of its [length] characters, never the characters themselves.
+ */
+internal fun obscuredForAccessibility(length: Int): AnnotatedString = AnnotatedString("\u2022".repeat(length))
 
 /**
  * Keeps autofill services away from the window this is composed in. The activity's window is
