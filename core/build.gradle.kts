@@ -5,6 +5,9 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.serialization)
+    // Publishes src/testFixtures (FakeNativeLlama, FakeInferenceEngine, FakeClock) to the tests of
+    // other modules: testImplementation(testFixtures(project(":core"))).
+    `java-test-fixtures`
 }
 
 java {
@@ -19,8 +22,11 @@ kotlin {
 }
 
 dependencies {
-    implementation(libs.kotlinx.coroutines.core)
+    // api, not implementation: Flow and StateFlow are part of InferenceEngine's signature.
+    api(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
+
+    testFixturesApi(libs.kotlinx.coroutines.core)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
