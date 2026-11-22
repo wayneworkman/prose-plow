@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "models": [
+    {
+      "id": "peacebell-v1-291m",
+      "status": "ready",
+      "purpose": "bundled",
+      "name": "peacebell-v1-291M",
+      "repository": "wayneworkman2012/peacebell-v1-291M",
+      "revision": "a44de191d94e8bf944b31a482fc0f04fa4433eb1",
+      "converter": "peacebell",
+      "ftype": "f16",
+      "output": "peacebell-v1-291m-f16.gguf",
+      "output_sha256": "df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868",
+      "files": {
+        "config.json": "ceccbcb977f7a62ab48a4341455bb1cd112104a987e70653218d362926cf6139",
+        "model.safetensors": "6d7490fb564cf809758de297d86a804e82b2b1fb791daadb634a4783597d2fe7",
+        "sentencepiece.model": "86a2f7434f6dfef8d4e39d1cbb6a2bc79507e3b20ac8ace37886e2d341dd48f2"
+      },
+      "reference_files": {
+        "configuration_gpt.py": "62f13c6f11e260689c435bafe5f6d3711b411a7a6a79f0615454607b29024e2e",
+        "modeling_gpt.py": "5afdd96c9e0e785609d0f91146b042580fbee14821d0d148aba7430b1b17c67a"
+      }
+    },
+    {
+      "id": "peacebell-v1-148m",
+      "status": "ready",
+      "purpose": "validation",
+      "note": "The smaller checkpoint of the same family. Converted and tested to prove that the architecture is driven by metadata; whether it is bundled is undecided.",
+      "name": "peacebell-v1-148M",
+      "repository": "wayneworkman2012/peacebell-v1-148M",
+      "revision": "9155a36017601957565a569c73a2b53c9c6a67ec",
+      "converter": "peacebell",
+      "ftype": "f16",
+      "output": "peacebell-v1-148m-f16.gguf",
+      "output_sha256": "e94e6816dda65325153ae81f26a82113dc209a24784fce029e415b971cb334ba",
+      "files": {
+        "config.json": "8994af353054e6dc17666185a91a3d26f700287e74c5ed54e9ce563a068b8388",
+        "model.safetensors": "6005b8217e4ea8ea04e278da5e34d9a07debe14c9760aa67fa132dc6c03277d2",
+        "sentencepiece.model": "86a2f7434f6dfef8d4e39d1cbb6a2bc79507e3b20ac8ace37886e2d341dd48f2"
+      },
+      "reference_files": {
+        "configuration_gpt.py": "62f13c6f11e260689c435bafe5f6d3711b411a7a6a79f0615454607b29024e2e",
+        "modeling_gpt.py": "5afdd96c9e0e785609d0f91146b042580fbee14821d0d148aba7430b1b17c67a"
+      }
+    },
+    {
+      "id": "boris-2-instruct",
+      "status": "planned",
+      "purpose": "bundled",
+      "note": "NOT CONVERTIBLE YET. Needs the boris2 architecture and its converter, which do not exist in native/ yet. The revision is the one the design was written against; fill in converter, output and the file hashes when the port lands. Until then only its tokenizer.json is read, as a stand-in for the byte-level BPE member of the peacebell family in the random-weights test.",
+      "name": "Boris-2-Instruct",
+      "repository": "opencerebral/Boris-2-Instruct",
+      "revision": "9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d",
+      "converter": null,
+      "ftype": "f16",
+      "output": null,
+      "files": null,
+      "reference_files": {
+        "tokenizer.json": "161294df90a5bc7449ca9e040bfa1928f5f6a8b4021bf6f042efeada5fc3591b"
+      }
+    },
+    {
+      "id": "qwen3.5-0.8b",
+      "status": "planned",
+      "purpose": "bundled",
+      "note": "NOT WIRED UP YET. Upstream llama.cpp loads this architecture, so the converter will be the patched copy's own convert_hf_to_gguf.py. Fill in revision, converter, output and the file hashes when the model is added.",
+      "name": "Qwen3.5-0.8B",
+      "repository": "Qwen/Qwen3.5-0.8B",
+      "revision": null,
+      "converter": null,
+      "ftype": "f16",
+      "output": null,
+      "files": null
+    }
+  ]
+}

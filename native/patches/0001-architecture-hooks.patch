@@ -1,0 +1,98 @@
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -101,6 +101,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "FishOmniModel": "drama3",
+     "GPT2LMHeadModel": "gpt2",
+     "GPTBigCodeForCausalLM": "starcoder",
++    "GPTForCausalLM": "peacebell",
+     "GPTNeoXForCausalLM": "gptneox",
+     "GPTRefactForCausalLM": "refact",
+     "Gemma2ForCausalLM": "gemma",
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -788,6 +788,7 @@ class MODEL_ARCH(IntEnum):
+     INKLING2         = auto()
+     INKLING2_LOOP    = auto()
+     DOMYN_EDGE       = auto()
++    PEACEBELL        = auto()
+ 
+ 
+ class VISION_PROJECTOR_TYPE(IntEnum):
+@@ -1804,6 +1805,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.INKLING2:         "inkling2",
+     MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
+     MODEL_ARCH.DOMYN_EDGE:       "domynedge",
++    MODEL_ARCH.PEACEBELL:        "peacebell",
+ }
+ 
+ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
+@@ -7203,6 +7205,16 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_GATE,
+         MODEL_TENSOR.OUTPUT_NORM,
+     ],
++    MODEL_ARCH.PEACEBELL: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_QKV,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.FFN_DOWN,
++    ],
+ }
+ 
+ # tensors that will not be serialized
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -187,6 +187,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_INKLING2,         "inkling2"         },
+     { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
+     { LLM_ARCH_DOMYN_EDGE,       "domynedge"        },
++    { LLM_ARCH_PEACEBELL,        "peacebell"        },
+     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
+ };
+ 
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -191,6 +191,7 @@ enum llm_arch {
+     LLM_ARCH_INKLING2,
+     LLM_ARCH_INKLING2_LOOP,
+     LLM_ARCH_DOMYN_EDGE,
++    LLM_ARCH_PEACEBELL,
+     LLM_ARCH_UNKNOWN,
+ };
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -400,6 +400,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_kolibri1(params);
+         case LLM_ARCH_DOMYN_EDGE:
+             return new llama_model_domyn_edge(params);
++        case LLM_ARCH_PEACEBELL:
++            return new llama_model_peacebell(params);
+         default:
+             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
+     }
+@@ -3958,6 +3960,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_BEAM:
+         case LLM_ARCH_KOLIBRI1:
+         case LLM_ARCH_DOMYN_EDGE:
++        case LLM_ARCH_PEACEBELL:
+             return LLAMA_ROPE_TYPE_NEOX;
+ 
+         case LLM_ARCH_DFLASH:
+diff --git a/src/models/models.h b/src/models/models.h
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -3420,3 +3420,5 @@ struct llama_model_domyn_edge : public llama_model_base {
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
++
++#include "peacebell.h"
