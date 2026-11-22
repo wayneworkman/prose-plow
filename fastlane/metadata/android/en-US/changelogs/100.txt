@@ -1,0 +1,7 @@
+First release.
+
+* Chat with small language models that are packaged in the app and run on the phone, with no network permission.
+* Several chats; the model can be switched in the middle of a chat.
+* Stop a reply, ask for an answer again, continue a reply, edit an earlier message.
+* A temperature for each model, and a system prompt for the models trained with one.
+* Chats are stored encrypted behind a mandatory lock: a passphrase or a fingerprint, never a PIN.

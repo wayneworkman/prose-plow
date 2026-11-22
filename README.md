@@ -958,6 +958,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `llama/` | The Android library around the native code: the CMake build for arm64, the JNI binding, the packaging of the models, the checks on the finished APK, and the tests that run on a phone |
 | `native/` | Everything below the JVM: the patches to llama.cpp, the two architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md` |
 | `models/` | `manifest.json` with the pinned revisions and hashes, and `convert_models.py`. See `models/README.md` |
+| `fastlane/` | The store metadata in the layout F-Droid reads (`metadata/android/en-US/`: title, descriptions, changelog, icon), and the script that renders the icon from the launcher artwork. See `fastlane/README.md` |
 | `third_party/llama.cpp` | Upstream llama.cpp as a git submodule at a pinned commit. It is never edited: builds work on a patched copy |
 | `gradle/libs.versions.toml` | Every Gradle plugin and library with its version |
 | `gradle/wrapper/` | The Gradle wrapper, with the version and SHA-256 of the distribution |
