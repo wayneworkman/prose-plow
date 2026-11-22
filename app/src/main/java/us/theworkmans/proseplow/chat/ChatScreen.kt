@@ -5,15 +5,18 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -107,7 +110,8 @@ import us.theworkmans.proseplow.ui.rememberCopyToClipboard
  * The chat, which is also the app's home: the conversation, the field to write in, and around
  * them everything that is one tap away. The list of chats is a drawer that slides over the
  * conversation (from the menu button or a swipe), so switching chats never leaves this screen;
- * the top bar names the chat and its model, and tapping it switches the model.
+ * the top bar names the chat and its model, and tapping it switches the model. Under the field
+ * to write in, one line reminds the reader that what a model writes may be wrong.
  *
  * Nothing shown here is put into saved instance state except whether the list follows the newest
  * message and how far it is scrolled.
@@ -264,6 +268,7 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                         onCancelEdit = viewModel::cancelEdit,
                     )
                 }
+                AiNotice()
             }
         }
     }
@@ -783,6 +788,35 @@ private fun InputBar(
             }
         }
     }
+}
+
+/**
+ * The line at the very bottom of the chat, under the field to write in: a standing reminder that
+ * what a model says may be wrong. It is the last thing in the screen's column, so it is there in
+ * every state of the chat (also where there is no field), and above the navigation bar, whose
+ * inset the column already keeps clear.
+ *
+ * While the on-screen keyboard is open the line is not composed at all: the room it would take
+ * is worth more to the conversation then. It comes and goes with the keyboard without any
+ * animation of its own; the list above only ever sees its viewport change, which it follows by
+ * layout as it does for the keyboard itself.
+ *
+ * It is plain text and nothing else: no click, and no live region, so a screen reader says it
+ * when the user moves to it and never because it reappeared.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AiNotice() {
+    if (WindowInsets.isImeVisible) return
+    Text(
+        text = stringResource(R.string.ai_notice),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+    )
 }
 
 @Composable

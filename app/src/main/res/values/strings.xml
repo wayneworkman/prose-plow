@@ -171,6 +171,7 @@
     <string name="send">Send</string>
     <string name="send_edit">Send the edited message</string>
     <string name="stop">Stop</string>
+    <string name="ai_notice">This app uses AI, and AI can make mistakes.</string>
     <string name="copy_message">Copy message</string>
     <string name="edit_message">Edit message</string>
     <string name="regenerate">Answer again</string>
