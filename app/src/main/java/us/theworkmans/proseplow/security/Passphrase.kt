@@ -103,7 +103,7 @@ fun CharArray.wipe() = fill('\u0000')
  * [chars] in Unicode Normalisation Form C: the array itself when it already is in that form (the
  * usual case), otherwise a new array, which the caller wipes.
  *
- * The same text can be typed as different code point sequences ("é" as one code point or as "e"
+ * The same text can be typed as different code point sequences (an accented "e" as one code point or as "e"
  * plus a combining accent), depending on the keyboard. Without normalisation a passphrase set
  * with one keyboard would not unlock with another, and there is no recovery. Every passphrase is
  * therefore normalised before its bytes are derived from, and before the rules count its length.
@@ -137,7 +137,7 @@ inline fun <T> withNfc(passphrase: CharArray, block: (CharArray) -> T): T {
 }
 
 /** The first character that can change under normalisation to form C (U+0300, the first combining mark). */
-private const val FIRST_COMPOSING_CHAR = '̀'
+private const val FIRST_COMPOSING_CHAR = '\u0300'
 
 /** UTF-8 bytes of [chars] without creating a String; the caller zeroes the result. */
 fun utf8Bytes(chars: CharArray): ByteArray {

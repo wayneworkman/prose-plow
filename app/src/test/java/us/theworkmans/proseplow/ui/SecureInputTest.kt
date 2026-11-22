@@ -14,10 +14,10 @@ class SecureInputTest {
     @Test
     fun accessibilityIsToldOneBulletForEachCharacterAndNothingElse() {
         assertEquals("", obscuredForAccessibility(0).text)
-        assertEquals("•••", obscuredForAccessibility(3).text)
+        assertEquals("\u2022\u2022\u2022", obscuredForAccessibility(3).text)
         val longest = obscuredForAccessibility(1024)
         assertEquals("the length is all it gives away", 1024, longest.text.length)
-        assertTrue(longest.text.all { it == '•' })
+        assertTrue(longest.text.all { it == '\u2022' })
         assertTrue("plain text, nothing attached to it", longest.spanStyles.isEmpty() && longest.paragraphStyles.isEmpty())
     }
 }

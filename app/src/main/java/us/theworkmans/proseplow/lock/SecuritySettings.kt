@@ -1,5 +1,7 @@
 package us.theworkmans.proseplow.lock
 
+import android.os.Build
+import android.text.format.DateFormat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,6 +30,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -52,10 +56,14 @@ import us.theworkmans.proseplow.security.PassphraseProblem
 import us.theworkmans.proseplow.security.PassphraseProof
 import us.theworkmans.proseplow.security.PassphraseRules
 import us.theworkmans.proseplow.security.ProofExpiredException
+import us.theworkmans.proseplow.security.ScreenshotAllowance
+import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SecurityStatus
+import us.theworkmans.proseplow.security.WindowSecurity
 import us.theworkmans.proseplow.security.wipe
 import us.theworkmans.proseplow.ui.PassphraseField
 import us.theworkmans.proseplow.ui.takeChars
+import java.util.Date
 
 /** What a passphrase check in Settings is for. */
 enum class ProtectedAction { CHANGE, FINGERPRINT_ON, FINGERPRINT_OFF }
@@ -71,7 +79,7 @@ sealed interface SecurityDialog {
     data object Reset : SecurityDialog
 }
 
-enum class SecurityError { MISMATCH, EMPTY, TOO_SHORT, TOO_LONG, DIGITS_ONLY, WRONG, THROTTLED, EXPIRED, FAILED }
+enum class SecurityError { MISMATCH, EMPTY, TOO_SHORT, TOO_LONG, DIGITS_ONLY, WRONG, THROTTLED, EXPIRED, FAILED, SCREENSHOTS_NOT_ALLOWED }
 
 private fun PassphraseProblem.toSecurityError() = when (this) {
     PassphraseProblem.EMPTY -> SecurityError.EMPTY
@@ -99,6 +107,9 @@ data class SecurityUiState(
  */
 class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
     val status: StateFlow<SecurityStatus> = appLock.status
+
+    /** The screenshot allowance that is running, or null. It ends by itself, and the switch follows. */
+    val screenshots: StateFlow<ScreenshotsAllowed?> = appLock.screenshots.allowed
 
     private val _state = MutableStateFlow(SecurityUiState())
     val state: StateFlow<SecurityUiState> = _state.asStateFlow()
@@ -202,6 +213,21 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
         _state.value = SecurityUiState()
     }
 
+    /**
+     * The "Allow screenshots" switch. On gives an allowance that ends by itself (see
+     * [ScreenshotAllowance]); off ends it now. Nothing is stored, and no passphrase is asked
+     * for: the app is unlocked, and the allowance opens no key. If the phone's screen cannot be
+     * watched nothing is allowed, and the section says so.
+     */
+    fun setScreenshotsAllowed(allowed: Boolean) {
+        if (!allowed) {
+            appLock.screenshots.end()
+            return
+        }
+        val granted = appLock.screenshots.grant()
+        _state.update { it.copy(error = if (granted) null else SecurityError.SCREENSHOTS_NOT_ALLOWED) }
+    }
+
     fun setLockTimeout(seconds: Int) {
         viewModelScope.launch {
             try {
@@ -219,12 +245,15 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
 
 /**
  * The rows of the Security section: change passphrase, fingerprint unlock, the background
- * timeout, "Lock now" and "Reset app data", with their dialogs. It emits its rows into the
- * column of the Settings screen it is placed in (which supplies the section title and the
- * spacing), and needs nothing but its ViewModel.
+ * timeout, "Lock now", the temporary screenshot allowance and "Reset app data", with their
+ * dialogs. It emits its rows into the column of the Settings screen it is placed in (which
+ * supplies the section title and the spacing), and needs nothing but its ViewModel.
  *
- * There is no switch for the lock itself, for screenshots or for the keyboard: the lock is
- * mandatory and those protections are always on, which the section says in a line of text.
+ * There is no switch for the lock itself, for the app switcher's preview or for the keyboard:
+ * the lock is mandatory and those two protections are always on, which the section says in a
+ * line of text. Screenshots are blocked too, except while the user has allowed them: that
+ * switch turns itself off again (when its time is up, or the screen turns off), and the row
+ * shows it happening.
  */
 @Composable
 fun SecuritySettingsSection(viewModel: SecurityViewModel) {
@@ -251,6 +280,7 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
     )
     TimeoutPicker(status.lockTimeoutSeconds, viewModel::setLockTimeout)
     OutlinedButton(onClick = viewModel::lockNow) { Text(stringResource(R.string.security_lock_now)) }
+    ScreenshotsRow(viewModel)
     Text(
         stringResource(R.string.security_always_on),
         style = MaterialTheme.typography.bodySmall,
@@ -308,6 +338,7 @@ private fun errorText(error: SecurityError?): String = when (error) {
     SecurityError.THROTTLED -> stringResource(R.string.lock_throttled)
     SecurityError.EXPIRED -> stringResource(R.string.passphrase_expired)
     SecurityError.FAILED -> stringResource(R.string.security_failed)
+    SecurityError.SCREENSHOTS_NOT_ALLOWED -> stringResource(R.string.security_screenshots_failed)
     null -> ""
 }
 
@@ -376,6 +407,32 @@ private fun ConfirmPassphraseDialog(message: String, state: SecurityUiState, onS
         },
         confirmButton = { TextButton(onClick = submit, enabled = !state.busy) { Text(stringResource(R.string.passphrase_continue)) } },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !state.busy) { Text(stringResource(R.string.cancel)) } },
+    )
+}
+
+/**
+ * The switch that allows screenshots for a while. On, it says when the allowance ends, as a
+ * time of day in the user's own format (the locale's, and 12 or 24 hours as set on the phone).
+ * It follows the allowance itself, so it turns off on the screen the moment the allowance ends.
+ * Where an allowance cannot be honoured (see [WindowSecurity.screenshotsCanBeAllowed]) the
+ * switch is disabled and says why.
+ */
+@Composable
+private fun ScreenshotsRow(viewModel: SecurityViewModel) {
+    val allowed by viewModel.screenshots.collectAsStateWithLifecycle()
+    val possible = WindowSecurity.screenshotsCanBeAllowed(Build.VERSION.SDK_INT)
+    val context = LocalContext.current
+    val running = allowed
+    SwitchRow(
+        title = pluralStringResource(R.plurals.security_screenshots, ScreenshotAllowance.DURATION_MINUTES, ScreenshotAllowance.DURATION_MINUTES),
+        support = when {
+            !possible -> stringResource(R.string.security_screenshots_unavailable)
+            running != null -> stringResource(R.string.security_screenshots_on, DateFormat.getTimeFormat(context).format(Date(running.untilWallMillis)))
+            else -> stringResource(R.string.security_screenshots_off)
+        },
+        checked = possible && running != null,
+        enabled = possible,
+        onCheckedChange = viewModel::setScreenshotsAllowed,
     )
 }
 

@@ -151,7 +151,7 @@ class Pbkdf2Test {
     fun matchesTheJdkImplementationIncludingNonAsciiPassphrases() {
         val random = SecureRandom()
         val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-        for (passphrase in listOf("correct horse battery", "pässwörd ünïcödé 密码 🔑", "a".repeat(100))) {
+        for (passphrase in listOf("correct horse battery", "p\u00E4ssw\u00F6rd \u00FCn\u00EFc\u00F6d\u00E9 \u5BC6\u7801 \uD83D\uDD11", "a".repeat(100))) {
             val salt = ByteArray(16).also(random::nextBytes)
             val chars = passphrase.toCharArray()
             val ours = Pbkdf2.hmacSha256(utf8Bytes(chars), salt, 2_000, 32)
@@ -162,7 +162,7 @@ class Pbkdf2Test {
 
     @Test
     fun utf8EncodingOfACharArray() {
-        assertArrayEquals("ä€".toByteArray(Charsets.UTF_8), utf8Bytes("ä€".toCharArray()))
+        assertArrayEquals("\u00E4\u20AC".toByteArray(Charsets.UTF_8), utf8Bytes("\u00E4\u20AC".toCharArray()))
         val chars = "secret".toCharArray()
         chars.wipe()
         assertTrue(chars.all { it == '\u0000' })
@@ -171,9 +171,9 @@ class Pbkdf2Test {
 
 /** Unicode normalisation of passphrases: the same text unlocks whichever way a keyboard composed it. */
 class PassphraseNormalisationTest {
-    // "é" as one code point, and as "e" followed by the combining acute accent.
-    private val composed = "café au lait"
-    private val decomposed = "café au lait"
+    // The accented "e" as one code point, and as "e" followed by the combining acute accent.
+    private val composed = "caf\u00E9 au lait"
+    private val decomposed = "cafe\u0301 au lait"
 
     @Test
     fun bothCompositionsOfTheSameTextGiveTheSameBytes() {
@@ -181,14 +181,14 @@ class PassphraseNormalisationTest {
         assertArrayEquals(passphraseBytes(composed.toCharArray()), passphraseBytes(decomposed.toCharArray()))
         assertArrayEquals(composed.toByteArray(Charsets.UTF_8), passphraseBytes(decomposed.toCharArray()))
         // Hangul typed as separate jamo, and as the syllable they make.
-        assertArrayEquals(passphraseBytes("한".toCharArray()), passphraseBytes("한".toCharArray()))
-        // Different texts stay different: compatibility forms (the "ﬁ" ligature) are not folded.
-        assertFalse(passphraseBytes("ﬁsh".toCharArray()).contentEquals(passphraseBytes("fish".toCharArray())))
+        assertArrayEquals(passphraseBytes("\uD55C".toCharArray()), passphraseBytes("\u1112\u1161\u11AB".toCharArray()))
+        // Different texts stay different: compatibility forms (the "fi" ligature, U+FB01) are not folded.
+        assertFalse(passphraseBytes("\uFB01sh".toCharArray()).contentEquals(passphraseBytes("fish".toCharArray())))
     }
 
     @Test
     fun textThatIsAlreadyNormalisedIsNotCopied() {
-        for (text in listOf("correct horse battery", "pässwörd ünïcödé", composed, "密码 🔑 and more", "")) {
+        for (text in listOf("correct horse battery", "p\u00E4ssw\u00F6rd \u00FCn\u00EFc\u00F6d\u00E9", composed, "\u5BC6\u7801 \uD83D\uDD11 and more", "")) {
             val chars = text.toCharArray()
             assertSame(text, chars, nfc(chars))
             assertEquals(text, String(chars))
@@ -224,18 +224,18 @@ class PassphraseNormalisationTest {
             val text = String(CharArray(1 + random.nextInt(40)) { random.nextInt(0x300).toChar() })
             assertTrue(Normalizer.isNormalized(text, Normalizer.Form.NFC))
         }
-        assertFalse("the first character past it is not", Normalizer.isNormalized("é", Normalizer.Form.NFC))
+        assertFalse("the first character past it is not", Normalizer.isNormalized("e\u0301", Normalizer.Form.NFC))
     }
 
     @Test
     fun theRulesCountTheNormalisedText() {
         // Ten letters each carrying a combining accent: ten characters, not twenty.
-        val tenAccented = "é".repeat(10).toCharArray()
+        val tenAccented = "e\u0301".repeat(10).toCharArray()
         assertNull(PassphraseRules.check(tenAccented))
-        assertEquals(PassphraseProblem.TOO_SHORT, PassphraseRules.check("é".repeat(9).toCharArray()))
+        assertEquals(PassphraseProblem.TOO_SHORT, PassphraseRules.check("e\u0301".repeat(9).toCharArray()))
         // 1,024 of them are within the limit although they are 2,048 chars.
-        assertNull(PassphraseRules.checkEntered("é".repeat(PassphraseRules.MAX_LENGTH).toCharArray()))
-        assertEquals(PassphraseProblem.TOO_LONG, PassphraseRules.checkEntered("é".repeat(PassphraseRules.MAX_LENGTH + 1).toCharArray()))
+        assertNull(PassphraseRules.checkEntered("e\u0301".repeat(PassphraseRules.MAX_LENGTH).toCharArray()))
+        assertEquals(PassphraseProblem.TOO_LONG, PassphraseRules.checkEntered("e\u0301".repeat(PassphraseRules.MAX_LENGTH + 1).toCharArray()))
         // Entered twice with different compositions is the same passphrase.
         assertNull(PassphraseRules.checkNew(composed.toCharArray(), decomposed.toCharArray()))
     }
@@ -250,7 +250,7 @@ class PassphraseRulesTest {
         assertEquals(PassphraseProblem.DIGITS_ONLY, PassphraseRules.check("12345678901234567890".toCharArray()))
         assertNull(PassphraseRules.check("123456789a".toCharArray()))
         assertNull(PassphraseRules.check("ten chars!".toCharArray()))
-        assertEquals("emoji count as one character each", PassphraseProblem.TOO_SHORT, PassphraseRules.check("🔑🔑🔑🔑🔑🔑🔑🔑🔑".toCharArray()))
+        assertEquals("emoji count as one character each", PassphraseProblem.TOO_SHORT, PassphraseRules.check("\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11\uD83D\uDD11".toCharArray()))
         assertNull(PassphraseRules.check(CharArray(PassphraseRules.MAX_LENGTH) { 'a' }))
         assertEquals(PassphraseProblem.TOO_LONG, PassphraseRules.check(CharArray(PassphraseRules.MAX_LENGTH + 1) { 'a' }))
     }

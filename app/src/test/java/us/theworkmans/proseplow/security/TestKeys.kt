@@ -173,6 +173,37 @@ class FakeClock(var wall: Long = 1_700_000_000_000L, var elapsed: Long = 50_000L
     }
 }
 
+/**
+ * [ScreenOffWatch] for the unit tests, in place of the phone's broadcast: it records whether
+ * something is watching, and [screenTurnsOff] is the power button.
+ */
+class FakeScreenOffWatch : ScreenOffWatch {
+    private var listener: (() -> Unit)? = null
+
+    /** Whether a listener is registered right now; on the phone, whether the receiver is. */
+    val watching: Boolean get() = listener != null
+    var starts = 0
+    var stops = 0
+
+    /** Makes [start] fail, as a system that refuses the registration would. */
+    var refuses = false
+
+    override fun start(onScreenOff: () -> Unit) {
+        if (refuses) throw IllegalStateException("the registration was refused")
+        if (listener == null) starts++
+        listener = onScreenOff
+    }
+
+    override fun stop() {
+        if (listener != null) stops++
+        listener = null
+    }
+
+    fun screenTurnsOff() {
+        listener?.invoke()
+    }
+}
+
 /** A configuration that validates, for tests that only care about some of its fields. */
 fun testConfig(
     failedAttempts: Int = 0,

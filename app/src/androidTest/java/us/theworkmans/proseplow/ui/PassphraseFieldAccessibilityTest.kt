@@ -53,7 +53,7 @@ class PassphraseFieldAccessibilityTest {
             val all = nodesWithThePassphraseField()
             val field = all.singleOrNull { it.isPassword }
             assertNotNull("the passphrase field is in the accessibility tree, marked as a password", field)
-            assertEquals("one bullet for each character", "•".repeat(passphrase.length), field!!.text.toString())
+            assertEquals("one bullet for each character", "\u2022".repeat(passphrase.length), field!!.text.toString())
             assertTrue("it is still an editable field to a screen reader", field.isEditable)
 
             for (node in all) {

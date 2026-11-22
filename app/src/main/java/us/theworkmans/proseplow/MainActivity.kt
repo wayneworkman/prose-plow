@@ -3,7 +3,6 @@ package us.theworkmans.proseplow
 import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -33,6 +32,7 @@ import us.theworkmans.proseplow.security.BiometricLauncher
 import us.theworkmans.proseplow.security.BiometricNotice
 import us.theworkmans.proseplow.security.BiometricPurpose
 import us.theworkmans.proseplow.security.LockState
+import us.theworkmans.proseplow.security.WindowSecurity
 import us.theworkmans.proseplow.ui.ActivityState
 import us.theworkmans.proseplow.ui.NoPersonalizedLearning
 import us.theworkmans.proseplow.ui.theme.ProsePlowTheme
@@ -61,12 +61,11 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        // Secure from the first frame, before any content exists, and never cleared: nothing the
-        // app shows may end up in a screenshot, a screen recording or the recents thumbnail. This
-        // is not a setting. Compose dialogs, menus and popups inherit the flag from this window
-        // (SecureFlagPolicy.Inherit, their default) when they open.
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) setRecentsScreenshotEnabled(false)
+        // Secure from the first frame, before any content exists and before anything is known:
+        // nothing the app shows ends up in a screenshot or a screen recording unless the user has
+        // allowed it for a while (see applyWindowPolicy), and the app switcher's preview is hidden
+        // in any case.
+        container.screenSecurity.apply(this, secure = true)
         // Nothing in this app is offered to, or saved by, an autofill service (passphrases,
         // prompts). Compose dialogs are separate windows; see ExcludeWindowFromAutofill.
         window.decorView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
@@ -146,6 +145,22 @@ class MainActivity : FragmentActivity() {
                 seen = count
             }
         }
+        // The window follows the screenshot allowance at once, both ways: when it is given, and
+        // when it ends by itself, by the screen turning off, by the user or by a reset.
+        lifecycleScope.launch {
+            appLock.screenshots.allowed.collect { applyWindowPolicy() }
+        }
+    }
+
+    /**
+     * Makes the window secure or not, as the policy says for this moment. The allowance is asked
+     * through `current()`, which first ends one whose time is up, so a timer that could not run
+     * while the phone slept never leaves the window open.
+     */
+    private fun applyWindowPolicy() {
+        val appLock = container.appLock
+        val secure = WindowSecurity.mustBeSecure(appLock.screenshots.current(), appLock.elapsedNow(), Build.VERSION.SDK_INT)
+        container.screenSecurity.apply(this, secure)
     }
 
     private fun setAppContent() {
@@ -195,6 +210,8 @@ class MainActivity : FragmentActivity() {
     override fun onStart() {
         super.onStart()
         container.appLock.onForeground()
+        // Before anything is drawn again: an allowance that ran out while the app was away is over.
+        applyWindowPolicy()
     }
 
     override fun onResume() {

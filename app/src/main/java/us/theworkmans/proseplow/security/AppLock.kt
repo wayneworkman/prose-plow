@@ -149,6 +149,12 @@ class AppLock<S : UnlockedSession>(
     /** Makes the session of an unlock. Called off the main thread; may read the stores and may fail. */
     private val openSession: (BlobCipher) -> S,
     private val biometricStatus: () -> BiometricStatus,
+    /**
+     * The temporary permission to take screenshots. It is not part of the lock (locking leaves
+     * it alone), but the lock is where two of its ends are: a reset ends it, and coming to the
+     * foreground is when an allowance whose timer could not run is found to be over.
+     */
+    val screenshots: ScreenshotAllowance,
     private val mainDispatcher: CoroutineDispatcher,
     private val ioDispatcher: CoroutineDispatcher,
 ) {
@@ -454,10 +460,14 @@ class AppLock<S : UnlockedSession>(
         }
     }
 
-    /** The activity is visible again. Also catches a timer that could not run (process frozen). */
+    /**
+     * The activity is visible again. Also catches the timers that could not run (process frozen,
+     * phone asleep): the lock's own, and the one that ends a screenshot allowance.
+     */
     fun onForeground() {
         lockTimer?.cancel()
         lockTimer = null
+        screenshots.current()
         if (backgroundPolicy.onForeground(clock.elapsedMillis())) lock()
     }
 
@@ -823,6 +833,8 @@ class AppLock<S : UnlockedSession>(
      */
     fun reset() {
         if (_state.value == LockState.Starting) return
+        // After a reset the app is as it was when first installed: nothing may be captured.
+        screenshots.end()
         leaveUnlocked(SessionEnd.RESET)
         pendingPurpose = null
         _unlockUi.value = UnlockUi()

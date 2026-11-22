@@ -23,9 +23,12 @@ import us.theworkmans.proseplow.security.AppLock
 import us.theworkmans.proseplow.security.BiometricLauncher
 import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.FakeClock
+import us.theworkmans.proseplow.security.FakeScreenOffWatch
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
 import us.theworkmans.proseplow.security.LockState
+import us.theworkmans.proseplow.security.ScreenshotAllowance
+import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SoftwareKeyVault
 import us.theworkmans.proseplow.security.UnlockedSession
 import javax.crypto.Cipher
@@ -56,6 +59,7 @@ class SecurityViewModelTest {
     private val files by lazy { AppFiles(temp.newFolder("files"), temp.newFolder("cache")) }
     private var biometric = BiometricStatus.NONE_ENROLLED
     private var promptCipher: Cipher? = null
+    private val screenWatch = FakeScreenOffWatch()
 
     private val passphrase = "correct horse battery"
     private val otherPassphrase = "a different one, longer"
@@ -83,6 +87,7 @@ class SecurityViewModelTest {
                 }
             },
             biometricStatus = { biometric },
+            screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
             mainDispatcher = dispatcher,
             ioDispatcher = dispatcher,
         )
@@ -231,6 +236,50 @@ class SecurityViewModelTest {
         viewModel.setLockTimeout(900)
         runCurrent()
         assertEquals(900, viewModel.status.value.lockTimeoutSeconds)
+        assertNull(viewModel.state.value.error)
+    }
+
+    @Test
+    fun theScreenshotSwitchGivesAnAllowanceThatEndsByItselfAndTheRowFollows() = runTest(dispatcher) {
+        unlockedApp()
+        val before = files.lockConfig.readText()
+        assertNull("blocked unless allowed", viewModel.screenshots.value)
+
+        viewModel.setScreenshotsAllowed(true)
+        assertEquals(
+            ScreenshotsAllowed(
+                untilElapsedMillis = clock.elapsed + ScreenshotAllowance.DURATION_MILLIS,
+                untilWallMillis = clock.wall + ScreenshotAllowance.DURATION_MILLIS,
+            ),
+            viewModel.screenshots.value,
+        )
+        assertNull(viewModel.state.value.error)
+        assertEquals("no dialog, no passphrase", SecurityUiState(), viewModel.state.value)
+
+        // The time is up while the settings are open: what the row shows turns off without a touch.
+        clock.advance(ScreenshotAllowance.DURATION_MILLIS)
+        testScheduler.advanceTimeBy(ScreenshotAllowance.DURATION_MILLIS)
+        runCurrent()
+        assertNull(viewModel.screenshots.value)
+
+        viewModel.setScreenshotsAllowed(true)
+        viewModel.setScreenshotsAllowed(false)
+        assertNull("off is at once", viewModel.screenshots.value)
+        assertFalse(screenWatch.watching)
+        assertEquals("the switch is no stored setting: the lock configuration never changed", before, files.lockConfig.readText())
+    }
+
+    @Test
+    fun anAllowanceThatCannotBeGuardedIsNotGivenAndTheSectionSaysSo() = runTest(dispatcher) {
+        unlockedApp()
+        screenWatch.refuses = true
+        viewModel.setScreenshotsAllowed(true)
+        assertNull(viewModel.screenshots.value)
+        assertEquals(SecurityError.SCREENSHOTS_NOT_ALLOWED, viewModel.state.value.error)
+
+        screenWatch.refuses = false
+        viewModel.setScreenshotsAllowed(true)
+        assertTrue(viewModel.screenshots.value != null)
         assertNull(viewModel.state.value.error)
     }
 

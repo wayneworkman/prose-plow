@@ -102,6 +102,20 @@ class SourceRulesTest {
         }
     }
 
+    /**
+     * Every Kotlin source of the module, tests included, is plain ASCII. A character outside it
+     * is written as an escape: two strings that only differ in how an accent is composed look
+     * the same on screen, a combining mark between quotes is invisible, and an editor that
+     * normalises what it saves would change either without a trace.
+     */
+    @Test
+    fun everyKotlinSourceIsPlainAscii() {
+        for (file in sources("src/main/java") + sources("src/test/java") + sources("src/androidTest/java")) {
+            val lines = file.readLines().withIndex().filter { (_, line) -> line.any { it.code > 127 } }.map { it.index + 1 }
+            assertEquals("${file.name} has characters outside ASCII on these lines; write them as \\u escapes", emptyList<Int>(), lines)
+        }
+    }
+
     @Test
     fun theLockManagerIsOnlyReachedUnderTheLocksMutex() {
         // In AppLock the manager is named in exactly two places: its constructor parameter, and
@@ -115,6 +129,57 @@ class SourceRulesTest {
             ),
             uses,
         )
+    }
+
+    /**
+     * What decides whether the app can be captured is carried out in exactly one class: the
+     * window's secure flag, the app switcher's preview and the screen-off broadcast that ends a
+     * screenshot allowance. Nothing else sets or clears the flag (so nothing can clear it by
+     * accident), no dialog opts out of inheriting it, the preview is only ever turned off, the
+     * receiver is not exported and is unregistered again, and the activity only asks the policy
+     * through the call that first ends an allowance whose time is up. And nothing about
+     * screenshots is stored: the lock configuration does not know the word.
+     */
+    @Test
+    fun theWindowPolicyIsCarriedOutInExactlyOnePlace() {
+        fun code(file: File) = file.readLines().map { it.trim() }.filterNot { it.startsWith("*") || it.startsWith("//") || it.startsWith("/**") }
+        val all = sources(main)
+        for (word in listOf("FLAG_SECURE", "setRecentsScreenshotEnabled", "ACTION_SCREEN_OFF")) {
+            val users = all.filter { file -> code(file).any { it.contains(word) } }.map { it.name }
+            assertEquals("$word is handled outside the class that owns the window policy", listOf("ScreenSecurity.kt"), users)
+        }
+        assertEquals("something overrides how its window inherits the secure flag", emptyList<String>(), all.filter { file -> code(file).any { it.contains("SecureFlagPolicy") } }.map { it.name })
+
+        val owner = code(File(module, "$main/ScreenSecurity.kt"))
+        assertEquals(
+            listOf("window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)", "window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)"),
+            owner.filter { it.contains("FLAG_SECURE") },
+        )
+        assertEquals(
+            "the app switcher's preview is turned off unconditionally, and never on",
+            listOf("if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) activity.setRecentsScreenshotEnabled(false)"),
+            owner.filter { it.contains("setRecentsScreenshotEnabled") },
+        )
+        assertEquals(
+            listOf("ContextCompat.registerReceiver(app, receiver, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED)"),
+            owner.filter { it.contains("registerReceiver(") && !it.contains("unregisterReceiver(") },
+        )
+        assertEquals(listOf("app.unregisterReceiver(receiver)"), owner.filter { it.contains("unregisterReceiver(") })
+
+        val activity = code(File(module, "$main/MainActivity.kt"))
+        assertEquals(
+            "the window starts secure, and afterwards is whatever the policy says at that moment",
+            listOf("container.screenSecurity.apply(this, secure = true)", "container.screenSecurity.apply(this, secure)"),
+            activity.filter { it.contains("screenSecurity.apply(") },
+        )
+        assertEquals(
+            listOf("val secure = WindowSecurity.mustBeSecure(appLock.screenshots.current(), appLock.elapsedNow(), Build.VERSION.SDK_INT)"),
+            activity.filter { it.contains("mustBeSecure(") },
+        )
+
+        for (name in listOf("LockConfig.kt", "LockManager.kt")) {
+            assertTrue("$name stores something about screenshots", !File(module, "$main/security/$name").readText().contains("creenshot"))
+        }
     }
 
     @Test

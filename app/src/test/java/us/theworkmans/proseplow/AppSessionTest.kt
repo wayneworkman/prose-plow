@@ -36,10 +36,12 @@ import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.AppLock
 import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.BlobCipher
+import us.theworkmans.proseplow.security.FakeScreenOffWatch
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
 import us.theworkmans.proseplow.security.LockState
+import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.SoftwareKeyVault
 import us.theworkmans.proseplow.security.UnlockedSession
 import java.io.File
@@ -294,6 +296,7 @@ class AppSessionTest {
                 WatchedSession(session, unlocked, log)
             },
             biometricStatus = { BiometricStatus.NONE_ENROLLED },
+            screenshots = ScreenshotAllowance(lockClock, FakeScreenOffWatch(), dispatcher),
             mainDispatcher = dispatcher,
             ioDispatcher = dispatcher,
         )

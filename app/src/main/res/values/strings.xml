@@ -93,7 +93,15 @@
     <string name="timeout_5_minutes">5 minutes</string>
     <string name="timeout_15_minutes">15 minutes</string>
     <string name="security_lock_now">Lock now</string>
-    <string name="security_always_on">Screenshots are blocked, the app\'s content is hidden in the recent apps screen, and the keyboard is asked not to learn from what you type. These protections are always on.</string>
+    <plurals name="security_screenshots">
+        <item quantity="one">Allow screenshots for %1$d minute</item>
+        <item quantity="other">Allow screenshots for %1$d minutes</item>
+    </plurals>
+    <string name="security_screenshots_off">Screenshots and screen recordings are blocked.</string>
+    <string name="security_screenshots_on">On until %1$s. It also ends when the screen turns off or the app is closed. While it is on, screenshots and screen recordings can capture your chats; the preview in the app switcher stays hidden.</string>
+    <string name="security_screenshots_unavailable">Needs Android 13 or later. On this version of Android the preview in the app switcher cannot be hidden by itself, so screenshots stay blocked.</string>
+    <string name="security_screenshots_failed">Screenshots could not be allowed: the phone did not let the app watch for the screen turning off.</string>
+    <string name="security_always_on">The app\'s content is always hidden in the app switcher, and the keyboard is always asked not to learn from what you type.</string>
     <string name="security_reset_support">Deletes every chat and setting and your passphrase, then starts again with first-time set-up.</string>
     <string name="security_failed">That did not work: the phone\'s key store or storage reported an error.</string>
     <string name="confirm_passphrase_title">Enter your passphrase</string>

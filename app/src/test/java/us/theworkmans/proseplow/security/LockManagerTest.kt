@@ -272,29 +272,29 @@ class LockManagerTest {
     fun aPassphraseUnlocksHoweverTheKeyboardComposedIt() {
         val m = manager()
         m.start()
-        // Set with "é" as one code point; entered with "e" and a combining accent, and the other way round.
-        val key = m.setUp("café au lait".toCharArray()).key
+        // Set with the accented "e" as one code point; entered with "e" and a combining accent, and the other way round.
+        val key = m.setUp("caf\u00E9 au lait".toCharArray()).key
         val restarted = manager()
         restarted.start()
-        assertArrayEquals(key.bytes, restarted.unlock("café au lait").key.bytes)
-        assertArrayEquals(key.bytes, restarted.unlock("café au lait").key.bytes)
+        assertArrayEquals(key.bytes, restarted.unlock("cafe\u0301 au lait").key.bytes)
+        assertArrayEquals(key.bytes, restarted.unlock("caf\u00E9 au lait").key.bytes)
         assertEquals(PassphraseResult.Wrong(0), restarted.checkPassphrase("cafe au lait".toCharArray()))
 
-        val proof = restarted.unlock("café au lait").proof
-        restarted.changePassphrase(proof, key, "naïve passphrase".toCharArray())
-        assertArrayEquals(key.bytes, manager().also { it.start() }.unlock("naïve passphrase").key.bytes)
+        val proof = restarted.unlock("caf\u00E9 au lait").proof
+        restarted.changePassphrase(proof, key, "nai\u0308ve passphrase".toCharArray())
+        assertArrayEquals(key.bytes, manager().also { it.start() }.unlock("na\u00EFve passphrase").key.bytes)
     }
 
     @Test
     fun thePassphraseArrayIsLeftForItsOwnerToWipe() {
         val m = manager()
         m.start()
-        val typed = "café au lait".toCharArray()
+        val typed = "cafe\u0301 au lait".toCharArray()
         m.setUp(typed)
-        assertEquals("café au lait", String(typed))
-        val again = "café au lait".toCharArray()
+        assertEquals("cafe\u0301 au lait", String(typed))
+        val again = "cafe\u0301 au lait".toCharArray()
         m.checkPassphrase(again)
-        assertEquals("café au lait", String(again))
+        assertEquals("cafe\u0301 au lait", String(again))
     }
 
     @Test

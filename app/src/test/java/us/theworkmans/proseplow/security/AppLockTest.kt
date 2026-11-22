@@ -52,6 +52,7 @@ class AppLockTest {
     private val sessions = mutableListOf<FakeSession>()
     private var biometric = BiometricStatus.NONE_ENROLLED
     private var openFails: Exception? = null
+    private val screenWatch = FakeScreenOffWatch()
 
     private lateinit var lock: AppLock<FakeSession>
 
@@ -141,6 +142,7 @@ class AppLockTest {
                 FakeSession(cipher, log).also { sessions += it }
             },
             biometricStatus = { biometric },
+            screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
             mainDispatcher = dispatcher,
             ioDispatcher = dispatcher,
         )
@@ -920,6 +922,113 @@ class AppLockTest {
         lock.reset()
         runCurrent()
         assertEquals(LockState.SetupRequired, lock.state.value)
+    }
+
+    // --- The screenshot allowance -------------------------------------------------------------------
+
+    /** Every file the app has, with its content: what "nothing was written" is measured on. */
+    private fun everythingOnDisk(): Map<String, List<Byte>> =
+        listOf(files.filesDir, files.cacheDir).flatMap { root -> root.walkTopDown().filter { it.isFile }.map { it.path to it.readBytes().toList() } }.toMap()
+
+    @Test
+    fun aScreenshotAllowanceOutlivesTheAppsOwnLockAndUnlock() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        assertTrue(lock.screenshots.grant())
+        val allowed = lock.screenshots.allowed.value
+        assertTrue(allowed != null)
+
+        // "Lock now": the lock screen can be captured as well while the allowance runs.
+        lock.lock()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(allowed, lock.screenshots.current())
+        enter(passphrase)
+        assertEquals(allowed, lock.screenshots.current())
+
+        // Nor does the background timeout end it, or coming back.
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(allowed, lock.screenshots.current())
+        lock.onForeground()
+        assertEquals(allowed, lock.screenshots.current())
+        assertTrue(screenWatch.watching)
+
+        // Only its own time does.
+        pass(ScreenshotAllowance.DURATION_MILLIS - 60_000 - 1)
+        assertEquals(allowed, lock.screenshots.allowed.value)
+        pass(1)
+        assertNull(lock.screenshots.allowed.value)
+        assertFalse(screenWatch.watching)
+    }
+
+    @Test
+    fun comingToTheForegroundEndsAnAllowanceWhoseTimerCouldNotRun() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.screenshots.grant()
+        lock.onBackground()
+        // The phone slept: the clock moved on past the deadline, no timer fired.
+        clock.advance(ScreenshotAllowance.DURATION_MILLIS)
+        assertTrue("nobody has looked yet", lock.screenshots.allowed.value != null)
+
+        lock.onForeground()
+        assertNull("over before anything is shown again", lock.screenshots.allowed.value)
+        assertFalse(screenWatch.watching)
+    }
+
+    @Test
+    fun aResetEndsAScreenshotAllowanceFromSettingsAndFromTheLockScreen() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.screenshots.grant()
+        lock.reset() // In Settings, unlocked.
+        assertNull("at once, before anything is deleted", lock.screenshots.allowed.value)
+        assertFalse(screenWatch.watching)
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        pass(ScreenshotAllowance.DURATION_MILLIS)
+        assertNull(lock.screenshots.allowed.value)
+
+        createPassphrase()
+        lock.screenshots.grant()
+        lock.lock()
+        runCurrent()
+        assertTrue(lock.screenshots.allowed.value != null)
+        lock.reset() // On the lock screen, the passphrase forgotten.
+        assertNull(lock.screenshots.allowed.value)
+        assertFalse(screenWatch.watching)
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertNull("and the app that starts again has nothing allowed", lock.screenshots.current())
+    }
+
+    @Test
+    fun aScreenshotAllowanceIsNeverWrittenToDisk() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        val before = everythingOnDisk()
+        assertTrue(before.isNotEmpty())
+
+        lock.screenshots.grant()
+        runCurrent()
+        assertEquals("giving it", before, everythingOnDisk())
+        screenWatch.screenTurnsOff()
+        assertEquals("the screen turning off", before, everythingOnDisk())
+        lock.screenshots.grant()
+        lock.screenshots.end()
+        assertEquals("turning it off", before, everythingOnDisk())
+        lock.screenshots.grant()
+        pass(ScreenshotAllowance.DURATION_MILLIS)
+        assertNull(lock.screenshots.allowed.value)
+        assertEquals("its time running out", before, everythingOnDisk())
+        assertFalse("the lock configuration has no word about it", files.lockConfig.readText().contains("creenshot"))
+
+        // So a new process, which only has the files, starts with nothing allowed.
+        lock.screenshots.grant()
+        startApp()
+        assertNull(lock.screenshots.allowed.value)
     }
 
     // --- The activity -------------------------------------------------------------------------------

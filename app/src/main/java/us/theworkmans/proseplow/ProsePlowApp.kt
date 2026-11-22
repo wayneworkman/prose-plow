@@ -16,6 +16,7 @@ import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.Clock
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
+import us.theworkmans.proseplow.security.ScreenshotAllowance
 import java.util.concurrent.Executors
 
 /**
@@ -57,6 +58,9 @@ class AppContainer(context: Context) {
         override fun elapsedMillis() = SystemClock.elapsedRealtime()
     }
 
+    /** Everything Android has to do for the window policy; see [ScreenSecurity]. */
+    val screenSecurity = ScreenSecurity(app)
+
     val appLock: AppLock<AppSession> = AppLock(
         manager = LockManager(
             store = LockConfigStore(files.lockConfig),
@@ -79,6 +83,7 @@ class AppContainer(context: Context) {
                 else -> BiometricStatus.UNAVAILABLE
             }
         },
+        screenshots = ScreenshotAllowance(clock, screenSecurity, Dispatchers.Main.immediate),
         mainDispatcher = Dispatchers.Main.immediate,
         ioDispatcher = Dispatchers.IO,
     )
