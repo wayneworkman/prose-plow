@@ -106,9 +106,144 @@
     <string name="passphrase_save">Save</string>
     <string name="passphrase_expired">Too much time has passed. Enter your passphrase again.</string>
 
-    <!-- The screen that stands in for the chat until it is written -->
-    <string name="placeholder_message">The app is unlocked. Chats will appear here.</string>
-    <string name="placeholder_sample">Sample text to copy</string>
-    <string name="placeholder_copy">Copy the sample text</string>
+    <!-- Shared by the unlocked screens -->
+    <string name="back">Back</string>
+    <string name="settings">Settings</string>
+    <string name="delete">Delete</string>
     <string name="session_write_failed">Something could not be saved: %1$s</string>
+    <string name="kept_copy">The file as it was has been kept.</string>
+
+    <!-- Models: names are proper names and are not translated -->
+    <string name="model_name_qwen3_5_0_8b" translatable="false">Qwen3.5 0.8B</string>
+    <string name="model_name_peacebell_v1_291m" translatable="false">Peacebell v1 291M</string>
+    <string name="model_name_boris_2_instruct" translatable="false">Boris-2-Instruct</string>
+    <string name="model_name_boris2_peacebell_think" translatable="false">Boris2 Peacebell Think</string>
+    <string name="model_description_qwen3_5_0_8b">A general assistant that speaks many languages. The most capable model here.</string>
+    <string name="model_description_peacebell_v1_291m">Answers questions about the Second World War from memory. Not a general assistant.</string>
+    <string name="model_description_boris_2_instruct">A very small chat model for everyday questions. Fluent, but often wrong on facts.</string>
+    <string name="model_description_boris2_peacebell_think">A small chat model that is still being trained.</string>
+
+    <!-- Chat: top bar -->
+    <string name="open_chats">Open the list of chats</string>
+    <string name="new_chat">New chat</string>
+    <string name="more_options">More options</string>
+    <string name="delete_chat">Delete chat</string>
+    <string name="switch_model">Switch model</string>
+    <string name="switch_model_busy">Unavailable while an answer is being written</string>
+    <string name="choose_model">Choose a model</string>
+
+    <!-- Chat: the list of chats -->
+    <string name="chats">Chats</string>
+    <string name="chats_empty">No chats yet. A chat appears here with its first message.</string>
+    <string name="chat_untitled">Untitled chat</string>
+    <string name="chat_answering">An answer is being written</string>
+    <string name="chat_row_support">%1$s · %2$s</string>
+    <string name="chat_just_now">just now</string>
+    <string name="delete_chat_named">Delete %1$s</string>
+    <string name="delete_chat_title">Delete this chat?</string>
+    <string name="delete_chat_message">“%1$s” will be deleted from this phone. This cannot be undone.</string>
+    <string name="delete_chat_message_untitled">This chat will be deleted from this phone. This cannot be undone.</string>
+
+    <!-- Chat: what the model is doing -->
+    <string name="model_loading">Loading %1$s…</string>
+    <string name="model_failed_title">%1$s could not be loaded</string>
+    <string name="model_not_offered_title">This chat\'s model is not in this build</string>
+    <string name="model_not_offered_detail">%1$s is not part of this build of the app. Choose another model to carry on with this chat.</string>
+    <string name="no_models_title">This build has no model</string>
+    <string name="no_models_detail">No model file is part of this build of the app, so messages cannot be answered. Chats that are already here can still be read.</string>
+    <string name="status_preparing">Getting ready…</string>
+    <string name="status_loading_model">Loading the model…</string>
+    <string name="status_reading">Reading the conversation…</string>
+    <string name="status_writing">Writing…</string>
+
+    <!-- Chat: the conversation -->
+    <string name="empty_title">Start a conversation</string>
+    <string name="empty_hint">%1$s answers on this phone. Nothing you write leaves it.</string>
+    <string name="message_hint">Message</string>
+    <string name="send">Send</string>
+    <string name="send_edit">Send the edited message</string>
+    <string name="stop">Stop</string>
+    <string name="copy_message">Copy message</string>
+    <string name="edit_message">Edit message</string>
+    <string name="regenerate">Answer again</string>
+    <string name="continue_reply">Continue</string>
+    <string name="scroll_to_latest">Go to the latest message</string>
+    <string name="message_footer_with_note">%1$s · %2$s</string>
+    <string name="note_stopped">Stopped</string>
+    <string name="note_stopped_empty">Stopped before anything was written</string>
+    <string name="note_length">Reached the length limit</string>
+    <string name="note_empty">The model gave an empty answer</string>
+    <plurals name="note_trimmed">
+        <item quantity="one">This conversation is longer than the model can read at once. The oldest %1$d message was left out of the latest answer.</item>
+        <item quantity="other">This conversation is longer than the model can read at once. The oldest %1$d messages were left out of the latest answer.</item>
+    </plurals>
+    <string name="editing_title">Editing an earlier message</string>
+    <string name="editing_support">Sending replaces that message and deletes everything after it. The model then answers again.</string>
+    <string name="cancel_edit">Cancel editing</string>
+    <string name="notice_other_reply_stopped">The answer in the other chat was stopped.</string>
+    <string name="notice_chat_gone">That chat is no longer on this phone.</string>
+
+    <!-- Chat: answers as Markdown -->
+    <string name="copy_code">Copy code</string>
+    <string name="code_copied">Code copied</string>
+    <string name="image_placeholder">[image: %1$s]</string>
+    <string name="image_placeholder_no_alt">[image]</string>
+    <string name="link_title">Open this link?</string>
+    <string name="link_title_cannot_open">Link</string>
+    <string name="link_message">The model wrote this address, and it may be wrong. Opening it hands it to another app, such as your browser.</string>
+    <string name="link_message_cannot_open">This kind of link cannot be opened from here. You can copy it.</string>
+    <string name="link_copy">Copy link</string>
+    <string name="link_open">Open</string>
+    <string name="link_no_app">No app on this phone could open that link.</string>
+
+    <!-- Chat: when a reply fails -->
+    <string name="error_model_not_loaded_title">The model was not ready</string>
+    <string name="error_model_not_loaded_detail">No model was loaded when the answer was asked for. Try again.</string>
+    <string name="error_model_load_failed_title">The model could not be loaded</string>
+    <string name="error_model_load_failed_detail">The model may be missing from this build, or the phone may be short of memory. Try again, or choose another model.</string>
+    <string name="error_invalid_request_title">The message could not be sent</string>
+    <string name="error_invalid_request_detail">The conversation could not be put into the form this model reads.</string>
+    <string name="error_prompt_too_long_title">The message is too long for this model</string>
+    <string name="error_prompt_too_long_detail">Tokens it needs: %1$d. Tokens the model can read at once: %2$d. That leaves no room for an answer; shorten the message and send it again.</string>
+    <string name="error_prompt_too_long_detail_plain">It leaves the model no room for an answer. Shorten the message and send it again.</string>
+    <string name="error_context_full_title">The model ran out of room</string>
+    <string name="error_context_full_detail">Its memory filled up while it was answering. Try again, or carry on in a new chat.</string>
+    <string name="error_native_title">The model stopped with an error</string>
+    <string name="error_native_detail">The answer could not be finished. Try again.</string>
+    <string name="error_unexpected_title">Something went wrong</string>
+    <string name="error_unexpected_detail">The answer could not be written. Try again.</string>
+
+    <!-- Chat: stored data that could not be read -->
+    <string name="chat_unreadable_title">This chat cannot be opened</string>
+    <string name="chat_unreadable_detail">Its file is damaged, or was written by a newer version of the app. The file has been left exactly as it is, in case a later version can read it. You can also delete the chat.</string>
+    <string name="chat_incomplete_title">Part of this chat could not be read</string>
+    <plurals name="chat_incomplete_messages">
+        <item quantity="one">%1$d message could not be read and is not shown.</item>
+        <item quantity="other">%1$d messages could not be read and are not shown.</item>
+    </plurals>
+    <string name="chat_incomplete_newer">This chat was last saved by a newer version of the app, and some of what that version stored may not be shown.</string>
+    <string name="chat_incomplete_other">A stored error message could not be read and is not shown.</string>
+    <string name="settings_issue_title">The settings could not be read completely</string>
+    <string name="settings_issue_unreadable">The stored settings could not be read, so the defaults are in use. The old settings file has been kept.</string>
+    <string name="settings_issue_partly_read">Some of the stored settings could not be read and were left out. The old settings file has been kept.</string>
+
+    <!-- Settings: system prompts -->
+    <string name="section_system_prompts">System prompts</string>
+    <string name="system_prompts_support">A system prompt is given to the model at the start of every conversation, before your first message. Each model has its own. Changes are saved as you type and apply from the next answer.</string>
+    <string name="system_prompt_hint">None</string>
+    <string name="system_prompt_unsupported">%1$s was trained without a system prompt, so there is none to set.</string>
+
+    <!-- Settings: about -->
+    <string name="section_about">About</string>
+    <string name="about_version">%1$s %2$s</string>
+    <string name="about_open">About and licences</string>
+    <string name="about_summary">Runs language models on this phone. Chats are stored encrypted on the device and are never sent anywhere.</string>
+    <string name="about_models">Models in this build</string>
+    <string name="about_no_models">This build contains no model.</string>
+    <string name="about_model_source">Source: huggingface.co/%1$s</string>
+    <string name="about_model_licence">Licence: %1$s</string>
+    <string name="about_licence_not_stated">not stated yet</string>
+    <string name="about_llama_cpp" translatable="false">llama.cpp</string>
+    <string name="about_llama_cpp_summary">The models are run by llama.cpp, which is used under the MIT licence:</string>
+    <string name="about_llama_cpp_licence" translatable="false">MIT License\n\nCopyright (c) 2023-2026 The ggml authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.</string>
 </resources>

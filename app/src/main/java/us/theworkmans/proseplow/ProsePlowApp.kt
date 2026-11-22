@@ -5,6 +5,10 @@ import android.content.Context
 import android.os.SystemClock
 import androidx.biometric.BiometricManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
+import us.theworkmans.proseplow.core.engine.InferenceEngine
+import us.theworkmans.proseplow.core.engine.LlamaEngine
+import us.theworkmans.proseplow.llama.NativeEngine
 import us.theworkmans.proseplow.security.AndroidKeyVault
 import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.AppLock
@@ -12,6 +16,7 @@ import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.Clock
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
+import java.util.concurrent.Executors
 
 /**
  * The application object. It only holds the [container]; nothing is created until the activity
@@ -24,7 +29,8 @@ class ProsePlowApp : Application() {
 /**
  * Hand-wired app-wide singletons (no DI framework), which outlive the activity. None of them
  * holds the data key or anything decrypted: that only exists inside an [AppSession], between an
- * unlock and the next lock.
+ * unlock and the next lock. The [engine] is no exception: it holds a conversation only while a
+ * session is using it, and the session makes it forget when it ends.
  */
 class AppContainer(context: Context) {
     private val app = context.applicationContext
@@ -32,6 +38,17 @@ class AppContainer(context: Context) {
     val files = AppFiles(app.filesDir, app.cacheDir)
 
     private val layout = DataLayout(files)
+
+    /**
+     * The inference engine, for the life of the process: loading a model takes seconds, and its
+     * weights are no secret, so the loaded model survives a lock and the next unlock finds it
+     * ready. Every call into native code is made on one thread of its own, as the engine requires.
+     * Nothing is created, and no thread started, before the first unlock.
+     */
+    private val engine: InferenceEngine by lazy {
+        val nativeThread = Executors.newSingleThreadExecutor { task -> Thread(task, "inference") }
+        LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher())
+    }
 
     private val clock = object : Clock {
         override fun wallMillis() = System.currentTimeMillis()
@@ -51,7 +68,8 @@ class AppContainer(context: Context) {
         ),
         files = files,
         clock = clock,
-        openSession = { cipher -> AppSession(cipher, layout) },
+        // The models offered are the ones whose files this build really carries, asked at every unlock.
+        openSession = { cipher -> AppSession(cipher, layout, engine, NativeEngine.availableModels(app)) },
         biometricStatus = {
             // Only "none enrolled" removes fingerprint unlock; NO_HARDWARE, HW_UNAVAILABLE,
             // UNSUPPORTED, SECURITY_UPDATE_REQUIRED and STATUS_UNKNOWN keep it for later.

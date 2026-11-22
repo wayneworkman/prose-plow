@@ -59,6 +59,50 @@ class SourceRulesTest {
     }
 
     @Test
+    fun theStoresKnowNeitherTheScreensNorAndroid() {
+        // data sits on the lock's primitives and the core, and under everything that shows something.
+        for (file in sources("$main/data")) {
+            val allowed = listOf("$app.data.", "$app.security.", "$app.core.")
+            val other = imports(file).filter { it.startsWith("$app.") && allowed.none(it::startsWith) }
+            assertEquals("${file.name} in data imports a package above it", emptyList<String>(), other)
+            val android = imports(file).filter { it.startsWith("android.") || it.startsWith("androidx.") }
+            assertEquals("${file.name} depends on Android", emptyList<String>(), android)
+        }
+        // And nothing below the screens knows them.
+        for (file in sources("$main/chat")) {
+            val upwards = imports(file).filter { it.startsWith("$app.settings.") || it.startsWith("$app.lock.") }
+            assertEquals("${file.name} in chat imports a screen that is not its own", emptyList<String>(), upwards)
+        }
+    }
+
+    /**
+     * Chat text, prompts and drafts are only ever stored encrypted. Saved instance state is
+     * written by the system, in the clear, so nothing in the packages that handle such text may
+     * use it for anything but a flag or a scroll position.
+     */
+    @Test
+    fun nothingDecryptedCanReachTheSavedInstanceState() {
+        for (file in sources("$main/chat") + sources("$main/settings") + sources("$main/data")) {
+            assertTrue("${file.name} uses a SavedStateHandle", imports(file).none { it.endsWith(".SavedStateHandle") })
+            val saved = file.readLines().map { it.trim() }.filter { it.contains("rememberSaveable") && !it.startsWith("import ") && !it.startsWith("*") }
+            for (line in saved) {
+                val harmless = line.contains("mutableStateOf(true)") || line.contains("mutableStateOf(false)") || line.contains("LazyListState.Saver")
+                assertTrue("${file.name} saves something that is not a flag or a scroll position: $line", harmless)
+            }
+        }
+    }
+
+    @Test
+    fun theUnlockedAppsSourcesArePlainAscii() {
+        val files = sources("$main/chat") + sources("$main/data") + sources("$main/settings") +
+            listOf("AppSession.kt", "AppNavigation.kt", "ui/Notices.kt", "ui/Links.kt").map { File(module, "$main/$it") }
+        for (file in files) {
+            val lines = file.readLines().withIndex().filter { (_, line) -> line.any { it.code > 127 } }.map { it.index + 1 }
+            assertEquals("${file.name} has characters outside ASCII on these lines; escape them, or move the text to strings.xml", emptyList<Int>(), lines)
+        }
+    }
+
+    @Test
     fun theLockManagerIsOnlyReachedUnderTheLocksMutex() {
         // In AppLock the manager is named in exactly two places: its constructor parameter, and
         // withManager, which holds the mutex. Everything else gets it handed in from there.

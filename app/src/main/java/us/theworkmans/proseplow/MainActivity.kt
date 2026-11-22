@@ -175,7 +175,7 @@ class MainActivity : FragmentActivity() {
                 val contentKey = remember(generation) { activityState.contentKey(generation) }
                 key(contentKey) {
                     CompositionLocalProvider(LocalViewModelStoreOwner provides owner) {
-                        UnlockedPlaceholder(session = session, appLock = appLock)
+                        AppNavigation(session = session, appLock = appLock)
                     }
                 }
                 val offer by appLock.fingerprintOffer.collectAsStateWithLifecycle()
