@@ -266,7 +266,7 @@ class LlamaEngineCancellationTest {
         } finally {
             dispatcher.close()
         }
-        assertEquals(setOf("native"), (fake.threads + factory.threads).map { it.name }.toSet())
+        assertEquals(setOf("native"), (fake.threads + factory.threads).map { it.plainName() }.toSet())
     }
 
     @Test
@@ -278,7 +278,7 @@ class LlamaEngineCancellationTest {
         engine.forget()
 
         assertEquals("one thread made every call", 1, fake.threads.size)
-        assertEquals("native", nativeThread().name)
+        assertEquals("native", nativeThread().plainName())
         assertFalse(Thread.currentThread() === nativeThread())
         // Every kind of call was among them.
         val kinds = fake.calls.map { it::class.simpleName }.toSet()
@@ -310,3 +310,10 @@ class LlamaEngineCancellationTest {
         assertTrue(fake.callsOf<Call.ClearMemory>().isEmpty())
     }
 }
+
+/**
+ * The thread's own name. The test JVM runs with assertions on, which puts kotlinx.coroutines in
+ * debug mode: while a coroutine runs on a thread its name is temporarily "name @coroutine#N", and
+ * a name read from another thread at that moment carries the suffix.
+ */
+private fun Thread.plainName(): String = name.substringBefore(" @")
