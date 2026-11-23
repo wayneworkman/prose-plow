@@ -167,7 +167,9 @@ internal fun reportSpeeds(label: String, speeds: Speeds, promptTokens: Int) {
 
 /**
  * Load time and memory of [model] opened with [settings]: the process's memory before, with
- * the model loaded and a prompt evaluated, after forgetting, and after closing.
+ * the model loaded and a prompt evaluated, after forgetting, and after closing; and how long
+ * the forgetting took, which is what a lock waits for (the native side frees the context and
+ * creates it again, at the model's real context size).
  */
 internal fun checkLoadAndMemory(label: String, model: ModelSpec, settings: NativeSettings, prompt: IntArray) {
     val before = memory()
@@ -179,12 +181,14 @@ internal fun checkLoadAndMemory(label: String, model: ModelSpec, settings: Nativ
         assertEquals(model.contextLength, native.contextSize())
         native.mustEvaluate(prompt)
         val used = memory()
+        val clearStart = System.nanoTime()
         native.clearMemory()
+        val clearMillis = (System.nanoTime() - clearStart) / 1e6
         val cleared = memory()
         report("$label: load %.0f ms; before: $before".format(loadMillis))
         report("$label: loaded: $loaded")
         report("$label: after a prompt of ${prompt.size} tokens: $used")
-        report("$label: after clearing the memory: $cleared")
+        report("$label: after clearing the memory, which took %.0f ms: $cleared".format(clearMillis))
     } finally {
         native.close()
     }

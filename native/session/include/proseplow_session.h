@@ -384,11 +384,12 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
 // tokenise, several times over, and the tokens of every chunk it evaluates, and frees each
 // copy as it is. Such a copy stays readable in the process until the allocator hands the block
 // out again or gives its page back, which the last step above only achieves for pages that
-// are free as a whole. Measured on a desktop with glibc after this function returned: stretches
-// of a prompt's text were still in the heap for two of the three bundled models, and stretches
-// of its token ids for up to two; which, and how much, depends on what the allocator did with
-// the blocks (native/README.md, "Forgetting", has the figures and names the allocations). Only
-// the end of the process removes them for certain.
+// are free as a whole. Measured after this function returned, with glibc on a desktop and with
+// Android's allocator on a phone: stretches of a prompt's text were still in the heap for two
+// of three models on the desktop and two of four on the phone, and stretches of its token ids
+// for up to two of the three and for all four; which, and how much, depends on what the
+// allocator did with the blocks (native/README.md, "Forgetting", has the figures and names
+// the allocations). Only the end of the process removes them for certain.
 //
 // Returns PP_STATUS_OK, or PP_STATUS_OUT_OF_MEMORY when the new context or the new sampler
 // chain could not be created. The conversation is gone in that case too, but the session is

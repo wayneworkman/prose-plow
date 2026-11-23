@@ -12,8 +12,6 @@ target_include_directories(test_session PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../
 target_link_libraries(test_session PRIVATE proseplow_session)
 target_compile_options(test_session PRIVATE -Wall -Wextra -Wpedantic)
 
-# What a forgotten conversation leaves in the memory of the process: a measurement more than a
-# test (see the top of the file for what it requires and what it only reports).
 # The path of a chat with a model whose ChatML is plain text. It has no ctest entry of its own:
 # the tests of the byte-level BPE members of the peacebell family (native/tests/run.py) run it
 # on the files they convert.
@@ -22,12 +20,14 @@ target_include_directories(test_chat_text PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/.
 target_link_libraries(test_chat_text PRIVATE proseplow_session)
 target_compile_options(test_chat_text PRIVATE -Wall -Wextra -Wpedantic)
 
+# What a forgotten conversation leaves in the memory of the process: a measurement more than a
+# test (see the top of test_residue.cpp for what it requires and what it only reports).
 add_executable(test_residue test_residue.cpp)
 target_include_directories(test_residue PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
 target_link_libraries(test_residue PRIVATE proseplow_session)
 target_compile_options(test_residue PRIVATE -Wall -Wextra -Wpedantic)
 
-# One residue entry per model, for the three bundled ones: they are what the app forgets.
+# One residue entry per bundled model: they are what the app forgets.
 function(proseplow_add_residue_test model)
     add_test(NAME ${model}.residue
         COMMAND "${PROSEPLOW_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/run_session.py"
@@ -45,6 +45,7 @@ endfunction()
 proseplow_add_residue_test(peacebell-v1-291m)
 proseplow_add_residue_test(boris-2-instruct)
 proseplow_add_residue_test(qwen3.5-0.8b)
+proseplow_add_residue_test(shard-2)
 
 # One ctest entry per model. The lock is the one every weight-loading test of native/tests
 # takes, so that "ctest -j" never runs two models at once on a shared machine.

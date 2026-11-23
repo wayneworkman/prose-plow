@@ -187,7 +187,7 @@ reported by ctest as skipped, never as failed.
 | `boris-2-instruct.chat-f32`, `.chat-f16` | A session of eight chat requests served from one context whose memory is kept between them (a turn appended, the same request again, an earlier message changed, another beginning): the encoder gives the reference's prompt tokens; every rewind goes through a checkpoint (the cut is refused before the restore and succeeds after it) or starts over when none fits; each reply, ended by the stop string, equals the reply the reference generated from scratch, as tokens and as text (F16: reported) |
 | `boris-2-instruct.no-ngram-lookup` | The F32 file with its four lookup arrays removed, against the reference with the lookup switched off: all the checks of `logits-f32`. It separates Canon and the hybrid memory from the n-gram input |
 | `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
-| `<model>.residue` | For the three bundled models: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process. How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
+| `<model>.residue` | For the four bundled models: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
 What `logits-f32` and `logits-f16` check for boris2 beyond the list above, because its Canon
@@ -797,7 +797,7 @@ llama.cpp copies what it is given into allocations of its own and frees them as 
 | What stays readable | Which allocation of llama.cpp it is in |
 | --- | --- |
 | The text of every piece that was tokenised | The `std::string` that `llama_tokenize` makes of its argument (`llama_vocab::tokenize`, `src/llama-vocab.cpp`), the fragment's text in `llama_vocab::impl::tokenize`, and for a SentencePiece vocabulary the string that `llama_escape_whitespace` builds from it. Three copies of a text for peacebell, two for the others, each time it is tokenised |
-| Token ids of the prompt | The vector the tokenizer collects its result in, each time it grows, and the result vector of `llama_tokenize`; `token_vec` of the context's batch allocator (`llama_batch_allocr::init`, `src/llama-batch.cpp`), which holds the tokens of the largest chunk evaluated; the copy each micro-batch makes of its tokens (`llama_batch_allocr::ubatch_add`; this one by reading the code, the others were found) |
+| Token ids of the prompt | The vector the tokenizer collects its result in, each time it grows, and the result vector of `llama_tokenize`; `token_vec` of the context's batch allocator (`llama_batch_allocr::init`, `src/llama-batch.cpp`), which holds the tokens of the largest chunk evaluated; the copy each micro-batch makes of its tokens (`llama_batch_allocr::ubatch_add`) |
 | Not searched for by the test below | The activations of the last chunk in the context's compute buffers, from which the rows of the embedding table give back the tokens; words of the text, shorter than a whole window, in the temporaries of the BPE tokenizers; whatever a call left on a stack |
 
 A freed block stays readable until the allocator hands it out again or gives its page back,
@@ -822,8 +822,45 @@ are the same from run to run and not from build to build: that program, with the
 and another heap, finds no prompt ids for peacebell where this test finds 21, and an earlier
 build of this test found 21 for Qwen3.5. The zeros in the text and prompt columns are
 therefore the allocator's doing, not the session's, and nothing to rely on; the 705 and the
-162 are the copies of the first table, untouched. On Android the allocator is a different one
-(scudo) and none of these figures has been measured there.
+162 are the copies of the first table, untouched.
+
+A window of the reply that also occurs in the prompt is counted with the prompt and not as the
+reply's: Qwen3.5 answers this text by repeating part of it, ten of its twelve reply tokens are
+a stretch of the prompt, and finding those says where the prompt is. That is also why its
+"before" figure is 16 and not 9: seven of the sixteen were the prompt, in a micro-batch copy.
+
+On the phone the allocator is another one (Android's scudo), and it keeps more. The same test
+built for Android and run from `adb shell` on the reference phone of "On the phone", twice for
+each model with identical results, found after `pp_session_clear_memory` and after
+`pp_session_close`:
+
+| Model | Text after tokenising alone | Text, after clearing / closing | Prompt ids, after clearing / closing | Reply ids, after clearing / closing |
+| --- | --- | --- | --- | --- |
+| peacebell-v1-291m | 744 | 496 / 0 | 39 / 27 | 0 / 0 |
+| boris-2-instruct | 534 | 0 / 0 | 40 / 27 | 0 / 0 |
+| qwen3.5-0.8b | 534 | 0 / 0 | 27 / 0 | 0 / 0 |
+| shard-2 | 534 | 534 / 534 | 54 / 54 | 0 / 0 |
+
+So on the phone, too, the text of a prompt (peacebell, Shard-2) and stretches of its token ids
+(all four) are still in the process after the call that a lock makes, and for Shard-2 even
+after the model was closed. These were measured in a program started from the shell, not in
+the app's own process, which the system starts differently and may run with other allocator
+settings; they show what this allocator does with freed blocks, not a figure for the app.
+The test is built for the phone from this directory with the NDK's toolchain file and nothing
+else, and leaves nothing on the phone:
+
+```sh
+# cmake and ninja of the SDK ($ANDROID_HOME/cmake/3.31.6/bin) first on PATH, as measured
+cmake -S native -B /path/to/scratch/android -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/29.0.14206865/build/cmake/android.toolchain.cmake" \
+      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static
+cmake --build /path/to/scratch/android --target test_residue
+adb shell mkdir -p /data/local/tmp/proseplow-dev
+adb push /path/to/scratch/android/session/tests/test_residue /path/to/models/<id>/<id>-f16.gguf /data/local/tmp/proseplow-dev/
+adb shell chmod 755 /data/local/tmp/proseplow-dev/test_residue
+adb shell /data/local/tmp/proseplow-dev/test_residue --gguf /data/local/tmp/proseplow-dev/<id>-f16.gguf
+adb shell rm -r /data/local/tmp/proseplow-dev
+```
 
 What would remove the rest is not in this library. Two things can: ending the process, which
 is the only one that is certain; or overwriting every block as it is freed, in every library
@@ -1041,14 +1078,18 @@ What packaging costs, measured for a debug build on a desktop with an SSD:
 | nothing | | 50.2 MB | |
 | peacebell-v1-291m (583.7 MB) | 10 s | about 634 MB | 2.9 GB |
 | qwen3.5-0.8b (1,516.7 MB) | 27 s | about 1,567 MB | 7.4 GB |
-| all three (2,392.3 MB) | 65 s | 2,442.5 MB | 12 GB |
+| three: peacebell, Boris-2, Qwen3.5 (2,392.3 MB) | 65 s | 2,442.5 MB | 12 GB |
+| all four, with Shard-2 (2,491.3 MB) | 76 s, which now includes hashing the models in the APK | 2,541.3 MB | not measured |
 
 AGP keeps four copies of an asset on its way into an APK (the generated directory, the merged
 assets of the library, those of the app, and a packaging intermediate) besides the APK itself:
-five times the model. A build that changes nothing takes 3 seconds; installing the APK with all
-three models over USB took 70 to 77 seconds. The times and the disk use in the table were
-measured before the libraries were stripped; the APK sizes of the two single-model rows are
-computed from the stripped build, the other two were built.
+five times the model. A build that changes nothing takes 3 seconds; installing the APK with
+three models over USB took 70 to 77 seconds, with all four 72. The times and the disk use of
+the first four rows were measured before the libraries were stripped; the APK sizes of the two
+single-model rows are computed from the stripped build, the others were built. A debug APK
+that is packaged again with fewer models keeps its old size (AGP rewrites it in place and
+leaves the gap); delete `app/build/outputs/apk/debug/app-debug.apk` first when the selection
+shrinks.
 
 ## On the phone
 
@@ -1087,7 +1128,8 @@ test whose model is absent is reported as skipped.
 
 ```sh
 # 1. The test APK with the two smaller models inside (0.9 GB), built and installed by hand so
-#    that it stays installed; Qwen3.5 sideloaded as above with the test package's name.
+#    that it stays installed; Qwen3.5 sideloaded as above with the test package's name. Or all
+#    four inside with -Pproseplow.models=all: 2.5 GB, 75 seconds to install over USB.
 ./gradlew :llama:assembleDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir=/path/to/models
 adb install -r llama/build/outputs/apk/androidTest/debug/llama-debug-androidTest.apk
 
@@ -1101,8 +1143,16 @@ adb uninstall us.theworkmans.proseplow.llama.test
 
 `./gradlew :llama:connectedDebugAndroidTest` with the same properties does the first two steps
 in one, but uninstalls the test APK when it is done, and a sideloaded model with it. Each
-measurement is printed as a line that begins with `PROSEPLOW`; no test prints prompt or reply
-text. The whole run takes about three minutes.
+measurement is printed as a line that begins with `PROSEPLOW` (`am instrument -r` shows them);
+no test prints prompt or reply text. The whole run takes about four minutes with all four
+models.
+
+The phone has to stay awake and unlocked for all of it, and a screen that times out locks it
+in the middle of a run without any test failing: the correctness checks pass behind a lock
+screen as well, only every speed is then that of a process that is not in front (the lines
+report the set of cores they were measured in, which is how to tell). `input keyevent
+KEYCODE_WAKEUP` sent from a computer does not count as activity and does not stop the timeout;
+a key event that reaches a window (a bare Shift, `input keyevent 59`) does.
 
 What is checked, for each model that is present:
 
@@ -1111,43 +1161,54 @@ What is checked, for each model that is present:
 | `RuntimeDeviceTest` | The libraries load from inside the APK and a CPU variant is selected; `cpu_capacity` is readable and gives a thread plan; the models the build reports are the ones that can be located |
 | `PeacebellDeviceTest`, `BorisDeviceTest` | Tokenising the 7,642 committed texts and the committed conversations gives the host's token ids, as plain text and with special tokens parsed; the greedy replies to the committed prompts equal the PyTorch reference's token for token; the memory is shortened (peacebell) or refuses and comes back through a checkpoint (Boris-2) with a continuation identical to a fresh evaluation; a cancellation interrupts a chunk (peacebell) or waits for it (Boris-2) and leaves the memory usable; load time, memory and speed are reported; memory is given back on close. Boris-2 further: the end-of-text token is refused as input, and the reference's chat session of eight requests through the engine of `core` gives the reference's prompt lengths and replies |
 | `QwenDeviceTest` | A greedy reply to a ChatML prompt is sane and the same twice; the ChatML markers are single tokens when the app writes them and text inside a message; the removal of the end of the memory is refused and a checkpoint brings it back with an identical continuation, twice; cancelling; load time and memory, mapped and read; speed with pinned and unpinned threads, in front and not |
-| all three | The engine of `core` (`LlamaEngine`) holds a chat of two turns on the real native layer and reuses its memory for the second |
+| `ShardDeviceTest` | Tokenising the 8,139 committed texts gives the host's token ids, as plain text and with special tokens parsed; the greedy continuations of the committed beginnings equal the reference's token for token, deletion tokens included; within the window the end of the memory is removed and the continuation equals a fresh evaluation; on the committed text of 1,500 tokens a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made; a cancellation interrupts a chunk; load time, memory and speed are reported |
+| the three chat models | The engine of `core` (`LlamaEngine`) holds a chat of two turns on the real native layer and reuses its memory for the second |
 | `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code; a size beyond its limit (a context, a text, a number of tokens or of banned tokens) arrives as an exception with its code and allocates nothing, a penalty window beyond the context costs nothing, the ninth checkpoint is refused, and forgetting a conversation leaves a session that is whole |
 | `ThreadMoveDeviceTest` | With the smallest model present: the test's activity leaves the front while one long prompt is being evaluated, and when that same call returns the session runs the plan's free threads and no longer claims to be pinned; the time of each chunk before and after the move is reported |
+| `BackgroundSpeedDeviceTest` | Nothing is required: for Qwen3.5 and peacebell, the speed of a prompt and of generation with the test's activity in front and then with nothing of the test in front, each line with the set of cores the process was in |
+| `ScreenOffSpeedDeviceTest` | Nothing is required, and nothing happens unless it is asked for with `-e screenOff true`: it turns the screen off, which locks the phone, and measures the same two speeds without and with a partial wake lock. **Built, never run**: the figures for a locked phone below come from a run of the whole suite during which the phone had locked itself |
 
-Three of these were written after the measurements below and have been built but **not yet
-run on a phone**: the size-limit and forgetting checks of `JniBoundaryDeviceTest`
-(`aSizeBeyondItsLimitIsAnExceptionWithItsCode`), its timing of the longest text
-(`theLongestTextIsTokenisedWithoutAStall`, which the table leaves out: 256 KiB of line breaks in
-under five seconds for every model present) and `ThreadMoveDeviceTest`. Until they have been,
-the checks of that kind to trust are the host's (`session/tests/test_session.cpp` checks the
-same limits, the same timing, and a move of the threads in the middle of one call, on Linux).
+`JniBoundaryDeviceTest` also times the longest text a session accepts, for every model present
+(`theLongestTextIsTokenisedWithoutAStall`): 256 KiB of line breaks must tokenise in under five
+seconds.
 
 ### What was measured
 
 The CPU variant selected is `libggml-cpu-android_armv8.6_1.so` (NEON, FMA, half-float
 arithmetic, dot product, int8 matrix multiply). `cpu_capacity` reads 453 for cpu0 to cpu3, 984
 for cpu4 to cpu6 and 1024 for cpu7, which gives four pinned threads on cpu4 to cpu7 and three
-unpinned threads otherwise. All three models are the F16 files, with a context of 4,096 tokens
+unpinned threads otherwise. All four models are the F16 files, with a context of 4,096 tokens
 (Boris-2: 2,048), mapped.
 
-| | peacebell-v1-291M | Boris-2-Instruct | Qwen3.5-0.8B |
-| --- | --- | --- | --- |
-| Tokenisation against the host vectors, texts / conversations differing | 0 of 7,642 / 0 of 22 | 0 of 7,642 / 0 of 118 | |
-| Greedy replies equal to the reference | 5 of 5 | 5 of 5, and 8 of 8 chat replies through the engine | same twice, names the capital |
-| Load, mapped / read into memory | 0.14 s / 0.49 s | 0.12 s | 0.45 s / 1.65 s |
-| Memory of the test process (PSS) before the model is loaded | 67 MiB | 64 MiB | 53 MiB |
-| With the model loaded, mapped: all, anonymous + file-backed | 888 MiB, 298 + 590 | 475 MiB, 167 + 308 | 1,621 MiB, 156 + 1,465 |
-| The same read into memory | 882 MiB, 849 + 32 | | 1,597 MiB, 1,582 + 16 |
-| After closing | 62 MiB | 61 MiB | 51 MiB |
-| Prompt, four pinned threads, in the engine's chunks of 32 / one batch, tokens per second | 183 / 190 | 379 / 413 | 89 / 92 |
-| Prompt, three unpinned threads | 140 / 150 | 289 / 323 | 67 / 70 |
-| Generation, tokens per second | 24 | 52 | 9.3 |
-| A checkpoint | 8 bytes | 381,700 bytes | 20,201,932 bytes |
-| Cancelling | 0.1 ms, inside a chunk | at the end of the chunk: at most 0.11 s | at the end of the chunk: at most 0.46 s in a prompt, 0.14 s in a reply |
+| | peacebell-v1-291M | Boris-2-Instruct | Qwen3.5-0.8B | Shard-2 |
+| --- | --- | --- | --- | --- |
+| Tokenisation against the host vectors, texts / conversations differing | 0 of 7,642 / 0 of 22 | 0 of 7,642 / 0 of 118 | | 0 of 8,139 (it has no conversations) |
+| Greedy replies equal to the reference | 5 of 5 | 5 of 5, and 8 of 8 chat replies through the engine | same twice, names the capital | 5 of 5 |
+| Load, mapped / read into memory | 0.15 s / 0.5 to 0.6 s | 0.15 s | 0.52 s / 2.0 s | 0.07 s |
+| Memory of the test process (PSS) before the model is loaded | 67 MiB | 64 MiB | 53 MiB | 47 MiB |
+| With the model loaded, mapped: all, anonymous + file-backed | 888 MiB, 298 + 590 | 475 MiB, 167 + 308 | 1,621 MiB, 156 + 1,465 | 304 MiB, 190 + 115 |
+| The same read into memory | 882 MiB, 849 + 32 | | 1,597 MiB, 1,582 + 16 | |
+| After closing | 62 MiB | 61 MiB | 51 MiB | 41 MiB |
+| Prompt, four pinned threads, in the engine's chunks of 32 / one batch, tokens per second | 183 / 190 | 379 / 413 | 89 / 92 | 791 to 834 / 887 to 938 |
+| Prompt, three unpinned threads | 140 / 150 | 289 / 323 | 67 / 70 | 640 / 750 |
+| Generation, tokens per second | 24 | 52 | 9.3 | 123 to 129 |
+| A checkpoint | 8 bytes | 381,700 bytes | 20,201,932 bytes | the window of its windowed layers: 8,392,096 bytes once the window is full (measured on the host) |
+| Cancelling | 0.1 ms, inside a chunk | at the end of the chunk: at most 0.11 s | at the end of the chunk: at most 0.46 s in a prompt, 0.14 s in a reply | 0.1 ms, inside a chunk |
+| Forgetting a conversation after a prompt of about 180 tokens | 38 to 161 ms | 24 to 28 ms | 15 to 19 ms | 28 to 70 ms |
+| The longest text a session accepts, 256 KiB of line breaks, tokenised | 61 ms | 45 ms | 255 ms | 55 ms |
 
 Speeds varied by a few per cent between runs, and by more when another app was busy; the
-figures are from one run of the whole suite, the cancellation times the longest of three runs.
+figures of the first three columns are from one run of the whole suite, the cancellation times
+the longest of three runs. That run was made before the session refitted its threads at every
+chunk, freed and recreated its context when forgetting and checked its sizes; the speeds were
+measured again afterwards. The prompts came out the same to within one per cent (184 / 190,
+378 / 411 and 90 / 92 tokens per second), generation at 24, 49 to 54 and 9.4 against the 24,
+52 and 9.3 of the table. The load times, the last two rows and the Shard-2 column are from
+those later runs. The mapped loads are 0.01 to 0.07 s longer than they were, more for the
+models with the larger headers; the likely reason is that loading reads the header twice now,
+once to hold the model to the length it was given. In one of three repeats of the peacebell
+measurement the process was in the `foreground` set and not in `top-app` when it began, could
+not be pinned and ran its prompt at 137 instead of 184; the line said so.
 
 - **Threads.** Four pinned threads are the fastest arrangement and the default; they need the
   app in front. With nothing of the test in front, the process was in the `foreground` set
@@ -1157,6 +1218,39 @@ figures are from one run of the whole suite, the cancellation times the longest 
   in every run. Two threads on one core, by contrast, is the case to fear: it happened once
   through a mistake in the pinning, and a test that takes seconds had not finished after seven
   minutes.
+- **A move in the middle of a prompt.** `ThreadMoveDeviceTest` evaluated 1,536 tokens with
+  Boris-2 as one call of 48 chunks and took the test's activity out of the front after the
+  second. Those two chunks took about 80 ms each on four pinned threads in the `top-app` set;
+  the system then moved the process to the `foreground` set (cpu0 to cpu6), the session
+  noticed at the next chunk and went on with the plan's three free threads, at 110 to 340 ms a
+  chunk in two runs, and that is how the same call returned. A session that looked at its threads only
+  when a call begins would have kept four threads pinned to cores of which one was no longer
+  the process's to use.
+- **Not in front, and locked.** Measured for the plan to let an answer finish after the app
+  was put in the background or the phone locked; a prompt of 160 tokens in chunks of 32 and 24
+  generated tokens, with the settings the app uses:
+
+  | Where the test process was | Set of cores | Threads | Qwen3.5, prompt / generation | peacebell, prompt / generation |
+  | --- | --- | --- | --- | --- |
+  | Its activity in front (two runs) | `top-app`, cpu0 to cpu7 | 4 pinned | 90 / 9.4 to 9.5 | 183 to 185 / 22 to 25 |
+  | Nothing of it in front, screen on (two runs) | `foreground`, cpu0 to cpu6 | 3 free | 67 / 9.2 to 9.3 | 138 / 25 |
+  | The phone locked and its screen off, no wake lock held (one run) | `foreground`, cpu0 to cpu6 | 3 free | 67 / 9.3 | 139 / 25 |
+
+  So a model that is not in front loses the fastest core and a quarter of its prompt speed,
+  and keeps its generation speed; the lock and the dark screen by themselves took nothing
+  more. (A second pair of measurements behind the lock screen, during one of which the screen
+  came on, gave 52 / 8.8 and 120 / 24.) Three things limit what this says about the app. The
+  test process is an instrumented one, which the system kept in the `foreground` set
+  throughout; an app that merely went to the background, with no foreground service, may be
+  put in a smaller set or stopped altogether, and that was not measured. The phone was on USB
+  power, where it does not suspend as it does on battery, so "no wake lock" was not put to the
+  test. And the locked figures were not taken by the test written for them
+  (`ScreenOffSpeedDeviceTest`, which was not run because it locks the phone) but by the whole
+  suite running while the phone had locked itself.
+- **Forgetting.** What a lock waits for is in the table: 15 to 161 ms, the longest for the
+  model with the largest memory per token. It frees and recreates the whole context whatever
+  is in it, so it should cost the same after a long conversation; it was only measured after
+  short ones (64 and about 180 tokens, with the same result for Boris-2).
 - **The F16 kernel (patch 0002).** Measured with peacebell on three unpinned threads, the same
   build before and after the patch reached this phone's variant: a prompt at 46 tokens per
   second before and 132 after, generation at 21.5 and 24.3, the greedy replies equal to the

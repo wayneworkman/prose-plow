@@ -24,6 +24,12 @@
 //     the allocator did with those blocks since. The numbers are the measurement to quote; a
 //     session that claimed them to be zero would have to make this program require it.
 //
+// A model can repeat its prompt, and Qwen3.5 does with this text: ten of its twelve reply
+// tokens are a stretch of the prompt. Windows of the reply that also occur in the prompt are
+// therefore not counted as the reply's: finding one says where the prompt is, which is the
+// second point, and nothing about the sampler. (This was learnt on a phone, where such windows
+// were found after forgetting, in the copy llama.cpp makes of each micro-batch's tokens.)
+//
 // Where a process cannot read itself through /proc/self/mem (anything but Linux) the program
 // reports that it measured nothing, and likewise in a build with a sanitizer, whose shadow
 // memory makes the writable address space terabytes and whose allocator keeps freed blocks back
@@ -89,6 +95,10 @@ struct patterns {
     std::vector<uint16_t> normalised_starts[256];
     std::unordered_multimap<uint32_t, size_t> prompt_starts;
     std::unordered_multimap<uint32_t, size_t> reply_starts;
+    // How many windows of the reply are the reply's alone, and how many also occur in the
+    // prompt and are left out of reply_starts for that reason.
+    size_t reply_windows_own = 0;
+    size_t reply_windows_shared = 0;
 
     void index() {
         for (int b = 0; b < 256; b++) {
@@ -106,8 +116,19 @@ struct patterns {
             prompt_starts.emplace(prompt[i], i);
         }
         reply_starts.clear();
+        reply_windows_own = 0;
+        reply_windows_shared = 0;
         for (size_t i = 0; i + k_reply_window <= reply.size(); i++) {
-            reply_starts.emplace(reply[i], i);
+            bool in_prompt = false;
+            for (size_t j = 0; j + k_reply_window <= prompt.size() && !in_prompt; j++) {
+                in_prompt = std::equal(reply.begin() + (ptrdiff_t) i, reply.begin() + (ptrdiff_t) (i + k_reply_window), prompt.begin() + (ptrdiff_t) j);
+            }
+            if (in_prompt) {
+                reply_windows_shared++;
+            } else {
+                reply_starts.emplace(reply[i], i);
+                reply_windows_own++;
+            }
         }
     }
 };
@@ -349,9 +370,12 @@ int main(int argc, char ** argv) {
     p.index();
     found live;
     scan(p, live);
-    r.check(live.prompt_ids > 0 && live.reply_ids > 0,
+    // A reply that is the prompt over again has no window of its own to look for.
+    r.check(live.prompt_ids > 0 && (live.reply_ids > 0 || p.reply_windows_own == 0),
             "while the conversation is live the scan finds it: %d window(s) of the text, %d of the prompt's %d token ids, %d of the reply's %zu", live.text,
             live.prompt_ids, n_tokens, live.reply_ids, p.reply.size());
+    r.note("of the reply's %zu windows, %zu also occur in the prompt and are counted with the prompt; the other %zu are looked for as the reply's",
+           p.reply_windows_own + p.reply_windows_shared, p.reply_windows_shared, p.reply_windows_own);
     r.note("after pp_session_tokenize alone, before anything was evaluated: %d window(s) of the text", after_tokenize.text);
 
     // --- Forget ---
