@@ -57,6 +57,18 @@ class ContextPolicyTest {
     }
 
     @Test
+    fun `a model is opened by the cap alone, whatever is available and whatever the system says`() {
+        assertEquals(1_375_000_000L, policy.openingBudgetBytes(phone))
+        // Below the floor, with nothing available and memory called low: the opening budget is still the cap.
+        val pressed = phone.copy(availableBytes = 0, thresholdBytes = 2_000_000_000L, low = true)
+        assertEquals(0L, policy.budgetBytes(pressed, currentBytes = 0))
+        assertEquals(1_375_000_000L, policy.openingBudgetBytes(pressed))
+        // A device that does not say how much memory it has opens nothing; one nobody asked opens anything.
+        assertEquals(0L, policy.openingBudgetBytes(DeviceMemory(totalBytes = 0, availableBytes = 0, thresholdBytes = 0, low = true)))
+        assertEquals(policy.capBytes(DeviceMemory.PLENTY.totalBytes), policy.openingBudgetBytes(DeviceMemory.PLENTY))
+    }
+
+    @Test
     fun `the device's memory limits each model of the catalogue on the test phone`() {
         fun limit(model: ModelSpec) =
             policy.memoryLimit(model.maxContextLength, model.contextBytesPerToken, phoneTotal)
@@ -177,6 +189,7 @@ class ContextPolicyTest {
         assertEquals(550_000_000L, cautious.capBytes(phoneTotal))
         assertEquals(2_200_000_000L, cautious.floorBytes(phone))
         assertEquals(400_000_000L, cautious.budgetBytes(phone, 0))
+        assertEquals(550_000_000L, cautious.openingBudgetBytes(phone))
         assertEquals("60 s reach 3,879 tokens of Qwen3.5: 3,072 in whole 1,024s", 3072, cautious.timeLimit(ModelCatalog.QWEN35_0_8B.readingTimes))
     }
 }

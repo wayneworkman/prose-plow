@@ -525,15 +525,16 @@ class LlamaEngineContextTest {
     }
 
     @Test
-    fun `a model is opened with less when the device has not the memory for its starting size, and not at all below the least`() = runTest {
+    fun `a model is opened with less when a quarter of the device's memory does not hold its starting size, and not at all below the least`() = runTest {
         // The catalogue says 1,000 bytes for a token of this model's context.
         val model = testModel(contextLength = 4096).copy(maxContextLength = 8192, contextBytesPerToken = 1000)
         fun factory() = FakeNativeLlamaFactory { spec -> FakeNativeLlama(contextTokens = spec.contextLength).also { it.registerChatMl() } }
         fun engineOver(factory: FakeNativeLlamaFactory) =
             LlamaEngine(factory, StandardTestDispatcher(testScheduler), newSeed = { TEST_SEED }, memoryGauge = { device })
 
-        // Room for 1,500,000 bytes: the tokens of 4,096 and of 2,048 do not fit it, those of 1,024 do.
-        device = DeviceMemory(totalBytes = 100_000_000_000, availableBytes = 20_001_500_000, thresholdBytes = 0, low = false)
+        // A quarter of 6,000,000 bytes is 1,500,000: the tokens of 4,096 and of 2,048 do not fit it, those of 1,024 do.
+        // All of it is available, so only the quarter decides.
+        device = DeviceMemory(totalBytes = 6_000_000, availableBytes = 6_000_000, thresholdBytes = 0, low = false)
         val tight = factory()
         val engine = engineOver(tight)
         engine.load(model)
@@ -541,8 +542,9 @@ class LlamaEngineContextTest {
         assertEquals(EngineState.Ready(model.id), engine.state.value)
         assertEquals(1024, tight.last.contextSize())
 
-        // Not even that: the model is not loaded, nothing is asked of the native side, and the failure says why.
-        device = device.copy(availableBytes = 20_000_500_000)
+        // Not even that (a quarter of 2,000,000 bytes is 500,000): the model is not loaded, nothing is asked of the
+        // native side, and the failure says why.
+        device = DeviceMemory(totalBytes = 2_000_000, availableBytes = 2_000_000, thresholdBytes = 0, low = false)
         val none = factory()
         val failed = engineOver(none)
         failed.load(model)
@@ -565,6 +567,24 @@ class LlamaEngineContextTest {
         refused.load(model)
         assertEquals(listOf(4096, 2048, 1024), never.openings.map { it.first })
         assertEquals(EngineState.Failed(model.id, EngineError.LoadFailed(model.id, LlamaEngine.TOO_LITTLE_MEMORY)), refused.state.value)
+    }
+
+    @Test
+    fun `what is available at the moment neither shrinks nor refuses an opening, and growth still keeps the floor`() = runTest {
+        // A large device that is busy: almost nothing available, far below the floor of a fifth, and memory called low.
+        // A quarter of its memory holds the 256 tokens of the starting size many times over.
+        device = DeviceMemory(totalBytes = 1_000_000_000, availableBytes = 1_000, thresholdBytes = 0, low = true)
+        val test = engine { it.bytesPerToken = 1000 }
+
+        assertEquals("opened at its full starting size", 256, test.fake.contextSize())
+        assertEquals(listOf(256 to Long.MAX_VALUE), test.factory.openings)
+        assertEquals(EngineState.Ready(small.id), test.engine.state.value)
+
+        // Growing is another matter: below the floor nothing is added.
+        val events = test.ask(long)
+        assertTrue(events.grown().isEmpty() && test.fake.resizes.isEmpty())
+        assertEquals(listOf(GenerationEvent.ContextLimited(256, GenerationEvent.ContextLimited.Reason.MEMORY)), events.limited())
+        assertEquals("Yes.", events.text())
     }
 }
 

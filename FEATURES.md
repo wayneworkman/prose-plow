@@ -1013,7 +1013,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | --- | --- | --- | --- |
   | No model, or another model, was loaded when the reply was asked for | "The model was not ready" | "No model was loaded when the answer was asked for. Try again." | "Try again" |
   | The model could not be loaded | "The model could not be loaded" | "The model may be missing from this build, or the phone may be short of memory. Try again, or choose another model." | "Try again" |
-  | The model could not be loaded because the device has too little memory available for it now (ENG-36) | "The model could not be loaded" | "The phone has too little free memory for this model right now. Close other apps and try again, or choose a smaller model." No technical detail is shown with it | "Try again" |
+  | The model could not be loaded because a quarter of the device's memory does not hold even its smallest opening context (ENG-36) | "The model could not be loaded" | "The phone has too little free memory for this model right now. Close other apps and try again, or choose a smaller model." No technical detail is shown with it | "Try again" |
   | The conversation could not be put into the model's prompt format | "The message could not be sent" | "The conversation could not be put into the form this model reads." | "Try again" |
   | The latest message alone leaves no room for a reply (ENG-05) | "The message is too long for this model" | "Tokens it needs: {n}. Tokens the model can read at once: {m}. That leaves no room for an answer; shorten the message and send it again." (without the numbers: "It leaves the model no room for an answer. Shorten the message and send it again.") | "Edit message", which starts MSG-13 for that message |
   | The model's memory ran out during the reply | "The model ran out of room" | "Its memory filled up while it was answering. Try again, or carry on in a new chat." | "Try again" |
@@ -1204,7 +1204,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   "The model may be missing from this build, or the phone may be short of memory. Try again, or
   choose another model.", with "Technical detail: {detail}" when there is one, and the actions
   "Choose a model" (which opens the picker) and "Try again". When the reason is that the device has
-  too little memory available for the model now (ENG-36), the second sentence is instead "The phone
+  too little memory for the model (ENG-36), the second sentence is instead "The phone
   has too little free memory for this model right now. Close other apps and try again, or choose a
   smaller model.", and no technical detail is shown. The card is not shown while a reply's own
   failure already says the same (MSG-14).
@@ -1947,9 +1947,12 @@ is what a port has to reproduce, whatever it is written in.
   what was read of it until the next lock: reading thousands of tokens again would cost the user
   more than the memory is worth until then. A limit found by ENG-33 stays in force across all of
   this.
-- **ENG-36** Opening a model follows the rule of ENG-31, with nothing held yet: the tokens of a
-  context of the starting size, at the catalogue's bytes for each token, must fit the smaller of a
-  quarter of the device's memory and what is available above the floor. If they do not, half the
+- **ENG-36** Opening a model is held to the quarter of ENG-31 alone: the tokens of a context of the
+  starting size, at the catalogue's bytes for each token, must fit a quarter of the device's memory.
+  What is available at that moment, the floor and the system's report of low memory (ENG-32) play
+  no part in opening; they bound growth only. The system makes room for the app in front by ending
+  others, and a model refused at opening leaves the user with no model at all, while a refused step
+  of growth only caps the conversation. If the tokens do not fit, half the
   size is taken, and half again, as long as the half is at least 1,024 tokens. Below that the model
   is not loaded: loading ends as failed for the reason "too little memory available", which the chat
   words on its own (MODEL-14, MSG-14). The engine decides this itself, before the native side is
@@ -2673,9 +2676,10 @@ This section is exact where the others describe. Each item carries one of three 
     limit; only the limit when it is not above `start`;
   - the sizes offered for choosing (MSET-19) = the steps from `start` to `byMemory`; a stored size
     stands for the largest of them not above it, or the smallest (MSET-22);
-  - the budget, with `held` the bytes of the tokens of the context as it is (its size times `bytes`;
-    0 when a model is opened) = the smaller of `cap` and `held` + `available` - `floor`, and not less
-    than 0. The bytes of a step that are held against it are those of its tokens (ENG-31);
+  - the budget of a step, with `held` the bytes of the tokens of the context as it is (its size
+    times `bytes`) = the smaller of `cap` and `held` + `available` - `floor`, and not less than 0.
+    The bytes of a step that are held against it are those of its tokens (ENG-31);
+  - the budget of an opening = `cap`, whatever `available`, `floor` and `low` are (ENG-36);
   - when a reply needs more than the context has, `needed` = the prompt's tokens plus `reserve`
     (FMT-16), or the limit if that is less. The target is the smallest step not below `needed`. The
     step taken is the largest step above the present size and not above the target whose bytes are

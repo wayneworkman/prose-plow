@@ -70,8 +70,9 @@ class DeviceContextLimits(val policy: ContextPolicy = ContextPolicy(), val total
  * - **The device's memory.** The context's memory is allocated in full and is resident at once;
  *   a size the phone cannot hold is not refused by the system, the process is ended while the
  *   memory is being prepared. So the guard is never to ask: the context may take at most
- *   [maxShareOfTotal] of the device's memory, and at any moment only as much as leaves
- *   [floorBytes] available to everything else ([budgetBytes]).
+ *   [maxShareOfTotal] of the device's memory, and when it grows only as much as leaves
+ *   [floorBytes] available to everything else ([budgetBytes]). A model is opened by the cap
+ *   alone ([openingBudgetBytes]).
  * - **Time**, for the automatic setting. Whenever the process has ended (the app was locked and
  *   left), the whole conversation is read again before the next answer. Left to itself the
  *   context therefore grows only as far as can be read again in [rereadSeconds], by the time
@@ -116,6 +117,18 @@ class ContextPolicy(
         val room = saturatingPlus(currentBytes, memory.availableBytes - floorBytes(memory))
         return minOf(capBytes(memory.totalBytes), room).coerceAtLeast(0)
     }
+
+    /**
+     * The most bytes the tokens of a context may take when a model is opened: the cap alone,
+     * [maxShareOfTotal] of the device's memory, whatever is available at that moment. The floor
+     * and the system's low-memory verdict play no part here; they hold only when a context grows
+     * ([budgetBytes]).
+     *
+     * The reason: Android makes room for the app in front by closing others, so memory that is
+     * taken now is not memory the opening lacks; and a refusal at opening leaves the user with
+     * no model at all, while a refused growth step only caps the length of the conversation.
+     */
+    fun openingBudgetBytes(memory: DeviceMemory): Long = capBytes(memory.totalBytes)
 
     /**
      * The largest context the device's memory allows for a model: the model's own maximum, or

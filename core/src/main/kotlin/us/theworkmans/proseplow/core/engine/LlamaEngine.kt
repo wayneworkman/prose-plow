@@ -327,9 +327,13 @@ class LlamaEngine(
     }
 
     /**
-     * Opens [model] with a context of its starting size, or, when the device has not the memory
-     * for that now, of half that size, and half again, down to [MIN_OPENING_CONTEXT]. Below
-     * that the model is not opened: a context too small to hold a question is of no use.
+     * Opens [model] with a context of its starting size, or, when that does not fit the policy's
+     * opening budget (a quarter of the device's memory, by [ContextPolicy.openingBudgetBytes]),
+     * of half that size, and half again, down to [MIN_OPENING_CONTEXT]. Below that the model is
+     * not opened: a context too small to hold a question is of no use. What is available at the
+     * moment and the floor kept for everything else are not asked here: they bound growth only,
+     * because a refusal now would leave no model at all and Android makes room for the app in
+     * front by closing others.
      *
      * What is held to the budget is what the tokens of the context take, by the catalogue's
      * figure for one token, which is the model file's own. A session reserves more than that,
@@ -340,7 +344,7 @@ class LlamaEngine(
      * less.
      */
     private fun openAtStartingSize(model: ModelSpec, progress: LoadProgress): NativeLlama {
-        val budget = contextPolicy.budgetBytes(memoryGauge.read(), currentBytes = 0)
+        val budget = contextPolicy.openingBudgetBytes(memoryGauge.read())
         var size = minOf(model.contextLength, model.maxContextLength)
         while (size.toLong() * model.contextBytesPerToken > budget) {
             if (size / 2 < MIN_OPENING_CONTEXT) throw NativeLlamaException(NativeLlamaException.OUT_OF_MEMORY, TOO_LITTLE_MEMORY)

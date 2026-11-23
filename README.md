@@ -276,10 +276,13 @@ needs more.
   fits the starting size: the little the two conversations have in common (1,024 tokens at
   most) is then read again. A conversation that only became shorter, because its latest
   message was edited, keeps its context and what was read of it until the next lock.
-- **Opening a model** follows the same rule. If the phone does not have the memory available
-  for the starting size, half of it is tried, and half again, down to 1,024 tokens; below
-  that the model is not loaded, and the app says that the phone has too little free memory
-  for it right now.
+- **Opening a model** asks only for the quarter. The starting size must fit a quarter of the
+  phone's memory; if it does not, half of it is tried, and half again, down to 1,024 tokens;
+  below that the model is not loaded, and the app says that the phone has too little free
+  memory for it. What is available at that moment, the fifth kept free and Android's report
+  of low memory play no part in opening: Android makes room for the app in front by closing
+  others, and a model refused at opening leaves no model at all, while a step refused later
+  only keeps the conversation shorter. They decide every step of growth, as above.
 - **What is counted.** The memory in all of this is what the tokens of a context take: the
   model's bytes for each token times the size, which is in use from the moment a context is
   created. A loaded model also reserves working memory that does not depend on the size of
@@ -1271,7 +1274,7 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 408 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `core` (JVM, 410 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
 | `app` (JVM, 590 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
