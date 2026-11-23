@@ -2263,6 +2263,27 @@ is what a port has to reproduce, whatever it is written in.
   cut at are dropped. A place inside a piece of text is only used if the tokeniser really puts
   a boundary between two tokens there, which is checked, not assumed. A native side that cannot
   save a checkpoint is tolerated; it costs time, never correctness.
+
+  A model that cannot remove the end of its memory (Qwen3.5, Boris-2; NAT-08) has two more
+  checkpoints, which follow the reply while it is written: one is taken every 32 tokens of the
+  reply, and the latest two are kept; the oldest of the two is dropped before the next is taken.
+  The reason: the text of a reply tokenised again is not always the tokens that were sampled (a
+  reply cut off at the length limit, whitespace trimmed at its end), so the next request can
+  differ from the memory near the end of the reply, and without them the only checkpoint before
+  that point is the one in front of the reply, which reads the whole reply again (about 13
+  seconds for 1,000 tokens of Qwen3.5 on the tested phone). With them, a request that differs
+  from the memory anywhere in the last 32 tokens of the reply reads again at most 64 tokens and
+  the difference (about a second for Qwen3.5), and never goes back to the checkpoint in front of
+  the reply: the latest lies at or before that point, or the one before it does, and neither
+  lies more than 64 tokens before it. Two are needed because a reply can end just after one was
+  taken, which leaves the latest behind a difference of a few tokens. They are not among the 4:
+  they never take the place of a checkpoint of the prompt, and they are dropped like the others
+  when the conversation is cut before them; a checkpoint of a later prompt that falls on the very
+  position of one takes it over. A reply that is stopped, cancelled or cut off keeps the two
+  taken last. A model that can remove the end of its memory (Peacebell, Shard-2) gets none. So at
+  most 6 checkpoints are held, never more even for a moment (4 and 1 while the oldest following
+  one is replaced, then 4 and 2): for Qwen3.5 6 x 19.3 MiB, about 116 MiB (4, about 77 MiB,
+  before there were following ones), for Boris-2 6 x 0.36 MiB, about 2.2 MiB (1.5 MiB).
 - **ENG-10** If the native memory and the engine's copy of it ever disagree in length, the
   memory is cleared and rebuilt.
 - **ENG-11** The part of the prompt that is not in memory is read in chunks, with a progress
@@ -2536,7 +2557,16 @@ is what a port has to reproduce, whatever it is written in.
   to the vault's own buffer piece by piece, behind the vault's own header; the engine
   adds to that header the model, the size of the context, the number of tokens, how long reading
   them again would take, and the size of the image. Every checkpoint the engine holds (ENG-09) goes
-  into the image. A save is made only when all of these hold, and otherwise the caller is told
+  into the image: the two that follow the last reply first, the latest first, and those of the
+  prompt after them in ascending order of their lengths. The order comes back from the
+  read-back, and it is how a restore tells them apart: the leading checkpoints, at most two,
+  each longer than the one after it, are the following ones, and every other is the prompt's.
+  So an image written before there were following checkpoints, whose checkpoints all ascend,
+  restores them all as the prompt's; and of an image with no checkpoint of the prompt, only the
+  latest following one is known as such. Taking a following checkpoint for a prompt's costs at
+  most a longer reading, never a wrong memory. An image carries at most 8 checkpoints, which is
+  also what the native session holds (NAT-06); the engine holds at most 6, so all go in. An
+  image of Qwen3.5 carries up to 6 checkpoints, 116 MiB of it. A save is made only when all of these hold, and otherwise the caller is told
   which did not:
   - a model is loaded and nothing else holds the engine. When the app has left the screen a reply
     or a load in progress goes first and nothing is saved; the save of a lock waits its turn;
@@ -2564,7 +2594,8 @@ is what a port has to reproduce, whatever it is written in.
   and within the size the user chose, if any; then the image is read through the vault's buffer.
   The tokens the native session reports and its count of the memory must both equal the header's
   count, and every checkpoint must lie within the memory; the engine then takes its copy of the
-  tokens and its list of checkpoints (the latest 4, ENG-09) from what came back. From then on the
+  tokens and its list of checkpoints from what came back: the ones that followed the last reply,
+  and of the prompt's the latest 4 (ENG-09, ENG-38). From then on the
   memory is ordinary memory (ENG-07, ENG-08); since no prediction survives, at least one token is
   read before the first token of the reply. Any failure at any point (the vault's checks, a context
   that cannot be made large enough, an import that fails or that the vault stops by refusing a
@@ -2641,7 +2672,7 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   | Context | the context the model was trained for (2,048 tokens for Boris-2, 32,768 for Peacebell, 262,144 for Qwen3.5); below that, a budget in bytes that the caller states: the session computes what a context of the size costs and refuses it before anything is allocated when it costs more (NAT-16) |
   | Tokens read in one go | 32,768; the app uses 256 |
   | Text tokenised in one call | 262,144 bytes |
-  | Checkpoints held at once | 8; the engine keeps 4 |
+  | Checkpoints held at once | 8; the engine keeps 4, and two that follow a reply (ENG-09) |
   | Banned tokens | the size of the vocabulary |
   | A model inside a larger file | its header and every tensor must end within the length given |
 
@@ -2658,7 +2689,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   still held; the session then answers "no" itself rather than produce wrong predictions.
 - **NAT-09** A checkpoint is the part of the model's state that cannot be recomputed by cutting,
   kept in native memory with the length it belongs to: next to nothing for Peacebell, 381,700
-  bytes for Boris-2, about 20 MB for Qwen3.5, up to about 8.4 MB for Shard-2. After a restore at
+  bytes for Boris-2, about 20 MB for Qwen3.5, up to about 8.4 MB for Shard-2; the engine holds
+  at most 6 (ENG-09), about 121 MB (116 MiB) for Qwen3.5 and 2.3 MB (2.2 MiB) for Boris-2. After a restore at
   least one token has to be read before sampling, because a checkpoint holds state, not
   predictions.
 - **NAT-10** Sampling follows a fixed order and computes the penalties itself, so that each
@@ -3533,7 +3565,7 @@ This section is exact where the others describe. Each item carries one of three 
 - **FMT-19** *(Free)* How a model file is carried and opened (packaged inside the app, mapped
   from an offset, the fallback to reading it), the threads (NAT-03), the choice among processor
   variants (NAT-04), the size of a chunk of prompt (32 tokens, and from 1,024 tokens in memory on
-  the model's chunk of a deep read, ENG-11; both change the reading times of FMT-20), the number of checkpoints (4),
+  the model's chunk of a deep read, ENG-11; both change the reading times of FMT-20), the number of checkpoints (4, and two that follow a reply, one taken every 32 tokens),
   the delays of the writer (1 second for lazy writes, 10 seconds at a lock), the names of files
   inside the private storage as far as FMT-03 does not fix them, and every matter of layout and
   colour.

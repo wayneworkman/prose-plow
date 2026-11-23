@@ -115,6 +115,7 @@ object ModelCatalog {
         contextBytesPerToken = 12_288,
         readingTimes = QWEN35_READING,
         deepReadChunk = RECURRENT_DEEP_READ_CHUNK,
+        cutsMemoryBack = false,
         licence = "Apache-2.0",
     )
 
@@ -187,6 +188,7 @@ object ModelCatalog {
         contextBytesPerToken = 63_488,
         readingTimes = BORIS_2_READING,
         deepReadChunk = RECURRENT_DEEP_READ_CHUNK,
+        cutsMemoryBack = false,
         licence = "Apache-2.0",
     )
 

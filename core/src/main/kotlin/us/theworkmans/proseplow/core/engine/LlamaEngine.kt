@@ -123,7 +123,17 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  *    limit is reached or the generation is cancelled. Text is assembled from token bytes so that
  *    no partial character and no part of a stop string is ever emitted ([ReplyAssembler]). When
  *    the model has a deletion token and samples it, the token is evaluated like any other and
- *    the reply the reader sees loses its last token ([GenerationEvent.TextReplaced]).
+ *    the reply the reader sees loses its last token ([GenerationEvent.TextReplaced]). For a
+ *    model that cannot cut its memory back ([ModelSpec.cutsMemoryBack]) two more checkpoints
+ *    **follow the reply**: one is taken every [Settings.followingCheckpointInterval] tokens of
+ *    the reply, and the latest two are kept. The reply's text tokenised again is not always
+ *    the tokens that were sampled (a reply cut off at the length limit, whitespace trimmed at
+ *    its end), so the next request can differ from the memory near the end of the reply. Where
+ *    it differs within the last interval of the reply, one of the two lies at or before that
+ *    point and less than two intervals before it, so the request reads again at most two
+ *    intervals and the difference, not the whole reply. They are apart from the checkpoints of
+ *    step 3 and never displace one of them, so at most [Settings.maxCheckpoints] and
+ *    [FOLLOWING_CHECKPOINTS] more are held at any moment.
  *
  * Invariants:
  * - All calls into [NativeLlama] and [NativeLlamaFactory] are made on [nativeDispatcher], one at
@@ -178,7 +188,17 @@ class LlamaEngine(
      * @property maxCheckpoints how many memory checkpoints are kept; 0 switches them off. Each
      *   costs native memory on a model with recurrent state (some megabytes to some tens of
      *   megabytes) and next to nothing on other models. Four cover the usual actions: a new turn,
-     *   regenerating the last answer, and editing either of the last two user messages.
+     *   regenerating the last answer, and editing either of the last two user messages. The
+     *   checkpoints that follow a reply ([followingCheckpointInterval]) are not among them.
+     * @property followingCheckpointInterval every how many tokens of a reply a checkpoint that
+     *   follows it is taken, for a model that cannot cut its memory back
+     *   ([ModelSpec.cutsMemoryBack]); 0 switches them off. The latest [FOLLOWING_CHECKPOINTS]
+     *   are kept, so a request whose tokens differ from the memory anywhere in the last this
+     *   many tokens of the last reply reads again at most twice this many and the difference.
+     *   32: a checkpoint is a copy of the recurrent state (19.3 MiB for Qwen3.5, 0.36 MiB for
+     *   Boris-2), a few milliseconds every 32 tokens of a reply that takes Qwen3.5 more than
+     *   three seconds to write on the tested phone, while reading 64 tokens again takes it about
+     *   a second.
      * @property evaluationChunk how many prompt tokens are evaluated between two progress
      *   reports and cancellation checks while the memory holds a short conversation.
      * @property deepReadTokens from how many tokens in memory on a prompt is read in the model's
@@ -204,6 +224,7 @@ class LlamaEngine(
      */
     data class Settings(
         val maxCheckpoints: Int = 4,
+        val followingCheckpointInterval: Int = 32,
         val evaluationChunk: Int = 32,
         val deepReadTokens: Int = 1024,
         val minReplyTokens: Int = ReplyLength.MIN_TOKENS,
@@ -213,6 +234,7 @@ class LlamaEngine(
     ) {
         init {
             require(maxCheckpoints >= 0) { "maxCheckpoints must not be negative" }
+            require(followingCheckpointInterval >= 0) { "followingCheckpointInterval must not be negative" }
             require(evaluationChunk >= 1) { "evaluationChunk must be at least 1" }
             require(deepReadTokens >= 0) { "deepReadTokens must not be negative" }
             require(minReplyTokens >= 1) { "minReplyTokens must be at least 1" }
@@ -221,8 +243,13 @@ class LlamaEngine(
         }
     }
 
-    /** A saved state of the memory when it held exactly the first [position] tokens. */
-    private class Checkpoint(val position: Int, val handle: Int)
+    /**
+     * A saved state of the memory when it held exactly the first [position] tokens. [follows]
+     * marks a checkpoint that follows a reply ([Settings.followingCheckpointInterval]);
+     * the others were taken at boundaries of a prompt, and only they count towards
+     * [Settings.maxCheckpoints].
+     */
+    private class Checkpoint(val position: Int, val handle: Int, val follows: Boolean = false)
 
     /**
      * The image a vault holds that the engine knows of: of [tokenCount] tokens of the
@@ -596,8 +623,7 @@ class LlamaEngine(
             val since = if (image != null && !image.waiting && image.vault === vault && image.conversationKey == conversationKey) image.tokenCount else 0
             if (times.secondsBetween(since, tokens) <= settings.newReadingSecondsOnLeaving) return notSaved(MemorySaveResult.NotSaved.Reason.LITTLE_NEW)
         }
-        // Every checkpoint goes into the image, oldest first, as many as an image carries.
-        val handles = checkpoints.sortedBy { it.position }.takeLast(NativeLlama.MAX_MEMORY_CHECKPOINTS).map { it.handle }.toIntArray()
+        val handles = imageCheckpoints()
         // An image the engine knows of in another vault is not the one this save replaces.
         if (savedImage?.vault !== vault) dropSavedImage()
         // Stops at the next piece for a request, for forgetting, unloading or loading, and for the
@@ -639,6 +665,47 @@ class LlamaEngine(
             return notSaved(MemorySaveResult.NotSaved.Reason.FAILED)
         }
     }
+
+    /**
+     * The handles of the checkpoints that go into an image, in the order the import reports
+     * them back: those that follow the last reply first, the latest first (so in descending
+     * order of their lengths), and then those of the prompts, oldest first (ascending), as many
+     * as an image carries beside them. Every checkpoint the engine holds fits:
+     * [Settings.maxCheckpoints] and [FOLLOWING_CHECKPOINTS], 6 by default, against the 8 of
+     * [NativeLlama.MAX_MEMORY_CHECKPOINTS], which is also what the native session holds at once.
+     * Should they ever not fit, the following ones and the latest of the prompts' go in: they
+     * are the ones the next request after a restore most likely goes back to. The order is what
+     * tells a restore which is which ([labelRestored]): an image carries no more than the
+     * lengths.
+     */
+    private fun imageCheckpoints(): IntArray {
+        val followers = checkpoints.filter { it.follows }.sortedByDescending { it.position }.take(NativeLlama.MAX_MEMORY_CHECKPOINTS)
+        val others = checkpoints.filter { !it.follows }.sortedBy { it.position }.takeLast(NativeLlama.MAX_MEMORY_CHECKPOINTS - followers.size)
+        return (followers + others).map { it.handle }.toIntArray()
+    }
+
+    /**
+     * Which of the checkpoints a restore brought back, in the order [imageCheckpoints] wrote
+     * them, followed the last reply. Those of the prompts were written in ascending order of
+     * their lengths, the following ones before them in descending order; so the following ones
+     * are the leading checkpoints, at most [FOLLOWING_CHECKPOINTS], each of which is longer than
+     * the one after it. A checkpoint that has none after it, or one not longer than the next, is
+     * taken for one of the prompts'. That is every checkpoint of an image without following
+     * ones, among them an image written before there were any (all ascending); the second
+     * following checkpoint of an image that has no checkpoint of a prompt at all; and a
+     * following checkpoint behind which a later prompt was read in part. Taking a following one
+     * for a prompt's costs at most a step back that reads more, never a wrong memory: every
+     * checkpoint is a true state of its length either way.
+     */
+    private fun labelRestored(model: ModelSpec, restored: List<MemoryCheckpoint>): Pair<List<MemoryCheckpoint>, List<MemoryCheckpoint>> {
+        if (!takesFollowingCheckpoints(model)) return emptyList<MemoryCheckpoint>() to restored
+        var leading = 0
+        while (leading < FOLLOWING_CHECKPOINTS && leading + 1 < restored.size && restored[leading].tokenCount > restored[leading + 1].tokenCount) leading++
+        return restored.take(leading) to restored.drop(leading)
+    }
+
+    /** Whether the engine keeps a checkpoint that follows a reply for [model]; see [Settings.followingCheckpointInterval]. */
+    private fun takesFollowingCheckpoints(model: ModelSpec): Boolean = !model.cutsMemoryBack && settings.followingCheckpointInterval > 0
 
     override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
         val startEpoch = epoch.get()
@@ -751,12 +818,15 @@ class LlamaEngine(
                 } finally {
                     tokens.fill(0)
                 }
-                // The latest checkpoints are kept, as many as the engine keeps; the rest are freed.
-                val ordered = restored.sortedBy { it.tokenCount }
+                // The checkpoints that followed the last reply are kept as such; of the prompts'
+                // the latest are kept, as many as the engine keeps. The rest are freed.
+                val (followers, prompts) = labelRestored(model, restored)
+                val ordered = prompts.sortedBy { it.tokenCount }
                 val surplus = (ordered.size - settings.maxCheckpoints).coerceAtLeast(0)
                 for (checkpoint in ordered.take(surplus)) native.dropCheckpoint(checkpoint.handle)
                 checkpoints.clear()
                 for (checkpoint in ordered.drop(surplus)) checkpoints += Checkpoint(checkpoint.tokenCount, checkpoint.handle)
+                for (checkpoint in followers) checkpoints += Checkpoint(checkpoint.tokenCount, checkpoint.handle, follows = true)
             }
         } catch (e: NativeLlamaException) {
             if (e.code == NativeLlamaException.MEMORY_STOPPED) {
@@ -1373,16 +1443,49 @@ class LlamaEngine(
             return true
         }
 
+        /**
+         * Keeps a checkpoint of the memory as it is now, at [position] (its length), among
+         * those of the prompts, dropping the oldest of them first when [Settings.maxCheckpoints]
+         * are held, so that the native side never holds more than the limit. The checkpoints
+         * that follow a reply are not counted and never dropped here. When one of them sits at
+         * this very position it is taken over as this boundary's checkpoint instead of a copy
+         * being made: it is the same state, and the next reply takes its own.
+         */
         private fun saveCheckpoint(position: Int) {
-            if (checkpoints.any { it.position == position }) return
-            // Make room first, so that the native side never holds more than the limit.
-            while (checkpoints.size >= settings.maxCheckpoints) {
-                val oldest = checkpoints.minBy { it.position }
+            val existing = checkpoints.firstOrNull { it.position == position }
+            if (existing != null && !existing.follows) return
+            while (checkpoints.count { !it.follows } >= settings.maxCheckpoints) {
+                val oldest = checkpoints.filter { !it.follows }.minBy { it.position }
                 native.dropCheckpoint(oldest.handle)
                 checkpoints.remove(oldest)
             }
+            if (existing != null) {
+                checkpoints.remove(existing)
+                checkpoints += Checkpoint(position, existing.handle)
+                return
+            }
             val handle = native.saveCheckpoint()
             if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(position, handle)
+        }
+
+        /**
+         * Takes a checkpoint that follows the reply, of the memory as it is now, and keeps the
+         * latest [FOLLOWING_CHECKPOINTS]. The oldest following one is dropped before the new one
+         * is taken, so that no more than [Settings.maxCheckpoints] and [FOLLOWING_CHECKPOINTS]
+         * are ever held, even for a moment (with the defaults: 4 and 1 held, then 4 and 2). Called
+         * on the native thread between two tokens of the reply, never inside a native
+         * computation.
+         */
+        private fun saveFollowingCheckpoint() {
+            while (checkpoints.count { it.follows } >= FOLLOWING_CHECKPOINTS) {
+                val oldest = checkpoints.filter { it.follows }.minBy { it.position }
+                native.dropCheckpoint(oldest.handle)
+                checkpoints.remove(oldest)
+            }
+            // Every checkpoint of a prompt lies at or before the reply's start, so none is here.
+            if (checkpoints.any { it.position == memory.size }) return
+            val handle = native.saveCheckpoint()
+            if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(memory.size, handle, follows = true)
         }
 
         /** Reports prompt progress from inside the native call, and passes on cancellation. */
@@ -1430,6 +1533,7 @@ class LlamaEngine(
             )
             this.reply = reply
             val single = IntArray(1)
+            val follows = takesFollowingCheckpoints(model)
             val observer = object : EvaluationObserver {
                 // The token is in the memory and the next is not yet sampled: the place to make way.
                 override fun onProgress(evaluatedTokens: Int) = standAside()
@@ -1483,6 +1587,8 @@ class LlamaEngine(
                 }
                 if (evaluated == 1) {
                     memory.add(token)
+                    // The memory now holds the prompt and generatedTokens tokens of the reply.
+                    if (follows && generatedTokens % settings.followingCheckpointInterval == 0) saveFollowingCheckpoint()
                 } else {
                     if (!interrupted()) {
                         job.ensureActive()
@@ -1570,6 +1676,14 @@ class LlamaEngine(
          */
         private const val MIN_READING_FACTOR = 0.25
         private const val MAX_READING_FACTOR = 4.0
+
+        /**
+         * How many checkpoints that follow a reply are kept: the latest and the one before it.
+         * With one, a reply that ended just after a checkpoint was taken leaves none before a
+         * difference a few tokens before its end; with two, one always lies within two intervals
+         * before any point of the reply's last interval.
+         */
+        const val FOLLOWING_CHECKPOINTS: Int = 2
 
         /** More rounds of fitting than a context has ways to shrink mean that something is wrong. */
         private const val MAX_FITTING_ROUNDS = 8

@@ -73,6 +73,14 @@ enum class ModelFamily(val promptFormat: PromptFormat, val continuesText: Boolea
  *   take Qwen3.5 about 1.4 s with nothing read and about 2.5 s with 7,000 read on the tested
  *   phone. A model with attention only is stopped inside a chunk and gets the session's whole
  *   batch, [MAX_EVALUATION_CHUNK]. Never more than that.
+ * @property cutsMemoryBack false for a model whose memory cannot be cut back to an earlier
+ *   length (a model with recurrent state: Qwen3.5, Boris-2), which can only go back to a
+ *   checkpoint. The engine then also keeps two checkpoints that follow a reply while it is
+ *   written, so that a next request that differs from the memory near the end of that reply
+ *   does not read the whole reply again. A model that can cut its memory back (attention only:
+ *   Peacebell, and Shard-2, whose session refuses only cuts behind a restored window) needs no
+ *   such checkpoints and is given none. A wrong true costs time and never correctness: the
+ *   engine still falls back to the checkpoints of the prompt.
  * @property defaultMaxNewTokens the longest reply, in tokens, when a request does not say. It is
  *   also the room the engine keeps free for the reply when it decides how much history fits.
  * @property sampling the model's reference sampling settings.
@@ -119,6 +127,7 @@ data class ModelSpec(
     val contextBytesPerToken: Long = 0,
     val readingTimes: ReadingTimes = ReadingTimes.UNKNOWN,
     val deepReadChunk: Int,
+    val cutsMemoryBack: Boolean = true,
 ) {
     init {
         require(id.isNotBlank()) { "A model needs an id" }

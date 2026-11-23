@@ -1099,7 +1099,9 @@ wrong on a phone or for one of the models:
   comes back cell for cell, and bit for bit.
 
   Measured on a desktop (6 threads, a batch of 256, pieces of 1 MiB, four checkpoints at the
-  quarters of the memory as the engine keeps four; not yet measured on the phone):
+  quarters of the memory as the engine then kept four; not yet measured on the phone; the engine
+  now keeps two more, which follow a reply, and an image of Qwen3.5 or Boris-2 carries up to
+  two checkpoints more than below, 19.3 MiB or 0.36 MiB each):
 
   | Model, tokens in memory (context) | Image | Of which the four checkpoints | Export, the sink only takes the piece | Export, the sink copies each piece | Import, the source copies each piece | Reading the same tokens instead |
   | --- | --- | --- | --- | --- | --- | --- |
@@ -1681,8 +1683,9 @@ not be pinned and ran its prompt at 137 instead of 184; the line said so.
   fast.
 - **Memory to plan for.** peacebell's key-value memory for 4,096 tokens is about 270 MiB of its
   anonymous part, whatever the length of the conversation: clearing the memory writes zeros
-  over all of it. A model with recurrent state adds its checkpoints: the engine keeps four,
-  so 81 MB for Qwen3.5.
+  over all of it. A model with recurrent state adds its checkpoints: the engine keeps four at
+  the boundaries of the prompt and two that follow a reply while it is written (one taken every
+  32 tokens of the reply, the latest two kept), so at most six, 121 MB for Qwen3.5.
 - **A context that grows** (`ContextGrowthDeviceTest`). The session's count of a context of
   4,096 tokens is 544 MiB for Qwen3.5 and 392 MiB for peacebell (346 MiB for Boris-2 at its
   2,048), of which the process had 143, 284 and 145 MiB resident as anonymous memory: the

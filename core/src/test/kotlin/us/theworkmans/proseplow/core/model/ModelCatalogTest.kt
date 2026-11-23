@@ -32,6 +32,14 @@ class ModelCatalogTest {
     }
 
     @Test
+    fun `only the models with recurrent state are marked as unable to cut their memory back`() {
+        assertEquals(
+            listOf(ModelCatalog.QWEN35_0_8B.id, ModelCatalog.BORIS_2_INSTRUCT.id),
+            ModelCatalog.all.filter { !it.cutsMemoryBack }.map { it.id },
+        )
+    }
+
+    @Test
     fun `the catalogue has the four known models in picker order`() {
         assertEquals(
             listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),
