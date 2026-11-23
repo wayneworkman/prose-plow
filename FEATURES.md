@@ -1717,7 +1717,8 @@ is what a port has to reproduce, whatever it is written in.
   recurrent state can be stopped only between chunks (NAT-07), so it gets the smaller chunk.
 - **ENG-12** The reply is sampled token by token with the model's sampling values, or with the
   request's in their place, and always with the model's banned tokens. The sampler is set up
-  once at the start of every reply, which is where a reply begins for the penalties (FMT-15). No
+  once at the start of every reply and told where the reply began for the penalties: where
+  sampling begins, or for a continued answer where its content begins in memory (FMT-15). No
   bundled model fixes the random seed, so a new one is drawn for every reply and no reply is
   reproducible.
 - **ENG-13** For each sampled token, in this order: if it is the model's deletion token, it
@@ -1744,8 +1745,9 @@ is what a port has to reproduce, whatever it is written in.
 - **ENG-16** A request can ask for the last message, a partial answer, to be continued instead
   of a new reply. The prompt then ends inside that message, with no end marker and no new turn,
   and the model carries on from its last character. The events carry only the continuation. Its
-  leading whitespace is kept, because there it is a real space between two words. Continuing an
-  empty answer is the same as a new reply.
+  leading whitespace is kept, because there it is a real space between two words. The presence
+  and frequency penalties count the whole answer, not only the continuation (FMT-15). Continuing
+  an empty answer is the same as a new reply.
 - **ENG-17** For a model with a deletion token: the token is put into the model's memory like
   any other and counts towards the reply's limit. What changes is the reader's view: the last
   token of the visible reply is taken back and the three steps of ENG-14 are run again over the
@@ -2551,8 +2553,12 @@ This section is exact where the others describe. Each item carries one of three 
      presence penalties cover the tokens of the reply and no token of the prompt: the score less
      the frequency penalty times the number of times the token occurs in the reply, less the
      presence penalty if that number is not zero. "The reply" is what the memory holds from the
-     length it had when the first token of this reply was sampled; for a continued answer that
-     is the continuation only. No window limits them: the whole memory counts. A token is
+     length it had when the first token of this reply was sampled; for a continued answer
+     ("Continue", ENG-16) it is the whole answer, from the first token of its content in the
+     prompt (after the role line and, for Qwen3.5, after the empty thinking block; for a model
+     that continues text, after the user's text), so what was written before the continuation
+     counts too. When the tokenizer puts no token boundary where the answer's content begins, or
+     the answer is empty, the reply is counted from where sampling begins. No window limits them: the whole memory counts. A token is
      covered from the moment it is in the memory and no longer once it has been removed from it.
   2. The banned tokens are given a score of minus infinity.
   3. With a temperature above 0: the temperature is applied; then top-k (unless it is 0); then
@@ -3057,9 +3063,7 @@ the fixtures under `core/src/test/resources/golden/`.
   - Limits found in the code, for whoever builds it: when a stop string ends a reply, the text
     reported is exactly what stood before it, so the caller puts the stop string back itself;
     the chat layer, as it is, removes whitespace at the end of a reply that a stop string ended
-    (MSG-08), which an inline tool must not suffer; the presence and frequency penalties count
-    only the tokens written since the latest continuation began (FMT-15), so an answer
-    assembled from several continuations is penalised piece by piece; and on the models that
+    (MSG-08), which an inline tool must not suffer; and on the models that
     cannot remove the end of their memory (NAT-08) a continuation costs a return to the last
     checkpoint whenever the appended text does not simply extend what the memory holds.
   - Open: how the paused answer, the value and the continuation appear in the chat while they

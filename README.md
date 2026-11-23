@@ -175,6 +175,9 @@ with the SHA-256 the converted file must have.
 | System prompt | yes | no | yes |
 
 The sampling values are each model's own reference settings, taken from its published files.
+The repetition penalty counts every token of the conversation; the presence penalty counts the
+tokens of the answer alone, and of the whole answer when one is continued, not only of the
+part written after "Continue".
 The temperature, the longest reply and how far the context may grow can be changed for each
 model in Settings; the other values are fixed. The most a reply can be set to is half of what
 the context may grow to on the phone under that setting, and never more than 4,096 tokens,

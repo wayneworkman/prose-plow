@@ -261,8 +261,10 @@ interface NativeLlama {
      * evaluated, and no longer once [rewindTo], [restoreCheckpoint] or [clearMemory] has removed
      * it.
      *
-     * The engine calls this once at the start of every reply, which is where a reply begins for
-     * the penalties.
+     * The engine calls this once at the start of every reply. Where the reply begins for the
+     * presence and frequency penalties is [SamplerConfig.replyStart]: where the first token is
+     * sampled after this call, or, for a reply that continues an answer already in memory, the
+     * memory position at which that answer began, so that the whole answer is counted.
      */
     fun configureSampler(config: SamplerConfig)
 
@@ -325,6 +327,14 @@ interface EvaluationObserver {
  * @property penaltyWindow how many of the latest tokens in memory the penalties look at:
  *   positive, or [NO_PENALTY_WINDOW]. The engine passes the latter: the references the models'
  *   settings come from penalise over the whole conversation, whatever size the context has.
+ * @property replyStart where the reply began, for the presence and frequency penalties (the
+ *   repetition penalty covers the whole memory regardless): [REPLY_START_AT_SAMPLING] for where
+ *   the first token is sampled after [NativeLlama.configureSampler], or the position in memory
+ *   (0 or more) at which the answer began, for a reply that continues an answer already in
+ *   memory, so that its first part is counted too. A position beyond the memory counts nothing
+ *   until the memory reaches it; clearing the memory ends the reply, and the next one begins
+ *   where sampling begins. Anything below -1 is refused by the native side with
+ *   [NativeLlamaException.INVALID_ARGUMENT]. This is `pp_sampler_config.reply_start`.
  * @property seed the seed of the random choice; its 32 bits are read as unsigned.
  * @property bannedTokenIds tokens that must never be returned by [NativeLlama.sampleNext].
  */
@@ -339,10 +349,18 @@ data class SamplerConfig(
     val penaltyWindow: Int,
     val seed: Int,
     val bannedTokenIds: List<Int>,
+    val replyStart: Int = REPLY_START_AT_SAMPLING,
 ) {
     companion object {
         /** The whole memory counts for the penalties: llama.cpp's own -1. No other value below 1 is accepted. */
         const val NO_PENALTY_WINDOW: Int = -1
+
+        /**
+         * The reply begins where the first token is sampled after the sampler is configured: the
+         * native `PP_REPLY_START_AT_SAMPLING` (-1). Every reply that does not continue an answer
+         * already in memory uses it, and so does one whose answer has no usable position.
+         */
+        const val REPLY_START_AT_SAMPLING: Int = -1
     }
 }
 

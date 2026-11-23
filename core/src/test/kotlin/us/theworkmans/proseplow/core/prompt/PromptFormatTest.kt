@@ -2,6 +2,7 @@ package us.theworkmans.proseplow.core.prompt
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -80,6 +81,74 @@ class PromptFormatTest {
         assertTrue(Qwen35ChatMlFormat.render(continued).text().endsWith("</think>\n\npartial"))
         assertTrue(PlainChatMlFormat.render(continued).text().endsWith("<|im_start|>assistant\npartial"))
         assertEquals(PromptSegment.Text("partial"), PeacebellChatMlFormat.render(continued).segments.last())
+    }
+
+    // --- Where the answer being continued begins ---
+
+    /** The text of [prompt] from [boundary] on, counting only segments that have text. */
+    private fun textFrom(prompt: Prompt, boundary: PromptBoundary): String {
+        val before = prompt.copy(segments = prompt.segments.subList(0, boundary.segment)).text().length
+        return prompt.text().substring(before + boundary.offset)
+    }
+
+    @Test
+    fun `a prompt that opens a new turn marks no reply content in any format`() {
+        for (format in formats) assertNull(format.javaClass.simpleName, format.render(conversation).replyContentStart)
+    }
+
+    @Test
+    fun `every format marks where the partial answer's text begins when it is continued`() {
+        val continued = PromptInput(
+            messages = listOf(user("Count to five."), assistant("One, two,")),
+            systemPrompt = "Be brief.",
+            continueFinalMessage = true,
+        )
+        for (format in formats) {
+            val prompt = format.render(continued)
+            val marker = checkNotNull(prompt.replyContentStart) { format.javaClass.simpleName }
+            assertEquals(format.javaClass.simpleName, "One, two,", textFrom(prompt, marker))
+        }
+    }
+
+    @Test
+    fun `Qwen marks the answer after the newlines that follow the closing think tag`() {
+        val prompt = Qwen35ChatMlFormat.render(
+            PromptInput(messages = listOf(user("q"), assistant("  <think>\nhmm\n</think>\n\nThe answer")), continueFinalMessage = true),
+        )
+        val marker = checkNotNull(prompt.replyContentStart)
+        assertEquals(PromptSegment.Special("</think>"), prompt.segments[marker.segment - 1])
+        assertEquals(PromptSegment.Text("\n\nThe answer"), prompt.segments[marker.segment])
+        assertEquals(2, marker.offset)
+    }
+
+    @Test
+    fun `peacebell marks the answer at the start of its own text segment`() {
+        val prompt = PeacebellChatMlFormat.render(
+            PromptInput(messages = listOf(user("q"), assistant(" partial")), continueFinalMessage = true),
+        )
+        // Peacebell does not trim: the answer begins with its space, at offset 0 of its segment.
+        assertEquals(PromptBoundary(prompt.segments.lastIndex, 0), prompt.replyContentStart)
+        assertEquals(PromptSegment.Text(" partial"), prompt.segments.last())
+    }
+
+    @Test
+    fun `plain ChatML marks the answer after the role line, past the whitespace the template trims`() {
+        val prompt = PlainChatMlFormat.render(
+            PromptInput(messages = listOf(user("q"), assistant("  partial ")), continueFinalMessage = true),
+        )
+        val marker = checkNotNull(prompt.replyContentStart)
+        assertEquals(0, marker.segment)
+        assertEquals("partial ", textFrom(prompt, marker))
+        assertTrue(prompt.text().substring(0, marker.offset).endsWith("<|im_start|>assistant\n"))
+    }
+
+    @Test
+    fun `completion marks the answer where the partial reply's text begins, after the latest user message`() {
+        val prompt = CompletionFormat.render(
+            PromptInput(listOf(user("Earlier"), assistant(" old"), user("Dear Sir,"), assistant(" I write")), continueFinalMessage = true),
+        )
+        assertEquals(PromptBoundary(0, "Dear Sir,".length), prompt.replyContentStart)
+        assertEquals(" I write", textFrom(prompt, checkNotNull(prompt.replyContentStart)))
     }
 
     // --- Qwen3.5 ---

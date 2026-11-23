@@ -39,7 +39,9 @@ package us.theworkmans.proseplow.core.prompt
  * Continuing a message: the open turn is the after-the-last-query layout without its end marker.
  * Its leading whitespace is trimmed as the template would, and its end is kept exactly, because
  * the model continues from the last character it wrote. With an empty partial answer this is the
- * opening of a new turn, token for token.
+ * opening of a new turn, token for token. The answer begins after the newlines that follow
+ * `</think>` (or after the role line, in the layout of an earlier turn), inside that text segment
+ * ([Prompt.replyContentStart]).
  */
 object Qwen35ChatMlFormat : PromptFormat {
 
@@ -52,6 +54,12 @@ object Qwen35ChatMlFormat : PromptFormat {
 
     /** The opening of an assistant turn after the last query, up to and including `<think>`. */
     private const val ASSISTANT_THINK_OPEN = "$IM_START" + "assistant\n" + THINK_OPEN
+
+    /** What stands between `</think>` and the answer. */
+    private const val ANSWER_AFTER_THINK = "\n\n"
+
+    /** The role line of an assistant turn written without a `<think>` block. */
+    private const val ROLE_LINE = "assistant\n"
 
     /** The opening of a new assistant turn with thinking off. */
     const val GENERATION_PROMPT: String = "$ASSISTANT_THINK_OPEN\n\n$THINK_CLOSE\n\n"
@@ -115,10 +123,12 @@ object Qwen35ChatMlFormat : PromptFormat {
             special(ASSISTANT_THINK_OPEN)
             text("\n" + PromptWhitespace.strip(reasoning) + "\n")
             special(THINK_CLOSE)
-            text("\n\n" + content)
+            if (open) replyContentStart(offset = ANSWER_AFTER_THINK.length)
+            text(ANSWER_AFTER_THINK + content)
         } else {
             special(IM_START)
-            text("assistant\n" + content)
+            if (open) replyContentStart(offset = ROLE_LINE.length)
+            text(ROLE_LINE + content)
         }
         if (!open) special(IM_END_LINE)
     }

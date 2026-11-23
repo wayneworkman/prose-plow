@@ -752,7 +752,7 @@ wrong on a phone or for one of the models:
   | Text to tokenise | 262144 bytes (`PP_TOKENIZE_BYTES_MAX`) | `PP_ERROR` (`PP_STATUS_TOKENIZE_FAILED`) |
   | Checkpoints held at once | 8 (`PP_CHECKPOINTS_MAX`) | -1, until one is dropped |
   | Penalty window | None | `PP_PENALTY_NO_WINDOW` (-1) is the whole memory, which is what the engine passes; 0 and other negative values are refused |
-  | Reply start | None | `PP_REPLY_START_AT_SAMPLING` (-1) or a position from 0; below -1 is `PP_STATUS_INVALID_ARGUMENT` |
+  | Reply start | None | `PP_REPLY_START_AT_SAMPLING` (-1) or a position from 0, which is what the engine passes (-1, or where a continued answer began); below -1 is `PP_STATUS_INVALID_ARGUMENT` |
   | Banned tokens | The size of the vocabulary | `PP_STATUS_INVALID_ARGUMENT` |
 
   The context has no fixed ceiling any more: what a model was trained for is its limit
@@ -805,7 +805,11 @@ wrong on a phone or for one of the models:
   after a partial assistant message) should count the whole answer, not only what is sampled
   now. `pp_sampler_config.reply_start` is the memory position at which the answer began, or
   `PP_REPLY_START_AT_SAMPLING` (-1) for "where the first token is sampled after this
-  configuration", which is what every other reply uses. Below -1 is refused. A position beyond
+  configuration", which is what every other reply uses. Below -1 is refused. The binding
+  passes `SamplerConfig.replyStart` through (`LlamaJni.configureSampler`, after the penalty
+  window): the engine sets the token position where the content of the answer being continued
+  begins in the prompt as evaluated, and -1 for a new reply, an empty answer, or an answer
+  whose start the tokenizer does not put on a token boundary. A position beyond
   the memory counts nothing until the memory reaches it; a clear, or a change of size that
   empties the memory, ends the reply, and the next one begins where sampling begins. A
   zero-initialised `pp_sampler_config` says position 0, the whole memory: set the field.

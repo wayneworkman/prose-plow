@@ -2,6 +2,7 @@ package us.theworkmans.proseplow.core.engine
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.engine.FakeNativeLlama.Call
@@ -94,6 +95,20 @@ class PromptTokeniserTest {
         assertEquals(5, tokenised.tokens.size)
         // Offset 2 is in front of the marker (position 2), offset 7 behind it (position 3).
         assertEquals(listOf(2, 3), tokeniser.boundaryPositions(tokenised, after = 0, limit = 10))
+    }
+
+    @Test
+    fun `the reply content position is the token position of the marker, checked like a boundary`() {
+        val prompt = Prompt(
+            segments = listOf(PromptSegment.TokenId(7), PromptSegment.Special("ab<|x|>cd")),
+            replyContentStart = PromptBoundary(1, 7),
+        )
+        val tokenised = tokeniser.tokenise(prompt)
+        assertEquals(4, tokeniser.replyContentPosition(tokenised))
+        assertEquals("at the start of a segment", 1, tokeniser.replyContentPosition(tokeniser.tokenise(prompt.copy(replyContentStart = PromptBoundary(1)))))
+        assertNull("inside the marker", tokeniser.replyContentPosition(tokeniser.tokenise(prompt.copy(replyContentStart = PromptBoundary(1, 4)))))
+        assertNull("no marker", tokeniser.replyContentPosition(tokeniser.tokenise(prompt.copy(replyContentStart = null))))
+        assertNull("nowhere", tokeniser.replyContentPosition(tokeniser.tokenise(prompt.copy(replyContentStart = PromptBoundary(5)))))
     }
 
     @Test

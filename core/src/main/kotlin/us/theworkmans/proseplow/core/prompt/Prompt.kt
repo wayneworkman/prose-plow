@@ -44,10 +44,20 @@ data class PromptBoundary(val segment: Int, val offset: Int = 0)
  *
  * [boundaries] are in ascending order, one per rendered message (including the system message)
  * and one for the open assistant turn at the end.
+ *
+ * [replyContentStart] is where the content of the open assistant message begins when a reply is
+ * being continued ([PromptInput.continueFinalMessage]): the first character of the partial
+ * answer as rendered, after the role line and anything else the format writes in front of the
+ * answer. It is null for a prompt that opens a new turn. The engine tells the sampler that the
+ * reply began there, so that the presence and frequency penalties count the whole answer and not
+ * only what is sampled after "Continue". Like a message boundary, a place inside a text segment
+ * is only a token position when the tokenizer puts a token boundary there, which the engine
+ * checks.
  */
 data class Prompt(
     val segments: List<PromptSegment>,
     val boundaries: List<PromptBoundary> = emptyList(),
+    val replyContentStart: PromptBoundary? = null,
 ) {
     /**
      * The text of all [PromptSegment.Text] and [PromptSegment.Special] segments joined together:

@@ -558,7 +558,7 @@ class LlamaEngine(
             noteReading(from = reusedTokens, to = tokens.size, nanos = promptReadyAt - readingFrom - (asideBeforeReply - asideBeforeReading))
             out.send(GenerationEvent.PromptProgress(tokens.size, tokens.size))
 
-            sample(maxNewTokens = minOf(requestedNewTokens, contextSize - tokens.size))
+            sample(fitted.prompt, maxNewTokens = minOf(requestedNewTokens, contextSize - tokens.size))
         }
 
         // --- The size of the context ---
@@ -886,8 +886,15 @@ class LlamaEngine(
 
         // --- Step 4: sample the reply ---
 
-        private suspend fun sample(maxNewTokens: Int) {
+        /**
+         * Samples the reply to [prompt], which is in memory as evaluated. The presence and
+         * frequency penalties count the reply from [replyStart] on.
+         */
+        private suspend fun sample(prompt: TokenisedPrompt, maxNewTokens: Int) {
             val sampling = request.sampling ?: model.sampling
+            // A continued message already has its first word; only a new reply loses leading space,
+            // and only a chat model's: a model that continues text keeps every character it writes.
+            val continuing = request.continueFinalMessage && !PromptWhitespace.isBlank(request.messages.last().content)
             native.configureSampler(
                 SamplerConfig(
                     temperature = sampling.temperature,
@@ -900,11 +907,9 @@ class LlamaEngine(
                     penaltyWindow = SamplerConfig.NO_PENALTY_WINDOW,
                     seed = sampling.seed ?: newSeed(),
                     bannedTokenIds = model.bannedTokenIds,
+                    replyStart = if (continuing) replyStart(prompt) else SamplerConfig.REPLY_START_AT_SAMPLING,
                 ),
             )
-            // A continued message already has its first word; only a new reply loses leading space,
-            // and only a chat model's: a model that continues text keeps every character it writes.
-            val continuing = request.continueFinalMessage && !PromptWhitespace.isBlank(request.messages.last().content)
             val reply = ReplyAssembler(
                 stopStrings = model.stopStrings + request.stopStrings,
                 dropLeadingWhitespace = !continuing && !model.family.continuesText,
@@ -971,6 +976,18 @@ class LlamaEngine(
         }
 
         private var reply: ReplyAssembler? = null
+
+        /**
+         * Where the answer being continued began in the model's memory: the token position of the
+         * prompt's [Prompt.replyContentStart], so that the presence and frequency penalties count
+         * the whole answer and not only what is sampled after "Continue". [prompt] is the prompt
+         * as fitted and evaluated, after any older turns were left out, so its token positions are
+         * the memory's. [SamplerConfig.REPLY_START_AT_SAMPLING] when the tokenizer puts no token
+         * boundary at the marker: a position inside a token would count text that is not the
+         * answer's, and counting from where sampling begins is the safer mistake.
+         */
+        private fun replyStart(prompt: TokenisedPrompt): Int =
+            checkNotNull(tokeniser).replyContentPosition(prompt) ?: SamplerConfig.REPLY_START_AT_SAMPLING
 
         private suspend fun finish(reason: FinishReason, stopString: String?) {
             val reply = reply

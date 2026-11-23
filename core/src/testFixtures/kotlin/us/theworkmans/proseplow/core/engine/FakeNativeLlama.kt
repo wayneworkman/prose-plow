@@ -108,6 +108,12 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     var sampler: SamplerConfig? = null
         private set
 
+    /**
+     * Where the current reply began for the presence and frequency penalties, as last configured
+     * ([SamplerConfig.replyStart]), or null before the first configuration.
+     */
+    val replyStart: Int? get() = sampler?.replyStart
+
     var closed: Boolean = false
         private set
 
@@ -386,6 +392,10 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     override fun configureSampler(config: SamplerConfig) {
         enter(Call.ConfigureSampler(config))
         require(config.penaltyWindow > 0 || config.penaltyWindow == SamplerConfig.NO_PENALTY_WINDOW) { "penaltyWindow ${config.penaltyWindow}" }
+        // As the native session: a reply start below -1 is refused and the previous sampler kept.
+        if (config.replyStart < SamplerConfig.REPLY_START_AT_SAMPLING) {
+            throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "replyStart ${config.replyStart} is below -1")
+        }
         sampler = config
         script = ArrayDeque(replies.removeFirstOrNull() ?: emptyList())
     }

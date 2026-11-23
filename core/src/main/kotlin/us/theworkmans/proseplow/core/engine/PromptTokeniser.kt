@@ -116,6 +116,21 @@ internal class PromptTokeniser(private val native: NativeLlama) {
         return found.asReversed()
     }
 
+    /**
+     * The token position at which the content of the open assistant message begins
+     * ([Prompt.replyContentStart]), or null when the prompt has no such marker or the tokenizer
+     * does not put a token boundary there. The check is the one [boundaryPositions] makes: a
+     * position that is not really between two tokens would make the penalties count part of a
+     * token that also spells the text in front of the answer, so it is not used at all.
+     *
+     * The position is an index into [TokenisedPrompt.tokens], which is the position in the
+     * model's memory once that prompt has been evaluated.
+     */
+    fun replyContentPosition(tokenised: TokenisedPrompt): Int? {
+        val marker = tokenised.prompt.replyContentStart ?: return null
+        return positionOf(tokenised, marker)
+    }
+
     private fun positionOf(tokenised: TokenisedPrompt, boundary: PromptBoundary): Int? {
         val segments = tokenised.prompt.segments
         if (boundary.segment !in segments.indices) return null

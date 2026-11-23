@@ -28,7 +28,9 @@ package us.theworkmans.proseplow.core.prompt
  * models `<|im_end|>` as a stop string.
  *
  * Continuing a message: the last message is rendered without `<|im_end|>` and no new turn is
- * opened. Its leading whitespace is trimmed as the template would; its end is kept exactly.
+ * opened. Its leading whitespace is trimmed as the template would; its end is kept exactly. The
+ * answer begins right after the role line ([Prompt.replyContentStart]), at a character offset in
+ * the one segment.
  */
 object PlainChatMlFormat : PromptFormat {
 
@@ -41,6 +43,7 @@ object PlainChatMlFormat : PromptFormat {
         val messages = input.checkedMessages()
         val text = StringBuilder()
         val boundaries = ArrayList<PromptBoundary>()
+        var replyContentStart: PromptBoundary? = null
 
         input.systemText()?.let { system ->
             boundaries += PromptBoundary(segment = 0, offset = text.length)
@@ -55,7 +58,9 @@ object PlainChatMlFormat : PromptFormat {
                 PromptRole.ASSISTANT -> "assistant"
             }
             if (open) {
-                text.append(IM_START).append(role).append('\n').append(PromptWhitespace.stripStart(message.content))
+                text.append(IM_START).append(role).append('\n')
+                replyContentStart = PromptBoundary(segment = 0, offset = text.length)
+                text.append(PromptWhitespace.stripStart(message.content))
             } else {
                 text.closedTurn(role, message.content)
             }
@@ -64,7 +69,7 @@ object PlainChatMlFormat : PromptFormat {
             boundaries += PromptBoundary(segment = 0, offset = text.length)
             text.append(IM_START).append("assistant\n")
         }
-        return Prompt(listOf(PromptSegment.Text(text.toString())), boundaries)
+        return Prompt(listOf(PromptSegment.Text(text.toString())), boundaries, replyContentStart)
     }
 
     private fun StringBuilder.closedTurn(role: String, content: String) {

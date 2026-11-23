@@ -80,10 +80,19 @@ internal fun PromptInput.checkedMessages(): List<PromptMessage> {
 internal class PromptBuilder {
     private val segments = ArrayList<PromptSegment>()
     private val boundaries = ArrayList<PromptBoundary>()
+    private var replyContentStart: PromptBoundary? = null
 
     /** Marks the start of a message at the next segment to be added. */
     fun boundary() {
         boundaries += PromptBoundary(segments.size)
+    }
+
+    /**
+     * Marks where the content of the open assistant message begins: [offset] characters into the
+     * next segment to be added. See [Prompt.replyContentStart].
+     */
+    fun replyContentStart(offset: Int = 0) {
+        replyContentStart = PromptBoundary(segments.size, offset)
     }
 
     fun text(text: String) {
@@ -98,5 +107,5 @@ internal class PromptBuilder {
         segments += PromptSegment.TokenId(id)
     }
 
-    fun build(): Prompt = Prompt(segments.toList(), boundaries.toList())
+    fun build(): Prompt = Prompt(segments.toList(), boundaries.toList(), replyContentStart)
 }

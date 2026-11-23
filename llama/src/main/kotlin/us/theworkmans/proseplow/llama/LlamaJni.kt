@@ -119,7 +119,11 @@ internal object LlamaJni {
     @JvmStatic
     external fun clearMemory(handle: Long)
 
-    /** `pp_session_configure_sampler`; the arguments are the fields of `SamplerConfig` in order. */
+    /**
+     * `pp_session_configure_sampler`. The arguments are the fields of `SamplerConfig`, with
+     * `replyStart` placed after `penaltyWindow` as in `pp_sampler_config`; the order must agree
+     * with `configure_sampler` and its signature `(JFIFFFFFIII[I)V` in `proseplow_jni.cpp`.
+     */
     @JvmStatic
     external fun configureSampler(
         handle: Long,
@@ -131,6 +135,7 @@ internal object LlamaJni {
         presencePenalty: Float,
         frequencyPenalty: Float,
         penaltyWindow: Int,
+        replyStart: Int,
         seed: Int,
         bannedTokenIds: IntArray,
     )

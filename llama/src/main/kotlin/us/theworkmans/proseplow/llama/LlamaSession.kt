@@ -78,6 +78,7 @@ internal class LlamaSession(private var handle: Long) : NativeLlama {
         config.presencePenalty,
         config.frequencyPenalty,
         config.penaltyWindow,
+        config.replyStart,
         config.seed,
         config.bannedTokenIds.toIntArray(),
     )

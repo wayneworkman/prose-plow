@@ -485,7 +485,7 @@ void clear_memory(JNIEnv * env, jclass, jlong handle) {
 
 void configure_sampler(JNIEnv * env, jclass, jlong handle, jfloat temperature, jint top_k, jfloat top_p, jfloat min_p,
                        jfloat repetition_penalty, jfloat presence_penalty, jfloat frequency_penalty, jint penalty_window,
-                       jint seed, jintArray banned) {
+                       jint reply_start, jint seed, jintArray banned) {
     guarded(env, PP_STATUS_SAMPLING_FAILED, 0, [&]() -> int {
         pp_session * s = session_of(env, handle);
         if (s == nullptr) {
@@ -507,8 +507,8 @@ void configure_sampler(JNIEnv * env, jclass, jlong handle, jfloat temperature, j
         config.presence_penalty   = presence_penalty;
         config.frequency_penalty  = frequency_penalty;
         config.penalty_window     = penalty_window;
-        config.reply_start        = -1; // where sampling begins; a zero-initialised field would mean position 0
-        config.seed              = (uint32_t) seed; // the 32 bits as they are, read as unsigned
+        config.reply_start        = reply_start; // -1 (PP_REPLY_START_AT_SAMPLING) or a memory position; below -1 is refused
+        config.seed               = (uint32_t) seed; // the 32 bits as they are, read as unsigned
         config.banned_tokens      = banned_tokens.empty() ? nullptr : banned_tokens.data();
         config.n_banned_tokens    = (int32_t) banned_tokens.size();
         const int32_t status = pp_session_configure_sampler(s, &config);
@@ -566,7 +566,7 @@ const JNINativeMethod k_methods[] = {
     {"restoreCheckpoint",  "(JI)Z",                                                             (void *) restore_checkpoint},
     {"dropCheckpoint",     "(JI)V",                                                             (void *) drop_checkpoint},
     {"clearMemory",        "(J)V",                                                              (void *) clear_memory},
-    {"configureSampler",   "(JFIFFFFFII[I)V",                                                   (void *) configure_sampler},
+    {"configureSampler",   "(JFIFFFFFIII[I)V",                                                  (void *) configure_sampler},
     {"sampleNext",         "(J)I",                                                              (void *) sample_next},
     {"threadSetup",        "(J)I",                                                              (void *) thread_setup},
 };

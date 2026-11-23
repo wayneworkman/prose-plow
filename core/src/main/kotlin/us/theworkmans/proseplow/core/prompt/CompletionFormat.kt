@@ -20,7 +20,8 @@ package us.theworkmans.proseplow.core.prompt
  *
  * Continuing a message: the prompt is the user's text immediately followed by the partial
  * answer, with nothing between them and nothing trimmed from either, so the model carries on
- * from the last character of what it wrote.
+ * from the last character of what it wrote. The answer begins where the partial answer's text
+ * begins, right after the user's text ([Prompt.replyContentStart]).
  */
 object CompletionFormat : PromptFormat {
 
@@ -31,9 +32,11 @@ object CompletionFormat : PromptFormat {
             ?: throw PromptFormatException("No user message to continue.")
         val text = if (input.continueFinalMessage) start + messages.last().content else start
         // The message begins at the start of the segment and the model's own text right after it.
+        val answer = PromptBoundary(segment = 0, offset = start.length)
         return Prompt(
             segments = listOf(PromptSegment.Text(text)),
-            boundaries = listOf(PromptBoundary(segment = 0), PromptBoundary(segment = 0, offset = start.length)),
+            boundaries = listOf(PromptBoundary(segment = 0), answer),
+            replyContentStart = answer.takeIf { input.continueFinalMessage },
         )
     }
 }

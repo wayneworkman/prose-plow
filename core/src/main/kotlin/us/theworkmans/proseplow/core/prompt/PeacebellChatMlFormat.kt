@@ -23,7 +23,8 @@ package us.theworkmans.proseplow.core.prompt
  * (empty) segment, mirroring the call that encodes nothing.
  *
  * Continuing a message: the last message is left without id 4 and no new turn is opened, so the
- * model continues the content.
+ * model continues the content. The answer begins at the start of the content's own segment
+ * ([Prompt.replyContentStart]).
  *
  * The model was trained without a system role; the catalogue marks it as not supporting a system
  * prompt and the engine then never passes one. If one is given all the same, it is rendered as a
@@ -66,6 +67,7 @@ object PeacebellChatMlFormat : PromptFormat {
     private fun PromptBuilder.turn(role: String, content: String, open: Boolean) {
         token(IM_START_ID)
         text(role + "\n")
+        if (open) replyContentStart()
         text(content)
         if (!open) token(IM_END_ID)
     }

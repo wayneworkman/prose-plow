@@ -175,6 +175,20 @@ class FakeNativeLlamaTest {
     }
 
     @Test
+    fun `a reply start below -1 is refused as the native side refuses it, and the previous sampler is kept`() {
+        configure()
+        val config = checkNotNull(fake.sampler)
+        assertEquals("the default is where sampling begins", SamplerConfig.REPLY_START_AT_SAMPLING, fake.replyStart)
+        val refused = assertThrows(NativeLlamaException::class.java) { fake.configureSampler(config.copy(replyStart = -2)) }
+        assertEquals(NativeLlamaException.INVALID_ARGUMENT, refused.code)
+        assertEquals(config, fake.sampler)
+        fake.configureSampler(config.copy(replyStart = 0))
+        assertEquals("position 0 is a position", 0, fake.replyStart)
+        fake.configureSampler(config.copy(replyStart = 99))
+        assertEquals("a position beyond the memory is accepted", 99, fake.replyStart)
+    }
+
+    @Test
     fun `a banned token is never sampled`() {
         val banned = fake.byteToken('x'.code)
         fake.enqueueReply("xaxbx")
