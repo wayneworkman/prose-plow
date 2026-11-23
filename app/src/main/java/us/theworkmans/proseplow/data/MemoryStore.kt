@@ -38,9 +38,10 @@ fun interface MemoryConversations {
 
     /**
      * The chat that [conversationKey] names ([SavedMemory.conversationKey]), with its messages as
-     * they are now (as stored, after any pruning) and the text besides them that a request of it
-     * to the model [modelId] ([SavedMemory.modelId]) would carry now; or null when there is no
-     * such chat any more, or no such model. Called on the engine's thread; may block on the disk.
+     * they are now (as stored, after any pruning), the text besides them that a request of it
+     * to the model [modelId] ([SavedMemory.modelId]) would carry now, and the text that the last
+     * request of it the engine has read carried; or null when there is no such chat any more, or
+     * no such model. Called on the engine's thread; may block on the disk.
      *
      * @throws IOException when it cannot be told now. That says nothing about the memory, which
      *   is then not deleted by the store.
@@ -57,9 +58,23 @@ fun interface MemoryConversations {
  * @property oldestMessageMillis the date of its oldest message (the chat's entry in the list
  *   records it). A memory is dated by the earlier of this and the dates of [messages].
  * @property requestText what a request of the conversation to the model asked about carries into
- *   the prompt besides the messages, as the settings are now.
+ *   the prompt besides the messages, as the settings are now. A memory is usable only when this
+ *   is what it was made with.
+ * @property readRequestText what the last request of the conversation that the engine has read
+ *   (in this unlocked session) carried besides the messages: the text the engine's memory of it
+ *   holds, which a save writes into the header. Null when the engine has read no request of it
+ *   in this session; its memory is then one read back from a saved memory whose header was just
+ *   found equal to [requestText], and a save writes [requestText]. Recording what was read, and
+ *   not what the settings say at the moment of the save, keeps a save from binding the old
+ *   text's memory to a new text should the hiding of a changed conversation ever be missed.
  */
-data class MemoryConversation(val chatId: String, val messages: List<ChatMessage>, val oldestMessageMillis: Long, val requestText: RequestText)
+data class MemoryConversation(
+    val chatId: String,
+    val messages: List<ChatMessage>,
+    val oldestMessageMillis: Long,
+    val requestText: RequestText,
+    val readRequestText: RequestText? = null,
+)
 
 /**
  * The text a request carries into the model's prompt besides the messages: what a memory was
@@ -99,7 +114,9 @@ data class FreeSpace(val usableBytes: Long, val totalBytes: Long)
  * authenticated with it: the format version, the build ([BuildIdentity]), the model and the
  * length of its packaged file, the chat, the id of the chat's first message, a digest of the
  * messages the memory was made from (their ids, dates and text), a digest of the text the
- * request carried besides them ([RequestText]: the system prompt, and any further system text),
+ * request carried besides them ([RequestText]: the system prompt, and any further system text;
+ * the text of the last request the engine read, [MemoryConversation.readRequestText], and the
+ * text of now only when it has read none since the unlock),
  * and the fields of [SavedMemory]. The date of the oldest of those messages is in the stream's own header
  * ([us.theworkmans.proseplow.security.StreamHeader.oldestMessageMillis]), and is the file's date.
  *
@@ -246,7 +263,9 @@ class MemoryStore internal constructor(
         val modelLength = modelFileLength(memory.modelId) ?: throw IOException("The model is not part of this build")
         if (memory.imageBytes < 0) throw IOException("An image cannot have a negative size")
         val header = try {
-            MemoryHeader(build, modelLength, chatId, messages.first().id, messages.size, digestOf(messages), requestDigestOf(conversation.requestText), memory).encode()
+            // What the memory was read with, not what the settings say now (see MemoryConversation).
+            val requestDigest = requestDigestOf(conversation.readRequestText ?: conversation.requestText)
+            MemoryHeader(build, modelLength, chatId, messages.first().id, messages.size, digestOf(messages), requestDigest, memory).encode()
         } catch (e: IllegalArgumentException) {
             throw IOException("The header of the memory is too long", e)
         }

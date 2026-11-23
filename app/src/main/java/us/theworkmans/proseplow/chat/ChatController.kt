@@ -199,9 +199,11 @@ enum class ChatNotice {
  *   asked for again, a retry, an expiry) until the engine has read a request built after that
  *   change. So a save at a lock that comes before that request cannot keep the old text. A
  *   change of a system prompt is such a change too ([systemPromptChanged]): the prompt is part
- *   of what the engine holds. And it tells the store the system prompt a request of the
- *   conversation would carry now, which the store binds a memory to, so that a memory made with
- *   another prompt is refused at the next unlock even where its deletion never happened.
+ *   of what the engine holds. And it tells the store two system prompts: the one the last
+ *   request of the conversation that the engine read carried, which a save binds the memory
+ *   to, and the one a request would carry now, which the check at the next unlock compares
+ *   that with. So a memory made with another prompt is refused at the next unlock even where
+ *   its deletion never happened, and even where the hiding above was missed.
  *
  * Threading: everything except the constructor, [shutdown], [conversation], [requestsBuilt],
  * [heldConversationKey] and [holdsSavableConversation] is called on the main dispatcher and all state is confined to it. The
@@ -306,6 +308,17 @@ class ChatController(
      */
     private val changes = AtomicLong(0)
     private val staleSince = ConcurrentHashMap<String, Long>()
+
+    /**
+     * By chat, what the last request of it that the engine has read carried into the prompt
+     * besides the messages: the text the engine's memory of that chat holds. Recorded when the
+     * engine shows that it read the request ([showsPromptRead]), and taken away when a restore
+     * fills the memory with what was saved, whose text the store has just found equal to that
+     * of now. The store writes this, not the settings of the moment of the save, into a saved
+     * memory's header ([MemoryConversation.readRequestText]). Written on the main thread, read
+     * from any.
+     */
+    private val readRequestTexts = ConcurrentHashMap<String, RequestText>()
 
     /** The job of the latest turn, running or not: the next turn waits until it has let go of the engine. */
     private var lastTurn: Job? = null
@@ -942,6 +955,7 @@ class ChatController(
             val settings = requestSettings(spec)
             val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens).copy(conversationKey = conversationKeyOf(reply.sessionId))
             val builtAfter = changes.get()
+            val carried = RequestText(request.systemPrompt, request.extraSystemText)
             builtRequests.incrementAndGet()
             engineHolds = reply.sessionId
             mayHold += reply.sessionId
@@ -951,6 +965,8 @@ class ChatController(
                     // and no other (it keeps only what this request's prompt begins with).
                     mayHold.retainAll(setOf(reply.sessionId))
                     mayHold += reply.sessionId
+                    // And its memory of this chat holds the text this request carried.
+                    readRequestTexts[reply.sessionId] = carried
                 }
                 if (running === reply) {
                     // The engine has read this request: what it holds no longer has the text of a change made before it.
@@ -1013,8 +1029,12 @@ class ChatController(
             val result = engine.restoreMemory(vault, conversationKeyOf(id), requestSettings(spec).maxContextTokens)
             if (result is MemoryRestoreResult.Restored || result == MemoryRestoreResult.AlreadyHeld) {
                 engineHolds = id
-                // A restore empties the memory before it fills it with this chat's.
-                if (result is MemoryRestoreResult.Restored) mayHold.clear()
+                // A restore empties the memory before it fills it with this chat's, made with the
+                // text of now: the store has just compared the saved memory's header with it.
+                if (result is MemoryRestoreResult.Restored) {
+                    mayHold.clear()
+                    readRequestTexts.remove(id)
+                }
                 mayHold += id
                 onMemoryRestored()
             }
@@ -1079,7 +1099,9 @@ class ChatController(
      * (see the class comment). A chat that was not opened since the unlock is read from the disk.
      * Its [MemoryConversation.requestText] is what a request to that model carries besides the
      * messages now: the system prompt the settings hold for it, taken from [requestSettings] as a
-     * reply's request takes it, and no other system text, because nothing sets any yet. From any
+     * reply's request takes it, and no other system text, because nothing sets any yet. Its
+     * [MemoryConversation.readRequestText] is what the last request of the chat that the engine
+     * has read in this session carried ([readRequestTexts]), null when there was none. From any
      * thread.
      *
      * @throws IOException when the chat's file exists and cannot be read.
@@ -1098,7 +1120,7 @@ class ChatController(
             }
         }
         val oldest = listOfNotNull(listed?.oldestMessageAtMillis, session.messages.minOfOrNull { it.createdAtMillis }).minOrNull() ?: return null
-        return MemoryConversation(id, session.messages, oldest, requestTextFor(spec))
+        return MemoryConversation(id, session.messages, oldest, requestTextFor(spec), readRequestTexts[id])
     }
 
     /**

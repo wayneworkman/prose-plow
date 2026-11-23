@@ -39,6 +39,7 @@ import us.theworkmans.proseplow.core.engine.SavedMemory
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.data.ModelMemoryPlatform
 import us.theworkmans.proseplow.data.ModelMemorySupport
+import us.theworkmans.proseplow.data.RequestText
 import us.theworkmans.proseplow.security.SessionClose
 import java.io.File
 import java.io.IOException
@@ -453,6 +454,58 @@ class ModelMemorySessionTest {
 
         exchange(session, "And another")
         assertEquals("known again once a later request was read", "And another", session.chat.conversation(key, ModelCatalog.default.id)?.messages?.dropLast(1)?.last()?.text)
+        session.close()
+    }
+
+    /**
+     * The chats record, for each chat, the text the last request of it that the engine has read
+     * carried, and tell the store that beside the text of now. The session's hiding of a chat
+     * whose system prompt changed is switched off here, to stand for a miss of it. Catches a
+     * record made when a request is built rather than read, one that follows the settings, and
+     * one kept over a restore that filled the memory with what was saved.
+     */
+    @Test
+    fun theChatsTellTheStoreTheTextOfTheLastRequestTheEngineRead() = runTest {
+        val session = unlocked()
+        val model = ModelCatalog.default.id
+        session.settings.update(urgent = true) { it.withSystemPrompt(model, "First prompt") }
+        exchange(session, "A question")
+        val id = session.id
+        val key = ChatController.conversationKeyOf(id)
+        val first = session.chat.conversation(key, model)!!
+        assertEquals(RequestText("First prompt", null), first.requestText)
+        assertEquals("the text the engine read", first.requestText, first.readRequestText)
+
+        // The miss: the prompt changes and the chat is not hidden.
+        session.settings.whenSystemPromptChanges { }
+        session.settings.update(urgent = true) { it.withSystemPrompt(model, "Second prompt") }
+        val missed = session.chat.conversation(key, model)!!
+        assertEquals("the text of now", RequestText("Second prompt", null), missed.requestText)
+        assertEquals("the text the memory holds", RequestText("First prompt", null), missed.readRequestText)
+
+        // A request with the new prompt that the engine has not read yet changes nothing; once it has, it is recorded.
+        app.engine.enqueue(listOf(Step.Hang))
+        assertTrue(session.chat.send(id, "Another question"))
+        runCurrent()
+        assertEquals(RequestText("First prompt", null), session.chat.conversation(key, model)!!.readRequestText)
+        session.chat.stop(id)
+        runCurrent()
+        assertEquals("nor after it was stopped unread", RequestText("First prompt", null), session.chat.conversation(key, model)!!.readRequestText)
+        exchange(session, "And another")
+        assertEquals(RequestText("Second prompt", null), session.chat.conversation(key, model)!!.readRequestText)
+
+        // Another chat takes the engine; this one's memory comes back from the saved one, made with the text of now.
+        session.chat.newChat()
+        exchange(session, "Elsewhere")
+        app.engine.restoreResult = MemoryRestoreResult.Restored(300)
+        app.engine.enqueue(listOf(Step.Hang))
+        val restoresBefore = app.engine.restores.size
+        assertTrue(session.chat.send(id, "Back again"))
+        runCurrent()
+        assertEquals(listOf(key), app.engine.restores.drop(restoresBefore))
+        assertNull("nothing read since the restore", session.chat.conversation(key, model)!!.readRequestText)
+        session.chat.stop(id)
+        runCurrent()
         session.close()
     }
 

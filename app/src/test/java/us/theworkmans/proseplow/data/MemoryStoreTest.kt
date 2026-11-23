@@ -78,12 +78,15 @@ class MemoryStoreTest {
     /** What a request to each model carries besides the messages now, by model id; none for a model not named. */
     private val requestTexts = mutableMapOf("model-a" to RequestText("Answer briefly.", null))
 
+    /** What the last request the engine read carried besides the messages, by model id; none for a model not named. */
+    private val readTexts = HashMap<String, RequestText>()
+
     /** The models the store asked about, in order. */
     private val modelsAsked = ArrayList<String>()
     private val conversations = MemoryConversations { key, modelId ->
         if (conversationsFail) throw IOException("The chats cannot be read now")
         modelsAsked += modelId
-        chats[key]?.copy(requestText = requestTexts[modelId] ?: RequestText(null, null))
+        chats[key]?.copy(requestText = requestTexts[modelId] ?: RequestText(null, null), readRequestText = readTexts[modelId])
     }
 
     private fun store(cipher: ChunkCipher = this.cipher) = MemoryStore(
@@ -279,6 +282,35 @@ class MemoryStoreTest {
         modelLengths["model-a"] = 600_000_000L
         requestTexts.clear()
         requestTexts["model-a"] = RequestText("Answer briefly.", null)
+        readTexts.clear()
+    }
+
+    /**
+     * A save binds the memory to the text the last request the engine read carried, and the
+     * check compares that with the text of now. Catches a save that writes the text of the
+     * moment of the save: a prompt replaced after the engine read the conversation, with the
+     * session's hiding of the change missed, would otherwise be bound to the old prompt's memory.
+     */
+    @Test
+    fun aSaveWritesTheTextTheEngineReadAndTheCheckComparesItWithTheTextOfNow() {
+        val image = image(2 * SMALL + 17)
+        val cases: List<Triple<String, RequestText?, Boolean>> = listOf(
+            Triple("read with the prompt of before", RequestText("Answer at length.", null), false),
+            Triple("read with the prompt of now", RequestText("Answer briefly.", null), true),
+            Triple("nothing read since the unlock: the text of now", null, true),
+        )
+        for ((case, read, usable) in cases) {
+            resetWorld()
+            chat()
+            if (read != null) readTexts["model-a"] = read
+            assertTrue(case, store().save(memoryOf(image), image))
+            if (usable) {
+                assertNotNull(case, store().saved())
+            } else {
+                assertNull(case, store().saved())
+                assertEquals(case, emptyList<String>(), leftInDirectory())
+            }
+        }
     }
 
     /**

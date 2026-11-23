@@ -77,6 +77,9 @@ class EngineMemoryStoreTest {
     /** The system prompt the settings hold for the model now; what the store is told a request carries. */
     private var systemPrompt = "Be brief."
 
+    /** The system prompt of the last request the engine read, as the session records it; null before the first. */
+    private var readPrompt: String? = null
+
     /** The chat's stored messages, as the store digests them; the request carries the same conversation. */
     private val messages = listOf(
         ChatMessage(id = "c1-u1", role = Role.USER, text = question, createdAtMillis = now - 120_000),
@@ -84,7 +87,7 @@ class EngineMemoryStoreTest {
     )
 
     private val conversations = MemoryConversations { conversationKey, modelId ->
-        if (conversationKey != key || modelId != model.id) null else MemoryConversation("c1", messages, messages.first().createdAtMillis, RequestText(systemPrompt, null))
+        if (conversationKey != key || modelId != model.id) null else MemoryConversation("c1", messages, messages.first().createdAtMillis, RequestText(systemPrompt, null), readPrompt?.let { RequestText(it, null) })
     }
 
     /** A store as a session makes one; a new one stands for the next unlock. */
@@ -123,6 +126,7 @@ class EngineMemoryStoreTest {
     private suspend fun Engine.ask(vararg sent: PromptMessage, reply: String): GenerationEvent.Done {
         fake.enqueueReply(reply)
         val events = engine.generate(GenerationRequest(model.id, sent.toList(), systemPrompt = systemPrompt, conversationKey = key)).toList()
+        readPrompt = systemPrompt
         return events.last() as GenerationEvent.Done
     }
 
@@ -186,6 +190,44 @@ class EngineMemoryStoreTest {
         assertEquals("refused and deleted", emptyList<String>(), memoryFiles())
         val done = test.ask(user(question), assistant("Fine."), user("And then?"), reply = "Then this.")
         assertEquals("everything was read with the new prompt", 0, done.stats.reusedPromptTokens)
+    }
+
+    /**
+     * A system prompt replaced after the engine read the conversation, with the session's hiding
+     * of a changed conversation missed (the store is told of the conversation as before): the
+     * save binds the memory to the prompt the engine read, so the check at the next unlock, with
+     * the new prompt, refuses and deletes it. Catches a save that writes the prompt of the
+     * moment of the save, which would bind the old prompt's memory to the new prompt.
+     */
+    @Test
+    fun aPromptChangedBeforeTheSaveWithTheHidingMissedIsStillRefusedAtTheNextUnlock() = runTest {
+        File(sessions, "c1.enc").writeText("a chat")
+        val test = engine()
+        test.ask(user(question), reply = "Fine.")
+        systemPrompt = "Answer at length."
+        assertTrue("the miss: the save is made", test.engine.saveMemory(store(), key, SaveTrigger.LOCK) is MemorySaveResult.Saved)
+        test.engine.forgetKeepingSavedMemory()
+
+        assertEquals("refused at the next unlock", MemoryRestoreResult.NothingSaved, test.engine.restoreMemory(store(), key))
+        assertTrue(test.fake.memory.isEmpty())
+        assertEquals("and deleted", emptyList<String>(), memoryFiles())
+    }
+
+    /**
+     * The ordinary paths are unchanged: a prompt that stays is restored, and so is one changed
+     * and then read by the engine before the save. Catches a save that binds the memory to an
+     * older prompt than the one the engine last read.
+     */
+    @Test
+    fun aPromptReadByTheEngineBeforeTheSaveIsTheOneTheMemoryIsBoundTo() = runTest {
+        File(sessions, "c1.enc").writeText("a chat")
+        val test = engine()
+        test.ask(user(question), reply = "Fine.")
+        systemPrompt = "Answer at length."
+        val held = test.ask(user(question), assistant("Fine."), user("And then?"), reply = "Then this.").let { test.fake.memory.size }
+        assertTrue(test.engine.saveMemory(store(), key, SaveTrigger.LOCK) is MemorySaveResult.Saved)
+        test.engine.forgetKeepingSavedMemory()
+        assertEquals(MemoryRestoreResult.Restored(held), test.engine.restoreMemory(store(), key))
     }
 
     private companion object {
