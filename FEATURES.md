@@ -21,6 +21,11 @@ is about things that are **not** built and is kept apart from everything else.
 - Text in double quotes is the exact wording the app shows. A name in braces, such as `{model}`,
   stands for a value that is filled in. All wording lives in
   `app/src/main/res/values/strings.xml`; another platform should say the same things.
+- A test of the build holds this file to the app (`FeaturesDocumentTest`, beside the rules about
+  the sources): it fails when the text of a string in `strings.xml` is not found here word for
+  word, when an identifier is defined twice or used without being defined, and when a link
+  within this file leads nowhere. A wording that changes in the app is changed here in the same
+  commit.
 - Numbers (lengths, times, counts) are the values in the code. Where two implementations must
   agree to the byte, the exact form is in
   [Exact formats and rules](#25-exact-formats-and-rules-fmt).
@@ -535,6 +540,10 @@ is about things that are **not** built and is kept apart from everything else.
     sooner cannot provide it as it is. What must hold in any case: the screen locks at once; the
     key is not kept longer than the stated limit; unlocking is never shortened; and "Lock now"
     always wins.
+- **LEASE-13** The 10 minutes count whatever the model is doing. Reading a conversation again is
+  part of the answer (ENG-34), so an answer in a conversation that takes longer than that to read is
+  stopped at the limit, possibly before it has written a word, and has to be asked for with the app
+  open. The text of MSET-19 says so to the user.
 
 ## 7. The end of the process (END)
 
@@ -720,7 +729,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   | --- | --- | --- |
   | `sessions/<id>.enc` | One chat: its messages, its unsent draft, its model, its title and the failure of its last request, if any | Encrypted, purpose `session:<id>` |
   | `session-index.enc` | The list of chats (a summary of each) and which chat was on screen last | Encrypted, purpose `session-index` |
-  | `settings.enc` | The system prompt of each model, the temperature and the longest reply set for each model, and whether the question about notifications has been asked | Encrypted, purpose `settings` |
+  | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); and whether the question about notifications has been asked | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
   | `security/lock.json` | The lock configuration (FMT-06) | Plain JSON without a secret in the clear |
 
@@ -978,6 +987,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | --- | --- | --- | --- |
   | No model, or another model, was loaded when the reply was asked for | "The model was not ready" | "No model was loaded when the answer was asked for. Try again." | "Try again" |
   | The model could not be loaded | "The model could not be loaded" | "The model may be missing from this build, or the phone may be short of memory. Try again, or choose another model." | "Try again" |
+  | The model could not be loaded because the device has too little memory available for it now (ENG-36) | "The model could not be loaded" | "The phone has too little free memory for this model right now. Close other apps and try again, or choose a smaller model." No technical detail is shown with it | "Try again" |
   | The conversation could not be put into the model's prompt format | "The message could not be sent" | "The conversation could not be put into the form this model reads." | "Try again" |
   | The latest message alone leaves no room for a reply (ENG-05) | "The message is too long for this model" | "Tokens it needs: {n}. Tokens the model can read at once: {m}. That leaves no room for an answer; shorten the message and send it again." (without the numbers: "It leaves the model no room for an answer. Shorten the message and send it again.") | "Edit message", which starts MSG-13 for that message |
   | The model's memory ran out during the reply | "The model ran out of room" | "Its memory filled up while it was answering. Try again, or carry on in a new chat." | "Try again" |
@@ -989,13 +999,13 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   action is offered as a plain row when the last turn has neither an answer nor a failure to
   show: the user's message has no reply at all (the process ended before one began), or the
   reply was stopped before it wrote anything or came out empty.
-- **MSG-16** When a conversation no longer fits the model's context, the oldest messages are
-  left out of the latest answer (ENG-04) and a note under the conversation says how many: "This
-  conversation is longer than the model can read at once. The oldest {n} message was left out
-  of the latest answer.", or with more than one "This conversation is longer than the model can
-  read at once. The oldest {n} messages were left out of the latest answer." The note belongs to
-  the latest reply in that chat: it is cleared when the next reply is asked for, and it is not
-  stored, so it is gone after a lock.
+- **MSG-16** When a conversation no longer fits the model's context at the limit that context may
+  grow to (ENG-29), the oldest messages are left out of the latest answer (ENG-04) and a note under
+  the conversation says how many: "This conversation is longer than the model can read at once. The
+  oldest {n} message was left out of the latest answer.", or with more than one "This conversation
+  is longer than the model can read at once. The oldest {n} messages were left out of the latest
+  answer." The note belongs to the latest reply in that chat: it is cleared when the next reply is
+  asked for, and it is not stored, so it is gone after a lock.
 - **MSG-17** A chat opens at its end. While a reply grows the list stays at the end; dragging
   towards older messages stops that, and reaching the end again, or a small button described as
   "Go to the latest message" that appears meanwhile, resumes it. Sending a message resumes it
@@ -1014,6 +1024,26 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   the load fails, the reply fails with that reason and can be tried again.
 - **MSG-22** However a generation ends (finished, failed, stopped, cancelled with the session),
   its message is never left marked as being written.
+- **MSG-23** When the model's context was made larger for a reply, or could not be made as large as
+  the conversation needs (ENG-28 to ENG-33), a note under the conversation says so. It stands above
+  the note of MSG-16 and has the same life: it belongs to the latest reply in that chat, is cleared
+  when the next reply is asked for, and is not stored. It is made of one or two of these sentences,
+  a growth before a limit, with the number of tokens written as the user's locale writes it:
+  - the context grew and the model kept what it had read: "This conversation needed more room, so
+    the model now reads up to {n} tokens at once.";
+  - the context grew and the conversation had to be read again from its start: "This conversation
+    needed more room, so the model now reads up to {n} tokens at once. For that it read the whole
+    conversation again.";
+  - it could not grow as far as needed because the device has too little memory available: "The
+    phone has too little free memory to give this conversation more room. For now the model reads up
+    to {n} tokens at once.";
+  - a larger context could not be created although the memory seemed to be there: "A larger context
+    could not be set up on this phone. Until the model is loaded again it reads up to {n} tokens at
+    once."
+
+  A reply for which the context grew more than once shows the size it ended with, and says that the
+  conversation was read again if any of the steps needed that. The sentence about a limit appears
+  with the reply that ran into the limit, not with every reply after it (ENG-33).
 
 ## 13. Markdown, links and copying (MD)
 
@@ -1066,7 +1096,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 `chat/ChatController.kt`, `chat/ChatScreen.kt`, `chat/ChatViewModel.kt`,
 `llama/src/main/kotlin/us/theworkmans/proseplow/llama/` (`ModelFiles.kt`, `NativeEngine.kt`),
 `models/manifest.json`; tests `core/.../core/model/ModelCatalogTest.kt`,
-`chat/ChatControllerTest.kt`, `llama/src/test/.../BundledModelNamesTest.kt`.
+`chat/ChatControllerTest.kt`, `ModelCatalogManifestTest.kt`,
+`llama/src/test/.../BundledModelNamesTest.kt`.
 
 - **MODEL-01** Three models are bundled. Their names are proper names and are shown as they are
   in every language.
@@ -1082,13 +1113,17 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   discovered, downloaded or imported at run time: adding or removing a model is a change of the
   build.
 - **MODEL-03** A new chat starts with Qwen3.5 0.8B when the build offers it (CHAT-04).
-- **MODEL-04** What each model is run with. The temperature and the longest reply can be changed
-  by the user (section 15); everything else is fixed. FMT-14 and FMT-15 give the exact rules.
+- **MODEL-04** What each model is run with. The temperature, the longest reply and how far the
+  context may grow can be changed by the user (section 15); everything else is fixed. FMT-14 and
+  FMT-15 give the exact rules, and FMT-20 those of the context.
 
   | | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
   | --- | --- | --- | --- |
-  | Context, tokens | 4,096 | 4,096 | 2,048 |
-  | Longest reply, tokens: default; allowed range | 1,024; 16 to 2,048 | 1,024; 16 to 2,048 | 512; 16 to 1,024 |
+  | Context at the start, tokens (ENG-28) | 4,096 | 4,096 | 2,048 |
+  | The most the context can become, tokens: what the model was trained with | 262,144 | 32,768 | 2,048 |
+  | Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 |
+  | Reading speed assumed until one is measured, tokens per second (ENG-30) | 90 | 184 | 380 |
+  | Longest reply, tokens: default; allowed range (MSET-11) | 1,024; 16 to at most 4,096 | 1,024; 16 to at most 4,096 | 512; 16 to 1,024 |
   | Temperature | 1.0 | 0 (always the most likely token) | 0.7 |
   | Top-k; top-p | 20; off | 50; 0.9 (both only matter once the temperature is raised) | 50; 0.9 |
   | Penalties | presence 2.0 | none | repetition 1.1 |
@@ -1096,6 +1131,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | Tokens never produced | none | token 0 | none |
   | System prompt | yes | no (trained without one) | yes |
   | Prompt format (FMT-09 to FMT-12) | ChatML with control tokens, thinking off | ChatML with injected marker ids | ChatML as plain text |
+
+  The trained context and the bytes for each token are also in `models/manifest.json`
+  (`trained_context`, `context_bytes_per_token`), where a test of the native build holds them to the
+  model files; a test of the app holds the catalogue to the manifest. The reading speeds were
+  measured on the one phone that was tested, with the app in front.
 
 - **MODEL-05** The model of a chat is chosen by tapping the title of the chat screen (the action
   is described as "Switch model"). A menu lists every offered model with its name and its
@@ -1125,11 +1165,14 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   since.
 - **MODEL-13** A build may carry any subset of the bundled models, down to none. The app copes
   with each case (MODEL-15, MODEL-16).
-- **MODEL-14** When the chat's model failed to load, a card says "{model} could not be loaded"
-  and "The model may be missing from this build, or the phone may be short of memory. Try again,
-  or choose another model.", with "Technical detail: {detail}" when there is one, and the
-  actions "Choose a model" (which opens the picker) and "Try again". It is not shown while a
-  reply's own failure already says the same (MSG-14).
+- **MODEL-14** When the chat's model failed to load, a card says "{model} could not be loaded" and
+  "The model may be missing from this build, or the phone may be short of memory. Try again, or
+  choose another model.", with "Technical detail: {detail}" when there is one, and the actions
+  "Choose a model" (which opens the picker) and "Try again". When the reason is that the device has
+  too little memory available for the model now (ENG-36), the second sentence is instead "The phone
+  has too little free memory for this model right now. Close other apps and try again, or choose a
+  smaller model.", and no technical detail is shown. The card is not shown while a reply's own
+  failure already says the same (MSG-14).
 - **MODEL-15** A chat whose model is not part of this build can be read but not continued until
   another model is chosen. A card says "This chat's model is not in this build" and "{model} is
   not part of this build of the app. Choose another model to carry on with this chat.", with the
@@ -1177,8 +1220,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     never reaching back beyond the start of what this generation wrote (so never into the user's
     text or into the part a continued message already had). The model itself still sees the
     token and what it abandoned; a deletion counts towards the reply's length (ENG-17).
-  - It runs with a context of 4,096 tokens, replies of 200 tokens by default (16 to 2,048 can be
-    set), temperature 0.9 and top-k 100. A reply ends at token 1 or token 2.
+  - It runs with a context of 4,096 tokens, which is what its model card gives as the context it
+    was trained with and where it stays: its file would allow 8,192, and the smaller number
+    counts (ENG-29). A token of context costs 40,960 bytes. Replies are 200 tokens by default (16
+    to 2,048 can be set), with temperature 0.9 and top-k 100. A reply ends at token 1 or token 2.
   - Its name is shown as "Shard-2" and its description as "Continues the text you write. It is
     not a chat model and does not answer questions. It can take back words it has just written.
     Its facts are often invented."
@@ -1197,13 +1242,13 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 **Source:** `settings/SettingsScreen.kt`, `settings/ModelSettingsScreen.kt`,
 `settings/SettingsViewModel.kt`, `settings/TemperatureInput.kt`, `settings/ReplyLengthInput.kt`,
 `settings/ModelCardLink.kt`, `data/SettingsStore.kt`, `core/.../core/model/ModelCard.kt`,
-`core/.../core/model/ReplyLength.kt`; tests in
+`core/.../core/model/ReplyLength.kt`, `core/.../core/engine/ContextPolicy.kt`; tests in
 `app/src/test/java/us/theworkmans/proseplow/settings/`, `data/SettingsStoreTest.kt`,
 `core/.../core/model/ModelCardTest.kt`.
 
 - **MSET-01** Settings are kept for each model, not for each chat: a chat that switches models
-  gets the other model's system prompt, temperature and longest reply with it. There is no
-  setting that applies to all models.
+  gets the other model's system prompt, temperature, longest reply and context size with it.
+  There is no setting that applies to all models.
 - **MSET-02** Under the heading "Models", Settings says "Each model has its own settings. Tap a
   model to see and change them." and lists every offered model as one row: its name, and a line
   with the values its next answer would be written with:
@@ -1216,7 +1261,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **MSET-03** A model's page is titled with the model's name and shows, in this order: the
   model's description; the link to its model card (MSET-15); the line "Changes are saved as you
   type and apply from the next answer."; the system prompt, or the reason why there is none;
-  the temperature; the longest reply; and the way back to the model's own values.
+  the temperature; the longest reply; how far the context may grow (MSET-19); and the way back
+  to the model's own values.
 - **MSET-04** The system prompt, for the models trained with one (Qwen3.5 and Boris-2): a field
   of 2 to 8 lines labelled "System prompt", which says "None" while empty, with the line "Given
   to the model at the start of every conversation, before your first message." It is stored as
@@ -1248,23 +1294,31 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   model's other sampling values stay. 0 makes the model always take the most likely token; the
   penalties still apply. For a model whose own temperature is 0 (Peacebell), any value above 0
   turns on sampling with that model's top-k and top-p.
-- **MSET-11** The longest reply is a whole number of tokens from 16 to half of the model's
-  context (MODEL-04), in a field labelled "Longest reply" that asks for the number keyboard.
-  Empty, the model's own value applies. Under it: "The most tokens one answer may have before it
-  stops with "Reached the length limit"; Continue carries on from there. A token is about three
-  quarters of a word. A longer limit leaves less room for the earlier conversation. Default for
-  this model: {default}; at most {most}." The two quoted names are the very texts of MSG-08 and
-  MSG-12.
-- **MSET-12** What is read as a longest reply: digits and nothing else (of any script), at most
-  9 of them, with blanks around them ignored. An entry that is not such a number, or lies
-  outside the model's range, is answered with "Enter a whole number from {least} to {most}. Not
-  saved until valid."
-- **MSET-13** The two limits are the engine's own numbers (ENG-04): it does not begin a reply
-  with less than 16 tokens of room, and it keeps at most half of the context free for a reply
-  while it leaves older messages out, so a longer limit could not be kept.
-- **MSET-14** A stored longest reply that the model no longer accepts (its context is a decision
-  of the build and can change) is neither used nor shown; the model's own value applies. It is
-  not moved to the nearest limit, because nobody chose that value.
+- **MSET-11** The longest reply is a whole number of tokens from 16 to half of what the model's
+  context may grow to on this device under the size chosen for it (MSET-19, ENG-29), and never more
+  than 4,096, in a field labelled "Longest reply" that asks for the number keyboard. With the
+  context left to itself the most is 4,096 for a model whose context may reach 8,192 tokens, and
+  1,024 for Boris-2; with a context held at 4,096 tokens it is 2,048. Empty, the model's own value
+  applies. Under it: "The most tokens one answer may have before it stops with "Reached the length
+  limit"; Continue carries on from there. A token is about three quarters of a word. A longer limit
+  leaves less room for the earlier conversation. Default for this model: {default}; at most {most}."
+  The two quoted names are the very texts of MSG-08 and MSG-12.
+- **MSET-12** What is read as a longest reply: digits and nothing else (of any script), at most 9 of
+  them, with blanks around them ignored. An entry that is not such a number, or lies outside the
+  range of MSET-11, is answered with "Enter a whole number from {least} to {most}. Not saved until
+  valid."
+- **MSET-13** The limits are the engine's own numbers (ENG-04, FMT-16): it does not begin a reply
+  with less than 16 tokens of room, and it keeps at most half of the context's limit free for a
+  reply while it leaves older messages out, so a longer limit could not be kept. The 4,096 is a
+  decision: that is plenty for one answer of a small model on a phone, however large the context may
+  become.
+- **MSET-14** A stored longest reply that lies outside the limits (how far a context may grow
+  depends on the build, the device and the size chosen for it, all of which can change) is not used:
+  the model's own value applies, itself held to the limits. It is not moved to the nearest limit,
+  because nobody chose that value. When the page is opened, such a value is not shown either. When
+  the limits change while the page is open, because another size is chosen for the context, an entry
+  that no longer lies within them stays in the field as typed and is marked as in MSET-12; it is in
+  use again as soon as the limits include it.
 - **MSET-15** The model card: a row "Model card" with the line "{address} · opens in your
   browser", where the address is `huggingface.co/{owner}/{name}` of the model's source
   repository. A tap (described as "open it in your browser") hands `https://` followed by that
@@ -1275,16 +1329,64 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   digits, `.`, `_` and `-`, each part beginning with a letter or a digit and at most 96
   characters, without `..`); for anything else the row is not shown, so no other host, path,
   query or user name can be smuggled in.
-- **MSET-16** "Restore this model's defaults" empties both number fields, whatever is in them.
-  It is enabled while either holds an entry. The line under it says "Sets the temperature and
-  the longest reply back to this model's own values. The system prompt stays as it is.", or for
-  a model without a system prompt "Sets the temperature and the longest reply back to this
-  model's own values." The system prompt is not a value with a default but something the user
-  wrote, and stays.
+- **MSET-16** "Restore this model's defaults" empties both number fields, whatever is in them, and
+  sets the context back to automatic (MSET-19). It is enabled while either field holds an entry or a
+  size is chosen for the context. The line under it says "Sets the temperature and the longest reply
+  back to this model's own values, and the context to automatic. The system prompt stays as it is.",
+  or for a model without a system prompt "Sets the temperature and the longest reply back to this
+  model's own values, and the context to automatic." The system prompt is not a value with a default
+  but something the user wrote, and stays.
 - **MSET-17** A value that is not set is not stored. A model whose own values improve in a later
   build therefore improves for everyone who never changed them.
-- **MSET-18** Not adjustable in the app: top-k, top-p, min-p, the penalties, the random seed,
-  the context length and what ends a reply.
+- **MSET-18** Not adjustable in the app: top-k, top-p, min-p, the penalties, the random seed, the
+  size a context starts with and what ends a reply.
+- **MSET-19** How far the model's context may grow is chosen under the heading "Context", for a
+  model whose context can grow on this device (ENG-29). The text under the heading says, with the
+  size the context starts with as its number: "How much of a conversation this model reads at once,
+  in tokens. It starts at {start} and grows only when a conversation needs more, which takes more of
+  the phone's memory. After the app was locked and left, the whole conversation is read again before
+  the next answer, so a longer conversation means a longer wait. An answer that goes on after the
+  app locks is stopped after ten minutes at the latest, so a conversation that takes longer than
+  that to read is best read with the app open. Beyond the limit chosen here, the oldest messages are
+  left out of an answer." Under it one size is chosen from a list:
+  - first "Automatic: up to {n} tokens on this phone", which is the default and stores nothing. The
+    number is the limit the context has when it is left to itself (ENG-29), worked out with the
+    reading speed of MODEL-04;
+  - then "Up to {n} tokens" for each fixed size: the size the context starts with, twice that, four
+    times, and so on, and as the last one the most the device's memory allows the model, which is
+    what the model was trained with when the memory holds that, and otherwise need not be a power of
+    two.
+
+  With 5,500,000,000 bytes of memory the list for Qwen3.5 is automatic up to 10,240 and the fixed
+  sizes 4,096, 8,192, 16,384, 32,768, 65,536 and 111,616; for Peacebell it is automatic up to 20,480
+  and the fixed sizes 4,096, 8,192, 16,384 and 20,480.
+- **MSET-20** Every size in that list says under its name what it costs, when the catalogue knows
+  the model's bytes for each token: "About {memory} of memory when full, and about {time} to read it
+  all again.", or for a model without a known reading speed "About {memory} of memory when full."
+  The memory is the size times the model's bytes for each token (MODEL-04), in the platform's short
+  form for an amount of bytes. The time is the size divided by the model's reading speed (MODEL-04),
+  rounded up to whole seconds. Below 90 seconds it is said in seconds, "{n} seconds" (for one, "{n}
+  second"); from there on in minutes, rounded to the nearest, "{n} minutes" (the form for one, "{n}
+  minute", exists and is never produced, because the least is 2). Both figures come from the
+  catalogue and from one phone, which is why the sentences say "about"; the engine itself decides
+  with what the loaded model reports and with the speed it has measured (ENG-30, ENG-31).
+  - **On Android:** `Formatter.formatShortFileSize`, which writes the amount in the user's locale
+    with its unit, such as 50 MB.
+- **MSET-21** A model whose context cannot grow on this device has nothing to choose, and one
+  sentence under the heading instead. When the size it has is all the model was trained with
+  (Boris-2, with 2,048): "This model reads at most {n} tokens of a conversation at once; that is the
+  model's own limit. Beyond it, the oldest messages are left out of an answer." When the device's
+  memory is the reason: "On this phone this model reads at most {n} tokens of a conversation at
+  once; the phone does not have the memory for more. Beyond it, the oldest messages are left out of
+  an answer."
+- **MSET-22** A size is stored the moment it is chosen and applies from the next answer (MSG-19).
+  Automatic is the absence of a stored size (MSET-17). A fixed size is the user's own decision: it
+  is held to the model and to the device's memory, and not to the reading time that bounds the
+  automatic size (ENG-29). A size smaller than the context already is makes the next answer leave
+  out what does not fit (ENG-30). Only the sizes of the list can be chosen. A stored size that is
+  not in the list (the build or the device was another when it was stored) stands for the largest
+  size of the list below it, or for the smallest when there is none; what the page shows as chosen
+  and what the engine is given are both that size.
 
 ## 16. Security settings (SECSET)
 
@@ -1338,7 +1440,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   every chat and setting and your passphrase, then starts again with first-time set-up."
   (RESET-05).
 - **SECSET-11** The texts of SECSET-05 and SECSET-07 take their number of minutes from the code
-  and have a singular form for a limit of one minute.
+  and have a singular form for a limit of one minute. No build shows the singular forms of the
+  two texts of SECSET-05, because that limit is 10 minutes: they are the same two sentences with
+  "minute" in place of "minutes", and they are the only wording of the app that this document
+  does not quote in full.
 
 ## 17. Screen capture, clipboard, keyboard and overlays (PRIV)
 
@@ -1499,9 +1604,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 ## 19. The inference engine (ENG)
 
 **Source:** `core/src/main/kotlin/us/theworkmans/proseplow/core/engine/` (`LlamaEngine.kt`,
-`InferenceEngine.kt`, `GenerationEvent.kt`, `ContextBudget.kt`, `PromptTokeniser.kt`,
-`ReplyAssembler.kt`, `StopStringMatcher.kt`, `Utf8Assembler.kt`, `EngineError.kt`,
-`NativeLlama.kt`); tests in `core/src/test/kotlin/us/theworkmans/proseplow/core/engine/`.
+`InferenceEngine.kt`, `GenerationEvent.kt`, `ContextBudget.kt`, `ContextPolicy.kt`,
+`PromptTokeniser.kt`, `ReplyAssembler.kt`, `StopStringMatcher.kt`, `Utf8Assembler.kt`,
+`EngineError.kt`, `NativeLlama.kt`), `DeviceMemoryGauge.kt`, `background/MemoryPressure.kt`; tests
+in `core/src/test/kotlin/us/theworkmans/proseplow/core/engine/`,
+`background/MemoryPressureTest.kt`.
 
 The engine is plain code above a narrow native interface: every decision about a reply is made
 here, and the native side only carries out single operations (section 20). The behaviour below
@@ -1511,22 +1618,27 @@ is what a port has to reproduce, whatever it is written in.
   overlap: a second request waits until the first has ended.
 - **ENG-02** The engine assumes nothing about who is calling: no screen, no lifecycle, no
   particular thread. A reply is a stream of events that anything can consume.
-- **ENG-03** The events of one reply, in order: at most one notice that the oldest messages were
-  left out (ENG-04), before anything else; progress of reading the prompt, as tokens read of
-  tokens in all, the first of which already counts what was still in memory; pieces of text; a
-  replacement of the text when the model took something back (ENG-17); and exactly one end,
-  which is either "done" with the reason, or a failure. Nothing follows the end.
-- **ENG-04** When the conversation and the room reserved for the reply do not fit the model's
-  context together, the oldest whole turns are left out, and no more of them than needed. A turn
-  is a message of the user with everything up to the next message of the user. The system
-  prompt is always kept, and so is the last turn: the latest message of the user and anything
-  after it, such as a partial answer that is being continued. The room reserved for the reply is
-  the longest reply asked for, but never more than half of the context (FMT-16).
-- **ENG-05** When only the last turn is left and it still does not fit with the full reserve,
-  it is sent as long as at least 16 tokens remain for a reply (or the longest reply asked for,
-  if that is less), and the reply then gets whatever room is left. If not even that remains, no
-  reply is begun and the request fails as "too long", with the number of tokens the shortest
-  possible prompt needs and the size of the context (MSG-14).
+- **ENG-03** The events of one reply, in order: notices about the size of the context, if it changed
+  or could not change as needed (that it was made larger, with the old size, the new size and
+  whether the conversation is read again, ENG-28; that it could not be made as large as needed, with
+  the size that is now the limit and the reason, ENG-33); at most one notice that the oldest
+  messages were left out (ENG-04); progress of reading the prompt, as tokens read of tokens in all,
+  the first of which already counts what was still in memory; pieces of text; a replacement of the
+  text when the model took something back (ENG-17); and exactly one end, which is either "done" with
+  the reason, or a failure. Nothing follows the end.
+- **ENG-04** When the conversation and the room reserved for the reply do not fit together into the
+  model's context even at the limit that context may grow to (ENG-29), the oldest whole turns are
+  left out, and no more of them than needed. Below the limit the context is made larger instead, and
+  nothing is left out (ENG-28). A turn is a message of the user with everything up to the next
+  message of the user. The system prompt is always kept, and so is the last turn: the latest message
+  of the user and anything after it, such as a partial answer that is being continued. The room
+  reserved for the reply is the longest reply asked for, but never more than half of that limit and
+  never more than 4,096 tokens (FMT-16).
+- **ENG-05** When only the last turn is left and it still does not fit with the full reserve, it is
+  sent as long as at least 16 tokens remain for a reply (or the longest reply asked for, if that is
+  less), and the reply then gets whatever room is left. If not even that remains, no reply is begun
+  and the request fails as "too long", with the number of tokens the shortest possible prompt needs
+  and the limit of the context (MSG-14).
 - **ENG-06** The conversation is rendered again from the start of what is sent for every
   request; the model's memory is never shifted or edited in place.
 - **ENG-07** The engine reuses what the model's memory already holds. It keeps a copy of the
@@ -1611,6 +1723,7 @@ is what a port has to reproduce, whatever it is written in.
   asked for never runs. Forgetting cannot be abandoned half-way, and it does not wait for a
   consumer of events that has stopped listening. If the native memory cannot be cleared, the
   model is freed, which clears it for certain. The app calls this at every lock (LOCK-17).
+  A context that had grown is back at the size it was opened with afterwards (ENG-35).
 - **ENG-22** A reply stands aside while a passphrase key is being derived (PASS-11): it pauses
   between two chunks of the prompt or between two tokens of the reply, never inside a
   computation (where its worker threads would keep the processor as busy as computing does),
@@ -1628,9 +1741,144 @@ is what a port has to reproduce, whatever it is written in.
   formats that tokenise each message on its own that bounds one message. For the plain-text
   ChatML format (Boris-2), where the whole conversation is one piece, it bounds the whole
   conversation as rendered, before any shortening by ENG-04.
-- **ENG-26** The size of the context is read back from the native side once the model is
-  loaded, not assumed from the catalogue.
+- **ENG-26** The size of the context is read back from the native side once the model is loaded and
+  after every change of that size, not assumed from the catalogue or from what was asked for.
 - **ENG-27** Every native call is made from one dedicated thread, one at a time.
+- **ENG-28** The context follows the conversation. A model is opened with a context of its starting
+  size (MODEL-04; ENG-36 for a device that cannot hold that). Before every reply the engine fits the
+  conversation to the limit of the context (ENG-29), not to the size it has. If the prompt and the
+  room reserved for the reply (FMT-16) then need more than the context has, the context is made
+  larger before anything is read: to the smallest of its steps that holds them. The steps are the
+  starting size, twice that, four times, and so on, with the limit itself as the last one; the step
+  that is needed is taken at once, without those between. A consumer is told with an event that
+  carries the old size, the new size and whether the conversation is read again (ENG-34).
+- **ENG-29** The limit of a context is the smallest of the following that apply (FMT-20 has the
+  arithmetic):
+  - what the model was trained with: the smaller of the catalogue's figure and what the model file
+    itself reports (the two differ for Shard-2, MODEL-21);
+  - what the device's memory allows: as many tokens as a quarter of the device's memory holds at the
+    model's bytes for each token, in whole multiples of 1,024, and never less than the starting
+    size;
+  - when the request names no size (the model's page says "Automatic"): what the model reads again
+    in 120 seconds at its reading speed (ENG-30), in whole multiples of 1,024, and never less than
+    the starting size;
+  - when the request names a size (MSET-22): that size, which then takes the place of the reading
+    time;
+  - a limit the engine has run into since the model was loaded (ENG-33).
+
+  The reasons. The memory of a context is allocated in full when the context is created, whether or
+  not a conversation fills it, so the largest context a model could have is not simply created. And
+  once the app was locked and left, its process has ended (END-01) and the next answer in a
+  conversation reads all of it again; left to itself the app does not let that wait grow beyond
+  about two minutes, and a longer one is the user's to choose.
+
+  With 5,500,000,000 bytes of memory and the figures of MODEL-04 the limits are 10,240 tokens for
+  Qwen3.5 left to itself (the time decides) and 111,616 at most by choice, 20,480 for Peacebell (the
+  memory decides) and 2,048 for Boris-2.
+- **ENG-30** The reading speed behind the automatic limit is one the engine has measured: after
+  every prompt of which at least 256 tokens had to be read, the tokens read divided by the time the
+  reading took, without the time spent standing aside (ENG-22) and without the fitting and growing
+  before it. Until there is such a measurement for the loaded model, the catalogue's figure is used
+  (MODEL-04); a model without one stays at its starting size when left to itself. A context that has
+  grown is not cut back by a slower measurement: while the request names no size, the limit is never
+  below the size the context has, so a conversation keeps what it was given until its memory is
+  cleared (ENG-35). A size the request names holds at once, also below what the context has: the
+  conversation is then fitted to it and what does not fit is left out (ENG-04).
+  - **Parity note:** the catalogue's speeds are those of one Android phone. A port needs figures
+    measured on its own devices for the time before the first measurement, and for what the
+    settings show (MSET-20).
+- **ENG-31** The device is asked before every step. Its memory is read at the moment a step is
+  decided, never remembered from an earlier one: how much the device has, how much of it is counted
+  as available now, the amount at which the system itself considers memory low, and whether it does
+  so now. The context's memory may then occupy at most the budget: the smaller of a quarter of the
+  device's memory, and what the context holds now plus what is available above the floor. The floor
+  is the larger of a fifth of the device's memory and twice the system's own low-memory amount. A
+  step that costs more than the budget is not asked for; the largest step that fits it is taken
+  instead, if there is one (ENG-33). What a size costs is asked of the loaded model (ENG-37). The
+  budget counts what the tokens of a context take (the model's bytes for each token times the
+  size). The native side counts more: what a loaded model reserves whatever the size of its
+  context, most of which is never touched. That part is the same before and after a step, so it is
+  taken from the model's own figure for the size it has and added to the budget, and the sum goes
+  to the native side with the step, which keeps the context's memory within it at every moment of
+  the change. A loaded model that cannot say what a context costs is not asked for another size:
+  the size it has is its limit (ENG-33).
+  - **On Android:** `ActivityManager.getMemoryInfo`: the fields `totalMem`, `availMem`, `threshold`
+    and `lowMemory`, read afresh for every decision.
+  - **Parity note:** a platform may not say how much memory is available to all apps, or may only
+    say how much this app may still take, and it may end an app that takes too much instead of
+    refusing the allocation. The properties to preserve: no step is taken that the device is not
+    known to have room for at that moment; room is left for everything else on the device; and the
+    decision is made with a fresh reading.
+- **ENG-32** While the system says that memory is low, nothing is added to a context. That is so
+  when the reading of ENG-31 says it, and for 60 seconds, on the device clock, after the system has
+  told the app so. The context then stays as it is for that reply, the oldest messages are left out
+  beyond it (ENG-04) and the consumer is told (ENG-33). Unlike a step that could not be taken, this
+  is not remembered as a limit: the next reply after the pressure has gone makes the context larger
+  as usual.
+  - **On Android:** `onLowMemory`, and `onTrimMemory` at the levels `TRIM_MEMORY_RUNNING_LOW`,
+    `TRIM_MEMORY_RUNNING_CRITICAL`, `TRIM_MEMORY_MODERATE` and `TRIM_MEMORY_COMPLETE`, both received
+    by the application object. The levels `TRIM_MEMORY_RUNNING_MODERATE`, `TRIM_MEMORY_UI_HIDDEN`
+    and `TRIM_MEMORY_BACKGROUND` do not count: the first says that memory is only beginning to get
+    short, and the others speak of the app's own place and not of memory. Since Android 14 a running
+    app is no longer told most of these levels, which is why the reading of ENG-31 is the guard and
+    these callbacks only add to it.
+  - **Parity note:** a platform's memory warning takes the part of these callbacks. The property to
+    preserve: for a while after a warning the app takes no more memory.
+- **ENG-33** When a step cannot be taken, the size the context has becomes its limit. When the
+  budget of ENG-31 does not hold the step that is needed, the context grows as far as the budget
+  allows, which may be not at all, and the size it then has is the limit for that model until it is
+  loaded again. The same holds when the native side refuses a step, and when a larger context could
+  not be created although the budget held it: the native side then sets up the previous size again,
+  with what the model had read if that could be saved, or failing that a smaller size (ENG-37), and
+  whatever exists is the limit. If no context exists at all any more, the model counts as not loaded
+  and the reply fails as in ENG-36. A consumer is told with an event that carries the limit and the
+  reason, which is either too little memory available or a context that could not be created; the
+  event is sent once for a limit, not with every reply that runs into it. The conversation is then
+  fitted to the limit (ENG-04).
+- **ENG-34** What a step costs. The model's memory of the conversation is carried into the larger
+  context, with its checkpoints (ENG-09), when the native side can do that within the budget; only
+  what is new is then read (ENG-07). When it cannot, the memory comes back empty and the whole
+  conversation is read again; the event of ENG-28 says which. Either way at least one token is read
+  before the first token of the reply is sampled, because no prediction survives the change. Reading
+  after a step is reading like any other: it reports its progress, stops between chunks when the
+  reply is stopped or the app locks, and stands aside for a key derivation (ENG-11, ENG-22). The
+  sampler and the threads are as they were.
+- **ENG-35** The memory of a grown context is given back by clearing the model's memory, which
+  returns the context to the size it was opened with. That happens:
+  - at every lock, with "forget" (ENG-21, LOCK-17);
+  - when a reply is asked for in a conversation that fits the starting size while the context is
+    larger, and at most 1,024 of the tokens in memory could have been used for it; those are then
+    read again. That is the case for another conversation, which shares only its beginning with the
+    one in memory;
+  - whenever the memory is cleared for another reason: the model cannot go back to the point a new
+    prompt needs (ENG-08), or a reply failed (ENG-19).
+
+  A conversation that only became shorter (its latest message was edited, say) keeps its context and
+  what was read of it until the next lock: reading thousands of tokens again would cost the user
+  more than the memory is worth until then. A limit found by ENG-33 stays in force across all of
+  this.
+- **ENG-36** Opening a model follows the rule of ENG-31, with nothing held yet: the tokens of a
+  context of the starting size, at the catalogue's bytes for each token, must fit the smaller of a
+  quarter of the device's memory and what is available above the floor. If they do not, half the
+  size is taken, and half again, as long as the half is at least 1,024 tokens. Below that the model
+  is not loaded: loading ends as failed for the reason "too little memory available", which the chat
+  words on its own (MODEL-14, MSG-14). The engine decides this itself, before the native side is
+  asked for anything, and gives the native side no narrower budget for the opening: what a model
+  reserves beyond its tokens is the same at every size and not known before it is loaded. Should
+  the native side refuse a size all the same, it is asked for half in the same way. A context
+  opened smaller is the starting size for everything else in this section.
+- **ENG-37** What the engine asks of the native side for all this: the context the model was trained
+  with; the bytes a context of a given size takes; and a change of size within a budget, which has
+  three outcomes. Done: the context has the size asked for, the memory was kept with its checkpoints
+  or is empty, and no prediction is ready. Refused before anything was touched (status 9): the size
+  is above the trained context or costs more than the budget. Not created after the old context was
+  given up (status 10): the previous size has been set up again, with its memory if that could be
+  saved, or failing that ever smaller sizes, and the size read back says what exists, 0 for nothing.
+  Opening takes the starting size and a budget, and answers a size beyond the budget with status 9
+  without creating anything; the engine states no budget there (ENG-36). Clearing the memory returns
+  the context to the size it was opened with.
+  To the sampler the engine says explicitly that the penalties have no window (FMT-15), so that they
+  cover the whole memory whatever size the context has.
 
 ## 20. The native session (NAT)
 
@@ -1670,7 +1918,7 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 
   | Size | Limit |
   | --- | --- |
-  | Context | 32,768 tokens, and the context the model was trained for |
+  | Context | the context the model was trained for (2,048 tokens for Boris-2, 32,768 for Peacebell, 262,144 for Qwen3.5); below that, a budget in bytes that the caller states: the session computes what a context of the size costs and refuses it before anything is allocated when it costs more (NAT-16) |
   | Tokens read in one go | 32,768; the app uses 256 |
   | Text tokenised in one call | 262,144 bytes |
   | Checkpoints held at once | 8; the engine keeps 4 |
@@ -1698,21 +1946,40 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   below one millionth selects the most-likely-token path.
 - **NAT-11** Boris-2 cannot be given its own end-of-text token as input (its computation would
   stop the process); the session refuses that token with a status and leaves the memory alone.
-- **NAT-12** A failure is one of eight status codes, shared with the engine and never
+- **NAT-12** A failure is one of ten status codes, shared with the engine and never
   renumbered: 1 load failed, 2 load cancelled, 3 tokenising failed, 4 context full, 5 evaluation
-  failed, 6 sampling failed, 7 out of memory, 8 invalid argument. A short technical description
+  failed, 6 sampling failed, 7 out of memory, 8 invalid argument, 9 context refused, 10 context
+  not created (ENG-37). A short technical description
   goes with it and never contains text of a conversation.
 - **NAT-13** Forgetting a conversation frees the context, the token batch and the sampler and
-  creates them again, after overwriting what the session can reach of the conversation: every
-  checkpoint, the scores of the last prediction, the candidate list, the tokens in the batch,
-  the session's own record of the tokens in memory, and the key-value and state buffers of the
-  memory. The model stays loaded. The allocator is then asked to give its free pages back. On
-  the phone that was tested this took between 15 and about 160 milliseconds, depending on the
-  model. MEM-04 says what it does not reach.
-- **NAT-14** Nothing in the native code logs or prints text, token ids or pieces, and
-  llama.cpp's own log is switched off for the whole process.
+  creates them again, the context at the size the model was opened with whatever it had grown
+  to, after overwriting what the session can reach of the conversation: every checkpoint, the
+  scores of the last prediction, the candidate list, the tokens in the batch, the session's own
+  record of the tokens in memory, and the key-value and state buffers of the memory. The model
+  stays loaded. The allocator is then asked to give its free pages back. On the phone that was
+  tested this took between 15 and about 160 milliseconds, depending on the model, with contexts
+  of the starting size; a context that has grown has more to overwrite (on a desktop: Qwen3.5
+  27 ms at 4,096 tokens and 104 ms at 65,536, Peacebell 105 ms at 4,096 and 189 ms at 16,384).
+  Changing the size of the context (NAT-16) overwrites and frees in the same way. MEM-04 says
+  what it does not reach.
+- **NAT-14** Nothing in the native code logs or prints text, token ids or pieces. llama.cpp's
+  own log is written nowhere: the session takes from it only the name of the compute back end
+  that was loaded, the description of a failure and the sizes of the buffers of a context, none
+  of which contains text of a conversation.
 - **NAT-15** Closing a model frees everything after the same overwriting, and the memory it used
   is given back to the system.
+- **NAT-16** The size of the context can change while the model stays loaded. The native layer
+  says what the model's largest context is and what a context of a given size costs in memory
+  (llama.cpp's own figures for the buffers it allocates, read when a context is created), and
+  changes the size when asked, within a budget in bytes. A size above the model's largest, or
+  whose cost is above the budget, is refused with nothing touched (code 9). Otherwise the old
+  context is overwritten and freed and the new one created; the memory is carried over when the
+  budget also covers the block it is copied through, and comes back empty otherwise;
+  checkpoints survive exactly when the memory does, and no prediction is ready afterwards. A
+  size that cannot be created falls back to the previous size, then to halves (code 10). Sizes
+  are whole multiples of 256 tokens, as llama.cpp rounds them. Not promised: surviving an
+  allocation that the system grants and cannot back, where the budget is the protection, or a
+  failure inside ggml's own bookkeeping allocation.
 
 ## 21. What stays in memory (MEM)
 
@@ -1721,7 +1988,9 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 `native/session/tests/test_residue.cpp`.
 
 - **MEM-01** While the app is unlocked, the data key, the decrypted chats and settings, and the
-  model's working memory of the conversation are in the app's memory.
+  model's working memory of the conversation are in the app's memory. That working memory is the
+  model's context, whose size follows the conversation (ENG-28): from the size it starts with up to
+  a quarter of the device's memory (ENG-29).
 - **MEM-02** When the session is closed (at a lock, or when an answer that was finished behind
   the lock has been saved), the data key's bytes are overwritten and the key refuses every
   further use; the engine overwrites its own copy of the conversation's tokens; and the native
@@ -1752,6 +2021,10 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 - **MEM-08** While an answer is being finished behind the lock, everything of MEM-01 is still in
   memory, the data key included, for at most 10 minutes (LEASE-12).
 - **MEM-09** Nothing is done about what the system may have moved to compressed swap.
+- **MEM-10** Clearing the model's memory at a lock also returns a grown context to the size it
+  started with (ENG-35), so the memory a long conversation took is given back to the device then.
+  The phone's times in NAT-13 were measured with contexts of the starting size; a context that has
+  grown has more to overwrite, and NAT-13 gives the times measured on a desktop.
 
 ## 22. About, licences and notices (ABOUT)
 
@@ -1829,8 +2102,8 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
 - **A11Y-04** The line "This app uses AI, and AI can make mistakes." is never announced by
   itself, only when the user moves to it (CHAT-20).
 - **A11Y-05** The titles of Settings and of a model's page, the headings of the groups in
-  Settings and About, and every heading of the notices are marked as headings, so a screen
-  reader can move from one to the next.
+  Settings and About, the heading "Context" on a model's page, and every heading of the notices
+  are marked as headings, so a screen reader can move from one to the next.
 - **A11Y-06** A row that is one action is read as one thing with what a tap does: a model's row
   in Settings ("open its settings"), the model card row ("open it in your browser"), and the
   title of the chat screen ("Switch model"). While the model picker is unavailable the title
@@ -1847,6 +2120,9 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
   much is in it. A test on a device looks at the field the way such a service does.
 - **A11Y-10** An accessibility service that the user has enabled can otherwise read what is on
   the screen, chats included (THREAT-12).
+- **A11Y-11** The sizes of MSET-19 are one group of radio buttons. Each row, its name together with
+  its cost, is one radio button that reports whether it is selected, and the whole row is the touch
+  target.
 
 ## 24. Guarantees of the build (BUILD)
 
@@ -2066,16 +2342,17 @@ This section is exact where the others describe. Each item carries one of three 
     chat) and each entry of `sessions` has `id`, `title`, `createdAtMillis`, `updatedAtMillis`,
     `modelId` and `messageCount`. Unknown fields are ignored; a list that cannot be read is
     rebuilt from the chat files (STORE-11).
-  - The settings: `{"schemaVersion": 1, "settings": {...}}`, where `settings` has
-    `systemPrompts` (an object from model id to text), `models` (an object from model id to an
-    object with the optional numbers `temperature` and `maxNewTokens`) and the boolean
-    `notificationsAsked`. A value that is not set is not written, a model with nothing set has
-    no entry, and `notificationsAsked` is written only once it is true. On reading, unknown
-    fields are
-    ignored; a system prompt that is not text, a temperature that is not a number from 0 to 2, a
-    longest reply that is not a whole number of at least 16 written as one, and a flag that is
-    not a boolean are left out and counted; anything counted, or a higher schema version, makes
-    the settings "partly read" (STORE-16); text that is not such an object is "unreadable".
+  - The settings: `{"schemaVersion": 1, "settings": {...}}`, where `settings` has `systemPrompts`
+    (an object from model id to text), `models` (an object from model id to an object with the
+    optional numbers `temperature`, `maxNewTokens` and `contextTokens`, the last being the size
+    chosen for the context, MSET-22) and the boolean `notificationsAsked`. A value that is not set
+    is not written, a model with nothing set has no entry, and `notificationsAsked` is written only
+    once it is true. On reading, unknown fields are ignored; a system prompt that is not text, a
+    temperature that is not a number from 0 to 2, a longest reply that is not a whole number of at
+    least 16 written as one, a context size that is not a whole number of at least 1,024 written as
+    one, and a flag that is not a boolean are left out and counted; anything counted, or a higher
+    schema version, makes the settings "partly read" (STORE-16); text that is not such an object is
+    "unreadable".
 
 ### Prompts
 
@@ -2218,22 +2495,24 @@ This section is exact where the others describe. Each item carries one of three 
   last, which gives a different result, and its built-in penalties give all three the same
   tokens to look at; neither is used. A temperature set by the user replaces the temperature in
   this table and nothing else.
-- **FMT-16** *(Must match)* Budget. With `context` the size of the model's context in tokens and
-  `asked` the longest reply (the user's value for the model, or the model's own):
-  - `reserve` = the smaller of `asked` and half of `context` (rounded down);
+- **FMT-16** *(Must match)* Budget. With `context` the limit of the model's context in tokens
+  (FMT-20) and `asked` the longest reply (the user's value for the model, or the model's own):
+  - `reserve` = the smallest of `asked`, half of `context` (rounded down) and 4,096;
   - `minimum` = the smaller of `asked` and 16;
-  - the conversation may begin at its first message or at any later message of the user. The
-    longest such conversation whose prompt, in tokens, plus `reserve` is not more than `context`
-    is sent, and the messages before its beginning are the ones reported as left out;
-  - if not even the conversation that begins at the latest message of the user fits with
-    `reserve`, that one is sent provided its prompt plus `minimum` is not more than `context`;
-    otherwise the request is too long (ENG-05);
-  - the reply may then have at most the smaller of `asked` and `context` less the prompt's
-    tokens. A deletion counts as a token of the reply; the token that ends a reply does not.
+  - the conversation may begin at its first message or at any later message of the user. The longest
+    such conversation whose prompt, in tokens, plus `reserve` is not more than `context` is sent,
+    and the messages before its beginning are the ones reported as left out;
+  - if not even the conversation that begins at the latest message of the user fits with `reserve`,
+    that one is sent provided its prompt plus `minimum` is not more than `context`; otherwise the
+    request is too long (ENG-05);
+  - the context is then made to hold the prompt plus `reserve`, or `context` if that is less
+    (FMT-20), and the reply may have at most the smaller of `asked` and the size the context then
+    has less the prompt's tokens. A deletion counts as a token of the reply; the token that ends a
+    reply does not.
 
   The lengths are counted in tokens of the rendered prompt, system text included, never in
   characters. A model that continues text has no earlier turns to leave out. The longest reply a
-  user can set is therefore from 16 tokens to half of the context (MSET-11).
+  user can set is therefore from 16 tokens to the smaller of half of `context` and 4,096 (MSET-11).
 - **FMT-17** *(Must match)* The text of a reply, from the bytes of its tokens (ENG-14): bytes are
   decoded as UTF-8 across token borders, with one replacement character (U+FFFD) for each
   longest invalid prefix and the bytes of an unfinished character dropped at the end; stop
@@ -2270,6 +2549,39 @@ This section is exact where the others describe. Each item carries one of three 
   the delays of the writer (1 second for lazy writes, 10 seconds at a lock), the names of files
   inside the private storage as far as FMT-03 does not fix them, and every matter of layout and
   colour.
+- **FMT-20** *(Must match)* The size of a context. All sizes are in tokens. `total` is the device's
+  memory in bytes, `available` the memory counted as available now and `low` the amount at which the
+  system considers memory low (ENG-31); `start` is the size the context was opened with, `trained`
+  the smaller of the catalogue's and the model file's trained context, `bytes` the model's bytes for
+  each token and `speed` its reading speed in tokens per second (ENG-30).
+  - `cap` = a quarter of `total`; `floor` = the larger of a fifth of `total` and twice `low`;
+  - `byMemory` = `trained` if `cap` holds that many tokens at `bytes` each, and otherwise the number
+    of tokens `cap` holds, rounded down to a multiple of 1,024; in either case not less than the
+    smaller of `start` and `trained`. With `bytes` not known, `byMemory` = `trained`;
+  - `byTime` = `speed` times 120, rounded down to a multiple of 1,024, and not less than `start`;
+    with no speed known, `start`;
+  - the limit with no size chosen = the smallest of `trained`, `byMemory`, `byTime` and a limit
+    found by ENG-33, and then not less than the size the context has now; the limit with a size
+    chosen = that size, held between 1 and `byMemory`, and not more than a limit found by ENG-33;
+  - the steps = `start`, twice `start`, four times `start` and so on while below the limit, then the
+    limit; only the limit when it is not above `start`;
+  - the sizes offered for choosing (MSET-19) = the steps from `start` to `byMemory`; a stored size
+    stands for the largest of them not above it, or the smallest (MSET-22);
+  - the budget, with `held` the bytes of the tokens of the context as it is (its size times `bytes`;
+    0 when a model is opened) = the smaller of `cap` and `held` + `available` - `floor`, and not less
+    than 0. The bytes of a step that are held against it are those of its tokens (ENG-31);
+  - when a reply needs more than the context has, `needed` = the prompt's tokens plus `reserve`
+    (FMT-16), or the limit if that is less. The target is the smallest step not below `needed`. The
+    step taken is the largest step above the present size and not above the target whose bytes are
+    not more than the budget; if there is none, or while the system reports low memory (ENG-32),
+    none is taken.
+
+  The quarter, the fifth, the factor of two, the 120 seconds and the 1,024 are the values of one
+  policy that the engine and the settings share. For `byMemory` the engine takes `bytes` from what
+  the loaded model reports for two sizes, and the settings take it from the catalogue; for a step
+  the bytes of a size are what the loaded model reports for that size, less what it reports beyond
+  the tokens of the size it has (ENG-31). What `total`, `available` and `low` are is the platform's
+  to say.
 
 ## 26. Security model (THREAT, DEC)
 
@@ -2622,8 +2934,8 @@ the fixtures under `core/src/test/resources/golden/`.
   - Limits found in the code: the engine gives a model that was trained without a system message
     no system text of any kind (ENG-24), so instructions sent this way do not reach Peacebell,
     and the text-continuation format ignores system text altogether. The system text is never
-    left out when a conversation is shortened (ENG-04) and counts against contexts of 4,096 and
-    2,048 tokens.
+    left out when a conversation is shortened (ENG-04) and counts against the model's context
+    (MODEL-04), which for Boris-2 is 2,048 tokens and cannot grow.
   - Open: which models get tools at all, and how long the instructions may be.
 - **TOOL-04** *A call written by the model.* The intention: the model writes a call as one line
   in the syntax of a Python call; some models have another, native form, and Qwen's resembles
@@ -2792,8 +3104,8 @@ Parity includes the absences. A port that adds one of these has changed what the
   of a graphics processor or neural accelerator; never two models in memory; never two replies
   at once.
 - **NOT-10** No settings for a single chat and no setting for all models; no control over top-k,
-  top-p, the penalties, the seed, the context length or what ends a reply; no "thinking" mode
-  for Qwen3.5; no reproducible reply.
+  top-p, the penalties, the seed, the size a context starts with or what ends a reply; no "thinking"
+  mode for Qwen3.5; no reproducible reply.
 - **NOT-11** No renaming of a chat, no search across chats, no folders, pins or archive, no
   alternative versions of an answer to go back to, no selecting several chats, and no undo of a
   deletion.
@@ -2809,3 +3121,8 @@ Parity includes the absences. A port that adds one of these has changed what the
   answer that was stopped, by anything, stays stopped until the user continues it or asks again.
 - **NOT-17** Nothing is written on the user's behalf: no reply is started without a tap, and an
   answer is never begun while the app is locked.
+- **NOT-18** No promise that the system never ends the app for lack of memory. The engine takes
+  memory only after asking how much there is (ENG-31), but what a system reports can change a moment
+  later, and a system may end an app without refusing anything first. What is kept then is the chat
+  on the disk (STORE-07): every message as it was sent, and the answer under way as far as it had
+  been written, at most a second behind.

@@ -57,6 +57,10 @@ enum pp_status {
     PP_STATUS_SAMPLING_FAILED   = 6,
     PP_STATUS_OUT_OF_MEMORY     = 7,
     PP_STATUS_INVALID_ARGUMENT  = 8, // the caller broke a documented precondition
+    PP_STATUS_CONTEXT_REFUSED   = 9, // a context size was refused before anything was touched: above what the
+                                     // model was trained for, or its computed cost above the budget
+    PP_STATUS_CONTEXT_NOT_CREATED = 10, // a context of the asked size could not be created after the old one
+                                     // was freed; pp_session_context_size says what the session has instead
 };
 
 // The limits on sizes that arrive from outside. llama.cpp takes a size as given and allocates
@@ -64,12 +68,17 @@ enum pp_status {
 // a value that is merely wrong, a setting read from damaged storage for instance, would
 // otherwise end the process inside the call instead of coming back as a status.
 
-// The largest context a session opens, in tokens. A session also refuses a context above the
-// one its model was trained for; this ceiling is for the model whose trained context is beyond
-// anything a phone can hold (Qwen3.5: 262144 tokens). It is the largest trained context among
-// the models that fit one, eight times what the app runs, and about 2 GiB of memory for a
-// model of the bundled kind (some 64 KiB per token).
-#define PP_CONTEXT_TOKENS_MAX 32768
+// The largest batch a session is opened with, in tokens: the most that one llama_process call
+// evaluates. The compute buffers are reserved for a whole batch (the scores of every token of
+// it: the batch times the vocabulary times four bytes), so this is the size that must not be
+// taken as given.
+//
+// The context has no such constant. Its ceiling is the model's own, the context it was trained
+// for (pp_session_max_context_size: 2,048 tokens for Boris-2, 32,768 for peacebell, 262,144
+// for Qwen3.5), and below that ceiling a size is held to a budget in bytes that the caller
+// states: the session computes what a context of the size costs before it allocates anything
+// and refuses a size that costs more (pp_session_context_bytes, pp_session_resize_context).
+#define PP_BATCH_TOKENS_MAX 32768
 
 // The most checkpoints a session holds at a time. One is megabytes for a model with recurrent
 // state (20 MB for Boris-2); the engine keeps four.
@@ -150,10 +159,13 @@ typedef bool (*pp_load_progress_fn)(float fraction, void * user_data);
 // from another thread rebuilds the pool. Where threads cannot be pinned at all (no such system
 // call, or it is refused), a session simply runs n_threads threads.
 struct pp_session_params {
-    int32_t n_ctx;      // the context in tokens; from 1 to PP_CONTEXT_TOKENS_MAX and at most the model's trained
-                        // context. Read the real value back with pp_session_context_size: llama.cpp rounds it up
+    int32_t n_ctx;      // the context the session opens with, in tokens; at least 1. More than the model was
+                        // trained for is taken as that. It is also the size pp_session_clear_memory returns
+                        // to. Read the real value back with pp_session_context_size: llama.cpp rounds it up
+    int64_t context_budget_bytes; // the most bytes the context may cost (see pp_session_context_bytes); at
+                        // least 1. An opening size that costs more is refused: PP_STATUS_CONTEXT_REFUSED
     int32_t n_batch;    // the most tokens evaluated by one llama_process call (and one micro-batch); from 1 to
-                        // PP_CONTEXT_TOKENS_MAX. More than n_ctx is taken as n_ctx
+                        // PP_BATCH_TOKENS_MAX. More than the context is taken as the context
     int32_t n_threads;  // threads for evaluation when they are not pinned; at least 1
     const int32_t * pinned_cpus; // CPU numbers to run one pinned thread each; NULL when n_pinned_cpus is 0
     int32_t n_pinned_cpus;       // 0: never pin
@@ -171,9 +183,16 @@ struct pp_session;
 // description of at most error_size bytes.
 //
 // Returns PP_STATUS_INVALID_ARGUMENT for parameters outside the ranges stated at
-// pp_session_params. A context or batch above PP_CONTEXT_TOKENS_MAX is refused before the file
-// is touched; a context above the model's trained one is refused once the model is loaded and
-// says so, before any context is created.
+// pp_session_params, before the file is touched. Returns PP_STATUS_CONTEXT_REFUSED, with the
+// model freed again, when the opening context costs more than the budget.
+//
+// What a context costs is only known from llama.cpp's report of one, so a session creates a
+// small context first and frees it (an eighth of the opening size and at most four batches,
+// rounded up to 256 tokens, when that is at least a batch and less than the opening size): the
+// one allocation that is made before any cost is known.
+// The opening size is then held to the budget before it is allocated. A session that opens
+// smaller is held to the budget after its context exists, and that context is freed again if
+// it costs more.
 int32_t pp_session_open_path(
         const char * path,
         const struct pp_session_params * params,
@@ -263,9 +282,88 @@ int32_t pp_session_vocab_size(const struct pp_session * session);
 // Memory
 //
 
-// The number of tokens the memory can hold: llama_n_ctx of the created context. 0 for a session
-// that has no context (see pp_session_clear_memory).
+// The number of tokens the memory can hold now: llama_n_ctx of the context there is. It changes
+// with pp_session_resize_context and goes back to the opening size with
+// pp_session_clear_memory. 0 for a session that has no context (see both).
 int32_t pp_session_context_size(const struct pp_session * session);
+
+// The most tokens a context of this model can have: the context it was trained for, from the
+// model file (llama_model_n_ctx_train).
+int32_t pp_session_max_context_size(const struct pp_session * session);
+
+// What a context of n_ctx tokens costs in bytes, at the batch this session was opened with:
+// what llama.cpp allocates for it (the key-value buffers, which are zeroed when they are
+// created and so resident at once; the recurrent state; the compute and output buffers; and
+// its own bookkeeping), and the session's record of the tokens. It is an upper bound on what
+// becomes resident, because the compute buffers and the bookkeeping are reserved for the worst
+// case and mostly never touched; the difference between two sizes, which is nearly all
+// key-value buffer, is what a caller should budget with.
+//
+// The figures are llama.cpp's own, read from the lines in which it reports each buffer it
+// allocated for a context of this session ("... buffer size = 48.00 MiB"): the key-value bytes
+// per token from the largest context created so far, the growth of the compute reservation
+// from two contexts of different sizes, and what llama.cpp does not report from the
+// allocator's statistics, where the system has any. Nothing is derived from the architecture.
+// Returns -1 for a size below 1 or above pp_session_max_context_size, and when the report was
+// not understood (its form is llama.cpp's to change): no size is costed then, and none can be
+// changed to.
+int64_t pp_session_context_bytes(const struct pp_session * session, int32_t n_ctx);
+
+// The bytes of the block that carrying the present memory over to another context would hold
+// beside a context (see pp_session_resize_context): llama_state_seq_get_size_ext for the whole
+// sequence. 0 for an empty memory and for a session without a context. The session does this
+// arithmetic itself; the number is here for a caller that wants to know the peak beforehand,
+// and for the tests of that arithmetic.
+int64_t pp_session_carry_bytes(const struct pp_session * session);
+
+// Gives the session a context of n_ctx tokens while the model stays loaded.
+//
+// budget_bytes is the most bytes the session's context memory may occupy at any moment during
+// and after the call, in the terms of pp_session_context_bytes. What happens is the best of
+// three that fits it:
+//
+// - The memory is carried over. Its sequence state (llama_state_seq_get_data_ext, every cell
+//   in use and the recurrent state) is written into one block; the old context is overwritten
+//   and freed as at a clear; the new one is created; the block is read into it, overwritten and
+//   freed. The peak is that block beside a context: beside the old one while it is written and
+//   beside the new one while it is read, so the larger of the two contexts plus the block
+//   (about the tokens in memory times the key-value bytes per token, plus the recurrent state).
+//   Afterwards pp_session_memory_token_count is what it was, every checkpoint is still valid,
+//   and the penalties cover what they covered. This needs the memory to fit the new size.
+// - The memory comes back empty, when the block does not fit the budget beside a context or
+//   could not be written or read: exactly what pp_session_clear_memory does, at the new size.
+//   Every checkpoint handle is unknown and the sampler begins again.
+// - The size is refused, when it is above pp_session_max_context_size, when its cost is above
+//   the budget, or when the cost is not known: PP_STATUS_CONTEXT_REFUSED, and nothing was
+//   touched. The memory, the checkpoints and a ready prediction are as they were.
+//
+// Which of the first two happened is what pp_session_memory_token_count says afterwards. No
+// prediction is ready after either: evaluate at least one token before sampling, as after a
+// restored checkpoint. llama.cpp makes every context a whole number of 256 tokens, so a size
+// is rounded up to one before it is costed or compared; a size that rounds to the present one
+// is nothing to do and changes nothing, a ready prediction included.
+//
+// When the new context cannot be created although its cost fits the budget, the session tries
+// the size it had, then halves of that down to 256 tokens, each only if it fits the budget, and
+// answers PP_STATUS_CONTEXT_NOT_CREATED: pp_session_context_size says which exists, and 0
+// means none (the session is then as after a failed pp_session_clear_memory). A memory that
+// was being carried over is put into the size it had if that could be created again, and is
+// gone otherwise.
+//
+// What is and is not promised about failing. A size is costed and held to the budget before
+// anything is allocated, and before llama.cpp is asked for a context the session maps and
+// unmaps the whole cost once, untouched, so a size the address space has no room for is
+// reported and never reaches llama.cpp. That matters because llama.cpp reports a key-value or
+// compute buffer it could not allocate (the creation fails and this function falls back), but
+// ggml ends the process when one of its own bookkeeping buffers cannot be had (GGML_ASSERT in
+// ggml_init): between the test and the allocation another thread can take the room, and then
+// that remains possible. And on a system that hands out address space without memory behind
+// it, Android among them, an allocation does not fail at all: the process is ended while the
+// buffer is zeroed. The budget is the protection there, and it is the caller's to derive from
+// the memory the system has free.
+//
+// Returns PP_STATUS_INVALID_ARGUMENT for a size or a budget below 1.
+int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, int64_t budget_bytes);
 
 // The number of tokens in memory: llama_memory_seq_pos_max + 1, which is 0 when it is empty,
 // as it also is for a session that has no context.
@@ -368,7 +466,8 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
 // Forgets the conversation: this is what runs when the app locks. Afterwards the memory is
 // empty, every checkpoint handle is unknown, no prediction is ready, the model is still loaded
 // and the sampler is still configured as it was: its random numbers start where they started,
-// and no reply has begun.
+// and no reply has begun. The context has the size the session was opened with, whatever it
+// had grown to: the memory a long conversation needed is given back with the conversation.
 //
 // What is done, in this order:
 // - every checkpoint is overwritten with zeros and freed;
@@ -379,8 +478,9 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
 //   and the context is freed with everything it owns;
 // - the session's record of the tokens in memory, which the penalties are computed from, is
 //   overwritten and emptied;
-// - a new context, a new batch and a new sampler chain are created from the parameters the old
-//   ones were created with (the thread pool is kept: it holds nothing of a conversation);
+// - a new context of the opening size, a new batch and a new sampler chain are created from
+//   the parameters the first ones were created with (the thread pool is kept: it holds
+//   nothing of a conversation);
 // - the allocator is asked to give its free pages back to the system (malloc_trim with glibc,
 //   mallopt(M_PURGE_ALL) on Android), which empties those pages.
 //
@@ -416,12 +516,17 @@ struct pp_sampler_config {
     float    repetition_penalty;  // 1 is neutral; covers every token in memory
     float    presence_penalty;    // 0 is neutral; covers the tokens of the reply
     float    frequency_penalty;   // 0 is neutral; covers the tokens of the reply
-    int32_t  penalty_window;      // how many of the latest tokens in memory the penalties look at; at least 1. The
-                                  // context size or more is no window, which is what the definitions below have
+    int32_t  penalty_window;      // how many of the latest tokens in memory the penalties look at: at least 1, or
+                                  // PP_PENALTY_NO_WINDOW for the whole memory, which is what the definitions
+                                  // below have. 0 and every other negative value are refused
     uint32_t seed;
     const llama_token * banned_tokens; // tokens that must never be sampled; may be NULL when n_banned_tokens is 0
     int32_t  n_banned_tokens;     // at most the size of the vocabulary
 };
+
+// No window for the penalties: llama.cpp's own value for "the whole context". Named and not a
+// number of tokens, because the context of a session can change (pp_session_resize_context).
+#define PP_PENALTY_NO_WINDOW (-1)
 
 // The lowest temperature that is used as one. The scores are divided by the temperature: a
 // value this side of a millionth turns their differences into infinities, and the "choice"

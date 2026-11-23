@@ -9,7 +9,6 @@ import org.junit.Test
 import us.theworkmans.proseplow.core.engine.FakeNativeLlama.Call
 import us.theworkmans.proseplow.core.model.ModelFamily
 import us.theworkmans.proseplow.core.model.ReplyLength
-import us.theworkmans.proseplow.core.model.replyLengthRange
 import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptMessage
@@ -99,7 +98,7 @@ class LlamaEngineBudgetTest {
     @Test
     fun `a reply limit at the model's maximum leaves a workable prompt and can be reached`() = runTest {
         val model = testModel(contextLength = 600)
-        val limit = model.replyLengthRange.last
+        val limit = ReplyLength.range(model.contextLength).last
         assertEquals(300, limit)
         val test = loadedEngine(model)
         test.fake.enqueueReply("y".repeat(1_000))

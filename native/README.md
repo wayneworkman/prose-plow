@@ -188,6 +188,7 @@ reported by ctest as skipped, never as failed.
 | `boris-2-instruct.no-ngram-lookup` | The F32 file with its four lookup arrays removed, against the reference with the lookup switched off: all the checks of `logits-f32`. It separates Canon and the hybrid memory from the n-gram input |
 | `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
 | `<model>.penalties` | For each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2, what the sampling penalties cover. A second context on the same file, which the session does not know, scores the same memory, and the penalties' definitions are applied to its scores as the test writes them out: the session's greedy choice must be the token that comes out on top, step by step, for a repetition penalty over the whole memory (1.1 and 1.6), for presence and frequency penalties over the reply alone (Qwen3.5's 2.0 among them), after going back to the end of the prompt and into the middle of a reply without configuring the sampler again (by removing the end of the memory where the model allows it, and through a checkpoint), with every checkpoint dropped, after a clear, after a prompt whose evaluation was cancelled and finished by a second call, and with a window. Each check names the mistake it is there to catch (a penalty over the reply alone, one that counts the prompt too, a record that still holds tokens which left the memory or lacks tokens that are in it) and fails when no step would have exposed it. Boris-2 further, against `boris-2-instruct-penalty.bin`: six requests of a conversation served from one memory, greedy with the model's repetition penalty of 1.1, choose the tokens that transformers' `generate()` chooses (128 reply tokens; a reference choice with a lead below 0.1 is reported, not required); at the first position of each reply, where only the prompt can be penalised, the logits and the scores after the penalty are the reference's to within 0.05 and the session's first choices in order are the reference's; with the penalty off the first token is the reference's without a penalty |
+| `<model>.context` | For each bundled model and for shard-2, the size of a session's context. The model's `trained_context` and `context_bytes_per_token` of `models/manifest.json` are held to the file. What the session says a context costs is held to what the allocator handed llama.cpp for contexts of 256, 512 and 1,024 tokens (within 1%), and for the model's largest context to llama.cpp's own sizing of it from a model loaded without allocating (within 3%), so nothing large is allocated. A size above the model's largest or above the budget is refused with the memory, a checkpoint and a ready prediction untouched; a budget one byte below the peak of a carry-over comes back with an empty memory and one at the peak with the memory carried over, its checkpoint valid and its continuation the same as a fresh evaluation at that size; a size smaller than the memory empties it. With the address space of the test process limited (never by using memory up), a larger size that cannot be mapped leaves the previous size with its memory, a tighter limit leaves half of it, none at all leaves no context, and a clear repairs that; opening over the budget is refused. The check of llama.cpp's report says in its own text what to do when the report's form changes |
 | `<model>.residue` | For the three bundled models and shard-2: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
@@ -688,13 +689,16 @@ phone runs. The header is the reference for every function; this is the outline:
 | `pp_session_evaluate` | Chunks through `llama_batch_ext` and `llama_process` with explicit positions and output for the last token only; a progress and a cancel callback |
 | `pp_session_rewind_to` | `llama_memory_seq_rm(mem, 0, n, -1)` and its own answer, which is "no" for a model with recurrent state. For a model with windowed layers the session answers "no" itself when those layers no longer hold the window before the cut (see below). Nothing ever calls `llama_memory_seq_add` or `llama_memory_seq_div` |
 | `pp_session_save_checkpoint`, `..._restore_checkpoint`, `..._drop_checkpoint` | The partial sequence state (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) kept in native memory with the token count it belongs to; restoring is the state, then the cut, in that order (see "Checkpoints" above) |
-| `pp_session_clear_memory` | Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens) and the session's own record of the tokens in memory; the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
+| `pp_session_max_context_size`, `pp_session_context_bytes`, `pp_session_carry_bytes` | The context the model was trained for (`llama_model_n_ctx_train`); what a context of a given size costs, from llama.cpp's own report of the buffers it allocated for the contexts of this session (see "A context that grows with the conversation" below); the size of the sequence state a carry-over holds beside a context (`llama_state_seq_get_size_ext`) |
+| `pp_session_resize_context` | Another context size with the model still loaded, held to a budget in bytes before anything is touched: the sequence state written into one block (`llama_state_seq_get_data_ext`) when the budget covers it, the old context overwritten and freed as at a clear, the new one created, the block read into it (`llama_state_seq_set_data_ext`), overwritten and freed; otherwise an empty memory. A size that cannot be created falls back to the previous one, then to halves |
+| `pp_session_clear_memory` | The context goes back to the size the session was opened with. Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens) and the session's own record of the tokens in memory; the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
 | `pp_session_configure_sampler`, `pp_session_sample_next` | A fixed order: the penalties, which the session computes itself from its record of the tokens in memory (see "Penalties that cover what their definitions cover" below), then a chain of banned tokens (logit bias of minus infinity) and, for a temperature of a millionth or more, temperature, top-k, top-p, min-p and the random choice, otherwise greedy; this is what `llama_sampler_sample` does (`llama_sampler_apply` on the scores, `llama_sampler_accept`), once per complete evaluation, on a candidate list of the session's own, with the sampler that chooses applied after the others and only when there is something to choose from |
 | `pp_session_close` | Everything freed, after the same overwriting as a clear |
 
 A failure is a status code, and the codes are the ones of the Kotlin `NativeLlamaException`,
-one for one. No function logs anything, and llama.cpp's own log is switched off for the whole
-process. The buffers the session and the front-end allocate themselves for text, tokens,
+one for one. No function logs anything, and llama.cpp's own log is written nowhere: the session
+takes from it only the name of the compute back end that was loaded, the description of a
+failure and the sizes of the buffers of a context. The buffers the session and the front-end allocate themselves for text, tokens,
 predictions or model state are overwritten before they are freed; llama.cpp's are not, which
 is the subject of "Forgetting" below.
 
@@ -742,18 +746,20 @@ wrong on a phone or for one of the models:
 
   | Size | Limit | Beyond it |
   | --- | --- | --- |
-  | Context (`n_ctx`) | 32768 tokens (`PP_CONTEXT_TOKENS_MAX`), and the context the model was trained for | `PP_STATUS_INVALID_ARGUMENT`, the first before the file is opened, the second once the model is loaded and before a context exists |
-  | Batch (`n_batch`) | 32768 tokens | `PP_STATUS_INVALID_ARGUMENT`; more than the context is taken as the context |
+  | Context | The context the model was trained for, and a budget in bytes that the caller states | More than the model's is taken as the model's when a session is opened and refused when a size is changed; a size whose computed cost is above the budget is refused before anything is allocated (`PP_STATUS_CONTEXT_REFUSED`) |
+  | Batch (`n_batch`) | 32768 tokens (`PP_BATCH_TOKENS_MAX`) | `PP_STATUS_INVALID_ARGUMENT`, before the file is opened; more than the context is taken as the context |
   | Model embedded in a file | The header and every tensor end within offset + length | `PP_STATUS_LOAD_FAILED`, before anything is loaded |
   | Text to tokenise | 262144 bytes (`PP_TOKENIZE_BYTES_MAX`) | `PP_ERROR` (`PP_STATUS_TOKENIZE_FAILED`) |
   | Checkpoints held at once | 8 (`PP_CHECKPOINTS_MAX`) | -1, until one is dropped |
-  | Penalty window | None | The context size or more is no window: the penalties look at the whole memory |
+  | Penalty window | None | `PP_PENALTY_NO_WINDOW` (-1) is the whole memory, which is what the engine passes; 0 and other negative values are refused |
   | Banned tokens | The size of the vocabulary | `PP_STATUS_INVALID_ARGUMENT` |
 
-  The ceiling of 32768 is the largest context any model of the kind this app bundles was
-  trained for (peacebell), eight times what the app runs, and about 2 GiB at the 64 KiB per
-  token such a model needs; Qwen3.5 was trained for 262144, which no phone holds, so the
-  trained context alone would not protect it. The text limit is a limit and not tokenising in
+  The context has no fixed ceiling any more: what a model was trained for is its limit
+  (2,048 tokens for Boris-2, 32,768 for peacebell, 262,144 for Qwen3.5), and because the
+  largest of those is more than any phone holds, a size below that limit is held to a budget
+  in bytes before it is allocated ("A context that grows with the conversation" below). The
+  batch keeps a ceiling, because the compute buffers are reserved for a whole batch of
+  scores. The text limit is a limit and not tokenising in
   pieces with a way to stop in between, for two reasons: where a piece ends changes the tokens
   on both sides of the cut, so pieces are only right at places the tokenizer knows and the
   session does not; and the call has nobody to ask whether to stop. With patch 0004 the
@@ -793,6 +799,90 @@ wrong on a phone or for one of the models:
   entirely. Nothing changes for a caller: `pp_sampler_config` is what it was, and a window of
   the context size, which the engine passes, is no window.
 
+- **A context that grows with the conversation.** A session is opened with a small context
+  (the app: 4,096 tokens, or the model's largest where that is less) and given another size
+  when the conversation needs one, up to the context the model was trained for. Two things
+  keep that from being an unchecked allocation. The caller states a budget in bytes, and the
+  session computes what a size costs and refuses it before anything is touched when it costs
+  more. And before llama.cpp is asked for a context, the session maps the whole cost once,
+  untouched, and unmaps it: a size the address space has no room for is reported and never
+  reaches llama.cpp.
+
+  What a context costs is llama.cpp's own figure. At every `llama_init_from_model` it logs the
+  size of each buffer it allocated, and the session reads those lines through the log
+  callback: the key-value buffers, which are rows of one size, give the bytes per token; the
+  compute reservation, which grows by the attention mask, is taken at two sizes (a session
+  creates a small context first for that, and frees it); the scheduler's bookkeeping, which
+  llama.cpp does not report, is the rest of what the allocator handed out. Nothing is derived
+  from an architecture. If the lines cannot be read the cost is unknown, every change of size
+  is refused, and `<model>.context` fails with a message that says so. `pp_session_context_bytes`
+  is what is allocated, an upper bound on what becomes resident: the key-value buffers are
+  zeroed when they are created and resident at once, the compute reservation and the
+  bookkeeping are mostly never touched. For a model's entry in `models/manifest.json`:
+
+  | Model | Trained context | Key-value bytes per token | Context of 4,096 tokens, allocated | Of which fixed, mostly untouched | The largest context, allocated |
+  | --- | --- | --- | --- | --- | --- |
+  | qwen3.5-0.8b | 262,144 | 12,288 | 516 MiB | 19 MiB recurrent state, 250 MiB compute reservation (the scores of a batch of 256 for 248,320 tokens), 198 MiB bookkeeping | 3,739 MiB |
+  | peacebell-v1-291m | 32,768 | 66,560 | 324 MiB | 36 MiB compute reservation, 28 MiB bookkeeping | 2,158 MiB |
+  | boris-2-instruct | 2,048 | 63,488 | 313 MiB at its 2,048 | 36 MiB compute reservation, 153 MiB bookkeeping | 313 MiB |
+  | shard-2 | 8,192 in the file, 4,096 by its card | 40,960 | 240 MiB | 11 MiB compute reservation, 70 MiB bookkeeping | 404 MiB |
+
+  When the size changes, the memory is carried over if the budget allows: the state of the
+  sequence is written into one block, the old context is overwritten and freed, the new one
+  is created, the block is read into it and overwritten before it is freed. The old context
+  goes before the new one comes, never the other way round, so the peak is the block beside
+  one context: the larger of the two contexts plus the tokens in memory times the key-value
+  bytes per token (plus the recurrent state, 19 MiB for Qwen3.5). A memory carried over
+  continues exactly as one evaluated at that size, with its checkpoints and with the record
+  the penalties are computed from. When the budget does not cover the block the memory comes
+  back empty, as after a clear, and the caller reads the conversation again; it asks
+  `pp_session_memory_token_count` which of the two happened. A forgotten conversation
+  (`pp_session_clear_memory`) returns the context to the size the session was opened with,
+  so a lock gives the memory back and costs one overwriting of the old buffers and one small
+  context.
+
+  What is promised about a size that cannot be had, and what is not. A size above the budget
+  or above the model's largest is refused with nothing touched (`PP_STATUS_CONTEXT_REFUSED`).
+  A size that fits the budget and cannot be created after the old context was freed is
+  reported (`PP_STATUS_CONTEXT_NOT_CREATED`): the session tries the size it had, then halves,
+  and says what exists. Not promised: that the process survives every allocation that fails.
+  llama.cpp reports a key-value or compute buffer it could not allocate, but ggml ends the
+  process when one of its own bookkeeping buffers cannot be had (`GGML_ASSERT` in `ggml_init`;
+  seen with Boris-2 under an address-space limit before the session tested for room itself).
+  The session's own test for room closes that for a size that cannot be mapped at the moment
+  of the test; it errs towards "no room" by the tens of MiB an allocator keeps of what was
+  freed, and it cannot help when another thread takes the room in between. And on a system
+  that grants address space without memory behind it, Android among them, an allocation does
+  not fail at all: the process is ended while a buffer is zeroed. There the budget is the
+  only protection, and deriving it from the memory the system has free is the caller's part.
+
+  Measured on a desktop (6 threads, a batch of 256, a busy machine; the phone is for the lead
+  to measure, see `ContextGrowthDeviceTest`), with 280 tokens in memory where a memory is
+  carried:
+
+  | Model, context | Allocated | Resident beyond the context of 4,096 | Created, empty | Created, memory carried | Prompt, generation (tokens/s) | Forgotten (back to 4,096) |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | Qwen3.5, 4,096 | 516 MiB | | | | 341, 28.9 | 27 ms |
+  | Qwen3.5, 8,192 | 566 MiB | 48 MiB | 40 ms | 54 ms | 348, 28.6 | 33 ms |
+  | Qwen3.5, 16,384 | 665 MiB | 145 MiB | 69 ms | 79 ms | 349, 28.9 | 45 ms |
+  | Qwen3.5, 32,768 | 865 MiB | 337 MiB | 136 ms | 136 ms | 347, 29.1 | 66 ms |
+  | Qwen3.5, 65,536 | 1,265 MiB | 721 MiB | 237 ms | 281 ms | 338, 28.1 | 104 ms |
+  | peacebell, 4,096 | 324 MiB | | | | 657, 71.2 | 105 ms |
+  | peacebell, 8,192 | 586 MiB | 260 MiB | 186 ms | 192 ms | 635, 69.0 | 132 ms |
+  | peacebell, 16,384 | 1,110 MiB | 781 MiB | 331 ms | 344 ms | 636, 72.4 | 189 ms |
+  | Shard-2, 8,192 | 403 MiB | 160 MiB | 113 ms | 122 ms | 2,898, 369 | 82 ms |
+
+  Creating and forgetting grow with the size, because every byte of the key-value buffers is
+  written once at each; a context that is large and nearly empty is as fast as a small one
+  (llama.cpp attends over the cells in use, not over the context); a full one is slower by
+  what the conversation costs, not the context (at 4,096 tokens in memory: Qwen3.5 255 prompt
+  tokens/s on average and 25.7 in generation, peacebell 281 and 37.3). A checkpoint does not
+  grow with the context (Qwen3.5 19.3 MiB, Boris-2 0.36 MiB, Shard-2 up to 8 MiB, peacebell 8
+  bytes), nor does the batch. The block of a carry-over is as large as the memory in use:
+  22.6 MiB for those 280 tokens of Qwen3.5 (19.3 of it the recurrent state), 67 MiB at 4,096;
+  17.8 MiB and 260 MiB for peacebell. Nothing above 1.1 GiB was allocated for these figures;
+  the largest contexts are costed, not measured.
+
 What a caller must know beyond the header is little: one thread should make all the calls of a
 session, a prediction exists only between a complete evaluation and the next call that changes
 the memory (sampling at any other time is an error, not stale output), and after a restore at
@@ -813,8 +903,12 @@ check instead of taking the machine down; keep new checks of that kind inside it
 ### Forgetting
 
 `pp_session_clear_memory` is what runs when the app locks. It frees the sampler chain, the
-batch and the context and creates them again from the parameters they were created with; the
-model stays loaded and the thread pool is kept. Before each is freed, what it holds of the
+batch and the context and creates them again from the parameters they were created with, the
+context at the size the session was opened with; the model stays loaded and the thread pool is
+kept. `pp_session_resize_context` does the same overwriting and freeing for another size, and
+the block it carries the memory through is overwritten before it is freed; `<model>.residue`
+changes the size both ways (memory carried, memory emptied) and requires of the result what
+it requires of a clear. Before each is freed, what it holds of the
 conversation and can be reached is overwritten: every checkpoint, the scores of the last
 prediction (which are also overwritten as soon as a token has been sampled from them, and when
 the next evaluation begins), the session's candidate list, the tokens in the batch, the
@@ -1196,9 +1290,10 @@ What is checked, for each model that is present:
 | `QwenDeviceTest` | A greedy reply to a ChatML prompt is sane and the same twice; the ChatML markers are single tokens when the app writes them and text inside a message; the removal of the end of the memory is refused and a checkpoint brings it back with an identical continuation, twice; cancelling; load time and memory, mapped and read; speed with pinned and unpinned threads, in front and not |
 | `ShardDeviceTest` | Tokenising the 8,139 committed texts gives the host's token ids, as plain text and with special tokens parsed; the greedy continuations of the committed beginnings equal the reference's token for token, deletion tokens included; within the window the end of the memory is removed and the continuation equals a fresh evaluation; on the committed text of 1,500 tokens a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made; a cancellation interrupts a chunk; load time, memory and speed are reported |
 | the three chat models | The engine of `core` (`LlamaEngine`) holds a chat of two turns on the real native layer and reuses its memory for the second |
-| `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code; a size beyond its limit (a context, a text, a number of tokens or of banned tokens) arrives as an exception with its code and allocates nothing, a penalty window beyond the context costs nothing, the ninth checkpoint is refused, and forgetting a conversation leaves a session that is whole |
+| `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code; a size beyond its limit (a context beyond its budget, a text, a number of tokens or of banned tokens) arrives as an exception with its code and allocates nothing, what a context costs is known, a change to a size above the model's largest or above the budget is refused with the context as it was, a penalty window beyond the context costs nothing, the ninth checkpoint is refused, and forgetting a conversation leaves a session that is whole |
 | `ThreadMoveDeviceTest` | With the smallest model present: the test's activity leaves the front while one long prompt is being evaluated, and when that same call returns the session runs the plan's free threads and no longer claims to be pinned; the time of each chunk before and after the move is reported |
 | `BackgroundSpeedDeviceTest` | Nothing is required: for Qwen3.5 and peacebell, the speed of a prompt and of generation with the test's activity in front and then with nothing of the test in front, each line with the set of cores the process was in |
+| `ContextGrowthDeviceTest` | Nothing is required beyond the sizes and codes: opt-in (`-e contextGrowth true`, and `-e contextFraction` for another share than a quarter). For Qwen3.5, peacebell and Boris-2 it reports the cost of the opening context and of the largest, the speed of a prompt and of generation at the opening size nearly empty and full, then doubles the context for as long as the growth stays inside that share of the memory the system reports free above its low-memory threshold, with 256 tokens in memory to carry over: for each size the time, how many tokens were still in memory, the process's memory before and after, and the speeds nearly empty; then the time of forgetting at the largest size and the memory after it, which shows whether a freed context goes back to the system |
 | `ScreenOffSpeedDeviceTest` | Nothing is required, and nothing happens unless it is asked for with `-e screenOff true`: it turns the screen off, which locks the phone, and measures the same two speeds without and with a partial wake lock. **Built, never run**: the figures for a locked phone below come from a run of the whole suite during which the phone had locked itself |
 
 `JniBoundaryDeviceTest` also times the longest text a session accepts, for every model present
@@ -1362,7 +1457,15 @@ converter writes over a constant in C++.
    the copy, and regenerate it with `tools/make-hook-patch.sh`.
 3. Rebuild from scratch (the script gives every file of a new commit a fresh modification
    time, so the build tree rebuilds everything) and run the whole test suite with the
-   checkpoints present. The compiler catches a renamed helper; only the tests catch a helper
+   checkpoints present. One test is about a log line and not about behaviour: the session
+   learns what a context costs from the lines in which llama.cpp reports the buffers of a
+   context it created (`... KV buffer size = 48.00 MiB`, `... RS buffer size`, `... compute
+   buffer size`, `... output buffer size`, read by `read_report` in `session/src/session.cpp`).
+   If their form has changed, `<model>.context` fails and says so, the session no longer knows
+   a cost and refuses every change of context size (it keeps working at the size it was opened
+   with); bring `read_report` in line with the new form. The same test relies on a model
+   loaded with `no_alloc` reporting the compute reservation of a context it does not allocate,
+   and on `GGML_PAD(n_ctx, 256)` being how a context size is rounded (`k_ctx_step`). The compiler catches a renamed helper; only the tests catch a helper
    whose behaviour changed. The parts of upstream that our code relies on are the graph helpers
    used in `llama-ext/src/models/` (`build_norm`, `build_qkv`, `build_rope`, `build_attn`,
    `build_ffn`), the SentencePiece-BPE and the GPT-2 BPE paths of `llama_tokenize`,

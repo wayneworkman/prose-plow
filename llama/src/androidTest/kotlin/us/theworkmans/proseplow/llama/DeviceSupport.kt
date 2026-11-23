@@ -40,9 +40,19 @@ internal fun assumePresent(model: ModelSpec) {
     )
 }
 
+/**
+ * A budget for the context that the opening context of every model fits: a limit that is stated,
+ * not memory that is taken. The tests that are about the budget pass their own.
+ */
+internal const val TEST_BUDGET_BYTES: Long = 2L shl 30
+
 /** Opens [model] with [settings] and reports nothing; the caller closes the result. */
-internal fun open(model: ModelSpec, settings: NativeSettings = NativeSettings()): LlamaSession =
-    LlamaFactory(appContext, settings).open(model) { true } as LlamaSession
+internal fun open(
+    model: ModelSpec,
+    settings: NativeSettings = NativeSettings(),
+    contextTokens: Int = model.contextLength,
+    budgetBytes: Long = TEST_BUDGET_BYTES,
+): LlamaSession = LlamaFactory(appContext, settings).open(model, { true }, contextTokens, budgetBytes) as LlamaSession
 
 /** An observer that never cancels and ignores progress. */
 internal object Uninterrupted : EvaluationObserver {

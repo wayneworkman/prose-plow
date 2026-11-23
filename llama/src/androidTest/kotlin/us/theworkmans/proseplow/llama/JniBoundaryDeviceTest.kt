@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import us.theworkmans.proseplow.core.engine.EvaluationObserver
 import us.theworkmans.proseplow.core.engine.NativeLlamaException
+import us.theworkmans.proseplow.core.engine.SamplerConfig
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
 
@@ -69,24 +70,31 @@ class JniBoundaryDeviceTest {
      * A size that arrives from outside and is beyond its limit must come back as an exception
      * with its code, at once: llama.cpp would allocate for any size it is handed, and on a phone
      * an allocation that cannot be met ends the process instead of failing. The limits are the
-     * ones of `proseplow_session.h` (`PP_CONTEXT_TOKENS_MAX`, `PP_TOKENIZE_BYTES_MAX`,
-     * `PP_CHECKPOINTS_MAX`); the numbers are repeated here on purpose, so that moving one is
-     * noticed.
+     * ones of `proseplow_session.h` (`PP_TOKENIZE_BYTES_MAX`, `PP_CHECKPOINTS_MAX`); the numbers
+     * are repeated here on purpose, so that moving one is noticed. A context has no fixed
+     * limit: more than the model was trained for is taken as that, and what that costs is held
+     * to the budget before anything is allocated.
      */
     @Test
     fun aSizeBeyondItsLimitIsAnExceptionWithItsCode() {
         val factory = LlamaFactory(appContext, NativeSettings())
         val before = memory()
-        for (context in intArrayOf(Int.MAX_VALUE, 32769)) {
-            try {
-                factory.open(model.copy(contextLength = context)) { true }.close()
-                fail("a context of $context tokens was opened")
-            } catch (e: NativeLlamaException) {
-                assertEquals("a context of $context tokens (${e.message})", NativeLlamaException.INVALID_ARGUMENT, e.code)
-            }
+        // The largest number there is, with a budget that no context of any model fits: the
+        // model's own largest context is what is costed, and refused.
+        try {
+            factory.open(model, { true }, Int.MAX_VALUE, 8L shl 20).close()
+            fail("a context of ${Int.MAX_VALUE} tokens was opened within 8 MiB")
+        } catch (e: NativeLlamaException) {
+            assertEquals("a context of ${Int.MAX_VALUE} tokens within 8 MiB (${e.message})", NativeLlamaException.CONTEXT_REFUSED, e.code)
+        }
+        try {
+            factory.open(model, { true }, model.contextLength, 0L).close()
+            fail("a context was opened with a budget of nothing")
+        } catch (e: NativeLlamaException) {
+            assertEquals("a budget of 0 bytes (${e.message})", NativeLlamaException.INVALID_ARGUMENT, e.code)
         }
         val after = memory()
-        report("${model.id} after two contexts beyond the limit were refused: $after (before: $before)")
+        report("${model.id} after a context beyond the budget was refused: $after (before: $before)")
         assertTrue("a refused context allocates nothing that stays", after.pss - before.pss < 48.0)
 
         val native = open(model)
@@ -96,10 +104,24 @@ class JniBoundaryDeviceTest {
             expectFailure(NativeLlamaException.TOKENIZE_FAILED, "a text one byte longer than the longest") {
                 native.tokenize(ByteArray(262145) { 'a'.code.toByte() }, false)
             }
-            expectFailure(NativeLlamaException.CONTEXT_FULL, "more tokens than the largest context holds") {
-                native.evaluate(IntArray(32769) { tokens[0] }, ENGINE_CHUNK, Uninterrupted)
+            expectFailure(NativeLlamaException.CONTEXT_FULL, "more tokens than the largest context of the model holds") {
+                native.evaluate(IntArray(native.maxContextSize + 1) { tokens[0] }, ENGINE_CHUNK, Uninterrupted)
             }
             assertEquals("none of them reached the memory", 0, native.memoryTokenCount())
+
+            // What a context costs is known, and a size is refused before anything is touched:
+            // one above the model's largest, and one whose cost is a byte above the budget.
+            val cost = native.contextBytes(native.contextSize())
+            assertTrue("the context of ${native.contextSize()} tokens costs $cost bytes", cost > 0)
+            report("${model.id}: a context of ${native.contextSize()} tokens costs $cost bytes, one of ${native.maxContextSize} (the model's largest) ${native.contextBytes(native.maxContextSize)}")
+            expectFailure(NativeLlamaException.INVALID_ARGUMENT, "the cost of a context above the model's largest") { native.contextBytes(native.maxContextSize + 1) }
+            expectFailure(NativeLlamaException.CONTEXT_REFUSED, "a context above the model's largest") {
+                native.resizeContext(native.maxContextSize + 1, Long.MAX_VALUE)
+            }
+            expectFailure(NativeLlamaException.CONTEXT_REFUSED, "a context whose cost is above the budget") { native.resizeContext(native.contextSize(), 1L) }
+            assertEquals("a refusal leaves the context as it was", model.contextLength.coerceAtMost(native.maxContextSize), native.contextSize())
+            expectFailure(NativeLlamaException.INVALID_ARGUMENT, "a penalty window of -2") { native.configureSampler(greedy(-2)) }
+            native.configureSampler(greedy(SamplerConfig.NO_PENALTY_WINDOW, model.bannedTokenIds).copy(repetitionPenalty = 1.1f))
             expectFailure(NativeLlamaException.INVALID_ARGUMENT, "more banned tokens than a vocabulary has") {
                 native.configureSampler(greedy(native.contextSize(), banned = List(1 shl 20) { 0 }))
             }
@@ -208,7 +230,7 @@ class JniBoundaryDeviceTest {
 
         var reports = 0
         try {
-            factory.open(model) { ++reports < 2 }.close()
+            factory.open(model, { ++reports < 2 }, model.contextLength, TEST_BUDGET_BYTES).close()
             fail("an abandoned load returned a model")
         } catch (e: NativeLlamaException) {
             assertEquals("abandoned by the progress callback (${e.message})", NativeLlamaException.LOAD_CANCELLED, e.code)
@@ -217,7 +239,7 @@ class JniBoundaryDeviceTest {
 
         class Boom : RuntimeException("thrown by the test's progress callback")
         try {
-            factory.open(model) { throw Boom() }.close()
+            factory.open(model, { throw Boom() }, model.contextLength, TEST_BUDGET_BYTES).close()
             fail("the progress callback's exception was swallowed")
         } catch (_: Boom) {
             // expected
@@ -227,7 +249,7 @@ class JniBoundaryDeviceTest {
         // name for which there is neither an asset nor a sideloaded file.
         val notCarried = model.copy(id = "not-in-any-build", ggufFileName = "not-in-any-build.gguf", bundled = false)
         try {
-            factory.open(notCarried) { true }.close()
+            factory.open(notCarried, { true }, notCarried.contextLength, TEST_BUDGET_BYTES).close()
             fail("a model that no build carries was opened")
         } catch (e: NativeLlamaException) {
             assertEquals("a model this build does not carry (${e.message})", NativeLlamaException.LOAD_FAILED, e.code)
@@ -238,7 +260,7 @@ class JniBoundaryDeviceTest {
         assertTrue("nothing of an abandoned load stays allocated", after.pss - before.pss < 48.0)
 
         // And a load still works.
-        factory.open(model) { true }.close()
+        factory.open(model, { true }, model.contextLength, TEST_BUDGET_BYTES).close()
     }
 
     @Test

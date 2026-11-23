@@ -5,7 +5,7 @@ Prose Plow runs small language models entirely on the phone. The models are pack
 * A model for each chat, which can be switched in the middle of the chat. Every answer is labelled with the model that wrote it.
 * A reply can be stopped while it is being written, asked for again, or continued after it was stopped or reached its length limit.
 * One of your own earlier messages can be edited, which removes everything after it and has the model answer the new text.
-* In Settings, a page for each model: a temperature from 0 to 2, the longest reply, and a system prompt for each model that was trained with one.
+* In Settings, a page for each model: a temperature from 0 to 2, the longest reply, how far its context may grow, and a system prompt for each model that was trained with one.
 * Answers are shown as Markdown, with a copy button on every message. Images are never loaded, and a link is handed to another app only after you have confirmed it.
 
 <b>Privacy</b>
@@ -30,6 +30,6 @@ Every model ships as 16-bit floats; nothing is quantised to fewer bits. That cos
 <b>Limits</b>
 Small models are often wrong. The chat screen says so at all times, under its title bar: "This app uses AI, and AI can make mistakes." Check anything that matters.
 
-Speed depends on the phone. On the one phone it was tested on, a Samsung Galaxy XCover7 Pro with Android 17, Qwen3.5 0.8B wrote about 9 tokens per second and Boris-2-Instruct about 52; other phones will differ. When a conversation no longer fits a model's context, the oldest messages are left out of the latest answer and the app says how many.
+Speed depends on the phone. On the one phone it was tested on, a Samsung Galaxy XCover7 Pro with Android 17, Qwen3.5 0.8B wrote about 9 tokens per second and Boris-2-Instruct about 52; other phones will differ. A model's context grows with the conversation as far as the model and the phone's memory allow; beyond that, the oldest messages are left out of the latest answer and the app says how many.
 
 The lock protects what is stored on the phone. It does not protect against someone who knows the passphrase, against whoever holds the phone while the app is unlocked, or against a compromised phone. The code has had no independent security review.

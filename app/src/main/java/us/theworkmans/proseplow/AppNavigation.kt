@@ -93,7 +93,7 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
         }
         composable<SettingsRoute> {
             val settingsViewModel: SettingsViewModel = viewModel(
-                factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models) } },
+                factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models, contextLimits = session.contextLimits) } },
             )
             val securityViewModel: SecurityViewModel = viewModel(
                 factory = viewModelFactory { initializer { SecurityViewModel(appLock) } },
@@ -116,7 +116,7 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
                 LaunchedEffect(modelId) { navController.popBackStack() }
             } else {
                 val modelViewModel: SettingsViewModel = viewModel(
-                    factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models) } },
+                    factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models, contextLimits = session.contextLimits) } },
                 )
                 ModelSettingsScreen(viewModel = modelViewModel, model = model, onBack = dropUnlessResumed { navController.popBackStack() })
             }

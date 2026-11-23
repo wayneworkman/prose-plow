@@ -4,12 +4,14 @@ package us.theworkmans.proseplow.core.model
  * How long a reply may be allowed to get: the limits of the "longest reply" a user can set for a
  * model, in tokens. They are not chosen for the settings screen; they are the two numbers the
  * engine itself goes by when it fits a conversation into the model's context, defined here once
- * and used by both.
+ * and used by both. They follow from how long the model's context may become, which depends on
+ * the model, the device and the user's choice of size (see the engine's ContextPolicy), so a
+ * model alone does not have a range: [range] is asked with that limit.
  *
  * - **At least [MIN_TOKENS].** The engine does not begin a reply for which less room than this is
  *   left once everything but the latest turn has been left out; a limit below it would ask for
  *   replies the engine considers no reply at all.
- * - **At most half of the context** ([maxTokens]). The room for a reply is taken from the room
+ * - **At most half of the context, and at most [MAX_TOKENS]** ([maxTokens]). The room for a reply is taken from the room
  *   for the conversation. While the engine can still leave older turns out, it keeps the reply's
  *   limit free, but never more than half of the context: the other half is the conversation's. A
  *   limit above half would therefore not be kept free, and a reply could run into the end of the
@@ -20,12 +22,15 @@ object ReplyLength {
     /** The shortest "longest reply". */
     const val MIN_TOKENS: Int = 16
 
-    /** The longest reply a model with a context of [contextTokens] can be set to. */
-    fun maxTokens(contextTokens: Int): Int = contextTokens / 2
+    /** The longest "longest reply" of any model: plenty for one answer of a small model on a phone. */
+    const val MAX_TOKENS: Int = 4096
+
+    /**
+     * The longest reply a model can be set to when its context may become [contextTokens] long:
+     * half of that, and never more than [MAX_TOKENS].
+     */
+    fun maxTokens(contextTokens: Int): Int = minOf(MAX_TOKENS, contextTokens / 2)
+
+    /** The limits to choose from when the context may become [contextLimit] tokens long. */
+    fun range(contextLimit: Int): IntRange = MIN_TOKENS..maxTokens(contextLimit)
 }
-
-/** The limits a user may choose from for this model's longest reply, in tokens; see [ReplyLength]. */
-val ModelSpec.replyLengthRange: IntRange get() = ReplyLength.MIN_TOKENS..ReplyLength.maxTokens(contextLength)
-
-/** True when [tokens] can be this model's longest reply. */
-fun ModelSpec.acceptsReplyLength(tokens: Int): Boolean = tokens in replyLengthRange

@@ -7,6 +7,7 @@ import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.FakeClock
 import us.theworkmans.proseplow.core.chat.SequentialIds
 import us.theworkmans.proseplow.core.chat.SessionCodec
+import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.FakeInferenceEngine
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelCatalog
@@ -33,6 +34,9 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
     /** The models the next session offers. */
     var models: List<ModelSpec> = ModelCatalog.bundled
 
+    /** What the device of the next session allows a model's context; a device with plenty of memory unless a test says otherwise. */
+    var contextLimits = DeviceContextLimits()
+
     private var unlocks = 0
 
     /**
@@ -40,7 +44,7 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
      * message and ids of different unlocks never collide.
      */
     fun open(cipher: BlobCipher = this.cipher, engine: InferenceEngine = this.engine): AppSession =
-        AppSession(cipher, layout, engine, models, dispatcher, dispatcher, clock, SequentialIds("u${++unlocks}-"))
+        AppSession(cipher, layout, engine, models, dispatcher, dispatcher, clock, SequentialIds("u${++unlocks}-"), contextLimits = contextLimits)
 
     /** The session [id] as it is on disk right now, or null when it has no file. */
     fun stored(id: String): ChatSession? {

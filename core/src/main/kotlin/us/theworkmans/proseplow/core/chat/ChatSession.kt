@@ -108,6 +108,8 @@ data class ChatSession(
         is GenerationEvent.Done -> finished(assistantId, event.finishReason, clock, exactText = event.exactText)
         is GenerationEvent.Error -> failed(assistantId, event.error, clock)
         is GenerationEvent.PromptProgress, is GenerationEvent.HistoryTrimmed -> this
+        // What became of the model's context is said beside the conversation; it is not part of it.
+        is GenerationEvent.ContextGrown, is GenerationEvent.ContextLimited -> this
     }
 
     /**

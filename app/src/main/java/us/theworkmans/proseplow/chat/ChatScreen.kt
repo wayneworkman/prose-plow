@@ -483,8 +483,8 @@ private fun Banners(
         }
         is ModelBanner.Failed -> NoticeCard(
             title = stringResource(R.string.model_failed_title, modelName(banner.modelId)),
-            detail = stringResource(R.string.error_model_load_failed_detail),
-            technical = banner.detail.takeIf { it.isNotBlank() }?.let { stringResource(R.string.failed_detail, it) },
+            detail = stringResource(ModelText.loadFailedDetailRes(banner.detail)),
+            technical = banner.detail.takeIf { it.isNotBlank() && !ModelText.isTooLittleMemory(it) }?.let { stringResource(R.string.failed_detail, it) },
             modifier = cardModifier,
         ) {
             TextButton(onClick = onChooseModel) { Text(stringResource(R.string.choose_model)) }
@@ -622,6 +622,7 @@ private fun MessageList(
     val messages = session.messages
     val error = session.error
     val trimmed = state.trimmedMessages
+    val contextNote = state.contextNote
     // What may be done to the conversation now: nothing while a reply is being written.
     val canAct = !session.isGenerating && state.canWrite
     val canContinue = canAct && ChatController.canContinue(session)
@@ -663,6 +664,9 @@ private fun MessageList(
                         onContinue = { viewModel.continueReply(message.id) },
                     )
                 }
+            }
+            if (contextNote != null) {
+                item(key = "context", contentType = "note") { ContextNoteItem(contextNote) }
             }
             if (trimmed != null) {
                 item(key = "trimmed", contentType = "note") { TrimmedNote(trimmed) }

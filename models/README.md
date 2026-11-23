@@ -41,6 +41,9 @@ carelessly (see "shard-2" below for the one model here that has one).
 | `id` | Our name for the model: the directory and file names are derived from it. Lower case, no spaces |
 | `status` | `ready`: converted by the script. `planned`: a placeholder for a model whose port or wiring does not exist yet; the script skips it and the `note` says what is missing |
 | `purpose` | `bundled`: goes into the app. `validation`: converted and tested only |
+| `trained_context` | The longest conversation the model is offered, in tokens: the context its file says it was trained for. The app shows it before the model is loaded, and a host test holds it to the file (`<model>.context`) |
+| `context_bytes_per_token` | What one token of context costs in memory: the bytes of the key-value buffers llama.cpp allocates per token for this file (16-bit keys and values of every attention layer). The same test reads it from llama.cpp's report of a context it created |
+| `file_context` | Only where the file's own context is longer than `trained_context` (`shard-2`: the card states 4,096 trained and the positions reach 8,192): the file's figure, which is what a loaded session reports as its largest. The test then holds `trained_context` to "not above the file" |
 | `name` | Written into the GGUF as `general.name`. For the `upstream` converter it is the name of the directory that converter is shown, from which it derives `general.name` (`Qwen3.5-0.8B` becomes "Qwen3.5 0.8B"), `general.basename` and `general.size_label` |
 | `repository`, `revision` | The model repository on the Hugging Face hub and the exact commit of it |
 | `converter` | Which converter turns the checkpoint into a GGUF; the names are the keys of `CONVERTERS` in `convert_models.py`: `peacebell`, `boris2` and `shard2` for the architectures this project ported, `upstream` for a model that upstream llama.cpp supports as it is |

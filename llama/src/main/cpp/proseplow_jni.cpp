@@ -230,7 +230,7 @@ jbyteArray runtime_description(JNIEnv * env, jclass) {
 // Opening and closing
 //
 
-jlong open_fd(JNIEnv * env, jclass, jint fd, jlong offset, jlong length, jint n_ctx, jint n_batch, jint n_threads,
+jlong open_fd(JNIEnv * env, jclass, jint fd, jlong offset, jlong length, jint n_ctx, jlong context_budget, jint n_batch, jint n_threads,
               jintArray pinned_cpus, jboolean map, jobject progress) {
     return guarded(env, PP_STATUS_LOAD_FAILED, (jlong) 0, [&]() -> jlong {
         std::vector<int32_t> cpus;
@@ -243,6 +243,7 @@ jlong open_fd(JNIEnv * env, jclass, jint fd, jlong offset, jlong length, jint n_
         upcall call{env, progress};
         pp_session_params params = {};
         params.n_ctx         = n_ctx;
+        params.context_budget_bytes = context_budget;
         params.n_batch       = n_batch;
         params.n_threads     = n_threads;
         params.pinned_cpus   = cpus.empty() ? nullptr : cpus.data();
@@ -366,6 +367,43 @@ jint memory_token_count(JNIEnv *, jclass, jlong handle) {
     return handle == 0 ? 0 : pp_session_memory_token_count((pp_session *) handle);
 }
 
+jint max_context_size(JNIEnv *, jclass, jlong handle) {
+    return handle == 0 ? 0 : pp_session_max_context_size((pp_session *) handle);
+}
+
+jlong context_bytes(JNIEnv * env, jclass, jlong handle, jint tokens) {
+    if (handle == 0) {
+        return 0;
+    }
+    pp_session * s = (pp_session *) handle;
+    if (tokens < 1 || tokens > pp_session_max_context_size(s)) {
+        throw_native(env, PP_STATUS_INVALID_ARGUMENT, "a context size outside 1 to the largest context of this model has no cost");
+        return 0;
+    }
+    const int64_t bytes = pp_session_context_bytes(s, tokens);
+    if (bytes < 0) {
+        // The session could not read what llama.cpp reports of a context: no size can be
+        // costed, and none will be changed to (see pp_session_context_bytes).
+        throw_native(env, PP_STATUS_CONTEXT_REFUSED, "what a context costs is not known for this session");
+        return 0;
+    }
+    return (jlong) bytes;
+}
+
+void resize_context(JNIEnv * env, jclass, jlong handle, jint tokens, jlong budget) {
+    if (handle == 0) {
+        throw_native(env, PP_STATUS_INVALID_ARGUMENT, "a closed session has no context to resize");
+        return;
+    }
+    pp_session * s = (pp_session *) handle;
+    // Refused, or not created at the size asked for: either way the caller is told with the
+    // status as its code, and asks the session what it has now.
+    const int32_t status = pp_session_resize_context(s, tokens, (int64_t) budget);
+    if (status != PP_STATUS_OK) {
+        throw_native(env, status, pp_session_last_error(s));
+    }
+}
+
 jint evaluate(JNIEnv * env, jclass, jlong handle, jintArray tokens, jint chunk_size, jobject observer) {
     return guarded(env, PP_STATUS_EVALUATION_FAILED, (jint) 0, [&]() -> jint {
         pp_session * s = session_of(env, handle);
@@ -377,9 +415,10 @@ jint evaluate(JNIEnv * env, jclass, jlong handle, jintArray tokens, jint chunk_s
             return 0;
         }
         const jsize count = env->GetArrayLength(tokens);
-        // More tokens than any context holds cannot be evaluated; refused before they are copied.
-        if (count > PP_CONTEXT_TOKENS_MAX) {
-            throw_native(env, PP_STATUS_CONTEXT_FULL, "more tokens than the largest context holds");
+        // More tokens than the largest context of this model holds cannot be evaluated; refused
+        // before they are copied.
+        if (count > pp_session_max_context_size(s)) {
+            throw_native(env, PP_STATUS_CONTEXT_FULL, "more tokens than the largest context of this model holds");
             return 0;
         }
         wiped<llama_token> copy((size_t) count);
@@ -510,13 +549,16 @@ jint thread_setup(JNIEnv *, jclass, jlong handle) {
 const JNINativeMethod k_methods[] = {
     {"runtimeInit",        "([B)I",                                                             (void *) runtime_init},
     {"runtimeDescription", "()[B",                                                              (void *) runtime_description},
-    {"openFd",             "(IJJIII[IZLus/theworkmans/proseplow/core/engine/LoadProgress;)J",   (void *) open_fd},
+    {"openFd",             "(IJJIJII[IZLus/theworkmans/proseplow/core/engine/LoadProgress;)J",  (void *) open_fd},
     {"close",              "(J)V",                                                              (void *) close_session},
     {"tokenize",           "(J[BZ)[I",                                                          (void *) tokenize},
     {"tokenToBytes",       "(JI)[B",                                                            (void *) token_to_bytes},
     {"isEndOfGeneration",  "(JI)Z",                                                             (void *) is_end_of_generation},
     {"contextSize",        "(J)I",                                                              (void *) context_size},
     {"memoryTokenCount",   "(J)I",                                                              (void *) memory_token_count},
+    {"maxContextSize",     "(J)I",                                                              (void *) max_context_size},
+    {"contextBytes",       "(JI)J",                                                             (void *) context_bytes},
+    {"resizeContext",      "(JIJ)V",                                                            (void *) resize_context},
     {"evaluate",           "(J[IILus/theworkmans/proseplow/core/engine/EvaluationObserver;)I",  (void *) evaluate},
     {"rewindTo",           "(JI)Z",                                                             (void *) rewind_to},
     {"saveCheckpoint",     "(J)I",                                                              (void *) save_checkpoint},

@@ -48,6 +48,9 @@ object ModelCatalog {
         stopTokenIds = listOf(248046, 248044),
         supportsSystemPrompt = true,
         sourceRepository = "Qwen/Qwen3.5-0.8B",
+        maxContextLength = 262_144,
+        contextBytesPerToken = 12_288,
+        readTokensPerSecond = 90,
         licence = "Apache-2.0",
     )
 
@@ -81,6 +84,9 @@ object ModelCatalog {
         bannedTokenIds = listOf(0),
         supportsSystemPrompt = false,
         sourceRepository = "wayneworkman2012/peacebell-v1-291M",
+        maxContextLength = 32_768,
+        contextBytesPerToken = 66_560,
+        readTokensPerSecond = 184,
         licence = "Apache-2.0",
     )
 
@@ -112,6 +118,9 @@ object ModelCatalog {
         stopTokenIds = listOf(0),
         supportsSystemPrompt = true,
         sourceRepository = "opencerebral/Boris-2-Instruct",
+        maxContextLength = 2048,
+        contextBytesPerToken = 63_488,
+        readTokensPerSecond = 380,
         licence = "Apache-2.0",
     )
 
@@ -154,6 +163,9 @@ object ModelCatalog {
         supportsSystemPrompt = false,
         bundled = false,
         sourceRepository = "Glint-Research/Shard-2",
+        // Its card calls 4,096 the trained context; the file itself would allow 8,192. The smaller counts.
+        maxContextLength = 4096,
+        contextBytesPerToken = 40_960,
         licence = "MIT",
     )
 

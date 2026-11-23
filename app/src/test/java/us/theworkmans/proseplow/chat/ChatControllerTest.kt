@@ -271,6 +271,50 @@ class ChatControllerTest {
     }
 
     @Test
+    fun whatBecameOfTheModelsContextIsSaidBesideTheChatUntilItsNextReply() = runTest {
+        val session = unlocked()
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.ContextGrown(fromTokens = 4096, toTokens = 8192, rereading = true)),
+                Step.Emit(GenerationEvent.ContextGrown(fromTokens = 8192, toTokens = 16_384, rereading = false)),
+                Step.Emit(GenerationEvent.ContextLimited(limitTokens = 16_384, reason = GenerationEvent.ContextLimited.Reason.MEMORY)),
+                Step.Emit(GenerationEvent.HistoryTrimmed(droppedMessages = 2, keptMessages = 3)),
+                Step.Emit(GenerationEvent.PromptProgress(evaluatedTokens = 40, totalTokens = 40)),
+                Step.Emit(GenerationEvent.TextDelta("Done.")),
+                Step.Emit(GenerationEvent.Done(FinishReason.END_OF_TURN, text = "Done.", stats = noStats)),
+            ),
+        )
+        assertEquals(emptyMap<String, ContextNote>(), session.state.contextNotes)
+        session.chat.send(session.id, "Long story")
+        runCurrent()
+
+        assertEquals(
+            "the size it has now, that the conversation was read again on the way, and where it ended",
+            mapOf(session.id to ContextNote(grownTo = 16_384, reread = true, limitedAt = 16_384, limitedByMemory = true)),
+            session.state.contextNotes,
+        )
+        assertEquals("the note about left-out messages is beside it", mapOf(session.id to 2), session.state.trimmedMessages)
+        assertEquals("none of it is part of the conversation", listOf("Long story", "Done."), session.openSession.messages.map { it.text })
+        assertNull(session.state.turn)
+
+        // The next reply needed nothing: the note goes.
+        exchange(session, "Short", "Yes.")
+        assertEquals(emptyMap<String, ContextNote>(), session.state.contextNotes)
+
+        // A larger context that could not be created is said as that, without a growth.
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.ContextLimited(limitTokens = 4096, reason = GenerationEvent.ContextLimited.Reason.FAILED)),
+                Step.Emit(GenerationEvent.TextDelta("Still here.")),
+                Step.Emit(GenerationEvent.Done(FinishReason.END_OF_TURN, text = "Still here.", stats = noStats)),
+            ),
+        )
+        session.chat.send(session.id, "And now?")
+        runCurrent()
+        assertEquals(mapOf(session.id to ContextNote(limitedAt = 4096, limitedByMemory = false)), session.state.contextNotes)
+    }
+
+    @Test
     fun stopKeepsWhatWasWrittenMarksItStoppedAndSavesItAtOnce() = runTest {
         val session = unlocked()
         val id = session.id

@@ -131,6 +131,18 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  *   at any point and leave the engine consistent.
  * - At least one prompt token is always evaluated before sampling, because the model's
  *   prediction only exists after an evaluation. That is why at most all but one token are reused.
+ * - **The context follows the conversation.** A model is opened with a context of its starting
+ *   size. When a conversation and the room for its reply no longer fit, the context is made
+ *   larger, to the smallest of its steps that fits, as far as the [contextPolicy] allows for
+ *   this model on this device: the model's own maximum, the device's memory, and, unless the
+ *   request names a size, the time it would take to read the conversation again. The model's
+ *   memory is carried into the larger context when that can be done; otherwise the conversation
+ *   is read again, which is an evaluation like any other and can be cancelled and paused like
+ *   one. A size that the device refuses, or that cannot be created, is this model's limit until
+ *   it is loaded again, and the oldest turns are left out only at the limit. Clearing the
+ *   memory gives the memory of a grown context back: that happens when the app locks, and
+ *   when a conversation is asked for that fits the starting size and shares little with the
+ *   one in memory.
  * - A generation stands aside while the [gate] is closed, at the points between two native
  *   computations: before the first chunk of the prompt, after every chunk, and after every token
  *   of the reply. The time it spends there is left out of the speeds it reports.
@@ -143,6 +155,10 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  * @param newSeed supplies the sampling seed when neither the request nor the model fixes one.
  * @param gate closed by whoever needs the processor more urgently than an answer does; see
  *   [GenerationGate]. An engine that is given none has one that nobody closes.
+ * @param memoryGauge says how much memory the device has and has available; asked before every
+ *   decision about the size of the context. An engine that is given none assumes plenty.
+ * @param contextPolicy how large a context may be on this device and through which sizes it
+ *   grows; see [ContextPolicy].
  */
 class LlamaEngine(
     private val factory: NativeLlamaFactory,
@@ -151,6 +167,8 @@ class LlamaEngine(
     private val nanoTime: () -> Long = System::nanoTime,
     private val newSeed: () -> Int = { Random.nextInt() },
     private val gate: GenerationGate = GenerationGate(),
+    private val memoryGauge: MemoryGauge = MemoryGauge { DeviceMemory.PLENTY },
+    private val contextPolicy: ContextPolicy = ContextPolicy(),
 ) : InferenceEngine {
 
     /**
@@ -162,16 +180,24 @@ class LlamaEngine(
      *   reports and cancellation checks.
      * @property minReplyTokens the least room for a reply with which a generation is still
      *   started when the latest turn alone nearly fills the context.
+     * @property giveBackRereadTokens the most tokens the engine reads again in order to give a
+     *   grown context back: a conversation that fits the size the context was opened with gets
+     *   that size back when no more than this many of the tokens in memory could have been
+     *   used for it. That is the case when another conversation is asked for, which shares
+     *   only its beginning with the one in memory. A conversation that merely became shorter
+     *   keeps its context, and what was read of it.
      */
     data class Settings(
         val maxCheckpoints: Int = 4,
         val evaluationChunk: Int = 32,
         val minReplyTokens: Int = ReplyLength.MIN_TOKENS,
+        val giveBackRereadTokens: Int = ContextPolicy.GRANULARITY,
     ) {
         init {
             require(maxCheckpoints >= 0) { "maxCheckpoints must not be negative" }
             require(evaluationChunk >= 1) { "evaluationChunk must be at least 1" }
             require(minReplyTokens >= 1) { "minReplyTokens must be at least 1" }
+            require(giveBackRereadTokens >= 0) { "giveBackRereadTokens must not be negative" }
         }
     }
 
@@ -194,6 +220,18 @@ class LlamaEngine(
     private var native: NativeLlama? = null
     private var loaded: ModelSpec? = null
     private val memory = TokenList()
+
+    /** The size the loaded model's context was opened with: where its steps begin. */
+    private var openedContext = 0
+
+    /** A limit that was found for the loaded model's context by being refused or failing; null until then. */
+    private var foundContextLimit: Int? = null
+
+    /** How fast the loaded model has last been seen to read a prompt on this device, in tokens per second; 0 until measured. */
+    private var measuredReadSpeed = 0.0
+
+    /** The limit the collector was last told of, so that the same one is not announced with every answer; null after a growth. */
+    private var announcedContextLimit: Int? = null
     private val checkpoints = ArrayList<Checkpoint>()
 
     // --- Loading ---
@@ -209,7 +247,7 @@ class LlamaEngine(
                 _state.value = EngineState.Loading(model.id, 0f)
                 val job = coroutineContext.job
                 try {
-                    val opened = factory.open(model) { fraction ->
+                    val opened = openAtStartingSize(model) { fraction ->
                         _state.value = EngineState.Loading(model.id, fraction.coerceIn(0f, 1f))
                         job.isActive
                     }
@@ -268,11 +306,50 @@ class LlamaEngine(
         }
     }
 
+    /**
+     * Opens [model] with a context of its starting size, or, when the device has not the memory
+     * for that now, of half that size, and half again, down to [MIN_OPENING_CONTEXT]. Below
+     * that the model is not opened: a context too small to hold a question is of no use.
+     *
+     * What is held to the budget is what the tokens of the context take, by the catalogue's
+     * figure for one token, which is the model file's own. A session reserves more than that,
+     * the same amount at every size and most of it never touched (the scores of a whole batch
+     * above all). No choice of size changes that amount, it was there before a context could
+     * grow, and it is not known before a session exists. The native side is therefore given no
+     * budget of its own to refuse the opening by; it may still refuse, and is then asked for
+     * less.
+     */
+    private fun openAtStartingSize(model: ModelSpec, progress: LoadProgress): NativeLlama {
+        val budget = contextPolicy.budgetBytes(memoryGauge.read(), currentBytes = 0)
+        var size = minOf(model.contextLength, model.maxContextLength)
+        while (size.toLong() * model.contextBytesPerToken > budget) {
+            if (size / 2 < MIN_OPENING_CONTEXT) throw NativeLlamaException(NativeLlamaException.OUT_OF_MEMORY, TOO_LITTLE_MEMORY)
+            size /= 2
+        }
+        while (true) {
+            try {
+                return factory.open(model, progress, size, Long.MAX_VALUE).also {
+                    openedContext = it.contextSize()
+                    foundContextLimit = null
+                    measuredReadSpeed = 0.0
+                }
+            } catch (e: NativeLlamaException) {
+                if (e.code != NativeLlamaException.CONTEXT_REFUSED) throw e
+                if (size / 2 < MIN_OPENING_CONTEXT) throw NativeLlamaException(NativeLlamaException.OUT_OF_MEMORY, TOO_LITTLE_MEMORY)
+                size /= 2
+            }
+        }
+    }
+
     /** Frees the loaded model, if any, and forgets everything about its memory. */
     private fun closeNative() {
         val current = native
         native = null
         loaded = null
+        openedContext = 0
+        foundContextLimit = null
+        measuredReadSpeed = 0.0
+        announcedContextLimit = null
         memory.wipe()
         checkpoints.clear()
         try {
@@ -341,6 +418,14 @@ class LlamaEngine(
             // Raised before the memory was touched.
             EngineError.InvalidRequest(e.message.orEmpty())
         } catch (e: NativeLlamaException) {
+            if (e.code == NativeLlamaException.CONTEXT_NOT_CREATED && native.contextSize() <= 0) {
+                // No context exists any more, of any size: the model is as good as not loaded.
+                closeNative()
+                val failure = EngineError.LoadFailed(model.id, TOO_LITTLE_MEMORY)
+                _state.value = EngineState.Failed(model.id, failure)
+                send(GenerationEvent.Error(failure))
+                return
+            }
             clearMemory(native)
             e.toEngineError()
         } catch (e: RuntimeException) {
@@ -399,36 +484,221 @@ class LlamaEngine(
                 finish(FinishReason.CANCELLED, null)
                 return
             }
-            val contextSize = native.contextSize()
             val requestedNewTokens = (request.maxNewTokens ?: model.defaultMaxNewTokens).coerceAtLeast(1)
-            val fitted = when (val result = fitPrompt(contextSize, requestedNewTokens)) {
-                is ContextBudget.Result.TooLong -> {
-                    out.send(GenerationEvent.Error(EngineError.PromptTooLong(result.promptTokens, contextSize)))
-                    return
+            // The conversation is fitted to the limit of the context, not to its present size:
+            // while the context can still grow, nothing is left out. Each round fits, makes the
+            // memory agree with the prompt (which may clear it, and with it give a grown context
+            // back), and then makes room. A size that cannot be had lowers the limit, and the
+            // next round fits to that; so the limit only ever goes down and the rounds end.
+            var limit = contextLimit()
+            var fitted: ContextBudget.Result.Fits
+            var rounds = 0
+            while (true) {
+                fitted = when (val result = fitPrompt(limit, requestedNewTokens)) {
+                    is ContextBudget.Result.TooLong -> {
+                        out.send(GenerationEvent.Error(EngineError.PromptTooLong(result.promptTokens, limit)))
+                        return
+                    }
+                    is ContextBudget.Result.Fits -> result
                 }
-                is ContextBudget.Result.Fits -> result
+                if (fitted.prompt.tokens.isEmpty()) throw PromptFormatException("The prompt is empty.")
+                // A collector that has gone is noticed before the memory is touched again.
+                job.ensureActive()
+                val wanted = minOf(limit, fitted.prompt.tokens.size + minOf(requestedNewTokens, ReplyLength.maxTokens(limit)))
+                giveBackIfLeft(fitted.prompt.tokens, wanted)
+                reuseMemory(fitted.prompt.tokens)
+                if (native.contextSize() >= wanted) break
+                growTowards(wanted, limit)
+                if (native.contextSize() >= wanted) break
+                limit = native.contextSize()
+                if (++rounds >= MAX_FITTING_ROUNDS) {
+                    throw NativeLlamaException(NativeLlamaException.CONTEXT_FULL, "The context could not be made to hold the conversation")
+                }
             }
+            val contextSize = native.contextSize()
             val tokens = fitted.prompt.tokens
-            if (tokens.isEmpty()) throw PromptFormatException("The prompt is empty.")
-            // Nothing has touched the memory yet: a collector that has gone costs nothing so far.
-            job.ensureActive()
             promptTokens = tokens.size
             droppedMessages = fitted.droppedMessages
             if (droppedMessages > 0) {
                 out.send(GenerationEvent.HistoryTrimmed(droppedMessages, request.messages.size - droppedMessages))
             }
 
-            reuseMemory(tokens)
             reusedTokens = memory.size
             out.send(GenerationEvent.PromptProgress(reusedTokens, tokens.size))
+            val readingFrom = nanoTime()
+            val asideBeforeReading = asideBeforeReply
             if (!evaluatePrompt(fitted.prompt)) {
                 finish(FinishReason.CANCELLED, null)
                 return
             }
             promptReadyAt = nanoTime()
+            // The reading alone: not the fitting and the growing before it, and not the time spent standing aside.
+            noteReadSpeed(evaluated = tokens.size - reusedTokens, nanos = promptReadyAt - readingFrom - (asideBeforeReply - asideBeforeReading))
             out.send(GenerationEvent.PromptProgress(tokens.size, tokens.size))
 
-            sample(maxNewTokens = minOf(requestedNewTokens, contextSize - tokens.size), contextSize = contextSize)
+            sample(maxNewTokens = minOf(requestedNewTokens, contextSize - tokens.size))
+        }
+
+        // --- The size of the context ---
+
+        /** The speed this model reads at: as measured in this session, or the catalogue's until then. */
+        private fun readSpeed(): Double = if (measuredReadSpeed > 0) measuredReadSpeed else model.readTokensPerSecond.toDouble()
+
+        /** Remembers how fast a prompt was read, when it was long enough to say. */
+        private fun noteReadSpeed(evaluated: Int, nanos: Long) {
+            if (evaluated >= MIN_TOKENS_FOR_SPEED && nanos > 0) measuredReadSpeed = evaluated * NANOS_PER_SECOND / nanos
+        }
+
+        /**
+         * What a context of [tokens] costs as the native side counts it, or null when it cannot
+         * say: for a size beyond the model's largest, and for a session that could not learn
+         * what its contexts cost. Such a session keeps the size it has; it still answers.
+         */
+        private fun nativeCost(tokens: Int): Long? {
+            if (tokens < 1 || tokens > native.maxContextSize) return null
+            return try {
+                native.contextBytes(tokens)
+            } catch (e: NativeLlamaException) {
+                if (e.code != NativeLlamaException.CONTEXT_REFUSED) throw e
+                null
+            }
+        }
+
+        /** The memory one more token of context costs for the loaded model, as it says itself; the catalogue's figure when it does not. */
+        private fun bytesPerToken(): Long {
+            val low = nativeCost(ContextPolicy.GRANULARITY)
+            val high = nativeCost(2 * ContextPolicy.GRANULARITY)
+            val asked = if (low != null && high != null) (high - low) / ContextPolicy.GRANULARITY else 0
+            return if (asked > 0) asked else model.contextBytesPerToken
+        }
+
+        /**
+         * How large this model's context may become for this request: what the policy allows
+         * for the model on this device (under the request's own choice of size, if it makes
+         * one), and no more than a limit that was found earlier by running into it.
+         *
+         * Left to itself, a context that has grown is not cut back because the model was since
+         * seen to read more slowly: the speed is measured again with every prompt, and a limit
+         * that followed every measurement down would leave out turns of a conversation that was
+         * already read, and read the rest again. What a conversation was given, it keeps until
+         * it is left; the limit of the moment counts for what is asked for from then on. A size
+         * the request names is another matter: it is the user's, and holds at once.
+         */
+        private fun contextLimit(): Int {
+            val allowed = contextPolicy.limit(
+                start = openedContext,
+                maxContext = minOf(model.maxContextLength, native.maxContextSize),
+                bytesPerToken = bytesPerToken(),
+                totalBytes = memoryGauge.read().totalBytes,
+                chosen = request.maxContextTokens,
+                tokensPerSecond = readSpeed(),
+            )
+            val limit = minOf(allowed, foundContextLimit ?: Int.MAX_VALUE)
+            return (if (request.maxContextTokens == null) maxOf(limit, native.contextSize()) else limit).coerceAtLeast(1)
+        }
+
+        /**
+         * Makes the context larger, towards [wanted] tokens and never beyond [limit]: to the
+         * smallest step that holds [wanted] if the device's memory allows that now, otherwise
+         * to the largest step it does allow. Where it ends below what was wanted, that size is
+         * the model's limit from now on, and the collector is told so once.
+         *
+         * The device's memory is read here, at the moment of the decision. The policy budgets
+         * what the tokens of a context take. The native side counts more: what a session
+         * reserves whatever the size of its context, most of which is never touched. That part
+         * is the same before and after a step, so it is added to the policy's budget, and the
+         * sum is what the native side is given; it keeps the context's memory within it at
+         * every moment, choosing itself whether the model's memory can be carried over.
+         */
+        private suspend fun growTowards(wanted: Int, limit: Int) {
+            val from = native.contextSize()
+            val device = memoryGauge.read()
+            val cost = nativeCost(from)
+            if (cost == null) {
+                // What a context costs is not known, so none is asked for.
+                limitFound(from, GenerationEvent.ContextLimited.Reason.FAILED)
+                return
+            }
+            val tokenBytes = from.toLong() * bytesPerToken()
+            val reserved = (cost - tokenBytes).coerceAtLeast(0)
+            val allowed = contextPolicy.budgetBytes(device, minOf(tokenBytes, cost))
+            val budget = if (allowed > Long.MAX_VALUE - reserved) Long.MAX_VALUE else allowed + reserved
+            val steps = contextPolicy.steps(start = openedContext, limit = limit)
+            val target = steps.firstOrNull { it >= wanted } ?: limit
+            if (device.low) {
+                // The system says memory is low: nothing is added while it says so. That is a
+                // state of the moment and not a limit of this model, so it is not remembered.
+                announceLimit(from, GenerationEvent.ContextLimited.Reason.MEMORY)
+                return
+            }
+            val affordable = steps.lastOrNull { step -> step > from && step <= target && nativeCost(step).let { it != null && it <= budget } }
+            if (affordable == null) {
+                limitFound(from, GenerationEvent.ContextLimited.Reason.MEMORY)
+                return
+            }
+            val held = memory.size
+            try {
+                native.resizeContext(affordable, budget)
+            } catch (e: NativeLlamaException) {
+                when (e.code) {
+                    NativeLlamaException.CONTEXT_REFUSED -> limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.MEMORY)
+                    NativeLlamaException.CONTEXT_NOT_CREATED -> {
+                        // Whatever exists now is what there is; a context that does not exist at all ends the generation as a failure of the model.
+                        if (native.contextSize() <= 0) throw e
+                        agreeWithNativeMemory()
+                        limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.FAILED)
+                    }
+                    else -> throw e
+                }
+                return
+            }
+            agreeWithNativeMemory()
+            announcedContextLimit = null
+            out.send(GenerationEvent.ContextGrown(fromTokens = from, toTokens = native.contextSize(), rereading = held > 0 && memory.size == 0))
+            if (affordable < target) limitFound(affordable, GenerationEvent.ContextLimited.Reason.MEMORY)
+        }
+
+        /**
+         * Gives a grown context back when the conversation that needed it has been left: when
+         * what is asked for now fits the size the context was opened with, and little of what
+         * the model has read could be used for it ([Settings.giveBackRereadTokens] at most,
+         * which are then read again). Clearing the memory is what returns the context to that
+         * size, so nothing is asked of the native side that a lock does not ask as well.
+         *
+         * Without this a model that can remove the end of its memory would keep the context of
+         * its longest conversation until the next lock, however short the conversations after
+         * it. A conversation that merely became shorter (its latest message was edited, say)
+         * keeps its context and what was read of it: reading thousands of tokens again costs
+         * the user more than the memory is worth until the next lock.
+         */
+        private fun giveBackIfLeft(prompt: IntArray, wanted: Int) {
+            if (native.contextSize() <= openedContext || wanted > openedContext) return
+            val reusable = minOf(memory.commonPrefixWith(prompt), prompt.size - 1)
+            if (reusable <= settings.giveBackRereadTokens) clearMemory()
+        }
+
+        /** After a resize: the engine's copy of the memory is what the native side kept, which is all of it or nothing. */
+        private fun agreeWithNativeMemory() {
+            if (native.memoryTokenCount() == memory.size) return
+            if (native.memoryTokenCount() == 0) {
+                // Not carried over. The checkpoints went with it.
+                memory.wipe()
+                checkpoints.clear()
+            } else {
+                clearMemory()
+            }
+        }
+
+        /** [tokens] is this model's limit until it is loaded again; the collector is told once. */
+        private suspend fun limitFound(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
+            foundContextLimit = minOf(tokens, foundContextLimit ?: Int.MAX_VALUE)
+            announceLimit(tokens, reason)
+        }
+
+        private suspend fun announceLimit(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
+            if (announcedContextLimit == tokens) return
+            announcedContextLimit = tokens
+            out.send(GenerationEvent.ContextLimited(tokens, reason))
         }
 
         // --- Step 1: render, tokenise, fit ---
@@ -562,7 +832,7 @@ class LlamaEngine(
 
         // --- Step 4: sample the reply ---
 
-        private suspend fun sample(maxNewTokens: Int, contextSize: Int) {
+        private suspend fun sample(maxNewTokens: Int) {
             val sampling = request.sampling ?: model.sampling
             native.configureSampler(
                 SamplerConfig(
@@ -573,7 +843,7 @@ class LlamaEngine(
                     repetitionPenalty = sampling.repetitionPenalty,
                     presencePenalty = sampling.presencePenalty,
                     frequencyPenalty = sampling.frequencyPenalty,
-                    penaltyWindow = contextSize,
+                    penaltyWindow = SamplerConfig.NO_PENALTY_WINDOW,
                     seed = sampling.seed ?: newSeed(),
                     bannedTokenIds = model.bannedTokenIds,
                 ),
@@ -680,7 +950,23 @@ class LlamaEngine(
         return if (frame == null) e.javaClass.simpleName else "${e.javaClass.simpleName} at ${frame.fileName}:${frame.lineNumber}"
     }
 
-    private companion object {
-        const val NANOS_PER_MILLI = 1_000_000L
+    companion object {
+        /**
+         * The message of the failure to load a model for which the device has too little memory
+         * available now, so that whoever words the failure for the user can tell it from the others.
+         */
+        const val TOO_LITTLE_MEMORY: String = "too little memory available for this model"
+
+        /** No model is opened with a context smaller than this. */
+        const val MIN_OPENING_CONTEXT: Int = 1024
+
+        private const val NANOS_PER_MILLI = 1_000_000L
+        private const val NANOS_PER_SECOND = 1e9
+
+        /** A prompt shorter than this says too little about the reading speed. */
+        private const val MIN_TOKENS_FOR_SPEED = 256
+
+        /** More rounds of fitting than a context has ways to shrink mean that something is wrong. */
+        private const val MAX_FITTING_ROUNDS = 8
     }
 }

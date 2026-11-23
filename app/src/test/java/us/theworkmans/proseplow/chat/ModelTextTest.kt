@@ -8,6 +8,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.w3c.dom.Element
 import us.theworkmans.proseplow.R
+import us.theworkmans.proseplow.core.chat.toChatError
+import us.theworkmans.proseplow.core.engine.EngineError
+import us.theworkmans.proseplow.core.engine.LlamaEngine
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
@@ -93,6 +96,20 @@ class ModelTextTest {
             assertTrue(completion, strings.getValue(completion).isNotBlank())
         }
         assertFalse("a model that continues text is not said to answer", "answer" in strings.getValue("empty_hint_completion"))
+    }
+
+    @Test
+    fun aModelThePhoneHasTooLittleMemoryForIsSaidInItsOwnWords() {
+        assertEquals(R.string.error_model_too_little_memory_detail, ModelText.loadFailedDetailRes(LlamaEngine.TOO_LITTLE_MEMORY))
+        assertTrue(ModelText.isTooLittleMemory(LlamaEngine.TOO_LITTLE_MEMORY))
+        for (other in listOf(null, "", "the file is missing", LlamaEngine.TOO_LITTLE_MEMORY + ".")) {
+            assertEquals(other, R.string.error_model_load_failed_detail, ModelText.loadFailedDetailRes(other))
+            assertFalse(ModelText.isTooLittleMemory(other))
+        }
+        val words = strings.getValue("error_model_too_little_memory_detail")
+        assertTrue("it says what is short, and that it is so now", "too little free memory" in words && "right now" in words)
+        // The engine's own failure to open a model carries exactly that detail.
+        assertEquals(LlamaEngine.TOO_LITTLE_MEMORY, EngineError.LoadFailed("m", LlamaEngine.TOO_LITTLE_MEMORY).toChatError(null).detail)
     }
 
     @Test

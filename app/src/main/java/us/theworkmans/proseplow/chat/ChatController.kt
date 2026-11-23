@@ -87,6 +87,8 @@ data class Turn(val sessionId: String, val assistantId: String, val phase: TurnP
  * @property turn the reply being generated, in whichever chat; null when none is.
  * @property engine what the inference engine is doing.
  * @property models the models this build offers, in the order the picker shows them.
+ * @property contextNotes by chat id, what became of the model's context for the latest reply in
+ *   that chat, when something did.
  * @property trimmedMessages by chat id, how many of the oldest messages the latest reply in that
  *   chat was generated without, because the conversation no longer fitted the model's context.
  */
@@ -97,6 +99,7 @@ data class ChatState(
     val engine: EngineState = EngineState.Unloaded,
     val models: List<ModelSpec> = emptyList(),
     val trimmedMessages: Map<String, Int> = emptyMap(),
+    val contextNotes: Map<String, ContextNote> = emptyMap(),
 ) {
     /** True when [modelId] is one of [models]. */
     fun offers(modelId: String): Boolean = models.any { it.id == modelId }
@@ -114,7 +117,21 @@ data class ChatState(
  * @property maxNewTokens the longest the reply may get, in tokens: what the user set for this
  *   model, or the model's own. Passed in full for the same reason.
  */
-data class ModelRequestSettings(val systemPrompt: String?, val sampling: SamplingParams, val maxNewTokens: Int)
+data class ModelRequestSettings(val systemPrompt: String?, val sampling: SamplingParams, val maxNewTokens: Int, val maxContextTokens: Int? = null)
+
+/**
+ * What became of the model's context while the latest reply in a chat was prepared: said under
+ * the conversation, like the note about messages that were left out.
+ *
+ * @property grownTo the size the context was given, in tokens, when it had to grow; null when
+ *   it did not.
+ * @property reread true when the whole conversation was read again for that.
+ * @property limitedAt the size beyond which the context could not grow, when that was found
+ *   out with this reply; null otherwise.
+ * @property limitedByMemory true when the device's memory was the reason, false when a larger
+ *   context could not be created.
+ */
+data class ContextNote(val grownTo: Int? = null, val reread: Boolean = false, val limitedAt: Int? = null, val limitedByMemory: Boolean = true)
 
 /** Things that happened and are said once. */
 enum class ChatNotice {
@@ -297,6 +314,7 @@ class ChatController(
                 open = replacement ?: state.open,
                 turn = state.turn?.takeUnless { it.sessionId == id },
                 trimmedMessages = state.trimmedMessages - id,
+                contextNotes = state.contextNotes - id,
             )
         }
         saveIndex(urgent = true)
@@ -601,7 +619,7 @@ class ChatController(
         reply.job = job
         running = reply
         lastTurn = job
-        _state.update { it.copy(turn = Turn(reply.sessionId, reply.assistantId, TurnPhase.Preparing), trimmedMessages = it.trimmedMessages - reply.sessionId) }
+        _state.update { it.copy(turn = Turn(reply.sessionId, reply.assistantId, TurnPhase.Preparing), trimmedMessages = it.trimmedMessages - reply.sessionId, contextNotes = it.contextNotes - reply.sessionId) }
         job.start()
         return true
     }
@@ -638,7 +656,7 @@ class ChatController(
             }
             // Read again: the draft may have changed while the model was loading.
             val settings = requestSettings(spec)
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens)
+            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)
             engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
         } catch (e: CancellationException) {
             throw e
@@ -662,6 +680,9 @@ class ChatController(
         when (event) {
             is GenerationEvent.HistoryTrimmed ->
                 _state.update { it.copy(trimmedMessages = it.trimmedMessages + (reply.sessionId to event.droppedMessages)) }
+            is GenerationEvent.ContextGrown -> note(reply) { it.copy(grownTo = event.toTokens, reread = it.reread || event.rereading) }
+            is GenerationEvent.ContextLimited ->
+                note(reply) { it.copy(limitedAt = event.limitTokens, limitedByMemory = event.reason == GenerationEvent.ContextLimited.Reason.MEMORY) }
             is GenerationEvent.PromptProgress -> phase(reply, TurnPhase.ReadingPrompt(event.evaluatedTokens, event.totalTokens))
             // Text added, or text the model took back: either way the message changes as it is written.
             is GenerationEvent.TextDelta, is GenerationEvent.TextReplaced -> {
@@ -673,6 +694,10 @@ class ChatController(
                 if (event is GenerationEvent.Done && event.finishReason != FinishReason.CANCELLED) onReplyFinished()
             }
         }
+    }
+
+    private fun note(reply: Running, change: (ContextNote) -> ContextNote) {
+        _state.update { it.copy(contextNotes = it.contextNotes + (reply.sessionId to change(it.contextNotes[reply.sessionId] ?: ContextNote()))) }
     }
 
     private fun phase(reply: Running, phase: TurnPhase) {

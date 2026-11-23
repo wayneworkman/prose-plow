@@ -138,7 +138,7 @@ internal fun measureSpeeds(
     isEnd: (Int) -> Boolean = { false },
 ): Speeds {
     val factory = if (plan == null) LlamaFactory(appContext, settings) else LlamaFactory(appContext, settings, plan)
-    val native = factory.open(model) { true } as LlamaSession
+    val native = factory.open(model, { true }, model.contextLength, TEST_BUDGET_BYTES) as LlamaSession
     try {
         // Once unmeasured: the first evaluation builds the thread pool and touches every page.
         native.mustEvaluate(prompt)

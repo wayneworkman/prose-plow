@@ -202,6 +202,10 @@
     <string name="note_stopped_empty">Stopped before anything was written</string>
     <string name="note_length">Reached the length limit</string>
     <string name="note_empty">The model gave an empty answer</string>
+    <string name="note_context_grown">This conversation needed more room, so the model now reads up to %1$s tokens at once.</string>
+    <string name="note_context_grown_reread">This conversation needed more room, so the model now reads up to %1$s tokens at once. For that it read the whole conversation again.</string>
+    <string name="note_context_limited_memory">The phone has too little free memory to give this conversation more room. For now the model reads up to %1$s tokens at once.</string>
+    <string name="note_context_limited_failed">A larger context could not be set up on this phone. Until the model is loaded again it reads up to %1$s tokens at once.</string>
     <plurals name="note_trimmed">
         <item quantity="one">This conversation is longer than the model can read at once. The oldest %1$d message was left out of the latest answer.</item>
         <item quantity="other">This conversation is longer than the model can read at once. The oldest %1$d messages were left out of the latest answer.</item>
@@ -230,6 +234,7 @@
     <string name="error_model_not_loaded_detail">No model was loaded when the answer was asked for. Try again.</string>
     <string name="error_model_load_failed_title">The model could not be loaded</string>
     <string name="error_model_load_failed_detail">The model may be missing from this build, or the phone may be short of memory. Try again, or choose another model.</string>
+    <string name="error_model_too_little_memory_detail">The phone has too little free memory for this model right now. Close other apps and try again, or choose a smaller model.</string>
     <string name="error_invalid_request_title">The message could not be sent</string>
     <string name="error_invalid_request_detail">The conversation could not be put into the form this model reads.</string>
     <string name="error_prompt_too_long_title">The message is too long for this model</string>
@@ -283,8 +288,24 @@
     <string name="reply_length_invalid">Enter a whole number from %1$s to %2$s.</string>
     <string name="reply_length_use_default">Use the model\'s default longest reply</string>
     <string name="model_restore_defaults">Restore this model\'s defaults</string>
-    <string name="model_restore_defaults_support">Sets the temperature and the longest reply back to this model\'s own values. The system prompt stays as it is.</string>
-    <string name="model_restore_defaults_support_no_prompt">Sets the temperature and the longest reply back to this model\'s own values.</string>
+    <string name="context_label">Context</string>
+    <string name="context_support">How much of a conversation this model reads at once, in tokens. It starts at %1$s and grows only when a conversation needs more, which takes more of the phone\'s memory. After the app was locked and left, the whole conversation is read again before the next answer, so a longer conversation means a longer wait. An answer that goes on after the app locks is stopped after ten minutes at the latest, so a conversation that takes longer than that to read is best read with the app open. Beyond the limit chosen here, the oldest messages are left out of an answer.</string>
+    <string name="context_automatic">Automatic: up to %1$s tokens on this phone</string>
+    <string name="context_fixed">Up to %1$s tokens</string>
+    <string name="context_cost">About %1$s of memory when full, and about %2$s to read it all again.</string>
+    <string name="context_cost_memory_only">About %1$s of memory when full.</string>
+    <string name="context_single_model">This model reads at most %1$s tokens of a conversation at once; that is the model\'s own limit. Beyond it, the oldest messages are left out of an answer.</string>
+    <string name="context_single_phone">On this phone this model reads at most %1$s tokens of a conversation at once; the phone does not have the memory for more. Beyond it, the oldest messages are left out of an answer.</string>
+    <plurals name="duration_seconds">
+        <item quantity="one">%1$d second</item>
+        <item quantity="other">%1$d seconds</item>
+    </plurals>
+    <plurals name="duration_minutes">
+        <item quantity="one">%1$d minute</item>
+        <item quantity="other">%1$d minutes</item>
+    </plurals>
+    <string name="model_restore_defaults_support">Sets the temperature and the longest reply back to this model\'s own values, and the context to automatic. The system prompt stays as it is.</string>
+    <string name="model_restore_defaults_support_no_prompt">Sets the temperature and the longest reply back to this model\'s own values, and the context to automatic.</string>
 
     <!-- Settings: about -->
     <string name="section_about">About</string>

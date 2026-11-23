@@ -15,6 +15,9 @@ import us.theworkmans.proseplow.background.AndroidReadyNotice
 import us.theworkmans.proseplow.background.AnswerService
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.KeepAliveSource
+import us.theworkmans.proseplow.background.MemoryPressure
+import us.theworkmans.proseplow.core.engine.ContextPolicy
+import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
@@ -37,7 +40,10 @@ import java.util.concurrent.Executors
  * container, and so never has a lock that could end it.
  */
 class ProsePlowApp : Application(), KeepAliveSource {
-    private val lazyContainer = lazy { AppContainer(this) }
+    /** What Android has said about memory being short; see [MemoryPressure]. It exists without the container. */
+    val memoryPressure = MemoryPressure { SystemClock.elapsedRealtime() }
+
+    private val lazyContainer = lazy { AppContainer(this, memoryPressure) }
     val container: AppContainer by lazyContainer
 
     override val keepAliveWanted: StateFlow<Boolean>?
@@ -46,6 +52,17 @@ class ProsePlowApp : Application(), KeepAliveSource {
     override fun onCreate() {
         super.onCreate()
         turnSmartSelectionOff()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        memoryPressure.onTrimLevel(level)
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION") // Still called on the versions this app runs on, and the one signal that the whole system is short.
+    override fun onLowMemory() {
+        super.onLowMemory()
+        memoryPressure.onLowMemory()
     }
 
     /**
@@ -67,8 +84,17 @@ class ProsePlowApp : Application(), KeepAliveSource {
  * unlock and the next lock. The [engine] is no exception: it holds a conversation only while a
  * session is using it, and the session makes it forget when it ends.
  */
-class AppContainer(context: Context) {
+class AppContainer(context: Context, memoryPressure: MemoryPressure) {
     private val app = context.applicationContext
+
+    /** The device's memory, asked whenever a model's context is to be given a size; see [DeviceMemoryGauge]. */
+    private val deviceMemory = DeviceMemoryGauge(app, memoryPressure)
+
+    /** How large a model's context may be on this phone; the same numbers the engine decides with. */
+    private val contextPolicy = ContextPolicy()
+
+    /** What this phone allows a model's context, for the settings and for the longest reply that follows from it. */
+    private val contextLimits = DeviceContextLimits(contextPolicy, deviceMemory.totalBytes())
 
     val files = AppFiles(app.filesDir, app.cacheDir)
 
@@ -84,7 +110,7 @@ class AppContainer(context: Context) {
      */
     private val engine: InferenceEngine by lazy {
         val nativeThread = Executors.newSingleThreadExecutor { task -> Thread(task, "inference") }
-        LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate)
+        LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate, memoryGauge = deviceMemory, contextPolicy = contextPolicy)
     }
 
     /**
@@ -122,7 +148,13 @@ class AppContainer(context: Context) {
         files = files,
         clock = clock,
         // The models offered are the ones whose files this build really carries, asked at every unlock.
-        openSession = { cipher -> AppSession(cipher, layout, engine, NativeEngine.availableModels(app), answerEvents = answerWork) },
+        openSession = { cipher ->
+            AppSession(
+                cipher, layout, engine, NativeEngine.availableModels(app),
+                answerEvents = answerWork,
+                contextLimits = contextLimits,
+            )
+        },
         biometricStatus = {
             // Only "none enrolled" removes fingerprint unlock; NO_HARDWARE, HW_UNAVAILABLE,
             // UNSUPPORTED, SECURITY_UPDATE_REQUIRED and STATUS_UNKNOWN keep it for later.

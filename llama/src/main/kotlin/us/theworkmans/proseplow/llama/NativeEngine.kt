@@ -57,7 +57,9 @@ object NativeEngine {
  *   the system can drop under memory pressure and read again; read weights are anonymous memory
  *   that can only be compressed into swap.
  * @property batchTokens the most tokens native code evaluates in one go; the engine's own chunk
- *   size applies below it. It bounds a work buffer, not the context.
+ *   size applies below it. It bounds a work buffer, not the context, and that buffer is paid
+ *   once for any context: the scores of a whole batch, which for the largest vocabulary bundled
+ *   (Qwen3.5) is 242 MiB reserved at 256 tokens, most of it never touched.
  */
 internal data class NativeSettings(
     val pinThreads: Boolean = true,
@@ -141,14 +143,14 @@ internal class LlamaFactory(
     private val threadPlan: ThreadPlan = ThreadPlanner.plan(CpuSysfs().capacities(), Runtime.getRuntime().availableProcessors()),
 ) : NativeLlamaFactory {
 
-    override fun open(model: ModelSpec, progress: LoadProgress): NativeLlama {
+    override fun open(model: ModelSpec, progress: LoadProgress, contextTokens: Int, budgetBytes: Long): NativeLlama {
         NativeRuntime.start(context)
         val location = ModelFiles.locate(context, model)
             ?: throw NativeLlamaException(NativeLlamaException.LOAD_FAILED, "This build does not carry the file of ${model.id}")
         val pinned = if (settings.pinThreads) threadPlan.pinnedCpus.toIntArray() else IntArray(0)
         return ModelFiles.open(context, location) { fd, offset, length ->
             fun load(map: Boolean): Long = LlamaJni.openFd(
-                fd, offset, length, model.contextLength, settings.batchTokens, threadPlan.unpinnedThreads, pinned, map, progress,
+                fd, offset, length, contextTokens, budgetBytes, settings.batchTokens, threadPlan.unpinnedThreads, pinned, map, progress,
             )
             val session = if (!settings.mapModel) {
                 load(map = false)

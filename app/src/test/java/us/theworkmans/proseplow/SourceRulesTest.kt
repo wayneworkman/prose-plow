@@ -15,6 +15,10 @@ class SourceRulesTest {
     /** The module directory: Gradle runs the unit tests from it. */
     private val module = File("").absoluteFile
 
+    /** The one line that makes the engine: with the app's gate, the device's memory and the app's one policy. */
+    private val engineIsMade =
+        "LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate, memoryGauge = deviceMemory, contextPolicy = contextPolicy)"
+
     private fun sources(directory: String): List<File> {
         val root = File(module, directory)
         assertTrue("$root is where the sources are", root.isDirectory)
@@ -714,7 +718,7 @@ class SourceRulesTest {
         assertEquals(listOf("if (settled) processEnder.end()"), lock.filter { it.contains("processEnder.") })
         // The application object does not make the lock (and with it the ender) by itself: only an activity asks for the container.
         val application = code(File(module, "$main/ProsePlowApp.kt")).joinToString("\n")
-        assertTrue(application.contains("private val lazyContainer = lazy { AppContainer(this) }"))
+        assertTrue(application.contains("private val lazyContainer = lazy { AppContainer(this, memoryPressure) }"))
         assertTrue(application.contains("get() = if (lazyContainer.isInitialized()) container.answerWork.keepAliveWanted else null"))
         assertEquals("the service must not create the container", emptyList<String>(), users(sources("$main/background"), "container"))
     }
@@ -745,7 +749,7 @@ class SourceRulesTest {
         assertEquals(listOf("heavyWork.standAside()", "heavyWork.carryOn()"), lock.filter { it.contains("heavyWork.") })
 
         val application = code(File(module, "$main/ProsePlowApp.kt"))
-        assertTrue(application.contains("LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate)"))
+        assertTrue(application.contains(engineIsMade))
         assertTrue(application.contains("override fun standAside() = generationGate.close()"))
         assertTrue(application.contains("override fun carryOn() = generationGate.open()"))
         assertEquals("one gate", listOf("private val generationGate = GenerationGate()"), application.filter { it.contains("GenerationGate(") })
@@ -766,7 +770,9 @@ class SourceRulesTest {
         assertTrue(engine.contains("val minReplyTokens: Int = ReplyLength.MIN_TOKENS,"))
         val limits = code(File(core, "model/ReplyLength.kt"))
         assertTrue(limits.contains("const val MIN_TOKENS: Int = 16"))
-        assertTrue(limits.contains("fun maxTokens(contextTokens: Int): Int = contextTokens / 2"))
+        assertTrue(limits.contains("const val MAX_TOKENS: Int = 4096"))
+        assertTrue(limits.contains("fun maxTokens(contextTokens: Int): Int = minOf(MAX_TOKENS, contextTokens / 2)"))
+        assertTrue(limits.contains("fun range(contextLimit: Int): IntRange = MIN_TOKENS..maxTokens(contextLimit)"))
 
         val all = sources(main)
         for (word in listOf("contextLength / 2", "contextSize / 2", "contextLength/2", "defaultMaxNewTokens * 2")) {
@@ -777,14 +783,78 @@ class SourceRulesTest {
         val controller = code(File(module, "$main/chat/ChatController.kt"))
         assertEquals(
             "every reply is asked for in one place, with the model's settings as they are then",
-            listOf("val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens)"),
+            listOf(
+                "val request = (sessions[reply.sessionId] ?: return)" +
+                    ".generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)",
+            ),
             controller.filter { it.contains("generationRequest(") },
         )
         assertEquals(listOf("ChatController.kt"), users(all, ".generationRequest("))
-        assertEquals(
-            listOf("ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model), current.maxNewTokens(model))"),
-            code(File(module, "$main/AppSession.kt")).filter { it.contains("ModelRequestSettings(") },
+        val session = code(File(module, "$main/AppSession.kt")).joinToString("\n")
+        assertTrue(
+            "the settings of a reply are read in one place: the longest reply held to the limit of the context under the size chosen for it",
+            session.contains(
+                listOf(
+                    "val chosen = contextLimits.chosen(model, current.contextTokens(model.id))",
+                    "ModelRequestSettings(",
+                    "current.systemPrompt(model.id).ifEmpty { null },",
+                    "current.sampling(model),",
+                    "current.maxNewTokens(model, contextLimits.limit(model, chosen)),",
+                    "chosen,",
+                    ")",
+                ).joinToString("\n"),
+            ),
         )
+        assertEquals(listOf("AppSession.kt"), users(all, "ModelRequestSettings(").filter { it != "ChatController.kt" })
+    }
+
+    /**
+     * How large a model's context may become is decided by one policy, in the core, which the
+     * engine and the settings share; the app has no number of its own for it. The device's
+     * memory is read in one place, afresh every time the engine asks, and what the system says
+     * in its callbacks only adds to that. And the penalties are told to look at the whole
+     * memory by name, not by a size that changes.
+     */
+    @Test
+    fun theContextHasOnePolicyAndTheDevicesMemoryIsReadInOnePlace() {
+        val all = sources(main)
+        val application = code(File(module, "$main/ProsePlowApp.kt"))
+        assertEquals("one policy", listOf("ProsePlowApp.kt"), users(all, "ContextPolicy("))
+        assertEquals(listOf("private val contextPolicy = ContextPolicy()"), application.filter { it.contains("ContextPolicy(") })
+        assertTrue(application.contains(engineIsMade))
+        assertTrue(application.contains("private val contextLimits = DeviceContextLimits(contextPolicy, deviceMemory.totalBytes())"))
+        assertEquals("made once, from the one policy and the memory the phone has", listOf("ProsePlowApp.kt"), users(all, "DeviceContextLimits(contextPolicy"))
+        assertTrue("the session has the phone's limits", application.contains("contextLimits = contextLimits,"))
+        val navigation = code(File(module, "$main/AppNavigation.kt"))
+        assertEquals(
+            "and so has every page of the settings",
+            2,
+            navigation.count { it.contains("SettingsViewModel(session.settings, session.models, contextLimits = session.contextLimits)") },
+        )
+        assertEquals(2, navigation.count { it.contains("SettingsViewModel(") })
+        for (word in listOf("contextBytesPerToken", "readTokensPerSecond", "maxShareOfTotal", "floorShareOfTotal", "rereadSeconds =")) {
+            assertEquals("$word is the policy's to use", emptyList<String>(), users(all, word))
+        }
+
+        assertEquals("the memory is read in one place", listOf("DeviceMemoryGauge.kt"), users(all, "getMemoryInfo("))
+        assertEquals(listOf("DeviceMemoryGauge.kt"), users(all, "ActivityManager.MemoryInfo"))
+        val gauge = code(File(module, "$main/DeviceMemoryGauge.kt"))
+        assertTrue("low is what the system says now or said shortly before", gauge.any { it.contains("low = info.lowMemory || pressure.isSet") })
+        assertTrue(application.contains("memoryPressure.onTrimLevel(level)"))
+        assertTrue(application.contains("memoryPressure.onLowMemory()"))
+
+        val core = File(module.parentFile, "core/src/main/kotlin/us/theworkmans/proseplow/core")
+        val engine = code(File(core, "engine/LlamaEngine.kt"))
+        assertEquals(listOf("penaltyWindow = SamplerConfig.NO_PENALTY_WINDOW,"), engine.filter { it.contains("penaltyWindow") })
+        assertTrue("the memory is read at the moment of each decision", engine.contains("val device = memoryGauge.read()"))
+        assertTrue("the policy budgets what the tokens of the context take", engine.contains("val allowed = contextPolicy.budgetBytes(device, minOf(tokenBytes, cost))"))
+        assertTrue(
+            "the native side counts what a session reserves at any size as well, so that is added to what it is given",
+            engine.contains("val budget = if (allowed > Long.MAX_VALUE - reserved) Long.MAX_VALUE else allowed + reserved"),
+        )
+        assertTrue(engine.contains("native.resizeContext(affordable, budget)"))
+        assertTrue("an opening is held to the budget by the engine itself", engine.contains("while (size.toLong() * model.contextBytesPerToken > budget) {"))
+        assertTrue(engine.contains("return factory.open(model, progress, size, Long.MAX_VALUE).also {"))
     }
 
     /**

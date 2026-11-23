@@ -49,6 +49,16 @@ enum class ModelFamily(val promptFormat: PromptFormat, val continuesText: Boolea
  * @property ggufFileName name of the model file among the app's assets.
  * @property contextLength the context, in tokens, the model is run with on the phone. This is a
  *   memory and speed decision and usually far below what the model was trained with.
+ * @property maxContextLength the context the model was trained with: the most its context can
+ *   ever be given. [contextLength] is where a context starts; it grows towards this as a
+ *   conversation needs it, as far as the device allows (see the engine's ContextPolicy). A
+ *   model that is given none cannot grow.
+ * @property contextBytesPerToken the memory one token of context costs, in bytes, for showing
+ *   what a context size costs before the model is loaded; 0 when not known. The loaded model
+ *   itself is asked when a size is decided on.
+ * @property readTokensPerSecond how fast the model reads a conversation on the phone it was
+ *   measured on, in front; 0 when not known. It bounds how far the context grows by itself,
+ *   until the speed on this very phone has been measured.
  * @property defaultMaxNewTokens the longest reply, in tokens, when a request does not say. It is
  *   also the room the engine keeps free for the reply when it decides how much history fits.
  * @property sampling the model's reference sampling settings.
@@ -91,6 +101,9 @@ data class ModelSpec(
     val sourceRepository: String,
     val licence: String?,
     val deletionTokenId: Int? = null,
+    val maxContextLength: Int = contextLength,
+    val contextBytesPerToken: Long = 0,
+    val readTokensPerSecond: Int = 0,
 ) {
     init {
         require(id.isNotBlank()) { "A model needs an id" }

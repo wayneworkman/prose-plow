@@ -68,12 +68,15 @@ fun ChatSession.promptHistory(exactText: Boolean = false): PromptHistory {
  *   (see [promptHistory]). It is asked for, rather than left to a default, so that no caller can
  *   send a model that continues text a prompt with its last space missing.
  * @param systemPrompt the system prompt the settings hold for that model, or null.
+ * @param maxContextTokens the size the settings hold as the most that model's context may grow
+ *   to, or null to leave that to the engine.
  */
 fun ChatSession.generationRequest(
     model: ModelSpec,
     systemPrompt: String?,
     sampling: SamplingParams? = null,
     maxNewTokens: Int? = null,
+    maxContextTokens: Int? = null,
 ): GenerationRequest {
     val history = promptHistory(exactText = model.family.continuesText)
     return GenerationRequest(
@@ -83,5 +86,6 @@ fun ChatSession.generationRequest(
         continueFinalMessage = history.continueFinalMessage,
         sampling = sampling,
         maxNewTokens = maxNewTokens,
+        maxContextTokens = maxContextTokens,
     )
 }

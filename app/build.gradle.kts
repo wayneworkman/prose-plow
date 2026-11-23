@@ -403,6 +403,16 @@ dependencies {
     androidTestImplementation(libs.androidx.test.core)
 }
 
+// Two of the unit tests read files of the repository that are not on their classpath: the list of
+// features, which is held to the app's wording, and the models' manifest, which the catalogue is
+// held to. They are declared here, so that a change to either of them runs the tests again
+// instead of leaving the result of an earlier run in place.
+tasks.withType<Test>().configureEach {
+    inputs.files(rootProject.file("FEATURES.md"), rootProject.file("models/manifest.json"))
+        .withPropertyName("repositoryFilesTheUnitTestsRead")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
 // The checks on every APK and bundle this module writes that the native code depends on: each
 // model in it is, byte for byte, one that models/manifest.json pins, and is stored on a 16 KiB
 // boundary; the native libraries are built for 16 KB pages. They live with the module they protect.

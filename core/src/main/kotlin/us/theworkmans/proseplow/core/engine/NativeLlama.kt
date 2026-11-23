@@ -74,6 +74,39 @@ interface NativeLlama {
     fun contextSize(): Int
 
     /**
+     * The model's trained context (`llama_model_n_ctx_train`): the largest size the context can
+     * usefully be given. The engine takes the smaller of this and the catalogue's
+     * [ModelSpec.maxContextLength].
+     */
+    val maxContextSize: Int
+
+    /**
+     * The memory, in bytes, that a context of [tokens] tokens takes at this session's batch
+     * size: what is allocated, which is an upper bound on what becomes resident. Budgets are
+     * made of differences between two sizes.
+     */
+    fun contextBytes(tokens: Int): Long
+
+    /**
+     * Gives the context another size. [budgetBytes] is the most the context's memory may occupy
+     * at any moment during and after the call; within it the implementation chooses the best
+     * way there. Three outcomes:
+     *
+     * - **Done.** [contextSize] is [tokens]. The memory was carried over when that fitted the
+     *   budget and is empty otherwise: ask [memoryTokenCount]. Checkpoint handles are valid
+     *   exactly when the memory was kept. No prediction is ready: evaluate before sampling. The
+     *   sampler's configuration and the threads are as they were.
+     * - **Refused**, with [NativeLlamaException.CONTEXT_REFUSED]: [tokens] is above
+     *   [maxContextSize] or would cost more than [budgetBytes]. Nothing was touched.
+     * - **Failed**, with [NativeLlamaException.CONTEXT_NOT_CREATED]: the new context could not be
+     *   created after the old one was given up. The implementation has then created the old
+     *   size again, with its memory if that could be saved, and failing that ever smaller
+     *   sizes. [contextSize] says what exists now, and [memoryTokenCount] what it holds; 0
+     *   for the size means that no context exists and the model must be loaded again.
+     */
+    fun resizeContext(tokens: Int, budgetBytes: Long)
+
+    /**
      * The number of tokens currently in memory: `llama_memory_seq_pos_max(mem, 0) + 1`, which is
      * 0 for an empty memory. The engine keeps its own copy of the tokens and uses this to detect
      * that the two have drifted apart.
@@ -179,6 +212,9 @@ interface NativeLlama {
      * - the sampler forgets the tokens it has seen (`llama_sampler_reset`).
      *
      * Afterwards [memoryTokenCount] is 0. The model stays loaded and the sampler stays configured.
+     * A context that had grown is back at the size it was opened with, so the memory a long
+     * conversation needed is given back when the conversation is left or the app locks; ask
+     * [contextSize].
      */
     fun clearMemory()
 
@@ -278,9 +314,9 @@ interface EvaluationObserver {
  * @property repetitionPenalty 1 is neutral.
  * @property presencePenalty 0 is neutral.
  * @property frequencyPenalty 0 is neutral.
- * @property penaltyWindow how many of the latest tokens in memory the penalties look at; always
- *   positive. The engine passes the context size, which is no window: the whole conversation
- *   counts.
+ * @property penaltyWindow how many of the latest tokens in memory the penalties look at:
+ *   positive, or [NO_PENALTY_WINDOW]. The engine passes the latter: the references the models'
+ *   settings come from penalise over the whole conversation, whatever size the context has.
  * @property seed the seed of the random choice; its 32 bits are read as unsigned.
  * @property bannedTokenIds tokens that must never be returned by [NativeLlama.sampleNext].
  */
@@ -295,7 +331,12 @@ data class SamplerConfig(
     val penaltyWindow: Int,
     val seed: Int,
     val bannedTokenIds: List<Int>,
-)
+) {
+    companion object {
+        /** The whole memory counts for the penalties: llama.cpp's own -1. No other value below 1 is accepted. */
+        const val NO_PENALTY_WINDOW: Int = -1
+    }
+}
 
 /** Receives the progress of a model load. */
 fun interface LoadProgress {
@@ -315,17 +356,22 @@ fun interface NativeLlamaFactory {
      * time: the engine closes the previous [NativeLlama] before it calls this.
      *
      * The implementation finds the file named [ModelSpec.ggufFileName], chooses threads and
-     * backend, and creates the context with [ModelSpec.contextLength] as `n_ctx`. Everything
-     * else about the model's behaviour reaches it later through the [NativeLlama] calls.
+     * backend, and creates the context with the smaller of [contextTokens] and the model's
+     * trained context as `n_ctx`: the size the context begins with. [budgetBytes] is what that
+     * context may cost. When it would cost more, nothing is created and this throws
+     * [NativeLlamaException] with [NativeLlamaException.CONTEXT_REFUSED]; the caller may ask
+     * again for less. Everything else about the model's behaviour reaches the implementation
+     * later through the [NativeLlama] calls.
      *
      * [progress] is called on the calling thread. When it returns false the load is abandoned
      * (return false from llama.cpp's `progress_callback`) and this method throws
      * [NativeLlamaException] with [NativeLlamaException.LOAD_CANCELLED].
      *
      * @throws NativeLlamaException with [NativeLlamaException.LOAD_FAILED] when the model cannot
-     *   be loaded, [NativeLlamaException.OUT_OF_MEMORY] when that is known to be the reason.
+     *   be loaded, [NativeLlamaException.OUT_OF_MEMORY] when that is known to be the reason,
+     *   [NativeLlamaException.CONTEXT_REFUSED] when the opening context is above the budget.
      */
-    fun open(model: ModelSpec, progress: LoadProgress): NativeLlama
+    fun open(model: ModelSpec, progress: LoadProgress, contextTokens: Int, budgetBytes: Long): NativeLlama
 }
 
 /**
@@ -361,5 +407,11 @@ class NativeLlamaException(val code: Int, message: String) : RuntimeException(me
 
         /** The caller broke a documented precondition. */
         const val INVALID_ARGUMENT: Int = 8
+
+        /** A context of the size asked for was not created, and nothing was touched: above the model's maximum, or above the budget. */
+        const val CONTEXT_REFUSED: Int = 9
+
+        /** The context could not be given its new size after the old one was given up; see [NativeLlama.resizeContext]. */
+        const val CONTEXT_NOT_CREATED: Int = 10
     }
 }

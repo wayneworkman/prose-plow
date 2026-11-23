@@ -224,6 +224,73 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
     override fun contextSize(): Int = contextTokens
 
+    /** The size the context was opened with, which [clearMemory] returns it to. */
+    var openingTokens: Int = contextTokens
+
+    /** What [maxContextSize] reports: the model's trained context. A fake that is given nothing cannot grow. */
+    var trainedContextTokens: Int = contextTokens
+
+    /** The memory one token of context costs; [contextBytes] is this many times the size, on top of [reservedBytes]. */
+    var bytesPerToken: Long = 0
+
+    /** What a context costs whatever its size, as a real session's reservations do. */
+    var reservedBytes: Long = 0
+
+    /** When false, the session does not know what a context costs: [contextBytes] says so and every resize is refused. */
+    var costKnown: Boolean = true
+
+    /** When false, a resize comes back with an empty memory, as when carrying it over did not fit the budget. */
+    var carriesMemoryOnResize: Boolean = true
+
+    /**
+     * Sizes from this one on cannot be created although they fit the budget: a resize to one of
+     * them fails after the old context was given up, and [contextAfterFailedResize] is what
+     * exists afterwards (the old size with its memory when null).
+     */
+    var cannotCreateFrom: Int? = null
+    var contextAfterFailedResize: Int? = null
+
+    /** Every resize asked for, as (tokens, budget), refused ones included. */
+    val resizes = ArrayList<Pair<Int, Long>>()
+
+    override val maxContextSize: Int get() = trainedContextTokens
+
+    override fun contextBytes(tokens: Int): Long {
+        if (tokens < 1 || tokens > trainedContextTokens) {
+            throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "a context of $tokens tokens has no cost")
+        }
+        if (!costKnown) throw NativeLlamaException(NativeLlamaException.CONTEXT_REFUSED, "what a context costs is not known")
+        return reservedBytes + tokens * bytesPerToken
+    }
+
+    override fun resizeContext(tokens: Int, budgetBytes: Long) {
+        callerThreads += Thread.currentThread()
+        check(!closed) { "resizeContext after close" }
+        resizes += tokens to budgetBytes
+        if (tokens > trainedContextTokens || !costKnown || contextBytes(tokens) > budgetBytes) {
+            throw NativeLlamaException(NativeLlamaException.CONTEXT_REFUSED, "a context of $tokens tokens is refused")
+        }
+        val impossible = cannotCreateFrom
+        if (impossible != null && tokens >= impossible) {
+            val left = contextAfterFailedResize
+            if (left != null) {
+                // The old size could not be restored with its memory: something smaller, and empty.
+                contextTokens = left
+                memoryTokens.clear()
+                savedCheckpoints.clear()
+            }
+            predictionReady = false
+            throw NativeLlamaException(NativeLlamaException.CONTEXT_NOT_CREATED, "a context of $tokens tokens could not be created")
+        }
+        require(tokens >= memoryTokens.size || !carriesMemoryOnResize) { "a context of $tokens tokens cannot hold the ${memoryTokens.size} in memory" }
+        contextTokens = tokens
+        if (!carriesMemoryOnResize) {
+            memoryTokens.clear()
+            savedCheckpoints.clear()
+        }
+        predictionReady = false
+    }
+
     override fun memoryTokenCount(): Int = memoryTokens.size
 
     override fun evaluate(tokens: IntArray, chunkSize: Int, observer: EvaluationObserver): Int {
@@ -290,10 +357,12 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         memoryTokens.clear()
         savedCheckpoints.clear()
         predictionReady = false
+        contextTokens = openingTokens
     }
 
     override fun configureSampler(config: SamplerConfig) {
         enter(Call.ConfigureSampler(config))
+        require(config.penaltyWindow > 0 || config.penaltyWindow == SamplerConfig.NO_PENALTY_WINDOW) { "penaltyWindow ${config.penaltyWindow}" }
         sampler = config
         script = ArrayDeque(replies.removeFirstOrNull() ?: emptyList())
     }
@@ -358,7 +427,27 @@ class FakeNativeLlamaFactory(
     private val callerThreads = LinkedHashSet<Thread>()
     val threads: Set<Thread> get() = callerThreads
 
-    override fun open(model: ModelSpec, progress: LoadProgress): NativeLlama {
+    /** Every opening asked for, as (tokens, budget), refused ones included. */
+    val openings = ArrayList<Pair<Int, Long>>()
+
+    /** The largest context this factory opens: a larger one is refused, whatever the budget, as by a native side that knows a cost its caller does not. */
+    var largestOpening: Int = Int.MAX_VALUE
+
+    override fun open(model: ModelSpec, progress: LoadProgress, contextTokens: Int, budgetBytes: Long): NativeLlama {
+        openings += contextTokens to budgetBytes
+        if (contextTokens > largestOpening) {
+            throw NativeLlamaException(NativeLlamaException.CONTEXT_REFUSED, "a context of $contextTokens tokens is refused")
+        }
+        val native = load(model, progress)
+        if (native.contextTokens > contextTokens) {
+            native.contextTokens = contextTokens
+            native.openingTokens = contextTokens
+        }
+        return native
+    }
+
+    /** The load itself: the scripted failure, the progress reports with their cancellation, then the fake of [create]. */
+    private fun load(model: ModelSpec, progress: LoadProgress): FakeNativeLlama {
         callerThreads += Thread.currentThread()
         failure?.let { throw it }
         for (step in progressSteps) {

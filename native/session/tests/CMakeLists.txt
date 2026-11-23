@@ -55,6 +55,33 @@ proseplow_add_penalties_test(boris-2-instruct)
 proseplow_add_penalties_test(qwen3.5-0.8b)
 proseplow_add_penalties_test(shard-2)
 
+# The size of a session's context: what a size costs, held to what llama.cpp allocates and to
+# the two facts of the model in models/manifest.json; how the size is changed with the memory
+# carried over or not; and what a size that cannot be had leaves behind.
+add_executable(test_context test_context.cpp)
+target_include_directories(test_context PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
+target_link_libraries(test_context PRIVATE proseplow_session)
+target_compile_options(test_context PRIVATE -Wall -Wextra -Wpedantic)
+
+function(proseplow_add_context_test model)
+    add_test(NAME ${model}.context
+        COMMAND "${PROSEPLOW_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/run_session.py"
+                --bin-dir "$<TARGET_FILE_DIR:test_context>"
+                --work-dir "${CMAKE_BINARY_DIR}/test-work"
+                --llama-src "${PROSEPLOW_LLAMA_SRC}"
+                --context
+                ${model})
+    set_tests_properties(${model}.context PROPERTIES
+        SKIP_RETURN_CODE 77
+        RESOURCE_LOCK proseplow_cpu
+        TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;CUDA_VISIBLE_DEVICES=")
+endfunction()
+proseplow_add_context_test(peacebell-v1-291m)
+proseplow_add_context_test(boris-2-instruct)
+proseplow_add_context_test(qwen3.5-0.8b)
+proseplow_add_context_test(shard-2)
+
 # One residue entry per bundled model: they are what the app forgets.
 function(proseplow_add_residue_test model)
     add_test(NAME ${model}.residue

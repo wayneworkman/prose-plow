@@ -75,9 +75,32 @@ sealed interface GenerationEvent {
      * The conversation did not fit the model's context together with room for the reply, so the
      * oldest [droppedMessages] messages were left out of the prompt; [keptMessages] were sent.
      * The system prompt and the latest user message are always kept. Emitted at most once,
-     * before any other event.
+     * before any event but those about the size of the context.
      */
     data class HistoryTrimmed(val droppedMessages: Int, val keptMessages: Int) : GenerationEvent
+
+    /**
+     * The conversation outgrew the context, and the context was made larger: from [fromTokens]
+     * to [toTokens]. When [rereading] is true the model's memory could not be carried over and
+     * the whole conversation is read again, which the [PromptProgress] events that follow
+     * report; otherwise the answer goes on at once. Emitted before any text.
+     */
+    data class ContextGrown(val fromTokens: Int, val toTokens: Int, val rereading: Boolean) : GenerationEvent
+
+    /**
+     * The context could not be made as large as the conversation needs, so from here on its
+     * limit is [limitTokens] and the oldest messages are left out beyond it ([HistoryTrimmed]
+     * says how many). Emitted once for each limit that is found, not for every answer after it.
+     */
+    data class ContextLimited(val limitTokens: Int, val reason: Reason) : GenerationEvent {
+        enum class Reason {
+            /** The device has too little memory available for a larger context now. */
+            MEMORY,
+
+            /** The larger context could not be created, although the memory seemed to be there. */
+            FAILED,
+        }
+    }
 
     /**
      * The prompt is being brought into the model's memory: [evaluatedTokens] of [totalTokens]

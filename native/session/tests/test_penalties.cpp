@@ -444,6 +444,7 @@ int main(int argc, char ** argv) {
         pp_session * opened = nullptr;
         pp_session_params params = {};
         params.n_ctx     = pp_test::k_n_ctx;
+        params.context_budget_bytes = (int64_t) 2 << 30; // a limit that is stated, not memory that is taken
         params.n_batch   = pp_test::k_n_batch;
         params.n_threads = pp_test::n_threads();
         params.load_mode = PP_LOAD_MODE_READ;
@@ -523,7 +524,7 @@ int main(int argc, char ** argv) {
         config.repetition_penalty = repetition;
         config.presence_penalty   = presence;
         config.frequency_penalty  = frequency;
-        config.penalty_window     = pp_test::k_n_ctx; // the context size: no window, as the engine sets it
+        config.penalty_window     = PP_PENALTY_NO_WINDOW; // as the engine sets it
         config.banned_tokens      = banned.data();
         config.n_banned_tokens    = (int32_t) banned.size();
         return config;

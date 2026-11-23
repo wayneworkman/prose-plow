@@ -25,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +44,7 @@ import us.theworkmans.proseplow.core.chat.MessageStatus
 import us.theworkmans.proseplow.core.engine.FinishReason
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import us.theworkmans.proseplow.ui.NoticeCard
+import java.text.NumberFormat
 
 private val BubbleShape = RoundedCornerShape(16.dp)
 
@@ -218,7 +220,7 @@ fun ErrorItem(error: ChatError, onRetry: () -> Unit, onEdit: (() -> Unit)?) {
         }
         ChatErrorKind.MODEL_LOAD_FAILED -> {
             title = stringResource(R.string.error_model_load_failed_title)
-            detail = stringResource(R.string.error_model_load_failed_detail)
+            detail = stringResource(ModelText.loadFailedDetailRes(error.detail))
         }
         ChatErrorKind.INVALID_REQUEST -> {
             title = stringResource(R.string.error_invalid_request_title)
@@ -250,7 +252,7 @@ fun ErrorItem(error: ChatError, onRetry: () -> Unit, onEdit: (() -> Unit)?) {
     NoticeCard(
         title = title,
         detail = detail,
-        technical = error.detail.takeUnless(PromptWhitespace::isBlank)?.let { stringResource(R.string.failed_detail, it) },
+        technical = error.detail.takeUnless { PromptWhitespace.isBlank(it) || ModelText.isTooLittleMemory(it) }?.let { stringResource(R.string.failed_detail, it) },
         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
     ) {
         if (error.kind == ChatErrorKind.PROMPT_TOO_LONG && onEdit != null) {
@@ -267,6 +269,29 @@ fun RetryRow(onRetry: () -> Unit) {
     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
         TextButton(onClick = onRetry) { Text(stringResource(R.string.try_again)) }
     }
+}
+
+/**
+ * Says what became of the model's context for the latest reply: that it was made larger for
+ * this conversation (and that the conversation was read again for it), and that it could not
+ * be made larger still, with the reason. Shown where the note about left-out messages is.
+ */
+@Composable
+fun ContextNoteItem(note: ContextNote) {
+    val number = remember { NumberFormat.getIntegerInstance() }
+    val grown = note.grownTo?.let { size ->
+        stringResource(if (note.reread) R.string.note_context_grown_reread else R.string.note_context_grown, number.format(size.toLong()))
+    }
+    val limited = note.limitedAt?.let { size ->
+        stringResource(if (note.limitedByMemory) R.string.note_context_limited_memory else R.string.note_context_limited_failed, number.format(size.toLong()))
+    }
+    if (grown == null && limited == null) return
+    Text(
+        text = listOfNotNull(grown, limited).joinToString(" "),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+    )
 }
 
 /** Says that the latest reply was written without the oldest [count] messages, and why. */

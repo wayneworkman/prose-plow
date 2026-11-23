@@ -43,6 +43,10 @@ sealed interface EngineState {
  * @property maxNewTokens the longest reply in tokens; null takes the model's default.
  * @property stopStrings text that ends the reply, in addition to the model's own stop strings.
  *   [GenerationEvent.Done.stopString] reports which one was reached.
+ * @property maxContextTokens the size the user chose as the most the model's context may grow
+ *   to for this conversation, or null to leave that to the engine (which then also holds it to
+ *   what can be read again in reasonable time). The model's own maximum and the device's
+ *   memory bound it either way; see [ContextPolicy].
  */
 data class GenerationRequest(
     val modelId: String,
@@ -53,6 +57,7 @@ data class GenerationRequest(
     val sampling: SamplingParams? = null,
     val maxNewTokens: Int? = null,
     val stopStrings: List<String> = emptyList(),
+    val maxContextTokens: Int? = null,
 )
 
 /**

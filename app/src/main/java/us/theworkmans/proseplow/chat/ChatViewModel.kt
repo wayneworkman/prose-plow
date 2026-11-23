@@ -88,6 +88,9 @@ data class ChatUiState(
     /** How many of the oldest messages the latest reply in this chat did not see; null when it saw all. */
     val trimmedMessages: Int? get() = chat.trimmedMessages[chat.open.id]?.takeIf { it > 0 }
 
+    /** What became of the model's context for the latest reply in this chat; null when nothing did. */
+    val contextNote: ContextNote? get() = chat.contextNotes[chat.open.id]
+
     /** What the reply being written here is waiting for; null when none is being written here. */
     val replyStatus: ReplyStatus?
         get() {

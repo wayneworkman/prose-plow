@@ -106,9 +106,28 @@ struct session_closer {
 };
 using session_ptr = std::unique_ptr<pp_session, session_closer>;
 
+// A budget for the context that every context of these tests fits: a limit that is stated, not
+// memory that is taken (the largest context here is a few hundred MiB).
+constexpr int64_t k_budget = (int64_t) 2 << 30;
+
+// Whether this is a build with the address sanitizer, whose allocator keeps what was freed:
+// what stays resident after something was given back says nothing about the session there.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool k_sanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool k_sanitized = true;
+#else
+constexpr bool k_sanitized = false;
+#endif
+#else
+constexpr bool k_sanitized = false;
+#endif
+
 pp_session_params default_params() {
     pp_session_params params = {};
     params.n_ctx     = k_n_ctx;
+    params.context_budget_bytes = k_budget;
     params.n_batch   = k_n_batch;
     params.n_threads = pp_test::n_threads();
     params.load_mode = PP_LOAD_MODE_READ;
@@ -202,7 +221,7 @@ pp_sampler_config greedy_config(const std::vector<llama_token> & banned) {
     config.temperature        = 0.0f;
     config.top_p              = 1.0f;
     config.repetition_penalty = 1.0f;
-    config.penalty_window     = k_n_ctx;
+    config.penalty_window     = PP_PENALTY_NO_WINDOW;
     config.banned_tokens      = banned.data();
     config.n_banned_tokens    = (int32_t) banned.size();
     return config;
@@ -441,37 +460,36 @@ int main(int argc, char ** argv) {
             if (limit.in_force()) {
                 const resident before = resident_memory();
                 const int64_t t0 = llama_time_us();
-                char why_ctx[256];
-                bad = params;
-                bad.n_ctx = std::numeric_limits<int32_t>::max();
-                const int32_t huge_ctx = pp_session_open_path(gguf.c_str(), &bad, &s, why_ctx, sizeof(why_ctx));
-                bad.n_ctx = PP_CONTEXT_TOKENS_MAX + 1;
-                const int32_t over_ceiling = pp_session_open_path(gguf.c_str(), &bad, &s, error, sizeof(error));
                 bad = params;
                 bad.n_batch = std::numeric_limits<int32_t>::max();
                 const int32_t huge_batch = pp_session_open_path(gguf.c_str(), &bad, &s, error, sizeof(error));
+                bad = params;
+                bad.context_budget_bytes = 0;
+                const int32_t no_budget = pp_session_open_path(gguf.c_str(), &bad, &s, error, sizeof(error));
                 const double seconds = (double) (llama_time_us() - t0) / 1e6;
                 const resident after = resident_memory();
-                r.check(huge_ctx == PP_STATUS_INVALID_ARGUMENT && over_ceiling == PP_STATUS_INVALID_ARGUMENT && huge_batch == PP_STATUS_INVALID_ARGUMENT &&
-                        s == nullptr && seconds < 1.0 && after.total < before.total + 16.0,
-                        "a context of %d tokens, one of %d (one above the ceiling), a batch of %d: INVALID_ARGUMENT (%d, %d, %d) in %.3f s, "
-                        "resident memory %.0f MiB before and %.0f MiB after (\"%s\")",
-                        std::numeric_limits<int32_t>::max(), PP_CONTEXT_TOKENS_MAX + 1, std::numeric_limits<int32_t>::max(), huge_ctx, over_ceiling, huge_batch,
-                        seconds, before.total, after.total, why_ctx);
+                r.check(huge_batch == PP_STATUS_INVALID_ARGUMENT && no_budget == PP_STATUS_INVALID_ARGUMENT && s == nullptr && seconds < 1.0 && after.total < before.total + 16.0,
+                        "a batch of %d tokens, a budget of 0 bytes: INVALID_ARGUMENT (%d, %d) in %.3f s, resident memory %.0f MiB before and %.0f MiB after",
+                        std::numeric_limits<int32_t>::max(), huge_batch, no_budget, seconds, before.total, after.total);
 
-                // More than the model was trained for, where that is below the ceiling: refused
-                // once the model is loaded and before a context exists.
+                // A context no machine can serve is not a number the session takes as given: it
+                // is the context the model was trained for, and that is held to the budget
+                // before it is allocated. The budget here is one that no context of any of the
+                // models fits, so the refusal names the size the number became.
                 const int32_t n_ctx_train = std::atoi(pp_test::meta(vocab_model.get(), arch + ".context_length").c_str());
-                if (n_ctx_train > 0 && n_ctx_train < PP_CONTEXT_TOKENS_MAX) {
-                    bad = params;
-                    bad.n_ctx = n_ctx_train + 1;
-                    const int32_t over_trained = pp_session_open_path(gguf.c_str(), &bad, &s, error, sizeof(error));
-                    r.check(over_trained == PP_STATUS_INVALID_ARGUMENT && s == nullptr, "a context of %d tokens for a model trained for %d: INVALID_ARGUMENT (\"%s\")",
-                            bad.n_ctx, n_ctx_train, error);
-                } else {
-                    r.note("the model was trained for %d tokens, which is not below the ceiling of %d: only the ceiling can refuse a context here",
-                           n_ctx_train, PP_CONTEXT_TOKENS_MAX);
-                }
+                char why_ctx[256];
+                bad = params;
+                bad.n_ctx = std::numeric_limits<int32_t>::max();
+                bad.context_budget_bytes = (int64_t) 8 << 20;
+                bad.load_mode = PP_LOAD_MODE_MMAP; // the model is loaded for this and freed again; mapped, that is quick
+                const int32_t huge_ctx = pp_session_open_path(gguf.c_str(), &bad, &s, why_ctx, sizeof(why_ctx));
+                const resident after_refusal = resident_memory();
+                r.check(huge_ctx == PP_STATUS_CONTEXT_REFUSED && s == nullptr && n_ctx_train > 0 &&
+                        std::string(why_ctx).find("a context of " + std::to_string(n_ctx_train) + " tokens") == 0 &&
+                        (k_sanitized || after_refusal.total - after_refusal.file < before.total - before.file + 16.0),
+                        "a context of %d tokens with a budget of 8 MiB: CONTEXT_REFUSED (%d) for the %d tokens the model was trained for, nothing left allocated "
+                        "(anonymous memory %.0f MiB before, %.0f MiB after; not judged under a sanitizer) (\"%s\")",
+                        std::numeric_limits<int32_t>::max(), huge_ctx, n_ctx_train, before.total - before.file, after_refusal.total - after_refusal.file, why_ctx);
             } else {
                 r.note("no address space limit can be set here: the checks with sizes beyond any machine are NOT run");
             }
@@ -758,8 +776,17 @@ int main(int argc, char ** argv) {
         const std::vector<llama_token> outside = {pp_session_vocab_size(s)};
         bad = greedy_config(outside);
         const int32_t bad_ban = pp_session_configure_sampler(s, &bad);
-        r.check(bad_window == PP_STATUS_INVALID_ARGUMENT && bad_top_k == PP_STATUS_INVALID_ARGUMENT && bad_ban == PP_STATUS_INVALID_ARGUMENT,
-                "a penalty window of 0, a negative top_k, a banned token outside the vocabulary: INVALID_ARGUMENT");
+        bad = greedy_config(banned);
+        bad.penalty_window = -2;
+        const int32_t negative_window = pp_session_configure_sampler(s, &bad);
+        pp_sampler_config whole = greedy_config(banned);
+        whole.repetition_penalty = 1.1f;
+        whole.penalty_window = PP_PENALTY_NO_WINDOW;
+        const int32_t no_window = pp_session_configure_sampler(s, &whole);
+        r.check(bad_window == PP_STATUS_INVALID_ARGUMENT && negative_window == PP_STATUS_INVALID_ARGUMENT && no_window == PP_STATUS_OK &&
+                bad_top_k == PP_STATUS_INVALID_ARGUMENT && bad_ban == PP_STATUS_INVALID_ARGUMENT,
+                "a penalty window of 0 or of -2, a negative top_k, a banned token outside the vocabulary: INVALID_ARGUMENT; PP_PENALTY_NO_WINDOW (%d): OK",
+                PP_PENALTY_NO_WINDOW);
 
         // A penalty window that no machine can serve, which llama.cpp's own penalties would
         // allocate in full when the sampler is created. The session's penalties look at its

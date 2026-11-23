@@ -158,7 +158,7 @@ class LlamaEngineGenerationTest {
             SamplerConfig(
                 temperature = 0.7f, topK = 50, topP = 0.9f, minP = 0.05f,
                 repetitionPenalty = 1.1f, presencePenalty = 2f, frequencyPenalty = 0.5f,
-                penaltyWindow = 1234, seed = TEST_SEED, bannedTokenIds = listOf(0, 188),
+                penaltyWindow = SamplerConfig.NO_PENALTY_WINDOW, seed = TEST_SEED, bannedTokenIds = listOf(0, 188),
             ),
             test.fake.sampler,
         )

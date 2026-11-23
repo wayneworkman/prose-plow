@@ -14,7 +14,6 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.ReplyLength
-import us.theworkmans.proseplow.core.model.acceptsReplyLength
 import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import java.io.IOException
@@ -30,18 +29,22 @@ import java.io.IOException
  *
  * @property temperature the sampling temperature, from [MIN_TEMPERATURE] to [MAX_TEMPERATURE].
  *   0 always takes the most likely token; higher values make the choice more varied.
+ * @property contextTokens the size the user chose as the most the model's context may grow to,
+ *   in tokens; null is automatic. What a model on a device can be given is not known here:
+ *   the choice is held to it where it is used.
  * @property maxNewTokens the longest reply, in tokens. What a model accepts depends on the
  *   model (see [ReplyLength]), which this class does not know: it only holds a value that could
  *   be some model's, and [AppSettings.maxNewTokens] is where a model's own limits are applied.
  */
-data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int? = null) {
+data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int? = null, val contextTokens: Int? = null) {
     init {
+        require(contextTokens == null || isPossibleContext(contextTokens)) { "A context has at least $MIN_CONTEXT_TOKENS tokens" }
         require(temperature == null || isValidTemperature(temperature)) { "A temperature is a number from $MIN_TEMPERATURE to $MAX_TEMPERATURE" }
         require(maxNewTokens == null || isPossibleReplyLength(maxNewTokens)) { "A reply is at least ${ReplyLength.MIN_TOKENS} tokens long" }
     }
 
     /** True when nothing is set, so that there is nothing to store for the model. */
-    val isDefault: Boolean get() = temperature == null && maxNewTokens == null
+    val isDefault: Boolean get() = temperature == null && maxNewTokens == null && contextTokens == null
 
     /**
      * The sampling a reply is generated with: [defaults], the model's own from the catalogue,
@@ -54,6 +57,12 @@ data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int?
         const val MAX_TEMPERATURE: Float = 2f
 
         fun isValidTemperature(value: Float): Boolean = value.isFinite() && value >= MIN_TEMPERATURE && value <= MAX_TEMPERATURE
+
+        /** No context is smaller than this, whatever the model. */
+        const val MIN_CONTEXT_TOKENS: Int = 1024
+
+        /** True when [tokens] could be a context size of some model. */
+        fun isPossibleContext(tokens: Int): Boolean = tokens >= MIN_CONTEXT_TOKENS
 
         /** True when [tokens] could be the longest reply of some model: not below the least any model accepts. */
         fun isPossibleReplyLength(tokens: Int): Boolean = tokens >= ReplyLength.MIN_TOKENS
@@ -120,12 +129,27 @@ data class AppSettings(
     }
 
     /**
-     * The longest reply [model] writes now, in tokens: what the user set for it if the model
-     * accepts that, and the catalogue's value otherwise. A stored value outside the model's
-     * limits is not moved to the nearest limit: it is a value nobody chose for this model as it
-     * is now (its context is a decision of the build and can change), so the model's own applies.
+     * The longest reply [model] writes now, in tokens, when its context may become
+     * [contextLimit] tokens long on this device under the user's choice of size: what the user
+     * set if that lies within the limits that follow from it (see [ReplyLength.range]), and the
+     * catalogue's value otherwise. A stored value outside the limits is not moved to the
+     * nearest limit: it is a value nobody chose for this model as it is now (how long its
+     * context may become depends on the build, the device and the size chosen, all of which
+     * can change), so the model's own applies, itself held to the limits.
      */
-    fun maxNewTokens(model: ModelSpec): Int = overrides(model.id).maxNewTokens?.takeIf(model::acceptsReplyLength) ?: model.defaultMaxNewTokens
+    fun maxNewTokens(model: ModelSpec, contextLimit: Int): Int {
+        val range = ReplyLength.range(contextLimit)
+        return overrides(model.id).maxNewTokens?.takeIf { it in range } ?: model.defaultMaxNewTokens.coerceAtMost(range.last.coerceAtLeast(1))
+    }
+
+    /** The size the user chose for the context of [modelId], or null for automatic. */
+    fun contextTokens(modelId: String): Int? = overrides(modelId).contextTokens
+
+    /** These settings with [tokens] as the chosen context size of [modelId]; null is automatic. */
+    fun withContextTokens(modelId: String, tokens: Int?): AppSettings {
+        val updated = overrides(modelId).copy(contextTokens = tokens)
+        return copy(modelOverrides = if (updated.isDefault) modelOverrides - modelId else modelOverrides + (modelId to updated))
+    }
 
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
     override fun toString(): String =
@@ -138,7 +162,7 @@ data class AppSettings(
  * ```
  * {"schemaVersion": 1, "settings": {
  *     "systemPrompts": {"<model id>": "<text>", ...},
- *     "models": {"<model id>": {"temperature": 0.7, "maxNewTokens": 512}, ...},
+ *     "models": {"<model id>": {"temperature": 0.7, "maxNewTokens": 512, "contextTokens": 8192}, ...},
  *     "notificationsAsked": true}}
  * ```
  *
@@ -190,6 +214,7 @@ object SettingsCodec {
                     putJsonObject(modelId) {
                         overrides.temperature?.let { put("temperature", it) }
                         overrides.maxNewTokens?.let { put("maxNewTokens", it) }
+                        overrides.contextTokens?.let { put("contextTokens", it) }
                     }
                 }
             }
@@ -243,7 +268,14 @@ object SettingsCodec {
                         ?.takeIf(ModelOverrides::isPossibleReplyLength)
                     if (maxNewTokens == null) skipped++
                 }
-                val read = ModelOverrides(temperature = temperature, maxNewTokens = maxNewTokens)
+                var contextTokens: Int? = null
+                val storedContext = model["contextTokens"]
+                if (storedContext != null) {
+                    contextTokens = (storedContext as? JsonPrimitive)?.takeUnless { it.isString }?.content?.toIntOrNull()
+                        ?.takeIf(ModelOverrides::isPossibleContext)
+                    if (contextTokens == null) skipped++
+                }
+                val read = ModelOverrides(temperature = temperature, maxNewTokens = maxNewTokens, contextTokens = contextTokens)
                 if (!read.isDefault) overrides[modelId] = read
             }
             else -> skipped++

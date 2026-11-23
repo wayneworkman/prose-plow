@@ -453,6 +453,24 @@ class ChatViewModelTest {
         assertEquals(4, state.trimmedMessages)
     }
 
+    @Test
+    fun whatBecameOfTheContextIsSaidForTheChatOnScreen() = runTest(StandardTestDispatcher(scheduler)) {
+        unlocked()
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.ContextGrown(fromTokens = 4096, toTokens = 8192, rereading = false)),
+                Step.Emit(GenerationEvent.TextDelta("Hi")),
+                Step.Emit(GenerationEvent.Done(FinishReason.END_OF_TURN, text = "Hi", stats = GenerationStats(0, 0, 0, 0, 0))),
+            ),
+        )
+        assertNull(state.contextNote)
+        viewModel.onInputChange("Hello")
+        viewModel.send()
+        runCurrent()
+        assertEquals(ContextNote(grownTo = 8192), state.contextNote)
+        assertNull("nothing was left out", state.trimmedMessages)
+    }
+
     // --- Things said once ----------------------------------------------------------------------
 
     @Test

@@ -13,6 +13,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.SessionFixture
+import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.ModelOverrides
@@ -119,7 +120,10 @@ class SettingsViewModelTest {
     // --- The longest reply ---
 
     private fun viewModelOver(session: AppSession) =
-        SettingsViewModel(session.settings, session.models, decimalSeparator = { '.' }, wholeNumber = { "%,d".format(Locale.ROOT, it) })
+        SettingsViewModel(
+            session.settings, session.models,
+            decimalSeparator = { '.' }, wholeNumber = { "%,d".format(Locale.ROOT, it) }, contextLimits = session.contextLimits,
+        )
 
     @Test
     fun aLongestReplyIsStoredAsItIsTypedAndAnEntryThatIsNoneIsNotSaved() = runTest {
@@ -131,8 +135,8 @@ class SettingsViewModelTest {
         assertEquals("", viewModel.replyLength(qwen))
         assertNull(stored())
         assertEquals("the default is named", "1,024", viewModel.defaultReplyLength(model))
-        assertEquals("16" to "2,048", viewModel.replyLengthLimits(model))
-        assertEquals("16" to "1,024", viewModel.replyLengthLimits(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals("a context that may grow leaves room for the longest reply there is", "16" to "4,096", viewModel.replyLengthLimits(model))
+        assertEquals("half of a context that cannot", "16" to "1,024", viewModel.replyLengthLimits(ModelCatalog.BORIS_2_INSTRUCT))
 
         // "300", one key at a time: "3" is below the least and is not saved, "30" and "300" are.
         viewModel.onReplyLengthChange(qwen, "3")
@@ -146,11 +150,11 @@ class SettingsViewModelTest {
         assertEquals(300, stored())
 
         // One digit too many: the entry is marked and the last valid value stays in use.
-        viewModel.onReplyLengthChange(qwen, "3000")
+        viewModel.onReplyLengthChange(qwen, "30000")
         assertTrue(viewModel.replyLengthInvalid(model))
-        assertEquals("3000", viewModel.replyLength(qwen))
+        assertEquals("30000", viewModel.replyLength(qwen))
         assertEquals(300, stored())
-        assertEquals(300, session.settings.settings.value.maxNewTokens(model))
+        assertEquals(300, session.settings.settings.value.maxNewTokens(model, viewModel.contextLimit(model)))
         viewModel.onReplyLengthChange(qwen, "1,5")
         assertTrue(viewModel.replyLengthInvalid(model))
         assertEquals(300, stored())
@@ -160,7 +164,7 @@ class SettingsViewModelTest {
         assertEquals("", viewModel.replyLength(qwen))
         assertFalse(viewModel.replyLengthInvalid(model))
         assertNull(stored())
-        assertEquals(1024, session.settings.settings.value.maxNewTokens(model))
+        assertEquals(1024, session.settings.settings.value.maxNewTokens(model, viewModel.contextLimit(model)))
 
         // It is there after a lock, encrypted like the rest, and a new page shows it.
         viewModel.onReplyLengthChange(qwen, "640")
@@ -199,6 +203,142 @@ class SettingsViewModelTest {
         session.close()
     }
 
+    // --- The context ---
+
+    /** The phone the app was measured on: 5.5 GB of memory. */
+    private val testPhone = DeviceContextLimits(totalBytes = 5_500_000_000L)
+
+    @Test
+    fun theSizesToChooseFromAreThoseThisPhoneAllowsEachWithWhatItCosts() = runTest {
+        val app = SessionFixture(temp.root, testScheduler).apply {
+            contextLimits = testPhone
+            models = ModelCatalog.bundled + ModelCatalog.SHARD_2
+        }
+        val session = app.open()
+        val viewModel = viewModelOver(session)
+
+        // Qwen3.5: left to itself as far as two minutes of reading; by choice as far as a quarter of the phone's memory.
+        val qwenOptions = viewModel.contextOptions(ModelCatalog.QWEN35_0_8B)
+        assertEquals(SettingsViewModel.ContextOption(tokens = null, limitTokens = 10_240, memoryBytes = 125_829_120, rereadSeconds = 114), qwenOptions.first())
+        assertEquals(listOf(null, 4096, 8192, 16_384, 32_768, 65_536, 111_616), qwenOptions.map { it.tokens })
+        assertEquals("a fixed size is its own limit", qwenOptions.drop(1).map { it.tokens }, qwenOptions.drop(1).map { it.limitTokens })
+        assertEquals(SettingsViewModel.ContextOption(4096, 4096, 50_331_648, 46), qwenOptions[1])
+        assertEquals(SettingsViewModel.ContextOption(111_616, 111_616, 1_371_537_408, 1241), qwenOptions.last())
+        assertEquals("said in seconds below a minute and a half, in minutes from there", listOf(2, null, 2, 3, 6, 12, 21), qwenOptions.map { it.rereadMinutes })
+
+        // Peacebell: the phone's memory is the limit, with or without a choice.
+        val peacebellOptions = viewModel.contextOptions(ModelCatalog.PEACEBELL_V1_291M)
+        assertEquals(listOf(null, 4096, 8192, 16_384, 20_480), peacebellOptions.map { it.tokens })
+        assertEquals(SettingsViewModel.ContextOption(null, 20_480, 1_363_148_800, 112), peacebellOptions.first())
+
+        // Models whose context cannot grow have nothing to choose: one fact to state.
+        assertEquals(listOf(SettingsViewModel.ContextOption(null, 2048, 2048L * 63_488, 6)), viewModel.contextOptions(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals(listOf(null), viewModel.contextOptions(ModelCatalog.SHARD_2).map { it.tokens })
+        assertEquals(4096, viewModel.contextOptions(ModelCatalog.SHARD_2).single().limitTokens)
+
+        assertEquals("10,240", viewModel.tokens(10_240))
+        session.close()
+    }
+
+    @Test
+    fun aChosenSizeIsStoredAtOnceAndTheLongestReplyFollowsIt() = runTest {
+        val app = SessionFixture(temp.root, testScheduler).apply { contextLimits = testPhone }
+        var session = app.open()
+        runCurrent()
+        var viewModel = viewModelOver(session)
+        val model = ModelCatalog.QWEN35_0_8B
+        fun stored() = session.settings.settings.value.contextTokens(qwen)
+        assertNull("automatic until something is chosen", viewModel.contextChoice(model))
+        assertNull(stored())
+        assertEquals(10_240, viewModel.contextLimit(model))
+        assertFalse(viewModel.hasOwnValues(qwen))
+
+        // A reply as long as the automatic context allows.
+        viewModel.onReplyLengthChange(qwen, "3000")
+        assertFalse(viewModel.replyLengthInvalid(model))
+
+        // The context is held at the size it starts with: half of that is the longest reply now.
+        viewModel.onContextChoice(qwen, 4096)
+        assertEquals(4096, viewModel.contextChoice(model))
+        assertEquals(4096, stored())
+        assertEquals(4096, viewModel.contextLimit(model))
+        assertTrue(viewModel.hasOwnValues(qwen))
+        assertEquals("16" to "2,048", viewModel.replyLengthLimits(model))
+        assertTrue("the entry no longer lies within the limits, and is marked", viewModel.replyLengthInvalid(model))
+        assertEquals("3000", viewModel.replyLength(qwen))
+        val id = session.openSession.id
+        app.engine.enqueueReply(listOf("Hi."))
+        session.chat.send(id, "Hello")
+        runCurrent()
+        assertEquals("the size goes with the request", 4096, app.engine.requests.last().maxContextTokens)
+        assertEquals("and a reply longer than its limits is not asked for: the model's own is", 1024, app.engine.requests.last().maxNewTokens)
+        assertEquals("1,024", viewModel.summary(model, viewModel.stored.value).replyTokens)
+
+        // A larger size by choice, beyond what the context grows to by itself.
+        viewModel.onContextChoice(qwen, 32_768)
+        assertEquals(32_768, viewModel.contextLimit(model))
+        assertFalse("the entry is within the limits again", viewModel.replyLengthInvalid(model))
+        app.engine.enqueueReply(listOf("Hi again."))
+        session.chat.send(id, "Hello again")
+        runCurrent()
+        assertEquals(32_768, app.engine.requests.last().maxContextTokens)
+        assertEquals(3000, app.engine.requests.last().maxNewTokens)
+
+        // What is not one of the sizes offered is not taken, and neither is anything for a model that is not here.
+        for (other in listOf(5000, 2048, 262_144, 0, -1)) viewModel.onContextChoice(qwen, other)
+        viewModel.onContextChoice("no-such-model", 8192)
+        viewModel.onContextChoice(ModelCatalog.BORIS_2_INSTRUCT.id, 4096)
+        assertEquals(32_768, stored())
+        assertEquals(setOf(qwen), session.settings.settings.value.modelOverrides.keys)
+
+        // It is there after a lock, encrypted like the rest.
+        session.close()
+        assertFalse(app.diskContains("contextTokens"))
+        session = app.open()
+        runCurrent()
+        viewModel = viewModelOver(session)
+        assertEquals(32_768, viewModel.contextChoice(model))
+        assertEquals("3000", viewModel.replyLength(qwen))
+
+        // Back to automatic: nothing is stored for it, and the request leaves the size to the engine.
+        viewModel.onContextChoice(qwen, null)
+        assertNull(viewModel.contextChoice(model))
+        assertNull(stored())
+        app.engine.enqueueReply(listOf("Once more."))
+        session.chat.send(session.openSession.id, "And again")
+        runCurrent()
+        assertNull(app.engine.requests.last().maxContextTokens)
+        assertEquals(3000, app.engine.requests.last().maxNewTokens)
+        session.close()
+    }
+
+    @Test
+    fun aStoredSizeThatIsNotOfferedHereCountsAsTheLargestBelowIt() = runTest {
+        val app = SessionFixture(temp.root, testScheduler).apply { contextLimits = testPhone }
+        var session = app.open()
+        // As a phone with more memory, or another build, could have stored them.
+        session.settings.update(urgent = true) {
+            it.withContextTokens(ModelCatalog.PEACEBELL_V1_291M.id, 32_768).withContextTokens(qwen, 12_000).withContextTokens(ModelCatalog.BORIS_2_INSTRUCT.id, 8192)
+        }
+        session.close()
+
+        session = app.open()
+        val viewModel = viewModelOver(session)
+        assertEquals("what the phone's memory allows", 20_480, viewModel.contextChoice(ModelCatalog.PEACEBELL_V1_291M))
+        assertEquals(20_480, viewModel.contextLimit(ModelCatalog.PEACEBELL_V1_291M))
+        assertEquals(8192, viewModel.contextChoice(ModelCatalog.QWEN35_0_8B))
+        assertEquals("what is shown as chosen is what is used", 8192, viewModel.contextLimit(ModelCatalog.QWEN35_0_8B))
+        runCurrent()
+        app.engine.enqueueReply(listOf("Hi."))
+        session.chat.send(session.openSession.id, "Hello")
+        runCurrent()
+        assertEquals(8192, app.engine.requests.last().maxContextTokens)
+        assertNull("a model that cannot grow has no choice to show", viewModel.contextChoice(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals(2048, viewModel.contextLimit(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals("16" to "1,024", viewModel.replyLengthLimits(ModelCatalog.BORIS_2_INSTRUCT))
+        session.close()
+    }
+
     @Test
     fun restoringAModelsDefaultsEmptiesItsNumbersAndLeavesItsSystemPrompt() = runTest {
         val app = SessionFixture(temp.root, testScheduler)
@@ -211,12 +351,14 @@ class SettingsViewModelTest {
         viewModel.onTemperatureChange(qwen, "1.2")
         viewModel.onReplyLengthChange(qwen, "99999") // Not valid: only the text is there.
         viewModel.onTemperatureChange(peacebell, "0.3")
+        viewModel.onContextChoice(qwen, 8192)
         assertTrue(viewModel.hasOwnValues(qwen))
 
         viewModel.restoreDefaults(qwen)
 
         assertEquals("", viewModel.temperature(qwen))
         assertEquals("", viewModel.replyLength(qwen))
+        assertNull("the context is automatic again", viewModel.contextChoice(ModelCatalog.QWEN35_0_8B))
         assertFalse(viewModel.hasOwnValues(qwen))
         val stored = session.settings.settings.value
         assertEquals(ModelOverrides(), stored.overrides(qwen))

@@ -49,6 +49,7 @@ internal object LlamaJni {
         offset: Long,
         length: Long,
         contextTokens: Int,
+        contextBudgetBytes: Long,
         batchTokens: Int,
         threads: Int,
         pinnedCpus: IntArray,
@@ -71,6 +72,26 @@ internal object LlamaJni {
 
     @JvmStatic
     external fun contextSize(handle: Long): Int
+
+    /** `pp_session_max_context_size`: the context the model was trained for. */
+    @JvmStatic
+    external fun maxContextSize(handle: Long): Int
+
+    /**
+     * `pp_session_context_bytes`. Throws `NativeLlamaException` with `INVALID_ARGUMENT` for a
+     * size outside 1 to [maxContextSize], and with `CONTEXT_REFUSED` when the session does not
+     * know what a context costs.
+     */
+    @JvmStatic
+    external fun contextBytes(handle: Long, tokens: Int): Long
+
+    /**
+     * `pp_session_resize_context`. Throws `NativeLlamaException` with `CONTEXT_REFUSED` when
+     * nothing was touched and with `CONTEXT_NOT_CREATED` when the old context was freed and
+     * the new size could not be created; [contextSize] then says what there is.
+     */
+    @JvmStatic
+    external fun resizeContext(handle: Long, tokens: Int, budgetBytes: Long)
 
     @JvmStatic
     external fun memoryTokenCount(handle: Long): Int

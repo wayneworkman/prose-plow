@@ -25,6 +25,7 @@ import us.theworkmans.proseplow.core.chat.Clock
 import us.theworkmans.proseplow.core.chat.IdSource
 import us.theworkmans.proseplow.core.chat.RandomIds
 import us.theworkmans.proseplow.core.chat.SystemClock
+import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.CoalescingWriter
@@ -88,6 +89,10 @@ class DataLayout(files: AppFiles) {
  * @param mainDispatcher where [chat] keeps its state; the screens' thread.
  * @param ioDispatcher where files are read and written.
  * @param writeTimeoutMillis how long [close] waits for the writes that are queued.
+ * @param contextLimits how large the context of a model may become on this device under the
+ *   user's choice of size; the longest reply is held to what follows from it, and the settings
+ *   show the sizes and what they cost by it. A session that is given none assumes a device
+ *   with plenty of memory.
  * @param answerEvents told, on the main dispatcher, when an answer begins and ends being
  *   written and when one is finished: what keeps the process alive out of sight goes by it.
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
@@ -104,6 +109,7 @@ class AppSession(
     ids: IdSource = RandomIds,
     private val writeTimeoutMillis: Long = WRITE_TIMEOUT_MILLIS,
     private val answerEvents: AnswerEvents = AnswerEvents.None,
+    val contextLimits: DeviceContextLimits = DeviceContextLimits(),
 ) : UnlockedSession {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
@@ -148,7 +154,13 @@ class AppSession(
                 opened = sessionStore.open(),
                 requestSettings = { model ->
                     val current = settingsStore.settings.value
-                    ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model), current.maxNewTokens(model))
+                    val chosen = contextLimits.chosen(model, current.contextTokens(model.id))
+                    ModelRequestSettings(
+                        current.systemPrompt(model.id).ifEmpty { null },
+                        current.sampling(model),
+                        current.maxNewTokens(model, contextLimits.limit(model, chosen)),
+                        chosen,
+                    )
                 },
                 clock = clock,
                 ids = ids,

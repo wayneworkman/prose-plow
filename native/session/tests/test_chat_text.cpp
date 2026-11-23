@@ -199,6 +199,7 @@ int main(int argc, char ** argv) {
 
         pp_session_params params = {};
         params.n_ctx = 1024;
+        params.context_budget_bytes = (int64_t) 2 << 30; // a limit that is stated, not memory that is taken
         params.n_batch = 512;
         params.n_threads = pp_test::n_threads();
         params.load_mode = PP_LOAD_MODE_READ;

@@ -212,16 +212,16 @@ class FakeNativeLlamaTest {
     fun `the factory opens fakes, reports progress and can be told to fail`() {
         val factory = FakeNativeLlamaFactory()
         val reported = ArrayList<Float>()
-        val native = factory.open(testModel(contextLength = 321)) { fraction -> reported.add(fraction) }
+        val native = factory.open(testModel(contextLength = 321), { fraction -> reported.add(fraction) }, 321, Long.MAX_VALUE)
         assertEquals(listOf(0f, 0.5f, 1f), reported)
         assertEquals(321, native.contextSize())
         assertEquals(native, factory.last)
 
-        val cancelled = assertThrows(NativeLlamaException::class.java) { factory.open(testModel()) { false } }
+        val cancelled = assertThrows(NativeLlamaException::class.java) { factory.open(testModel(), { false }, 4096, Long.MAX_VALUE) }
         assertEquals(NativeLlamaException.LOAD_CANCELLED, cancelled.code)
         assertEquals(1, factory.opened.size)
 
         factory.failure = NativeLlamaException(NativeLlamaException.LOAD_FAILED, "scripted")
-        assertEquals(NativeLlamaException.LOAD_FAILED, assertThrows(NativeLlamaException::class.java) { factory.open(testModel()) { true } }.code)
+        assertEquals(NativeLlamaException.LOAD_FAILED, assertThrows(NativeLlamaException::class.java) { factory.open(testModel(), { true }, 4096, Long.MAX_VALUE) }.code)
     }
 }

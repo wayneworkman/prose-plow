@@ -282,6 +282,7 @@ int main(int argc, char ** argv) {
     }
     pp_session_params params = {};
     params.n_ctx     = 512;
+    params.context_budget_bytes = (int64_t) 2 << 30; // a limit that is stated, not memory that is taken
     params.n_batch   = 64;
     params.n_threads = pp_test::n_threads();
     params.load_mode = PP_LOAD_MODE_MMAP;
@@ -387,6 +388,43 @@ int main(int argc, char ** argv) {
     r.check(cleared == PP_STATUS_OK && after_clear.reply_ids == 0, "after pp_session_clear_memory: no window of the reply's token ids (%d found)", after_clear.reply_ids);
     r.note("after pp_session_clear_memory: %d window(s) of the text and %d of the prompt's token ids are still readable, in blocks that llama.cpp freed without overwriting them",
            after_clear.text, after_clear.prompt_ids);
+
+    // --- The same conversation again, and a change of the context's size ---
+    // First with the memory carried over into the larger context, which keeps the conversation
+    // and copies its state through one block; then back with a budget one byte short of what
+    // carrying needs, which forgets it. What is required after that is what is required after
+    // a clear: the freed contexts and the block the state went through have left no token id
+    // of the reply behind.
+    {
+        std::vector<llama_token> clear((size_t) n_tokens);
+        for (int32_t i = 0; i < n_tokens; i++) {
+            clear[(size_t) i] = (llama_token) (p.prompt[(size_t) i] ^ k_mask32);
+        }
+        status = pp_session_evaluate(s, clear.data(), n_tokens, 32, &observer, &in_memory);
+        wipe(clear.data(), clear.size() * sizeof(llama_token));
+        // The reply one token at a time, as sampled tokens are evaluated: given in one piece it
+        // would be a prompt, and llama.cpp's freed copies of a prompt's tokens are the part
+        // that is reported and not required.
+        for (size_t i = 0; i < p.reply.size() && status == PP_STATUS_OK; i++) {
+            llama_token token = (llama_token) (p.reply[i] ^ k_mask32);
+            status = pp_session_evaluate(s, &token, 1, 1, &observer, &in_memory);
+            token = 0;
+        }
+    }
+    const int32_t held = pp_session_memory_token_count(s);
+    const int32_t n_small = pp_session_context_size(s), n_large = 2 * n_small;
+    const int64_t generous = (int64_t) 2 << 30;
+    const int32_t grown = pp_session_resize_context(s, n_large, generous);
+    const int32_t carried = pp_session_memory_token_count(s);
+    const int64_t peak = std::max(pp_session_context_bytes(s, n_small), pp_session_context_bytes(s, n_large)) + pp_session_carry_bytes(s);
+    const int32_t shrunk = pp_session_resize_context(s, n_small, peak - 1);
+    found after_resize;
+    scan(p, after_resize);
+    r.check(status == PP_STATUS_OK && grown == PP_STATUS_OK && carried == held && held > n_tokens && shrunk == PP_STATUS_OK && pp_session_memory_token_count(s) == 0 &&
+            after_resize.reply_ids == 0,
+            "the conversation again (%d tokens), carried into a context of %d (%d tokens there), then back to %d with a budget one byte short of carrying it: "
+            "an empty memory and no window of the reply's token ids (%d found)", held, n_large, carried, n_small, after_resize.reply_ids);
+    r.note("after that change of size: %d window(s) of the text and %d of the prompt's token ids are still readable", after_resize.text, after_resize.prompt_ids);
 
     pp_session_close(s);
     found after_close;

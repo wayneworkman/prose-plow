@@ -3,9 +3,9 @@ package us.theworkmans.proseplow.settings
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.lifecycle.ViewModel
 import kotlinx.coroutines.flow.StateFlow
+import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.model.ModelSpec
-import us.theworkmans.proseplow.core.model.acceptsReplyLength
-import us.theworkmans.proseplow.core.model.replyLengthRange
+import us.theworkmans.proseplow.core.model.ReplyLength
 import us.theworkmans.proseplow.data.AppSettings
 import us.theworkmans.proseplow.data.SettingsStore
 import java.text.DecimalFormatSymbols
@@ -31,18 +31,22 @@ import java.text.NumberFormat
  * of the fields that are open.
  *
  * @param models the models this build offers; each gets a row in Settings and a page of its
- *   own, with its system prompt (or the reason why it has none), its temperature and its
- *   longest reply.
+ *   own, with its system prompt (or the reason why it has none), its temperature, its longest
+ *   reply and how far its context may grow.
  * @param decimalSeparator the decimal mark of the user's locale, asked for whenever a number is
  *   read or shown, so that a change of language while the screen is open is followed.
  * @param wholeNumber a whole number as the user's locale writes it in a sentence (1,024 or
  *   1.024); asked for whenever one is shown, for the same reason.
+ * @param contextLimits what this device allows a model's context: the sizes to choose from,
+ *   what each costs, and with them the limits of the longest reply. A ViewModel that is given
+ *   none assumes a device with plenty of memory.
  */
 class SettingsViewModel(
     private val settings: SettingsStore,
     val models: List<ModelSpec>,
     private val decimalSeparator: () -> Char = { DecimalFormatSymbols.getInstance().decimalSeparator },
     private val wholeNumber: (Int) -> String = { NumberFormat.getIntegerInstance().format(it.toLong()) },
+    private val contextLimits: DeviceContextLimits = DeviceContextLimits(),
 ) : ViewModel() {
 
     /** The settings as they are stored now. The rows of the Settings page are made of these. */
@@ -57,14 +61,19 @@ class SettingsViewModel(
         }
     }
 
+    /** The size chosen for the context of each model that has one, by model id; a model that is not here is left to itself. */
+    private val contexts = mutableStateMapOf<String, Int>().apply {
+        for ((modelId, overrides) in settings.settings.value.modelOverrides) overrides.contextTokens?.let { put(modelId, it) }
+    }
+
     /**
      * The text of each longest-reply field that is not empty, by model id. A stored value that
-     * its model does not accept is not in use (the model's own is) and is not shown either.
+     * lies outside the model's limits is not in use (the model's own is) and is not shown either.
      */
     private val replyLengths = mutableStateMapOf<String, String>().apply {
         for (model in models) {
             val own = settings.settings.value.overrides(model.id).maxNewTokens
-            if (own != null && model.acceptsReplyLength(own)) put(model.id, ReplyLengthInput.format(own))
+            if (own != null && own in replyLengthRange(model)) put(model.id, ReplyLengthInput.format(own))
         }
     }
 
@@ -113,24 +122,32 @@ class SettingsViewModel(
     /** The text in the longest-reply field of [modelId]; empty when the model's own applies. */
     fun replyLength(modelId: String): String = replyLengths[modelId].orEmpty()
 
-    /** True when the longest-reply field of [model] holds something that is not a length the model accepts. */
-    fun replyLengthInvalid(model: ModelSpec): Boolean = ReplyLengthInput.parse(replyLength(model.id), model) == ReplyLengthInput.Parsed.Invalid
+    /**
+     * The limits of the longest reply of [model] now: those that follow from how long its
+     * context may become on this device under the size chosen for it (see [ReplyLength]). They
+     * change when another size is chosen.
+     */
+    private fun replyLengthRange(model: ModelSpec): IntRange = ReplyLength.range(contextLimit(model))
 
-    /** The longest reply [model] has in the catalogue, as a sentence shows it. */
-    fun defaultReplyLength(model: ModelSpec): String = wholeNumber(model.defaultMaxNewTokens)
+    /** True when the longest-reply field of [model] holds something that is not a length within its limits. */
+    fun replyLengthInvalid(model: ModelSpec): Boolean =
+        ReplyLengthInput.parse(replyLength(model.id), replyLengthRange(model)) == ReplyLengthInput.Parsed.Invalid
 
-    /** The shortest and the longest "longest reply" [model] accepts, as a sentence shows them. */
-    fun replyLengthLimits(model: ModelSpec): Pair<String, String> = wholeNumber(model.replyLengthRange.first) to wholeNumber(model.replyLengthRange.last)
+    /** The longest reply [model] writes when none is set: the catalogue's, within the limits; as a sentence shows it. */
+    fun defaultReplyLength(model: ModelSpec): String = wholeNumber(model.defaultMaxNewTokens.coerceAtMost(replyLengthRange(model).last))
+
+    /** The shortest and the longest "longest reply" [model] accepts now, as a sentence shows them. */
+    fun replyLengthLimits(model: ModelSpec): Pair<String, String> = replyLengthRange(model).let { wholeNumber(it.first) to wholeNumber(it.last) }
 
     /**
-     * The longest-reply field of [modelId] was edited. The text is kept as typed. A number the
-     * model accepts is stored at once and an empty field stores "the model's own"; anything
-     * else stores nothing, so the last valid value stays.
+     * The longest-reply field of [modelId] was edited. The text is kept as typed. A number
+     * within the model's limits is stored at once and an empty field stores "the model's own";
+     * anything else stores nothing, so the last valid value stays.
      */
     fun onReplyLengthChange(modelId: String, text: String) {
         val model = models.firstOrNull { it.id == modelId } ?: return
         if (text.isEmpty()) replyLengths.remove(modelId) else replyLengths[modelId] = text
-        when (val parsed = ReplyLengthInput.parse(text, model)) {
+        when (val parsed = ReplyLengthInput.parse(text, replyLengthRange(model))) {
             ReplyLengthInput.Parsed.Default -> settings.update { it.withMaxNewTokens(modelId, null) }
             is ReplyLengthInput.Parsed.Value -> settings.update { it.withMaxNewTokens(modelId, parsed.tokens) }
             ReplyLengthInput.Parsed.Invalid -> Unit
@@ -140,16 +157,74 @@ class SettingsViewModel(
     /** One tap back to the model's own longest reply: empties the field, whatever was in it. */
     fun useDefaultReplyLength(modelId: String) = onReplyLengthChange(modelId, "")
 
-    /** True when [modelId] has a temperature or a longest reply of its own, or a field holds an entry for one. */
-    fun hasOwnValues(modelId: String): Boolean = temperature(modelId).isNotEmpty() || replyLength(modelId).isNotEmpty()
+    /**
+     * One size the context of a model may be allowed to grow to.
+     *
+     * @property tokens the size that is stored for it; null for the automatic one.
+     * @property limitTokens how large the context may become with it on this device.
+     * @property memoryBytes what a context of that size costs in memory; 0 when that is not known.
+     * @property rereadSeconds how long the model takes to read a conversation of that size
+     *   again, at the speed it was measured with; null when that is not known.
+     */
+    data class ContextOption(val tokens: Int?, val limitTokens: Int, val memoryBytes: Long, val rereadSeconds: Int?) {
+        /** The time in whole minutes, for a time that is better said so: from a minute and a half on. Null below that. */
+        val rereadMinutes: Int? get() = rereadSeconds?.takeIf { it >= SECONDS_SAID_AS_MINUTES }?.let { (it + 30) / 60 }
+    }
 
     /**
-     * Back to the model's own temperature and longest reply: both fields are emptied, whatever
-     * was in them. The system prompt is not a value with a default but something the user
-     * wrote, and stays.
+     * The sizes to choose from for the context of [model]: the automatic one first, then the
+     * fixed ones, smallest first. Only the automatic one for a model whose context cannot grow
+     * on this device, which is then no choice but a fact to state.
+     */
+    fun contextOptions(model: ModelSpec): List<ContextOption> {
+        val automatic = contextOption(model, null, contextLimits.limit(model, chosen = null))
+        val fixed = contextLimits.choices(model)
+        return if (fixed.size < 2) listOf(automatic) else listOf(automatic) + fixed.map { contextOption(model, it, it) }
+    }
+
+    private fun contextOption(model: ModelSpec, tokens: Int?, limit: Int) =
+        ContextOption(tokens, limit, contextLimits.bytes(model, limit), contextLimits.rereadSeconds(model, limit))
+
+    /**
+     * The option of [model] that is in force: null for the automatic one, otherwise one of the
+     * fixed sizes. A stored size that is not among them (the catalogue or the device changed)
+     * counts as the size it stands for here, as it does where it is used (see
+     * [DeviceContextLimits.chosen]). A model with nothing to choose has no choice.
+     */
+    fun contextChoice(model: ModelSpec): Int? =
+        if (contextLimits.choices(model).size < 2) null else contextLimits.chosen(model, contexts[model.id])
+
+    /** How long the context of [model] may become now, in tokens: the limit under the size chosen for it. */
+    fun contextLimit(model: ModelSpec): Int = contextLimits.limit(model, contextLimits.chosen(model, contexts[model.id]))
+
+    /** A number of tokens as a sentence shows it. */
+    fun tokens(count: Int): String = wholeNumber(count)
+
+    /**
+     * Another size was chosen for the context of [modelId]: null for the automatic one,
+     * otherwise one of the fixed sizes of [contextOptions]; anything else is ignored. Stored
+     * at once. The limits of the longest reply follow from it; an entry in that field which no
+     * longer lies within them is marked there and is not in use until it does.
+     */
+    fun onContextChoice(modelId: String, tokens: Int?) {
+        val model = models.firstOrNull { it.id == modelId } ?: return
+        if (tokens != null && tokens !in contextLimits.choices(model)) return
+        if (tokens == null) contexts.remove(modelId) else contexts[modelId] = tokens
+        settings.update { it.withContextTokens(modelId, tokens) }
+    }
+
+    /** True when [modelId] has a temperature, a longest reply or a context size of its own, or a field holds an entry for one. */
+    fun hasOwnValues(modelId: String): Boolean =
+        temperature(modelId).isNotEmpty() || replyLength(modelId).isNotEmpty() || contexts.containsKey(modelId)
+
+    /**
+     * Back to the model's own temperature and longest reply and to the automatic context: both
+     * fields are emptied, whatever was in them. The system prompt is not a value with a default
+     * but something the user wrote, and stays.
      */
     fun restoreDefaults(modelId: String) {
         useDefaultTemperature(modelId)
+        onContextChoice(modelId, null)
         useDefaultReplyLength(modelId)
     }
 
@@ -165,7 +240,7 @@ class SettingsViewModel(
     /** The summary of [model] under the settings [stored]. */
     fun summary(model: ModelSpec, stored: AppSettings): ModelSummary = ModelSummary(
         temperature = TemperatureInput.format(stored.sampling(model).temperature.coerceAtLeast(0f), decimalSeparator()),
-        replyTokens = wholeNumber(stored.maxNewTokens(model)),
+        replyTokens = wholeNumber(stored.maxNewTokens(model, contextLimits.limit(model, contextLimits.chosen(model, stored.contextTokens(model.id))))),
         systemPrompt = when {
             !model.supportsSystemPrompt -> SystemPromptState.NOT_POSSIBLE
             stored.systemPrompt(model.id).isEmpty() -> SystemPromptState.NONE
@@ -174,4 +249,8 @@ class SettingsViewModel(
     )
 
     fun loadIssueShown() = settings.loadIssueShown()
+
+    private companion object {
+        const val SECONDS_SAID_AS_MINUTES = 90
+    }
 }

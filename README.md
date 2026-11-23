@@ -66,13 +66,27 @@ Chats:
 - **A longest reply for each model**, in tokens (a token is about three quarters of a word).
   An answer that reaches it stops with "Reached the length limit" and can be continued. Left
   empty, a model uses its own value from the table below; it can be set from 16 tokens to
-  half of the model's context, because the room for a reply is taken from the room for the
-  earlier conversation.
+  half of what the model's context may grow to on this phone, because the room for a reply is
+  taken from the room for the earlier conversation, and never to more than 4,096.
 - **Answers as Markdown**, with selectable text, a copy button on every message and on every
   block of code. Images are never loaded: the app shows their alternative text. A link is shown
   in full and is handed to another app only after you have confirmed it.
-- **Long conversations.** When a conversation no longer fits the model's context, the oldest
-  messages are left out of the latest answer and the app says how many.
+- **A context that grows with the conversation.** A model starts with a context of 4,096
+  tokens (Boris-2 with its 2,048) and is given more only when a conversation needs it, up to
+  a limit: what the model was trained with, what a quarter of the phone's memory holds, and,
+  unless you choose a size yourself on the model's page, what the model can read again in
+  about two minutes. Before every step the app asks Android how much memory is available, and
+  it takes no step that would leave too little. The chat says when the context has grown and
+  when it could not. Locking the app gives the memory back, and so does the next answer in
+  another conversation that needs no more than the starting size.
+  [The context grows with the conversation](#the-context-grows-with-the-conversation) has
+  the numbers.
+- **Long conversations.** At the limit of the context, the oldest messages are left out of
+  the latest answer and the app says how many. They stay in the chat.
+- **At the edge of the phone's memory Android can still end the app.** The app checks before
+  it takes memory, but it cannot promise what Android does a moment later. If the app is
+  ended, the chats are on disk, encrypted: only what was not yet written of the answer under
+  way is lost.
 - **Drafts.** What you have typed and not sent is kept with its chat.
 - **An answer is finished when you leave.** While an answer is being written the app runs a
   foreground service, with a silent notification that says "Writing an answer..." and nothing
@@ -152,18 +166,100 @@ with the SHA-256 the converted file must have.
 | --- | --- | --- | --- |
 | What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts |
 | Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project |
-| Context on the phone, tokens | 4,096 | 4,096 | 2,048 |
-| Longest reply, tokens: the default, and the most it can be set to | 1,024; 2,048 | 1,024; 2,048 | 512; 1,024 |
+| Context, tokens: at the start, and the most the model was trained with | 4,096; 262,144 | 4,096; 32,768 | 2,048; 2,048 |
+| Longest reply, tokens: the default, and the most it can be set to | 1,024; 4,096 | 1,024; 4,096 | 512; 1,024 |
 | Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 |
 | System prompt | yes | no | yes |
 
 The sampling values are each model's own reference settings, taken from its published files.
-The temperature and the longest reply can be changed for each model in Settings; the other
-values are fixed. The most a reply can be set to is half of the context: that is as much room
-as the engine keeps free for a reply while it leaves older messages out, so a longer limit
-could not be kept.
+The temperature, the longest reply and how far the context may grow can be changed for each
+model in Settings; the other values are fixed. The most a reply can be set to is half of what
+the context may grow to on the phone under that setting, and never more than 4,096 tokens,
+which is plenty for one answer of a small model: half is as much room as the engine keeps free
+for a reply while it leaves older messages out, so a longer limit could not be kept. With the
+context held at 4,096 tokens the most is therefore 2,048.
 The Qwen3.5 file leaves out the vision tower and the multi-token-prediction head of the
 checkpoint: the app is text only.
+
+### The context grows with the conversation
+
+A model's context is how much of a conversation it reads at once. Its memory is allocated in
+full when the context is created, whether or not a conversation fills it, so the app does not
+create the largest context a model could have: it starts small and grows when a conversation
+needs more.
+
+| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
+| --- | --- | --- | --- |
+| Context at the start, tokens | 4,096 | 4,096 | 2,048 |
+| The most the model was trained with, tokens | 262,144 | 32,768 | 2,048 |
+| Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 |
+| Memory of the context at the start | 50 MB | 273 MB | 130 MB |
+
+- **Steps.** When a conversation, and the room kept free for its reply, no longer fit, the
+  context is made larger: to twice the starting size, four times, and so on, with the limit
+  itself as the last step. The smallest step that fits is taken in one go.
+- **The limit** is the smallest of three. What the model was trained with. What a quarter of
+  the phone's memory holds at the model's bytes for each token, in whole 1,024 tokens. And,
+  only while the model's page says "Automatic", what the model reads again in about two
+  minutes: its reading speed times 120 seconds, in whole 1,024 tokens, and never less than
+  the starting size. The speed is the one the running app has measured once it has read a
+  prompt of 256 tokens or more, and before that the speed in the table under
+  [Speed on the one phone that was tested](#speed-on-the-one-phone-that-was-tested). A context
+  that has grown is not cut back by a slower measurement: it keeps its size until the
+  conversation is left. On the tested phone this makes 10,240 tokens for Qwen3.5, where the
+  time decides, and about 20,000 for Peacebell, where the memory does.
+- **A size of your own.** Besides "Automatic", a model's page offers the fixed sizes from the
+  starting size up to what the phone's memory allows, each with the memory it takes when it
+  is full and the time the model needs to read it all again. A fixed size is not held to the
+  two minutes; that time is yours to spend. A model that cannot grow on the phone has no
+  choice there, and one sentence that says how much it reads.
+- **Asked before every step.** The app reads Android's own account of the memory
+  (`ActivityManager.MemoryInfo`) at that moment, never an earlier one. A step is taken only
+  if, with the context at its new size, the memory still counted as available is at least a
+  fifth of the phone's memory and at least twice the amount at which Android itself calls
+  memory low. While Android reports low memory, or has told the app so within the last minute
+  (`onLowMemory`, and `onTrimMemory` at the levels that speak of memory running low), nothing
+  is added. On Android 14 and later a running app is no longer told most of those levels,
+  which is why the reading at the moment is the guard and the callbacks only add to it.
+- **When a step cannot be taken**, the context grows as far as it can, and the size it then
+  has is the limit for that model until it is loaded again. The chat says so once, and from
+  there the oldest messages are left out, as at any limit. If a larger context cannot be
+  created although the memory seemed to be there, the previous one is set up again with what
+  the model had read, and the same applies.
+- **What growing costs.** The model keeps what it has read when its context grows, where that
+  can be carried over, and reads only what is new. Where it cannot, the conversation is read
+  again from the start, and the chat says so.
+- **What a long conversation costs after a lock.** When the app is locked and left, its
+  process ends (see [The lock](#the-lock)), and the next answer in a conversation reads all of
+  it again. At the speeds measured on the tested phone, 10,240 tokens take Qwen3.5 about two
+  minutes, 32,768 about six, and the 110,000 or so that the phone's memory allows it about
+  twenty. Behind the lock nothing changes for that: an answer that is still being read or
+  written ten minutes after the app locked is stopped. A conversation that takes longer than
+  that to read has to be read with the app open.
+- **Giving it back.** Clearing the model's memory returns the context to its starting size.
+  That happens at every lock, and when an answer is asked for in another conversation that
+  fits the starting size: the little the two conversations have in common (1,024 tokens at
+  most) is then read again. A conversation that only became shorter, because its latest
+  message was edited, keeps its context and what was read of it until the next lock.
+- **Opening a model** follows the same rule. If the phone does not have the memory available
+  for the starting size, half of it is tried, and half again, down to 1,024 tokens; below
+  that the model is not loaded, and the app says that the phone has too little free memory
+  for it right now.
+- **What is counted.** The memory in all of this is what the tokens of a context take: the
+  model's bytes for each token times the size, which is in use from the moment a context is
+  created. A loaded model also reserves working memory that does not depend on the size of
+  its context and is mostly never touched, above all room for the scores of a whole batch of
+  tokens (see the table under "The generation session" in
+  [native/README.md](native/README.md)). That part is the same before and after a step and
+  was there before a context could grow, so it is not counted against the quarter or the
+  room; what of it is in use is already missing from the memory Android reports as
+  available.
+
+This is no promise that the app never runs out of memory. Every check is made with what
+Android reports at that moment; another app can take the memory a moment later, and Android
+then ends apps without asking. If it ends this one, the chats are safe: a message is written
+to disk, encrypted, when it is sent, and an answer while it is being written, so at most the
+last words of the answer under way are lost.
 
 ### Supported, not bundled: Shard-2
 
@@ -180,7 +276,8 @@ third-party notices (`app/notices/`; a test fails while a bundled model has none
 model's lines in this file and in the store description.
 
 What it is, for when that happens: Shard-2 is not a chat model. It is given only the latest
-message, exactly as written, and writes on from it (context 4,096 tokens, replies of up to 200,
+message, exactly as written, and writes on from it (context 4,096 tokens, which is what its
+card says it was trained with and where it stays; replies of up to 200,
 temperature 0.9 and top-k 100 as in its reference script, no system prompt). It has one token
 beyond its tokenizer that takes back the token before it: the app applies that as it happens,
 so words the model retracts disappear from the reply while the model itself still sees what it
@@ -317,6 +414,9 @@ optionally a second time by a fingerprint key.
   key included, and told to start nothing new. When that one answer is finished, or ten
   minutes after the moment of locking if it is not (it is then stopped and kept as a stopped
   message), the session is closed in the order described above and the key is overwritten.
+  The ten minutes count whatever the model is doing: reading a long conversation again is
+  part of the answer, so one that takes longer than that to read is not finished behind the
+  lock (see [The context grows with the conversation](#the-context-grows-with-the-conversation)).
   "Lock now" is the stronger action and never leaves anything alive, whatever the setting; a
   reset ends it too. The setting is a field of `lock.json`, because it is needed while the app
   is locked; a file without the field means on.
@@ -367,12 +467,18 @@ it or losing the phone loses the chats.
 ### What stays in memory
 
 - While the app is unlocked, the data key, the decrypted chats and settings, and the model's
-  working memory of the conversation are in the app's memory.
+  working memory of the conversation are in the app's memory. That working memory is the
+  model's context: 4,096 tokens at the start (2,048 for Boris-2), and more when a conversation
+  has made it grow, up to a quarter of the phone's memory (see
+  [The context grows with the conversation](#the-context-grows-with-the-conversation)).
 - When the session is closed (at a lock, or when an answer that was finished behind the lock
   is saved), the data key's array is zeroed and the key refuses every further use, and the
   engine clears the model's memory of the conversation: the native session overwrites its own
   buffers and the saved checkpoints in place before it frees them, which takes between 15 and
-  about 160 milliseconds on the phone that was tested, depending on the model.
+  about 160 milliseconds on the phone that was tested, depending on the model. That was
+  measured with contexts of the starting size; a context that has grown has more to
+  overwrite. Clearing also returns the context to its starting size, so the memory a long
+  conversation took is given back to the phone.
 - That does not reach everything. llama.cpp makes copies of its own while it works and frees
   them without overwriting them: measured on that phone after the native clear, copies of the
   prompt's text were still readable in the process for two of the four models that were
@@ -1109,11 +1215,11 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 344 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 541 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 372 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 562 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
-| Native host suite (46 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
+| Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark | `./gradlew :app:connectedDebugAndroidTest` |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
@@ -1138,7 +1244,9 @@ A model is a build change, never a download by the app. In outline:
 3. Add its tests to the native suite. A model of an architecture that llama.cpp does not have
    needs that architecture ported first, with reference data from its PyTorch implementation.
 4. Add it to the catalogue in `core` (`ModelCatalog.kt`) with its prompt format, sampling
-   settings, context length and licence, and its name to the app's strings.
+   settings, context (the size it starts with, the size it was trained with, the bytes for
+   each token and its reading speed on the tested phone) and licence, and its name to the
+   app's strings. A test compares the context numbers with the manifest's.
 5. Add it to the third-party notices (`app/notices/`): its licence, its copyright lines and
    what the conversion changed. A model is bundled only when its licence is established; a
    test fails while a bundled model has no entry there.
@@ -1163,6 +1271,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `gradle/wrapper/` | The Gradle wrapper, with the version and SHA-256 of the distribution |
 | `env.sh` | Puts the JDK and `adb` on `PATH` for the current shell |
 | `local.properties.example` | A template for the optional `local.properties` |
+| `FEATURES.md` | Everything the app does that a user or a tester can observe, item by item and with its exact wording, so that a version for another platform can be held to the same behaviour |
 | `LICENSE` | The Apache License 2.0 |
 
 ## Contributing
@@ -1173,6 +1282,9 @@ sections, from someone who has actually followed them.
 - Run `./gradlew check` before you send a change, and `native/tools/host-check.sh` if it touches
   anything under `native/` or `models/`.
 - Tests arrive in the same change as the code they cover.
+- `FEATURES.md` describes the app item by item and quotes every text it shows. A change of
+  behaviour changes its item there, and a string that is added or reworded is quoted there in
+  the same commit: a test fails otherwise and says what to do.
 - Logic that needs no Android belongs in `core`. `app` depends on `core`, never the reverse.
 - The app requests no permission. A change that adds one, or a dependency that brings one, fails
   the build and needs a very good reason.

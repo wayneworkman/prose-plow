@@ -4,6 +4,7 @@ import androidx.annotation.StringRes
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
 import us.theworkmans.proseplow.R
+import us.theworkmans.proseplow.core.engine.LlamaEngine
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelFamily
 
@@ -71,6 +72,18 @@ object ModelText {
         ModelFamily.COMPLETION -> R.string.system_prompt_unsupported_completion
         ModelFamily.QWEN35_CHATML, ModelFamily.PEACEBELL_CHATML, ModelFamily.PLAIN_CHATML, null -> R.string.system_prompt_unsupported
     }
+
+    /**
+     * True when [detail], the technical detail of a failure to load a model, is the engine's
+     * fixed way of saying that the phone had too little memory available for it. That failure
+     * has plain words of its own, and its detail is not shown: it would say the same less well.
+     */
+    fun isTooLittleMemory(detail: String?): Boolean = detail == LlamaEngine.TOO_LITTLE_MEMORY
+
+    /** The plain words for a model that could not be loaded, by the [detail] of the failure. */
+    @StringRes
+    fun loadFailedDetailRes(detail: String?): Int =
+        if (isTooLittleMemory(detail)) R.string.error_model_too_little_memory_detail else R.string.error_model_load_failed_detail
 }
 
 /** The name of the model [modelId] as shown everywhere; its id when this version does not know it. */

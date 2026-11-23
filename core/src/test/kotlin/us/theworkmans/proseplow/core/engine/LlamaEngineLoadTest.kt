@@ -151,8 +151,8 @@ class LlamaEngineLoadTest {
         // Cancelled during the last progress report: the factory still returns a model.
         test.factory.progressSteps = listOf(0f)
         var first = true
-        val factory = NativeLlamaFactory { model, progress ->
-            val native = test.factory.open(model, progress)
+        val factory = NativeLlamaFactory { model, progress, contextTokens, budgetBytes ->
+            val native = test.factory.open(model, progress, contextTokens, budgetBytes)
             if (first) {
                 first = false
                 loading.cancel()
