@@ -1150,9 +1150,9 @@ native/tools/host-check.sh
 
 It builds llama.cpp and this project's native libraries for the host with GCC, converts the
 32-bit validation files, and runs the test suite, which compares the converted files and the
-running models with the PyTorch reference. In the check it ended with
-`100% tests passed out of 29`: 23 tests ran and the six of the optional fourth model were
-skipped. The line `fatal: not a git repository` during the CMake configuration is expected (the
+running models with the PyTorch reference. It ends with `100% tests passed out of 55`; the
+tests of a model whose checkpoint is not there are listed below that line as skipped, and so
+is one test that needs optional Python packages. The line `fatal: not a git repository` during the CMake configuration is expected (the
 patched copy of llama.cpp is not a git checkout). `native/README.md` describes every test.
 
 ### Run the Kotlin tests and the checks
@@ -1242,7 +1242,9 @@ unzip -p "$APK" assets/models/qwen3.5-0.8b.gguf.so | sha256sum
 
 Check that the native libraries were stripped of their debug information. The build must not
 have printed `Unable to strip the following libraries`, and the `unzip -l` listing must show
-these sizes for a build of the pinned sources, in a debug and in a release APK alike:
+sizes close to these, in a debug and in a release APK alike. They were measured for a build of
+commit `af14daa`; later changes to the native code move `libllama.so` and
+`libproseplow_jni.so` by some kilobytes:
 
 | Library | Bytes |
 | --- | --- |
@@ -1251,7 +1253,9 @@ these sizes for a build of the pinned sources, in a debug and in a release APK a
 | `libproseplow_jni.so` | 110,752 |
 | `libc++_shared.so` | 1,374,336 |
 
-All thirteen libraries together are 13,588,024 bytes. If `libllama.so` is about 40 MB instead,
+All thirteen libraries of that build together were 13,588,024 bytes: the twelve that
+`native/README.md` lists under "What is built" (13,577,928 bytes) and
+`libandroidx.graphics.path.so` (10,096 bytes), which Compose brings. If `libllama.so` is about 40 MB instead,
 the NDK named in `app/build.gradle.kts` is not installed. The native libraries are reproducible:
 in the check, the libraries built from a clean clone in another directory with a freshly
 installed NDK were byte for byte the ones the developers' own tree had built.
@@ -1506,7 +1510,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `app/` | The Android application: the Compose screens, the lock and the encryption (`security/`), the encrypted stores (`data/`), chat (`chat/`) and settings (`settings/`) |
 | `core/` | Plain Kotlin without any Android dependency: the chat model, the prompt format of each model, the model catalogue, and the inference engine above the native layer |
 | `llama/` | The Android library around the native code: the CMake build for arm64, the JNI binding, the packaging of the models, the checks on the finished APK, and the tests that run on a phone |
-| `native/` | Everything below the JVM: the patches to llama.cpp, the three architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md` |
+| `native/` | Everything below the JVM: the patches to llama.cpp, the three architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md`, and `native/patches/README.md` for moving llama.cpp to a newer commit |
 | `models/` | `manifest.json` with the pinned revisions and hashes, and `convert_models.py`. See `models/README.md` |
 | `fastlane/` | The store metadata in the layout F-Droid reads (`metadata/android/en-US/`: title, descriptions, changelog, icon), and the script that renders the icon from the launcher artwork. See `fastlane/README.md` |
 | `third_party/llama.cpp` | Upstream llama.cpp as a git submodule at a pinned commit. It is never edited: builds work on a patched copy |

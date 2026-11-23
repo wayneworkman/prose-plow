@@ -15,7 +15,7 @@ newer, git, tar and a C++17 compiler, so WSL or a recent bash should work, but n
 | Path | What it holds |
 | --- | --- |
 | `../third_party/llama.cpp` | Upstream llama.cpp as a git submodule, pinned. **Never edited**, see below |
-| `patches/` | The changes to upstream files, as patches, and `UPSTREAM_COMMIT`, the commit they apply to |
+| `patches/` | The changes to upstream files, as patches, `UPSTREAM_COMMIT`, the commit they apply to, and `README.md`, the step-by-step runbook for moving that commit |
 | `llama-ext/` | Files we add to llama.cpp, at the path they get inside it: per architecture `src/models/<arch>.cpp`, `src/models/<arch>.h` and `conversion/<arch>.py`, for `peacebell`, `boris2` and `shard2` |
 | `tools/prepare-llama-src.sh` | Writes the patched copy of llama.cpp that everything compiles and imports |
 | `tools/make-hook-patch.sh` | The reverse: turns edits made in a patched copy back into a patch |
@@ -52,17 +52,18 @@ What goes where:
   `llama-ext/`.
 - A **change to an upstream file** goes into a patch, and stays as small as upstream's tables
   demand: an enum value, a name, a `case`. The architectures share one patch,
-  `patches/0001-architecture-hooks.patch`: 68 added lines in seven files (23 in C++, 45 in
-  Python), two of which replace an existing line. peacebell accounts for 7 and 13 of them,
+  `patches/0001-architecture-hooks.patch`: 68 added lines in seven files (22 in C++, 46 in
+  Python), two of which replace an existing line. peacebell accounts for 6 and 13 of them,
   boris2 for 10 and 16: it also needs the hybrid memory with both halves in every layer, a
   refusal by the model saver, and the token id of each KV cell kept in a saved state. shard2
-  accounts for 6 and 16 and needs no hook for its memory: upstream gives every model with
+  accounts for 6 and 17 and needs no hook for its memory: upstream gives every model with
   windowed layers the cache it needs.
   All architecture hooks live in this one patch because they sit on neighbouring lines of the
   same tables; an unrelated change (a kernel, a loader fix) gets a patch of its own. There are
-  four:
-  - `patches/0002-arm-f16-weights-kernel.patch` (23 added lines in two files) makes the CPU
-    backend use tinyBLAS's batch kernel for 16-bit float weights times 32-bit activations on
+  four (all line counts here are the ones `tools/make-hook-patch.sh` prints, which leave out
+  blank lines):
+  - `patches/0002-arm-f16-weights-kernel.patch` (23 added and 3 removed lines in two files)
+    makes the CPU backend use tinyBLAS's batch kernel for 16-bit float weights times 32-bit activations on
     every ARM build. Upstream has the kernel but compiles it out of every build with half-float
     arithmetic (`ggml/src/ggml-cpu/llamafile/sgemm.cpp`) and leaves tinyBLAS out altogether where
     the int8 matrix instructions or SVE exist (`ggml/src/ggml-cpu/ggml-cpu.c`), which together
@@ -70,9 +71,9 @@ What goes where:
     types through and nothing else. It only takes effect with `GGML_LLAMAFILE=ON`, changes
     nothing on x86, and makes a prompt of an F16 model about three times as fast on the phone
     ("On the phone" has the numbers); generation, one token at a time, does not go through it.
-  - `patches/0003-mmap-window-for-embedded-models.patch` (50 added lines in three files) makes
-    a model that is loaded from an open file at an offset (`llama_model_load_from_file_ptr`)
-    map only its own tensor data. Upstream maps the whole containing file from its first byte
+  - `patches/0003-mmap-window-for-embedded-models.patch` (50 added and 9 removed lines in three
+    files) makes a model that is loaded from an open file at an offset
+    (`llama_model_load_from_file_ptr`) map only its own tensor data. Upstream maps the whole containing file from its first byte
     and asks for all of it to be read ahead; for a model inside an APK that would be every
     other model in the APK as well. The loader now tells the file which bytes are the model's
     (`llama_file::set_mmap_window`), and the mapping, its read-ahead and every later unmapping
@@ -80,16 +81,17 @@ What goes where:
     model loaded by path is mapped as before. The patch also frees what upstream leaks when
     it refuses to map a model at an unaligned offset. Not adjusted: `mlock` of such a model,
     which this project does not use (the lock fails with a warning and the load goes on).
-  - `patches/0004-linear-byte-fallback-in-spm-tokenizer.patch` (one line removed) makes the
-    SentencePiece tokenizer take time in proportion to the text. For a character that is not in
+  - `patches/0004-linear-byte-fallback-in-spm-tokenizer.patch` (one line removed, two lines of
+    comment added in its place) makes the SentencePiece tokenizer take time in proportion to
+    the text. For a character that is not in
     the vocabulary it emits the character's bytes, and before doing so upstream reserved room in
     the output for exactly those bytes; a vector asked for an exact size every time grows by
     copying itself every time, so a text of such characters took time with the square of its
     length: 4 seconds for 256 KiB of line breaks through the peacebell vocabulary on a desktop
     processor, 0.03 with the line gone. Tokenising cannot be interrupted, which is what made this matter. The line
-    sits in a function that 0001 rewrites, so this patch is made on top of that one and has to
-    be made again (`tools/make-hook-patch.sh`) when 0001 changes those lines.
-  - `patches/0005-wipe-token-ids-of-a-restored-state.patch` (23 added lines in one file) makes
+    is in `resegment` of the SentencePiece tokenizer session in `src/llama-vocab.cpp`, a file
+    that no other patch touches.
+  - `patches/0005-wipe-token-ids-of-a-restored-state.patch` (20 added lines in one file) makes
     llama.cpp overwrite two lists before it frees them. When it reads the state of a sequence
     back (`llama_kv_cache::state_read_meta`, which an import of a memory and a change of
     context size that carries the memory over both go through), it collects the cells to
@@ -1330,8 +1332,12 @@ a build from nothing.
 
 ### What is built
 
-Twelve libraries reach the APK, eleven built here and the C++ runtime. Sizes are for the
-stripped files that both a debug and a release APK contain. The app module strips them when it
+Twelve libraries of this module reach the APK, eleven built here and the C++ runtime. Sizes are
+for the stripped files that both a debug and a release APK contain, measured for a build of
+commit `af14daa`; later changes to the native code move `libllama.so` and
+`libproseplow_jni.so` by some kilobytes. The app's APK carries one library more,
+`libandroidx.graphics.path.so` (10,096 bytes), which Compose brings: thirteen in all, 13,588,024
+bytes in that build, as the root `README.md` says. The app module strips them when it
 packages them, which needs the same `ndkVersion` there as here: without it the build still
 succeeds, prints "Unable to strip the following libraries", and every APK is about 80 MB larger.
 
@@ -1744,6 +1750,9 @@ Make it data-driven: read every dimension from metadata, and prefer a metadata k
 converter writes over a constant in C++.
 
 ### Moving the upstream pin
+
+`patches/README.md` is the step-by-step runbook for this, with the commands, what each
+prints and when to stop and ask. What follows is the background it relies on.
 
 1. Check out the new commit in `third_party/llama.cpp` and write its full hash into
    `patches/UPSTREAM_COMMIT`. The prepare script refuses to run while the two disagree: moving

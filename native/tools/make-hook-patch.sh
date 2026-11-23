@@ -3,7 +3,7 @@
 #
 #   native/tools/make-hook-patch.sh <patch-name> [edited-copy]
 #
-# patch-name is a file name under native/patches/ (for example 0001-peacebell-hooks.patch); it is
+# patch-name is a file name under native/patches/ (for example 0001-architecture-hooks.patch); it is
 # created or replaced. edited-copy defaults to $PROSEPLOW_LLAMA_SRC.
 #
 # The patch is the difference between "the pinned commit plus every OTHER patch" and the edited
