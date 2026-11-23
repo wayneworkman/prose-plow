@@ -335,6 +335,26 @@ class NativePackaging {
 
 val modelManifest: File = rootProject.layout.projectDirectory.file("models/manifest.json").asFile
 
+// The Android Gradle plugin packages a debug APK by updating the file that is already there,
+// and such an update moves nothing: a model that leaves the selection leaves a gap of its own
+// size in the file, and a model that comes in goes to the end when no gap takes it. The file is
+// valid either way and only too large, up to the 4 GiB at which an APK ends. Gradle runs a task
+// from the beginning, after removing what it wrote the last time, when a plain input value of
+// the task has changed, or an input file that was not declared for incremental use. So the
+// selection of models, and the manifest it is resolved against, are made such inputs of every
+// packaging task here: the APK is written afresh whenever the set of models in it may have
+// changed, and updated in place as before when it has not.
+//
+// These tasks are taken by the beginning of their names (package<Variant>, of which the plugin
+// has several), unlike the checks below: a task this misses keeps the old behaviour, and a
+// task too many only runs once more after the selection changed.
+val selectedModels: Provider<String> =
+    providers.gradleProperty("proseplow.models").orElse(providers.environmentVariable("PROSEPLOW_MODELS")).orElse("none")
+tasks.matching { it.name.startsWith("package") }.configureEach {
+    inputs.property("proseplow.models", selectedModels)
+    inputs.file(modelManifest).withPropertyName("proseplow.modelManifest").withPathSensitivity(PathSensitivity.NONE)
+}
+
 tasks.configureEach {
     val reportFile = layout.buildDirectory.file("reports/native-packaging/$name.txt").get().asFile
     doLast {

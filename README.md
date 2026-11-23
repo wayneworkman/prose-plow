@@ -859,20 +859,11 @@ the app loads the best one for the phone's processor), copies each selected mode
 and compares its SHA-256 with the manifest once more. A model file that is not the pinned
 conversion fails the build. The limit of the APK format is 4 GiB.
 
-**Delete the old APK before you build with another selection of models:**
-
-```sh
-rm -f app/build/outputs/apk/debug/app-debug.apk
-```
-
-The packaging step of a debug build updates the APK that is already there, and the Android
-Gradle plugin never makes that file smaller. In the check, a build without models after one with
-all three left a file of 2.4 GB with no model in it, and going back to all three then gave
-3.96 GB, of which 1.5 GB was unused space, not far below the limit of the format. Both files were
-valid and passed every check; they were only too large. With the old APK deleted first, the
-sizes are the ones in the table. `rm -rf app/build llama/build` does the same and frees the disk
-space as well. A release build did not show this: its APK came out at the right size after the
-selection was changed from all three to none.
+**Changing the selection of models needs nothing by hand.** The packaging tasks take the
+selection and the manifest as inputs, so the APK is written afresh whenever the set of models
+in it may have changed. Left to itself, the Android Gradle plugin updates a debug APK in place
+and never makes that file smaller: a model that leaves the selection would leave a gap of its
+own size, and one that comes back would be appended after it.
 
 ### Check the APK
 
@@ -1122,7 +1113,7 @@ None of it has been tried.
 | `app` (JVM, 541 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
-| Native host suite (29 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
+| Native host suite (46 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark | `./gradlew :app:connectedDebugAndroidTest` |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 

@@ -1119,9 +1119,9 @@ five times the model. A build that changes nothing takes 3 seconds; installing t
 three models over USB took 70 to 77 seconds, with Shard-2 as well 72. The times and the disk use of
 the first four rows were measured before the libraries were stripped; the APK sizes of the two
 single-model rows are computed from the stripped build, the others were built. A debug APK
-that is packaged again with fewer models keeps its old size (AGP rewrites it in place and
-leaves the gap); delete `app/build/outputs/apk/debug/app-debug.apk` first when the selection
-shrinks.
+is written afresh when the selection of models changes: `../llama/apk-checks.gradle.kts` makes
+the selection and the manifest inputs of the packaging tasks. Without that, AGP updates the
+file in place, and a model that leaves the selection leaves a gap of its own size.
 
 ## On the phone
 
