@@ -11,9 +11,9 @@ float32 are still float32 and unchanged, no value overflowed, and the share of v
 in the half-precision subnormal range stays small (a backend that flushes subnormals to zero
 must not be able to change the model).
 
-What a file of each architecture must contain is described once, in ARCHITECTURES below: the
-tensor map from GGUF names to checkpoint names with their transforms, the tensors that stay
-float32, and the metadata. Both checks return a list of problems, empty when the file is right,
+What a file of each architecture must contain is described once, in ARCHITECTURES below: how
+its checkpoint is read, the tensor map from GGUF names to checkpoint names with their
+transforms, the tensors that stay float32, and the metadata. Both checks return a list of problems, empty when the file is right,
 and print what they measured.
 """
 from __future__ import annotations
@@ -57,6 +57,23 @@ def read_safetensors(path: Path) -> dict[str, np.ndarray]:
         assert info["dtype"] in _SAFETENSORS_DTYPES, f"{name} is {info['dtype']}, expected one of {sorted(_SAFETENSORS_DTYPES)}"
         begin, end = info["data_offsets"]
         tensors[name] = data[begin:end].view(_SAFETENSORS_DTYPES[info["dtype"]]).reshape(info["shape"])
+    return tensors
+
+
+def read_pickled_state(path: Path) -> dict[str, np.ndarray]:
+    """The state dict of a PyTorch checkpoint whose payload is {"model": state dict, ...}.
+
+    The file is a pickle and is not trusted: weights_only=True makes the unpickler construct
+    tensors and plain containers only and refuse anything else. Never load it another way.
+    """
+    import torch
+
+    payload = torch.load(str(path), map_location="cpu", weights_only=True)
+    assert isinstance(payload, dict) and isinstance(payload.get("model"), dict), f"{path.name} is not a dict with a 'model' state dict"
+    tensors = {}
+    for name, tensor in payload["model"].items():
+        assert tensor.dtype == torch.float32, f"{name} is {tensor.dtype}, expected float32"
+        tensors[name] = tensor.numpy().astype("<f4", copy=False)
     return tensors
 
 
@@ -111,6 +128,9 @@ class _Peacebell:
 
     name = "peacebell"
     model_type = "gpt"  # of the checkpoint's config.json
+
+    def read_checkpoint(self, model_dir: Path) -> dict[str, np.ndarray]:
+        return read_safetensors(model_dir / "model.safetensors")
 
     def tensors(self, config: dict) -> dict[str, _Source]:
         names: dict[str, _Source] = {"token_embd.weight": ("wte.weight", None), "output_norm.weight": ("ln_f.weight", None)}
@@ -168,6 +188,9 @@ class _Boris2:
     # checkpoint tensor's name) and element type.
     _lookup = (("bigram_keys", "UINT64"), ("bigram_rows", "INT32"), ("trigram_keys", "UINT64"), ("trigram_rows", "INT32"))
 
+    def read_checkpoint(self, model_dir: Path) -> dict[str, np.ndarray]:
+        return read_safetensors(model_dir / "model.safetensors")
+
     def tensors(self, config: dict) -> dict[str, _Source]:
         names: dict[str, _Source] = {
             "token_embd.weight": ("model.embed_tokens.weight", None),
@@ -222,27 +245,131 @@ class _Boris2:
                 problems.append(f"boris2.ngram.{suffix} is not strictly increasing")
 
 
-ARCHITECTURES = {arch.name: arch for arch in (_Peacebell(), _Boris2())}
+class _Shard2:
+    """Shard-2: no tensor is transformed, one tensor of the checkpoint is left out, and the vocabulary has one token more than the tokenizer."""
+
+    name = "shard2"
+    model_type = "shard2"
+
+    # The one tensor the converter must not write: the model's forward pass never reads it.
+    unused = "indexer.gate"
+
+    def read_checkpoint(self, model_dir: Path) -> dict[str, np.ndarray]:
+        return read_pickled_state(model_dir / "Shard-2.pt")
+
+    def tensors(self, config: dict) -> dict[str, _Source]:
+        names: dict[str, _Source] = {"token_embd.weight": ("embed.weight", None), "output_norm.weight": ("final_norm.weight", None)}
+        for i in range(config["num_hidden_layers"]):
+            p = f"prelude.{i}."
+            names.update({
+                f"blk.{i}.attn_norm.weight": (p + "attn_norm.weight", None),
+                f"blk.{i}.attn_qkv.weight": (p + "attn.qkv.weight", None),
+                f"blk.{i}.attn_q_norm.weight": (p + "attn.q_norm.weight", None),
+                f"blk.{i}.attn_k_norm.weight": (p + "attn.k_norm.weight", None),
+                f"blk.{i}.attn_output.weight": (p + "attn.out.weight", None),
+                f"blk.{i}.post_attention_norm.weight": (p + "attn_post_norm.weight", None),
+                f"blk.{i}.ffn_norm.weight": (p + "ffn_norm.weight", None),
+                f"blk.{i}.ffn_up.weight": (p + "ffn.gate_up.weight", None),
+                f"blk.{i}.ffn_down.weight": (p + "ffn.down.weight", None),
+                f"blk.{i}.post_ffw_norm.weight": (p + "ffn_post_norm.weight", None),
+            })
+        return names
+
+    def stays_f32(self, name: str, stored: np.ndarray) -> bool:
+        # Every norm weight: of the blocks, of the heads of Q and K, and the final one.
+        return stored.ndim < 2
+
+    def check_metadata(self, f: _File, config: dict, source: dict[str, np.ndarray], problems: list[str]) -> None:
+        expect = _Expect(f, problems)
+        n_layer = config["num_hidden_layers"]
+        expect.equal("shard2.context_length", config["max_position_embeddings"])
+        expect.equal("shard2.trained_sequence_length", config["trained_sequence_length"])
+        expect.equal("shard2.embedding_length", config["hidden_size"])
+        expect.equal("shard2.block_count", n_layer)
+        expect.equal("shard2.feed_forward_length", config["intermediate_size"])
+        expect.equal("shard2.attention.head_count", config["num_attention_heads"])
+        expect.equal("shard2.attention.head_count_kv", config["num_key_value_heads"])
+        expect.equal("shard2.attention.key_length", config["head_dim"])
+        expect.equal("shard2.attention.value_length", config["head_dim"])
+        expect.float32("shard2.rope.freq_base", config["rope_theta"])
+        # What nn.RMSNorm() uses when it is given no epsilon: the machine epsilon of float32, exactly.
+        if f.value("shard2.attention.layer_norm_rms_epsilon") != float(np.finfo(np.float32).eps):
+            problems.append(f"shard2.attention.layer_norm_rms_epsilon is {f.value('shard2.attention.layer_norm_rms_epsilon')!r}, expected the float32 machine epsilon")
+        expect.equal("shard2.attention.sliding_window", config["sliding_window"])
+        # A layer is global when it is a multiple of global_attention_every layers before the last;
+        # every other layer is local: it sees the window and it rotates.
+        local = [(n_layer - 1 - i) % config["global_attention_every"] != 0 for i in range(n_layer)]
+        expect.equal("shard2.attention.sliding_window_pattern", local)
+        expect.equal("shard2.attention.rope_pattern", local)
+        expect.equal("shard2.backspace_token_id", config["backspace_token_id"])
+        expect.equal("shard2.chat.format", "completion")
+
+        # The tensor set is compared by the caller, so the unused tensor is known to be absent
+        # from the file; here: it is the single number the converter may leave out.
+        if self.unused not in source or source[self.unused].shape != (1,):
+            problems.append(f"the checkpoint has no {self.unused} of one value: something else was left out of the file")
+        elif set(source) - {self.unused} != {name for name, _ in self.tensors(config).values()}:
+            problems.append("the checkpoint holds tensors that the file neither carries nor is known to leave out")
+
+    def check_vocab(self, f: _File, model_dir: Path, config: dict, problems: list[str]) -> None:
+        import hashlib
+
+        expect = _Expect(f, problems).equal
+        with open(model_dir / "tokenizer.json", encoding="utf-8") as fp:
+            tokenizer = json.load(fp)
+        by_id = {i: t for t, i in tokenizer["model"]["vocab"].items()}
+        special = {t["content"]: t["id"] for t in tokenizer["added_tokens"] if t.get("special")}
+        backspace = config["backspace_token_id"]
+        expect("tokenizer.ggml.model", "gpt2")
+        expect("tokenizer.ggml.pre", "gpt-2")
+        # The tokenizer's vocabulary, then the deletion token at the next id.
+        if backspace != len(by_id) or f.value("tokenizer.ggml.tokens") != [by_id[i] for i in range(len(by_id))] + [config["backspace_token"]]:
+            problems.append("tokenizer.ggml.tokens are not the tokens of tokenizer.json followed by the deletion token")
+        # The four tokens that are not text are control tokens: never produced from text
+        # tokenised without special-token parsing, and without a piece when detokenised.
+        control = set(special.values()) | {backspace}
+        if len(control) != 4 or f.value("tokenizer.ggml.token_type") != [3 if i in control else 1 for i in range(len(by_id) + 1)]:
+            problems.append("tokenizer.ggml.token_type does not mark exactly <pad>, <bos>, <eos> and the deletion token as control tokens")
+        expect("tokenizer.ggml.merges", [" ".join(m) if isinstance(m, list) else m for m in tokenizer["model"]["merges"]])
+        # The trained special token, which the tokenizer calls <eos>, is the boundary between two
+        # texts: llama.cpp's end and beginning marker alike. Nothing is added to a prompt.
+        expect("tokenizer.ggml.eos_token_id", special.get("<eos>"))
+        expect("tokenizer.ggml.bos_token_id", special.get("<eos>"))
+        expect("tokenizer.ggml.padding_token_id", special.get("<pad>"))
+        expect("tokenizer.ggml.add_bos_token", False)
+        expect("tokenizer.ggml.add_eos_token", False)
+        expect("tokenizer.ggml.clean_spaces", False)
+        expect("tokenizer.ggml.suppress_tokens", None)
+        expect("tokenizer.chat_template", None)
+        expect("shard2.tokenizer.kind", "byte-bpe")
+        expect("shard2.tokenizer.source_sha256", hashlib.sha256((model_dir / "tokenizer.json").read_bytes()).hexdigest())
+
+
+ARCHITECTURES = {arch.name: arch for arch in (_Peacebell(), _Boris2(), _Shard2())}
 
 
 def _common(f: _File, model_dir: Path, problems: list[str]):
     """Checks shared by both file types; returns the architecture, the checkpoint tensors and the tensor map."""
     with open(model_dir / "config.json", encoding="utf-8") as fp:
         config = json.load(fp)
-    source = read_safetensors(model_dir / "model.safetensors")
 
     arch = ARCHITECTURES.get(f.value("general.architecture"))
     if arch is None:
         raise ValueError(f"general.architecture is {f.value('general.architecture')!r}: no description of such a file in check_gguf.py")
     if config.get("model_type") != arch.model_type:
         raise ValueError(f"a {arch.name} file cannot come from the checkpoint in {model_dir} (model_type {config.get('model_type')!r})")
+    source = arch.read_checkpoint(model_dir)
     arch.check_metadata(f, config, source, problems)
 
     names = arch.tensors(config)
     if set(f.tensors) != set(names):
         problems.append(f"tensor set differs: missing {sorted(set(names) - set(f.tensors))[:3]}, unexpected {sorted(set(f.tensors) - set(names))[:3]}")
 
-    _check_vocab(f, arch.name, model_dir, config, problems)
+    # An architecture whose vocabulary is not one of the two kinds below describes its own.
+    if hasattr(arch, "check_vocab"):
+        arch.check_vocab(f, model_dir, config, problems)
+    else:
+        _check_vocab(f, arch.name, model_dir, config, problems)
     return arch, source, names
 
 
@@ -299,7 +426,10 @@ def _check_vocab(f: _File, arch: str, model_dir: Path, config: dict, problems: l
         merges = [" ".join(m) if isinstance(m, list) else m for m in tokenizer["model"]["merges"]]
         expect("tokenizer.ggml.merges", merges)
         expect(f"{arch}.tokenizer.kind", "byte-bpe")
-        expect(f"{arch}.chat.format", "chatml-text")
+        with open(model_dir / "tokenizer_config.json", encoding="utf-8") as fp:
+            chat_template = json.load(fp).get("chat_template")
+        # A checkpoint without a chat template continues text; only peacebell has such members.
+        expect(f"{arch}.chat.format", "chatml-text" if chat_template is not None else "completion")
         expect("tokenizer.ggml.eos_token_id", config["eos_token_id"])
         expect("tokenizer.ggml.padding_token_id", config["pad_token_id"])
         expect("tokenizer.ggml.add_bos_token", False)
@@ -310,8 +440,7 @@ def _check_vocab(f: _File, arch: str, model_dir: Path, config: dict, problems: l
             suppress = f.value("tokenizer.ggml.suppress_tokens") or []
             if config["train_pad_id"] not in suppress:
                 problems.append(f"tokenizer.ggml.suppress_tokens {suppress} lacks the training pad {config['train_pad_id']}")
-        with open(model_dir / "tokenizer_config.json", encoding="utf-8") as fp:
-            expect("tokenizer.chat_template", json.load(fp).get("chat_template"))
+        expect("tokenizer.chat_template", chat_template)
 
 
 def _expected(source: dict[str, np.ndarray], spec: _Source) -> np.ndarray:
@@ -344,7 +473,10 @@ def check_f32(llama_src: Path, gguf_path: Path, model_dir: Path) -> list[str]:
     return problems
 
 
-def check_f16(llama_src: Path, gguf_path: Path, model_dir: Path, f32_path: Path) -> list[str]:
+def check_f16(llama_src: Path, gguf_path: Path, model_dir: Path, f32_path: Path | None, trained: bool = True) -> list[str]:
+    """trained=False: the weights are an initialisation, not a model. Its output projections are
+    drawn so small that about 1% of them are half-precision subnormals; the share is then
+    reported and not held to the limit, which is there for files that ship."""
     gguf = load_gguf_module(llama_src)
     f = _File(gguf, gguf_path)
     problems: list[str] = []
@@ -374,18 +506,20 @@ def check_f16(llama_src: Path, gguf_path: Path, model_dir: Path, f32_path: Path)
         subnormal = float(np.count_nonzero((magnitude > 0) & (magnitude < F16_SMALLEST_NORMAL))) / half.size
         n_zeroed += int(np.count_nonzero((magnitude == 0) & (stored.reshape(-1) != 0)))
         worst_subnormal = max(worst_subnormal, (subnormal, name))
-        if subnormal >= MAX_SUBNORMAL_FRACTION:
+        if trained and subnormal >= MAX_SUBNORMAL_FRACTION:
             problems.append(f"{name}: {100 * subnormal:.3f}% of the values are half-precision subnormals (limit {100 * MAX_SUBNORMAL_FRACTION}%)")
     if f.value("general.file_type") != int(gguf.LlamaFileType.MOSTLY_F16):
         problems.append("general.file_type is not MOSTLY_F16")
 
-    # Apart from the file type, the metadata must not depend on the precision.
-    f32 = _File(gguf, f32_path)
-    differing = [k for k in sorted(set(f.keys()) | set(f32.keys())) if k != "general.file_type" and f.value(k) != f32.value(k)]
-    if differing:
-        problems.append(f"metadata differs from the F32 file: {differing[:4]}")
+    # Apart from the file type, the metadata must not depend on the precision (when there is an F32 file to compare with).
+    if f32_path is not None:
+        f32 = _File(gguf, f32_path)
+        differing = [k for k in sorted(set(f.keys()) | set(f32.keys())) if k != "general.file_type" and f.value(k) != f32.value(k)]
+        if differing:
+            problems.append(f"metadata differs from the F32 file: {differing[:4]}")
 
     print(f"note  {n_f16} F16 matrices equal to the rounded checkpoint, {n_f32} F32 tensors equal to the checkpoint; "
-          f"largest subnormal share {100 * worst_subnormal[0]:.3f}% ({worst_subnormal[1]}, limit {100 * MAX_SUBNORMAL_FRACTION}%); "
+          f"largest subnormal share {100 * worst_subnormal[0]:.3f}% ({worst_subnormal[1]}, "
+          f"{'limit ' + str(100 * MAX_SUBNORMAL_FRACTION) + '%' if trained else 'not judged: untrained weights'}); "
           f"{n_zeroed} non-zero values rounded to zero; no infinities")
     return problems

@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import us.theworkmans.proseplow.BuildConfig
 import us.theworkmans.proseplow.R
+import us.theworkmans.proseplow.chat.ModelText
 import us.theworkmans.proseplow.chat.modelName
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.SettingsStore
@@ -141,7 +142,7 @@ private fun ModelSettings(viewModel: SettingsViewModel, model: ModelSpec) {
         )
     } else {
         Text(
-            stringResource(R.string.system_prompt_unsupported, name),
+            stringResource(ModelText.noSystemPromptRes(model.id), name),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

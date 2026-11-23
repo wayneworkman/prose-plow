@@ -20,15 +20,21 @@ import org.junit.Test
  *
  * The Kotlin formats must agree byte for byte. Any difference here means the model would be shown
  * a prompt it was not trained on.
+ *
+ * One fixture is different: `completion.json`, for models that only continue text. Such a model
+ * has no template to render, so its expected prompts are written by hand, from the model's
+ * reference script, and the fixture says so in its `note`.
  */
 class GoldenPromptTest {
 
+    /** A fixture file. A generated one names its [source] and what produced it; a hand-written one has a [note]. */
     @Serializable
     private class Fixture(
         val format: String,
-        val source: Source,
+        val source: Source? = null,
         val cases: List<Case>,
-        @SerialName("produced_with") val producedWith: Map<String, String>,
+        @SerialName("produced_with") val producedWith: Map<String, String> = emptyMap(),
+        val note: String? = null,
     )
 
     @Serializable
@@ -117,7 +123,7 @@ class GoldenPromptTest {
     @Test
     fun `Qwen3_5 format matches the model's chat template byte for byte`() {
         val fixture = fixture("qwen35-chatml")
-        assertEquals("Qwen/Qwen3.5-0.8B", fixture.source.repository)
+        assertEquals("Qwen/Qwen3.5-0.8B", fixture.source?.repository)
         assertTrue("expected the full set of cases", fixture.cases.size >= 40)
         assertRendersLikeTheTemplate(fixture, Qwen35ChatMlFormat)
     }
@@ -125,7 +131,7 @@ class GoldenPromptTest {
     @Test
     fun `plain ChatML format matches the Boris-2-Instruct template byte for byte`() {
         val fixture = fixture("plain-chatml")
-        assertEquals("opencerebral/Boris-2-Instruct", fixture.source.repository)
+        assertEquals("opencerebral/Boris-2-Instruct", fixture.source?.repository)
         assertTrue("expected the full set of cases", fixture.cases.size >= 27)
         assertRendersLikeTheTemplate(fixture, PlainChatMlFormat)
     }
@@ -133,7 +139,7 @@ class GoldenPromptTest {
     @Test
     fun `peacebell format makes the same encode calls and injects the same ids as build_chatml_ids`() {
         val fixture = fixture("peacebell-chatml")
-        assertEquals("tokenization_gpt.py", fixture.source.file)
+        assertEquals("tokenization_gpt.py", fixture.source?.file)
         assertTrue("expected the full set of cases", fixture.cases.size >= 27)
         fixture.forEachCase { case ->
             val expected = checkNotNull(case.tokens).map { token ->
@@ -144,6 +150,29 @@ class GoldenPromptTest {
                 }
             }
             assertEquals(expected, PeacebellChatMlFormat.render(case.input()).segments)
+        }
+    }
+
+    @Test
+    fun `completion format gives exactly the prompts written out by hand`() {
+        val fixture = fixture("completion")
+        assertTrue("the fixture says that it is not generated", checkNotNull(fixture.note).startsWith("Written by hand."))
+        val names = fixture.cases.map { it.name }.toSet()
+        assertEquals("duplicate case names", fixture.cases.size, names.size)
+        val required = listOf(
+            "single message",
+            "a space at the end is kept",
+            "earlier turns are not part of the prompt",
+            "a system prompt is ignored",
+            "continue a partial answer",
+            "continue keeps whitespace on every side",
+            "continue after earlier turns",
+        )
+        assertTrue("lacks ${required - names}", names.containsAll(required))
+        assertRendersLikeTheTemplate(fixture, CompletionFormat)
+        // The prompt is one text segment in every case: nothing in it is parsed for special tokens.
+        fixture.forEachCase { case ->
+            assertEquals(listOf(PromptSegment.Text(checkNotNull(case.rendered))), CompletionFormat.render(case.input()).segments)
         }
     }
 
@@ -166,8 +195,9 @@ class GoldenPromptTest {
             val names = fixture.cases.map { it.name }.toSet()
             assertEquals("$name has duplicate case names", fixture.cases.size, names.size)
             assertTrue("$name lacks ${required - names}", names.containsAll(required))
-            assertEquals("$name: sha256 of the source file", 64, fixture.source.sha256.length)
-            assertEquals("$name: revision of the source snapshot", 40, fixture.source.revision.length)
+            val source = checkNotNull(fixture.source) { "$name is generated and must name its source" }
+            assertEquals("$name: sha256 of the source file", 64, source.sha256.length)
+            assertEquals("$name: revision of the source snapshot", 40, source.revision.length)
             assertTrue("$name records what produced it", fixture.producedWith.keys.containsAll(listOf("python", "jinja2")))
         }
     }

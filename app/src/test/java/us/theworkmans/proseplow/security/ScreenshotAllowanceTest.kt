@@ -37,8 +37,8 @@ class ScreenshotAllowanceTest {
         runCurrent()
     }
 
-    /** What the activity does whenever it applies the policy. */
-    private fun windowIsSecure() = WindowSecurity.mustBeSecure(allowance.current(), clock.elapsed, android13)
+    /** What the activity does whenever it applies the policy, here with the app unlocked. */
+    private fun windowIsSecure() = WindowSecurity.mustBeSecure(unlocked = true, allowance.current(), clock.elapsed, android13)
 
     @Test
     fun nothingIsAllowedUntilTheUserAllowsIt() = runTest(dispatcher) {
@@ -87,7 +87,7 @@ class ScreenshotAllowanceTest {
         // The phone slept through the deadline: the clock moved on, the timer has not run.
         clock.advance(duration)
         assertTrue("nobody has looked yet", allowance.allowed.value != null)
-        assertTrue("the policy already answers by the deadline", WindowSecurity.mustBeSecure(allowance.allowed.value, clock.elapsed, android13))
+        assertTrue("the policy already answers by the deadline", WindowSecurity.mustBeSecure(unlocked = true, allowance.allowed.value, clock.elapsed, android13))
 
         assertNull("and the first look ends it", allowance.current())
         assertNull(allowance.allowed.value)
@@ -203,38 +203,95 @@ class ScreenshotAllowanceTest {
         val afterRestart = ScreenshotAllowance(clock, FakeScreenOffWatch(), dispatcher)
         assertNull(afterRestart.allowed.value)
         assertNull(afterRestart.current())
-        assertTrue(WindowSecurity.mustBeSecure(afterRestart.current(), clock.elapsed, android13))
+        assertTrue(WindowSecurity.mustBeSecure(unlocked = true, afterRestart.current(), clock.elapsed, android13))
     }
 
-    /** The whole rule: secure unless an allowance is running at this moment, on a version that can honour it. */
+    /**
+     * The whole rule: secure unless the app is unlocked and an allowance is running at this
+     * moment, on a version that can honour it. Every combination is listed: a screen on which a
+     * passphrase is asked for (the app not unlocked) is secure in each of them.
+     */
     @Test
-    fun theWindowIsSecureUnlessAnAllowanceIsRunningRightNow() {
+    fun theWindowIsSecureUnlessTheUnlockedAppHasAnAllowanceRunningRightNow() {
         val now = 1_000_000L
         val running = ScreenshotsAllowed(untilElapsedMillis = now + 1, untilWallMillis = 0)
         val endingNow = ScreenshotsAllowed(untilElapsedMillis = now, untilWallMillis = 0)
         val over = ScreenshotsAllowed(untilElapsedMillis = now - 1, untilWallMillis = 0)
-        val table = listOf(
-            // allowance, Android version, secure
-            Triple(null, 33, true),
-            Triple(null, 37, true),
-            Triple(null, 28, true),
-            Triple(running, 33, false),
-            Triple(running, 37, false),
-            Triple(running, 32, true),
-            Triple(running, 28, true),
-            Triple(endingNow, 33, true),
-            Triple(endingNow, 37, true),
-            Triple(endingNow, 28, true),
-            Triple(over, 33, true),
-            Triple(over, 37, true),
-            Triple(over, 28, true),
-        )
-        for ((allowed, sdk, secure) in table) {
-            assertEquals("allowance $allowed on Android API $sdk", secure, WindowSecurity.mustBeSecure(allowed, now, sdk))
+        val open = setOf(Triple(true, running, 33), Triple(true, running, 37))
+        var rows = 0
+        for (unlocked in listOf(true, false)) {
+            for (allowed in listOf(null, running, endingNow, over)) {
+                for (sdk in listOf(28, 32, 33, 37)) {
+                    val secure = Triple(unlocked, allowed, sdk) !in open
+                    assertEquals(
+                        "unlocked $unlocked, allowance $allowed, Android API $sdk",
+                        secure,
+                        WindowSecurity.mustBeSecure(unlocked, allowed, now, sdk),
+                    )
+                    rows++
+                }
+            }
         }
+        assertEquals(32, rows)
+        // Said once more for what matters most: not unlocked is secure, with the longest allowance on the newest version.
+        val forEver = ScreenshotsAllowed(untilElapsedMillis = Long.MAX_VALUE, untilWallMillis = Long.MAX_VALUE)
+        assertTrue(WindowSecurity.mustBeSecure(unlocked = false, forEver, now, 37))
+        assertFalse(WindowSecurity.mustBeSecure(unlocked = true, forEver, now, 37))
         // The wall clock time an allowance carries is for display and decides nothing.
-        assertFalse(WindowSecurity.mustBeSecure(running.copy(untilWallMillis = Long.MIN_VALUE), now, 33))
-        assertTrue(WindowSecurity.mustBeSecure(over.copy(untilWallMillis = Long.MAX_VALUE), now, 33))
+        assertFalse(WindowSecurity.mustBeSecure(true, running.copy(untilWallMillis = Long.MIN_VALUE), now, 33))
+        assertTrue(WindowSecurity.mustBeSecure(true, over.copy(untilWallMillis = Long.MAX_VALUE), now, 33))
+    }
+
+    /**
+     * Dialogs and menus are built again exactly when the window turns secure under the unlocked
+     * app: an allowance ended. Not when it opens, not while nothing changes, and not when the
+     * app locks, which removes its screens anyway.
+     */
+    @Test
+    fun openDialogsAreOnlyRenewedWhenTheWindowTurnsSecureUnderTheUnlockedApp() {
+        for (wasSecure in listOf(true, false)) {
+            for (secure in listOf(true, false)) {
+                for (unlocked in listOf(true, false)) {
+                    val expected = !wasSecure && secure && unlocked
+                    assertEquals(
+                        "was secure $wasSecure, is secure $secure, unlocked $unlocked",
+                        expected,
+                        WindowSecurity.mustRenewWindows(wasSecure = wasSecure, secure = secure, unlocked = unlocked),
+                    )
+                }
+            }
+        }
+    }
+
+    /** The two rules together, as the activity applies them while an allowance comes and goes. */
+    @Test
+    fun anAllowanceEndingUnderTheUnlockedAppRenewsItsWindowsOnce() = runTest(dispatcher) {
+        var wasSecure = true
+        var renewals = 0
+        fun apply(unlocked: Boolean): Boolean {
+            val secure = WindowSecurity.mustBeSecure(unlocked, allowance.current(), clock.elapsed, android13)
+            if (WindowSecurity.mustRenewWindows(wasSecure, secure, unlocked)) renewals++
+            wasSecure = secure
+            return secure
+        }
+        assertTrue(apply(unlocked = true))
+        allowance.grant()
+        assertFalse(apply(unlocked = true))
+        assertFalse(apply(unlocked = true))
+        assertEquals(0, renewals)
+
+        // The app locks during the allowance: secure at once, and nothing to renew.
+        assertTrue(apply(unlocked = false))
+        assertEquals(0, renewals)
+        assertTrue("the allowance itself goes on", allowance.allowed.value != null)
+        // Unlocked again within the ten minutes: open again.
+        assertFalse(apply(unlocked = true))
+
+        pass(duration)
+        assertTrue(apply(unlocked = true))
+        assertEquals("the dialogs that were open are built again", 1, renewals)
+        assertTrue(apply(unlocked = true))
+        assertEquals("once", 1, renewals)
     }
 
     @Test

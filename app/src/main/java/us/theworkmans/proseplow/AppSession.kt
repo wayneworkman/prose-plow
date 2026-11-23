@@ -7,7 +7,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -80,6 +79,7 @@ class DataLayout(files: AppFiles) {
  * @param models the models this build offers.
  * @param mainDispatcher where [chat] keeps its state; the screens' thread.
  * @param ioDispatcher where files are read and written.
+ * @param writeTimeoutMillis how long [close] waits for the writes that are queued.
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
  *   then shows that the data could not be opened, with Try again, instead of an empty app.
  */
@@ -92,6 +92,7 @@ class AppSession(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     clock: Clock = SystemClock,
     ids: IdSource = RandomIds,
+    private val writeTimeoutMillis: Long = WRITE_TIMEOUT_MILLIS,
 ) : UnlockedSession {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
@@ -105,7 +106,7 @@ class AppSession(
 
     private val writerScope = CoroutineScope(SupervisorJob() + ioDispatcher)
 
-    /** Every write to the session's files goes through here. [close] waits for it before the data key goes. */
+    /** Every write to the session's files goes through here. [close] gives it time to finish before the data key goes. */
     private val writer = CoalescingWriter(writerScope, LAZY_WRITE_MILLIS) { _, failure -> _writeFailure.value = failure.javaClass.simpleName }
 
     /** The encrypted settings. */
@@ -175,11 +176,19 @@ class AppSession(
      * 1. The reply in flight is stopped. What was written of it is kept, marked as stopped, and
      *    handed to the writer with everything else that changed.
      * 2. The engine forgets the conversation; the model stays loaded.
-     * 3. The writer finishes what it was given and accepts nothing more.
+     * 3. The writer accepts nothing more and gets [writeTimeoutMillis] to finish what it was
+     *    given.
      *
-     * Only then does this return, and the lock destroys the data key. Every step is bounded, so
-     * that a native call or a write that hangs cannot keep the key alive for ever; and each step
-     * is taken whatever became of the one before.
+     * Then this returns, and the lock destroys the data key. Every step is bounded, so that a
+     * native call or a write that hangs cannot keep the key alive for ever; and each step is
+     * taken whatever became of the one before.
+     *
+     * A write that is stuck in the disk when the time is up is not waited for: it cannot be
+     * interrupted, and the key must go. Its bytes were sealed before, so it may still reach the
+     * disk when the disk lets it; everything queued behind it fails, because sealing needs the
+     * key. [awaitStopped] waits for that last write, for the reset. Until it has ended, another
+     * unlock can already be writing the same file, and the late write may then replace the
+     * newer content with what this session had; the stores cannot tell the two apart.
      */
     override suspend fun close() {
         try {
@@ -188,10 +197,21 @@ class AppSession(
             try {
                 forgetConversation()
             } finally {
-                withTimeoutOrNull(WRITE_TIMEOUT_MILLIS) { writer.closeAndJoin() }
-                writerScope.coroutineContext.job.cancelAndJoin()
+                withTimeoutOrNull(writeTimeoutMillis) { writer.closeAndJoin() }
+                // Not joined: a blocking write cannot be cancelled, and waiting for it here is
+                // what would keep the key alive.
+                writerScope.cancel()
             }
         }
+    }
+
+    /**
+     * Returns when the writer has really ended: when the write that [close] may have left
+     * behind has returned, however long that takes. Nothing of this session touches a file after
+     * that.
+     */
+    override suspend fun awaitStopped() {
+        writerScope.coroutineContext.job.join()
     }
 
     /**

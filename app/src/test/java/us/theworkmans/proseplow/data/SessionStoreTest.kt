@@ -348,4 +348,47 @@ class SessionStoreTest {
         layout.sessions.writeText("a file where the directory should be")
         assertThrows(IOException::class.java) { store().open() }
     }
+
+    // --- What the encryption does not do ---
+
+    /**
+     * A limit, stated here so that it is not mistaken for something the store guards against:
+     * what is authenticated with a blob says what it is (this session, by its id), not which
+     * version of it. Someone who can write the app's files, without any key, can therefore put
+     * an older copy of a chat back in place of the newer one, and bring back a chat that was
+     * deleted. The store cannot notice either, and the README says so under "What this does
+     * not protect against". Noticing it would need a counter kept where such a person cannot
+     * write, which this app does not have.
+     *
+     * What does hold is asserted beside it: only a file that this key sealed as this very
+     * session is accepted, so nothing can be forged, and nothing moved from one chat to another.
+     */
+    @Test
+    fun anOlderCopyOfASessionPutBackByHandIsAcceptedBecauseOnlyItsIdentityIsAuthenticated() {
+        val first = conversation("s1").withDraft("what was there first")
+        val writing = store()
+        writing.save(first)
+        val olderBytes = file("s1").readBytes()
+        writing.save(first.withDraft("what replaced it"))
+        assertEquals("what replaced it", (store().load("s1") as SessionStore.Loaded.Readable).session.draft)
+        assertEquals("the app itself keeps no older copy of a file it understood", emptyList<File>(), keptCopies())
+
+        // Rolled back by someone who can only copy files: it loads as the chat, without any notice.
+        file("s1").writeBytes(olderBytes)
+        assertEquals(SessionStore.Loaded.Readable(first), store().load("s1"))
+        assertEquals(emptyList<File>(), keptCopies())
+
+        // Deleted by its owner, then put back the same way: it is listed again.
+        store().delete("s1")
+        assertFalse(file("s1").exists())
+        layout.sessions.mkdirs()
+        file("s1").writeBytes(olderBytes)
+        assertEquals(listOf("s1"), store().open().index.sessions.map { it.id })
+
+        // But the same bytes under another chat's name are not that chat, and a changed byte opens nothing.
+        file("s2").writeBytes(olderBytes)
+        assertSame(SessionStore.Loaded.Unreadable, store().load("s2"))
+        file("s1").writeBytes(olderBytes.copyOf().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() })
+        assertSame(SessionStore.Loaded.Unreadable, store().load("s1"))
+    }
 }

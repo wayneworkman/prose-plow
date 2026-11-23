@@ -8,6 +8,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import us.theworkmans.proseplow.core.prompt.CompletionFormat
 import us.theworkmans.proseplow.core.prompt.PeacebellChatMlFormat
 import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
 import us.theworkmans.proseplow.core.prompt.Qwen35ChatMlFormat
@@ -21,7 +22,7 @@ class ModelCatalogTest {
     @Test
     fun `the catalogue has the four known models in picker order`() {
         assertEquals(
-            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "boris2-peacebell-think"),
+            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),
             ModelCatalog.all.map { it.id },
         )
     }
@@ -34,13 +35,19 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun `the model in training is known but not offered`() {
-        assertFalse(ModelCatalog.BORIS2_PEACEBELL_THINK.bundled)
+    fun `what is offered is what is bundled, and a model can be known without being bundled`() {
+        // Every catalogue model ships today, so the rule is shown on a copy of one that does
+        // not: a model is bundled unless it says otherwise, and `bundled` alone decides whether
+        // the catalogue offers it.
+        val notShipped = ModelCatalog.BORIS_2_INSTRUCT.copy(id = "known-but-not-shipped", ggufFileName = "known-but-not-shipped.gguf", bundled = false)
+        assertTrue(ModelCatalog.BORIS_2_INSTRUCT.bundled)
+        assertFalse(notShipped.bundled)
+        assertEquals(ModelCatalog.all.filter { it.bundled }, ModelCatalog.bundled)
+        assertEquals(ModelCatalog.bundled, (ModelCatalog.all + notShipped).filter { it.bundled })
         assertEquals(
-            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct"),
+            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),
             ModelCatalog.bundled.map { it.id },
         )
-        assertSame(ModelCatalog.BORIS2_PEACEBELL_THINK, ModelCatalog.find("boris2-peacebell-think"))
     }
 
     @Test
@@ -109,14 +116,43 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun `boris2-peacebell-think is plain ChatML with a stop string and never emits token 188`() {
-        val model = ModelCatalog.BORIS2_PEACEBELL_THINK
-        assertSame(PlainChatMlFormat, model.promptFormat)
-        assertEquals(listOf("<|im_end|>"), model.stopStrings)
-        assertEquals(listOf(188), model.bannedTokenIds)
-        assertEquals(listOf(0), model.stopTokenIds)
-        assertTrue(model.supportsSystemPrompt)
-        assertNull("the licence is not stated until the model is published", model.licence)
+    fun `Shard-2 continues text with its reference sampling and a deletion token, and is offered`() {
+        val model = ModelCatalog.SHARD_2
+        assertEquals("shard-2", model.id)
+        assertEquals("Shard-2", model.displayName)
+        assertEquals(ModelFamily.COMPLETION, model.family)
+        assertSame(CompletionFormat, model.promptFormat)
+        assertTrue(model.family.continuesText)
+        assertEquals("shard-2.gguf", model.ggufFileName)
+        assertEquals(4096, model.contextLength)
+        assertEquals(200, model.defaultMaxNewTokens)
+        assertEquals(SamplingParams(temperature = 0.9f, topK = 100, topP = 1.0f, minP = 0.0f), model.sampling)
+        assertEquals("no penalties", SamplingParams().copy(temperature = 0.9f, topK = 100), model.sampling)
+        assertFalse(model.sampling.isGreedy)
+        assertEquals(listOf(1, 2), model.stopTokenIds)
+        assertEquals(emptyList<String>(), model.stopStrings)
+        assertEquals(emptyList<Int>(), model.bannedTokenIds)
+        assertEquals(4096, model.deletionTokenId)
+        assertFalse(model.supportsSystemPrompt)
+        assertEquals("Glint-Research/Shard-2", model.sourceRepository)
+        assertEquals("MIT", model.licence)
+        assertTrue(model.bundled)
+        assertTrue(model in ModelCatalog.bundled)
+        assertSame(model, ModelCatalog.find("shard-2"))
+    }
+
+    @Test
+    fun `only Shard-2 has a deletion token and only it continues text`() {
+        assertEquals(listOf("shard-2"), ModelCatalog.all.filter { it.deletionTokenId != null }.map { it.id })
+        assertEquals(listOf("shard-2"), ModelCatalog.all.filter { it.family.continuesText }.map { it.id })
+    }
+
+    @Test
+    fun `a deletion token cannot also end the reply or be banned`() {
+        val valid = ModelCatalog.SHARD_2
+        assertThrows(IllegalArgumentException::class.java) { valid.copy(stopTokenIds = listOf(1, 4096)) }
+        assertThrows(IllegalArgumentException::class.java) { valid.copy(bannedTokenIds = listOf(4096)) }
+        assertEquals(7, valid.copy(deletionTokenId = 7).deletionTokenId)
     }
 
     @Test

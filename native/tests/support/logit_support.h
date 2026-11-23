@@ -48,6 +48,11 @@ struct reference {
 
     // The whole logit vector of a position, or nullptr when the file does not carry it.
     const float * full_row(const sequence & s, size_t pos) const {
+        // A file with the vector at every position lists the positions in order: no search then,
+        // which matters for a sequence of thousands of tokens.
+        if (pos < s.full_pos.size() && (size_t) s.full_pos[pos] == pos) {
+            return s.full.data() + pos * n_vocab;
+        }
         for (size_t i = 0; i < s.full_pos.size(); i++) {
             if ((size_t) s.full_pos[i] == pos) {
                 return s.full.data() + i * n_vocab;
@@ -107,14 +112,24 @@ class evaluator {
 
     ~evaluator() { close(); }
 
+    // What open() asks of the next context besides its arguments. The defaults are what every
+    // test used before these existed: a context of k_n_ctx tokens per sequence, and llama.cpp's
+    // own default for a model with windowed layers (they keep every cell, like the other layers).
+    uint32_t n_ctx    = k_n_ctx;
+    bool     swa_full = true;
+    // Threads for a call that feeds a single token; 0 means as many as for a batch. The graph
+    // of one token of a small model is over before a large pool has woken up.
+    int      n_threads_single = 0;
+
     void open(uint32_t n_ubatch, uint32_t n_seq_max = 1) {
         close();
         llama_context_params params = llama_context_default_params();
-        params.n_ctx           = k_n_ctx * n_seq_max;
+        params.n_ctx           = n_ctx * n_seq_max;
+        params.swa_full        = swa_full;
         params.n_batch         = k_n_batch;
         params.n_ubatch        = n_ubatch;
         params.n_seq_max       = n_seq_max;
-        params.n_threads       = n_threads();
+        params.n_threads       = n_threads_single > 0 ? n_threads_single : n_threads();
         params.n_threads_batch = n_threads();
         params.no_perf         = true;
         if (!f16) {

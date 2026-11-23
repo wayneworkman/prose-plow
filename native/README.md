@@ -16,7 +16,7 @@ newer, git, tar and a C++17 compiler, so WSL or a recent bash should work, but n
 | --- | --- |
 | `../third_party/llama.cpp` | Upstream llama.cpp as a git submodule, pinned. **Never edited**, see below |
 | `patches/` | The changes to upstream files, as patches, and `UPSTREAM_COMMIT`, the commit they apply to |
-| `llama-ext/` | Files we add to llama.cpp, at the path they get inside it: per architecture `src/models/<arch>.cpp`, `src/models/<arch>.h` and `conversion/<arch>.py`, for `peacebell` and `boris2` |
+| `llama-ext/` | Files we add to llama.cpp, at the path they get inside it: per architecture `src/models/<arch>.cpp`, `src/models/<arch>.h` and `conversion/<arch>.py`, for `peacebell`, `boris2` and `shard2` |
 | `tools/prepare-llama-src.sh` | Writes the patched copy of llama.cpp that everything compiles and imports |
 | `tools/make-hook-patch.sh` | The reverse: turns edits made in a patched copy back into a patch |
 | `tools/env.sh`, `tools/host-check.sh` | The environment for the commands below, and all of them in one script |
@@ -52,13 +52,15 @@ What goes where:
   `llama-ext/`.
 - A **change to an upstream file** goes into a patch, and stays as small as upstream's tables
   demand: an enum value, a name, a `case`. The architectures share one patch,
-  `patches/0001-architecture-hooks.patch`: 46 added lines in seven files (17 in C++, 29 in
+  `patches/0001-architecture-hooks.patch`: 68 added lines in seven files (23 in C++, 45 in
   Python), two of which replace an existing line. peacebell accounts for 7 and 13 of them,
   boris2 for 10 and 16: it also needs the hybrid memory with both halves in every layer, a
-  refusal by the model saver, and the token id of each KV cell kept in a saved state.
+  refusal by the model saver, and the token id of each KV cell kept in a saved state. shard2
+  accounts for 6 and 16 and needs no hook for its memory: upstream gives every model with
+  windowed layers the cache it needs.
   All architecture hooks live in this one patch because they sit on neighbouring lines of the
   same tables; an unrelated change (a kernel, a loader fix) gets a patch of its own. There are
-  two:
+  three:
   - `patches/0002-arm-f16-weights-kernel.patch` (23 added lines in two files) makes the CPU
     backend use tinyBLAS's batch kernel for 16-bit float weights times 32-bit activations on
     every ARM build. Upstream has the kernel but compiles it out of every build with half-float
@@ -78,6 +80,15 @@ What goes where:
     model loaded by path is mapped as before. The patch also frees what upstream leaks when
     it refuses to map a model at an unaligned offset. Not adjusted: `mlock` of such a model,
     which this project does not use (the lock fails with a warning and the load goes on).
+  - `patches/0004-linear-byte-fallback-in-spm-tokenizer.patch` (one line removed) makes the
+    SentencePiece tokenizer take time in proportion to the text. For a character that is not in
+    the vocabulary it emits the character's bytes, and before doing so upstream reserved room in
+    the output for exactly those bytes; a vector asked for an exact size every time grows by
+    copying itself every time, so a text of such characters took time with the square of its
+    length: 4 seconds for 256 KiB of line breaks through the peacebell vocabulary on a desktop
+    processor, 0.03 with the line gone. Tokenising cannot be interrupted, which is what made this matter. The line
+    sits in a function that 0001 rewrites, so this patch is made on top of that one and has to
+    be made again (`tools/make-hook-patch.sh`) when 0001 changes those lines.
 - Only `libllama` is built and linked. llama.cpp's helper library (`common`) contains an HTTP
   client and a downloader; the CMake project fails if that target even exists.
 
@@ -115,13 +126,15 @@ ever written next to the sources:
 | Variable | Meaning |
 | --- | --- |
 | `PROSEPLOW_VENV` | The virtualenv from above. Optional when it is already activated |
-| `PROSEPLOW_BUILD` | A scratch directory for everything generated: the patched copy, the build tree, converted models, on-demand reference data. About 5 GB after a full test run (4.7 GB of it the converted models), 7 GB while it runs |
+| `PROSEPLOW_BUILD` | A scratch directory for everything generated: the patched copy, the build tree, converted models, on-demand reference data. About 5.5 GB after a full test run (5.0 GB of it the converted models), 7.5 GB while it runs |
 | `PROSEPLOW_MODEL_SRC` | The directory that holds the downloaded checkpoints (see `../models/README.md`). Optional: without it the code still builds, and the tests that need weights are skipped |
 
 Optional: `PROSEPLOW_JOBS` (parallel compile jobs, default all processors), `PROSEPLOW_THREADS`
 (inference threads in the tests, default 4), `PROSEPLOW_MODEL_OUT` (where converted models go,
 default `$PROSEPLOW_BUILD/models`), `PROSEPLOW_LLAMA_SRC` (the patched copy, default
-`$PROSEPLOW_BUILD/llama-src`).
+`$PROSEPLOW_BUILD/llama-src`), `PROSEPLOW_PEACEBELL_PACKAGES` (checkpoint directories of
+peacebell models that are not published yet, separated by `:`, for the one test that reads
+them; see `peacebell-bpe-packages` below).
 
 Everything in one command, from the repository root:
 
@@ -146,7 +159,7 @@ ctest --test-dir "$PROSEPLOW_BUILD/host" --output-on-failure
 ```
 
 A clean build takes about 40 seconds with 6 jobs, the conversions a few seconds per file (a
-minute for all seven), the test suite about eight minutes with 6 threads. The build is CPU
+minute for all nine), the test suite about fourteen minutes with 6 threads. The build is CPU
 only, static, without OpenMP and without ccache, and by default tuned to the build machine
 (`-march=native`; pass `-DGGML_NATIVE=OFF` to cmake for a portable binary). The explicit
 conversion step is optional: the tests convert what they need and reuse it while it is current.
@@ -163,16 +176,18 @@ reported by ctest as skipped, never as failed.
 | Test | What must hold |
 | --- | --- |
 | `<model>.convert-determinism` | Two fresh conversions and the converted file have the same SHA-256, for F32 and F16 (F16 alone for a stock architecture, which has no validation file) |
-| `<model>.gguf-f32` | Every tensor of the F32 file equals the checkpoint tensor byte for byte; values carried as metadata equal the stored ones exactly (peacebell: the ReZero scalars; boris2: the four n-gram lookup arrays, with their integer types); hyper-parameters equal `config.json`; vocabulary, token types and the recorded normaliser equal the tokenizer file. boris2: the 31 Canon kernels equal the documented transform of the stored ones |
+| `<model>.gguf-f32` | Every tensor of the F32 file equals the checkpoint tensor byte for byte; values carried as metadata equal the stored ones exactly (peacebell: the ReZero scalars; boris2: the four n-gram lookup arrays, with their integer types); hyper-parameters equal `config.json`; vocabulary, token types and the recorded normaliser equal the tokenizer file. boris2: the 31 Canon kernels equal the documented transform of the stored ones. shard2: the checkpoint's one unused tensor is the only one left out; the window, the two per-layer flag arrays (which layers are windowed, which rotate), the epsilon and the special ids are what the checkpoint and its reference code say; the vocabulary is the tokenizer's followed by the deletion token, and the four tokens that are not text are control tokens |
 | `<model>.gguf-f16` | Every matrix is exactly the round-to-nearest half-precision cast of the checkpoint; the tensors the architecture keeps in float32 are still float32 and unchanged (norm weights; boris2: also the Canon kernels and the n-gram projection); no infinities; under 0.5% half-precision subnormals in every tensor; metadata identical to the F32 file |
-| `<model>.tokenizer` | peacebell: the front-end reproduces the committed token vectors: 0 mismatches in exact mode and in safe mode, and safe mode never produces a chat marker from text; plus the calling contract (buffer sizes, malformed UTF-8, null arguments). boris2: llama.cpp's own tokenizer reproduces the committed vectors of the `tokenizers` library with special tokens parsed and as plain text, where the end-of-text token never occurs; `pp_chatml_text_tokenize` reproduces 118 conversations rendered by transformers' template renderer, among them every character the template's trim removes; every reported message end is the token count of the shorter conversation; the calling contract |
+| `<model>.tokenizer` | peacebell: the front-end reproduces the committed token vectors: 0 mismatches in exact mode and in safe mode, and safe mode never produces a chat marker from text; plus the calling contract (buffer sizes, malformed UTF-8, null arguments). boris2: llama.cpp's own tokenizer reproduces the committed vectors of the `tokenizers` library with special tokens parsed and as plain text, where the end-of-text token never occurs; `pp_chatml_text_tokenize` reproduces 118 conversations rendered by transformers' template renderer, among them every character the template's trim removes; every reported message end is the token count of the shorter conversation; the calling contract. shard2: llama.cpp's own tokenizer reproduces the committed vectors, which add 507 texts that spell its four control tokens (`<pad>`, `<bos>`, `<eos>` and the deletion token `<bs>`, which the tokenizer file does not contain); typed as text each of them stays plain characters, none of them is ever produced from text, and none contributes anything when a token is turned back into text. Every model of this test is held to the last three |
 | `<model>.tokenizer-live` | The same against the reference library itself (SentencePiece, or `tokenizers` and transformers), on a larger corpus generated at test time; for SentencePiece it puts every user-defined symbol of the tokenizer file in every awkward position |
-| `<model>.logits-f32` | F32 file, F32 KV cache, no flash attention: logits within 5e-3 of the PyTorch reference for one batch, token by token, uneven batches, micro-batch sizes 1, 2, 7, 32 and 512, and after a rewind; all of those within 5e-3 of each other over the whole vocabulary; 20 rewinds at arbitrary positions equal to a fresh evaluation, with a control that the wrong prefix does change the logits; greedy replies identical to the reference. peacebell: a suppressed token is never sampled, even against a +1e9 bias. boris2: see below |
-| `<model>.logits-f16` | F16 file as it ships (F16 KV cache, default attention path), same ways of feeding the tokens: mean KL at most 1e-5 (boris2: 5e-5) and max KL at most 5e-3 against the fp32 reference, top-1 agreement at least 99.5%. Greedy divergence, if any, is reported |
-| `peacebell-bpe-random` | All of the peacebell checks for a seeded random checkpoint with the shape of the family's byte-level BPE member, which is not trained yet: the converter's other tokenizer branch, llama.cpp's own tokenizer against the `tokenizers` library, the plain-text ChatML encoder, and the sampler mask on the training pad token |
+| `<model>.logits-f32` | F32 file, F32 KV cache, no flash attention: logits within 5e-3 of the PyTorch reference for one batch, token by token, uneven batches, micro-batch sizes 1, 2, 7, 32 and 512, and after a rewind; all of those within 5e-3 of each other over the whole vocabulary; 20 rewinds at arbitrary positions equal to a fresh evaluation, with a control that the wrong prefix does change the logits; greedy replies identical to the reference. peacebell: a suppressed token is never sampled, even against a +1e9 bias. boris2 and shard2: see below |
+| `<model>.logits-f16` | F16 file as it ships (F16 KV cache, default attention path), same ways of feeding the tokens: mean KL at most 1e-5 (boris2: 5e-5) and max KL at most 5e-3 against the fp32 reference, top-1 agreement at least 99.5%. Greedy divergence, if any, is reported. shard2: also 4,000 tokens sampled with the reference script's settings, with the share of the deletion token and of each special id |
+| `peacebell-bpe-random` | All of the peacebell checks for a seeded random checkpoint with the shape of the family's byte-level BPE members, none of which is published yet: the converter's other tokenizer branch, llama.cpp's own tokenizer against the `tokenizers` library, the plain-text ChatML encoder, the sampler mask on the training pad token, and a chat through the session (`session/tests/test_chat_text.cpp`: a conversation with a system message rendered, evaluated in chunks and answered; an earlier message changed and the memory cut back to what the two conversations share; a reply ended by the end-of-text token and by the end marker's text, whose first character arrives inside another token; the next turn appended without a cut). Then the same weights without a chat template, which must give a file that says `completion`, and with a template the encoder does not implement, which the converter must refuse |
+| `peacebell-bpe-packages` | The same checks, with text instead of random tokens as reference sequences, for each checkpoint directory named in `PROSEPLOW_PEACEBELL_PACKAGES`: the real byte-level BPE members exist as packages of the training pipeline before they are published. A package with a chat template is tested as a chat model, one without as a model that continues text; a package that records training step 0 is untrained, and three limits that only make sense for a trained model are relaxed for it (ties in the top-1 count, the size of the rewind control, the subnormal share). The package's own model code is never run: the reference is the verified code of the published family with the package's weights. Skipped wherever the variable is not set |
 | `boris-2-instruct.chat-f32`, `.chat-f16` | A session of eight chat requests served from one context whose memory is kept between them (a turn appended, the same request again, an earlier message changed, another beginning): the encoder gives the reference's prompt tokens; every rewind goes through a checkpoint (the cut is refused before the restore and succeeds after it) or starts over when none fits; each reply, ended by the stop string, equals the reply the reference generated from scratch, as tokens and as text (F16: reported) |
 | `boris-2-instruct.no-ngram-lookup` | The F32 file with its four lookup arrays removed, against the reference with the lookup switched off: all the checks of `logits-f32`. It separates Canon and the hybrid memory from the n-gram input |
-| `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b): what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small |
+| `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
+| `<model>.residue` | For the three bundled models: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process. How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
 What `logits-f32` and `logits-f16` check for boris2 beyond the list above, because its Canon
@@ -195,38 +210,91 @@ layers keep a recurrent state that cannot be rewound:
 - with the F32 file, in a run of its own because it ends the process: feeding the end-of-text
   token trips the graph's assertion.
 
+What `logits-f32` and `logits-f16` check for shard2. Both are judged against the reference's
+whole logit vector at every position (the vocabulary has 4,097 tokens, so that costs little),
+on five short prompts with greedy continuations and on sequences longer than the window of its
+local layers: 300, 600 and 1,500 tokens against a window of 256, made of a prompt and what the
+reference itself sampled after it, deletion tokens included, plus one sequence in which each of
+the four special ids is an input.
+
+- every way of feeding the tokens (one batch, token by token, uneven batches, micro-batches of
+  1, 2, 7, 32 and 512) with the local layers' cell store full-size and pruned (see "The shard2
+  architecture" for the two);
+- the logits of the ids 0, 1 and 2 and of the deletion token one by one at every position, and
+  the deletion token's log-probability;
+- the reference's greedy continuations, which it generated by recomputing the whole prefix for
+  every token, reproduced by decoding one token at a time;
+- **the context**: one sequence of 8,192 tokens, twice the length the model was trained on,
+  against the reference in four stretches; a token beyond the context is refused and nothing is
+  lost; the last tokens decoded again one at a time; the pruned store over the same length;
+- **cuts of the memory**, which llama.cpp never refuses for this cache: with the full-size
+  store 20 successive cuts at arbitrary positions, most of them many windows back, equal a
+  fresh evaluation (with the control that a wrong beginning changes the logits); with the
+  pruned store the cuts that the `llama_memory_seq_pos_min` test allows equal a fresh
+  evaluation, down to the last token it allows, and the cuts it forbids are accepted all the
+  same and are wrong by more than 0.5 (the negative control), also for the full-size store
+  once a checkpoint was restored into it;
+- the discipline: cuts that the test forbids, made through a checkpoint instead (restore, cut
+  at the checkpoint's length, decode forward), equal a fresh evaluation; the size of a
+  checkpoint; the removal of the whole sequence;
+- a full sequence state restored into a new context: the next tokens within the limit (not bit
+  for bit: the restored cells land in other slots), and the local store then begins at the
+  window of the saved position;
+- with the F32 file, in three short runs of their own: a file without the window or without
+  one of its two per-layer flag arrays is refused when it is loaded.
+
 For orientation, the values measured when this was written (6 threads, a desktop CPU with AVX2):
 
-| | peacebell-v1-291M | peacebell-v1-148M | Boris-2-Instruct |
-| --- | --- | --- | --- |
-| F32, largest logit error against the reference (limit 5e-3) | 8.7e-5 | 3.1e-5 | 1.7e-4 |
-| F16, mean KL / max KL (limits 1e-5, boris2 5e-5 / 5e-3) | 9.7e-7 / 3.8e-5 | 6.3e-7 / 9.8e-6 | 8.6e-6 / 4.9e-4 |
-| F16, top-1 agreement; largest logit error | 100%; 0.034 | 100%; 0.020 | 100%; 0.27 |
-| Greedy replies identical to the reference, F32 / F16 | 5 of 5 / 5 of 5 | 5 of 5 / 5 of 5 | 5 of 5 / 5 of 5, and 8 of 8 chat replies |
-| Generation, F32 / F16, tokens per second | 38 / 77 | 74 / 139 | 80 / 150 |
-| Prompt in one batch, F16, tokens per second | 560 | 1040 | 1100 |
+| | peacebell-v1-291M | peacebell-v1-148M | Boris-2-Instruct | Shard-2 |
+| --- | --- | --- | --- | --- |
+| F32, largest logit error against the reference (limit 5e-3) | 8.7e-5 | 3.1e-5 | 1.7e-4 | 6.7e-4 up to 1,500 tokens, 3.6e-3 over 8,192 |
+| F16, mean KL / max KL (limits 1e-5, boris2 5e-5 / 5e-3) | 9.7e-7 / 3.8e-5 | 6.3e-7 / 9.8e-6 | 8.6e-6 / 4.9e-4 | 2.7e-6 / 2.4e-5 (5.5e-5 over 8,192 tokens) |
+| F16, top-1 agreement; largest logit error | 100%; 0.034 | 100%; 0.020 | 100%; 0.27 | 99.93%; 0.038 |
+| Greedy replies identical to the reference, F32 / F16 | 5 of 5 / 5 of 5 | 5 of 5 / 5 of 5 | 5 of 5 / 5 of 5, and 8 of 8 chat replies | 5 of 5 / 5 of 5 |
+| Generation, F32 / F16, tokens per second | 38 / 77 | 74 / 139 | 80 / 150 | 154 / 284 |
+| Prompt in one batch, F16, tokens per second | 560 | 1040 | 1100 | 2780 |
 
 Boris-2 further: 0 tokenizer mismatches in 7,642 committed and 25,045 live texts and in 118
 conversations; a rewind through a checkpoint within 1.8e-4 of a fresh evaluation, the same
 rewind with stale Canon history off by 4.3 at least; a checkpoint is 381,700 bytes. The stock
 Qwen3.5-0.8B file generates about 30 tokens per second, and its checkpoint is 20,201,932 bytes.
 
+Shard-2 further: 0 tokenizer mismatches in 8,139 committed and 25,145 live texts; the logits of
+its ids 0, 1, 2 and of the deletion token within 4e-4 of the reference at every position (F32);
+a cut of the memory that the `llama_memory_seq_pos_min` test allows within 2e-5 of a fresh
+evaluation, a cut it forbids off by 1.6 at least, and by 0.02 when one key of 255 is missing; a
+checkpoint is 8,392,096 bytes with an F16 cache; 6.3% of 4,000 sampled tokens are the deletion
+token, the ids 0 and 1 never come and id 2 once. Its speeds are for the sequence of 1,500
+tokens and for single tokens fed with two threads, which this small a model prefers when the
+machine is busy; a context of 8,192 tokens fills at 1,900 tokens per second (F16), and through
+the session with 6 threads it generates about 440 tokens per second. All of these moved by a
+factor of two with the load of the shared machine they were measured on.
+
 ### Reference data
 
 The reference is always the PyTorch model, fp32 on the CPU.
 
-- Committed in `tests/data/` (3.5 MB): the token vectors `peacebell-v1-tokens.bin` (7,642 texts
-  and 22 conversations with the ids of the SentencePiece library, in both modes) and
+- Committed in `tests/data/` (5.0 MB): the token vectors `peacebell-v1-tokens.bin` (7,642 texts
+  and 22 conversations with the ids of the SentencePiece library, in both modes),
   `boris-2-instruct-tokens.bin` (the same texts and 118 conversations with the ids of the
-  `tokenizers` library); per checkpoint, `<model>-logits.bin` (five conversations with the
-  reference's greedy reply; the top 20 logits at every position and the whole logit vector at
-  the last prompt position); and `boris-2-instruct-chat.bin` (the chat session with the
-  reference's replies). These pin the expected behaviour independently of what is installed.
+  `tokenizers` library) and `shard-2-tokens.bin` (the same texts and 507 that spell its four
+  control tokens; no conversations, the model has no chat format); per checkpoint,
+  `<model>-logits.bin` (five conversations, for Shard-2 five prompts, with the reference's
+  greedy reply; the top 20 logits at every position and the whole logit vector at the last
+  prompt position); `boris-2-instruct-chat.bin` (the chat session with the reference's
+  replies); and `shard-2-long-logits.bin` (the sequences longer than its attention window: 300,
+  600 and 1,500 tokens sampled by the reference, and one that feeds every special id). These
+  pin the expected behaviour independently of what is installed.
 - Generated on demand into the build tree, because they are too large to commit: the logits of
-  the whole vocabulary at every position (the KL test needs them), the live token vectors, the
-  random checkpoint, and the boris2 reference without the n-gram lookup. A regenerated
-  reference is first compared with the committed one, so a PyTorch that computes something
-  else is noticed.
+  the whole vocabulary at every position (the KL test needs them; for Shard-2 both precisions
+  are judged against them, and one more file covers a sequence of 8,192 tokens, 186 MB in
+  all), the live token vectors, the random checkpoint, and the boris2 reference without the
+  n-gram lookup. A regenerated reference is first compared with the committed one, so a
+  PyTorch that computes something else is noticed.
+- For Shard-2 the on-demand files take their token sequences from the committed ones instead
+  of making them again: its long sequences were sampled, and a logit that differs in its last
+  bit on another machine could choose another token. Sampling and greedy choices are made
+  once, when a committed file is written.
 
 The generators are in `tests/refgen/`; the three binary formats are described in
 `tests/refgen/formats.py`. To regenerate the committed files after a checkpoint or tokenizer
@@ -237,15 +305,21 @@ python3 native/tests/refgen/gen_logit_ref.py --model-dir /path/to/checkpoint --o
 python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/peacebell --out native/tests/data/peacebell-v1-tokens.bin
 python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/boris-2 --out native/tests/data/boris-2-instruct-tokens.bin
 python3 native/tests/refgen/gen_chat_ref.py --model-dir /path/to/boris-2 --out native/tests/data/boris-2-instruct-chat.bin
+python3 native/tests/refgen/gen_logit_ref.py --model-dir /path/to/shard-2 --long --out native/tests/data/shard-2-long-logits.bin
+python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/shard-2 --out native/tests/data/shard-2-tokens.bin
 ```
 
 The Boris-2 reference has no cache, so its replies are made by a forward pass over the whole
-prefix for every token: generating the three files takes about a minute with 6 threads.
+prefix for every token: generating the three files takes about a minute with 6 threads. The
+three Shard-2 files take about a minute as well. Run these with `python3 -I` when the
+checkpoint directory is not your own work: `-I` keeps the current directory and the user's
+site packages off the module search path.
 
 The committed token vectors contain only text written for this project and seeded random text,
 with the symbols every tokenizer of the family has (years, month names, the URL scheme, the chat
 markers). Symbols specific to one tokenizer file are covered by the live test, which reads them
-from the file.
+from the file. The committed Shard-2 logit references contain prompts written for this project
+and what the model itself wrote after them.
 
 ## The peacebell architecture
 
@@ -268,6 +342,16 @@ the logits), hence the small architecture file.
   converter refuses a SentencePiece model whose normaliser the front-end does not implement and
   records what it saw under `peacebell.tokenizer.*`; the front-end checks that record when it
   loads.
+- The family's other tokenizer is a byte-level BPE (`tokenizer.ggml.model = gpt2`, pre-tokenizer
+  `gpt-2`), which llama.cpp reproduces token for token without a front-end. Those checkpoints
+  have a training pad token whose output row was never trained; the file lists it under
+  `tokenizer.ggml.suppress_tokens`, and whoever samples must ban it.
+- `peacebell.chat.format` says how a prompt is built: `chatml-ids` (SentencePiece: the two marker
+  ids around separately encoded segments), `chatml-text` (byte-level BPE with the plain-text
+  ChatML template: `pp_chatml_text_tokenize`, a reply ends on the marker's text or the
+  end-of-text token) or `completion` (byte-level BPE without a chat template: the prompt is the
+  text, the end-of-text token ends it). The converter decides from the checkpoint's files and
+  refuses a chat template other than the one the encoder writes out.
 
 ## The boris2 architecture
 
@@ -397,6 +481,161 @@ A full sequence state (`llama_state_seq_get_data`, without the flag) carries the
 their token ids as well as the Canon rows, and restores into a new context bit for bit; it
 grows by about 64 KB per token with an F16 cache.
 
+## The shard2 architecture
+
+`general.architecture = "shard2"` (Glint-Research/Shard-2, 49.4 M parameters): a model that
+continues text, with one token of its own, `<bs>`, by which it takes back the token before it.
+Its block is "sandwich-normed", `x += post_norm(attn(pre_norm(x)))` and
+`x += post_norm(ffn(pre_norm(x)))`, every norm an RMSNorm; attention has a fused q/k/v
+projection and an RMS norm over each head of Q and of K; the feed-forward is a fused SwiGLU;
+the head is tied to the embedding. Its 20 layers are of two kinds:
+
+- **local** layers (16) see a sliding window of 256 keys, the token itself and the 255 before
+  it, and rotate Q and K by position (RoPE over neighbouring pairs);
+- **global** layers (4: every sixth counting back from the last, so 1, 7, 13 and 19) see the
+  whole sequence and carry no position encoding of any kind.
+
+No stock architecture computes this (the nearest, gemma3, scales the embedding, has a GELU
+feed-forward with separate matrices and rotates every layer), but every piece of it exists
+upstream, so the architecture file contains no computation of its own:
+
+| What | Upstream machinery it uses, unchanged |
+| --- | --- |
+| Local and global layers in one model | The interleaved sliding-window cache (`llama_kv_cache_iswa`): one cell store for the global layers, one for the local ones. `llama_model::create_memory` builds it for any model whose hyper-parameters name a window; no hook |
+| The window | `LLAMA_SWA_TYPE_STANDARD`: a key is hidden when `query - key >= n_swa`. With `n_swa = 256` that is the reference's `(query - key) < 256` exactly, not off by one |
+| Which layers are local, which rotate | Two per-layer flag arrays of the file, `shard2.attention.sliding_window_pattern` and `shard2.attention.rope_pattern`, which upstream reads into `hparams.is_swa_impl` and `hparams.rope_pattern`; `build_rope` does nothing on a layer without the flag. Upstream's pattern helper (`set_swa_pattern`) cannot place the global layers where this model has them, so the file carries the arrays |
+| QK-norm, sandwich norms | The tensors `attn_q_norm`, `attn_k_norm`, `post_attention_norm`, `post_ffw_norm` and `build_norm`, as gemma3 uses them |
+| Fused projections | `build_qkv` and `build_ffn(..., LLM_FFN_SWIGLU, LLM_FFN_SEQ)` |
+
+Facts that matter when working on it:
+
+- Everything comes from metadata: width, depth, heads, the window, the two flag arrays, the
+  RoPE base and the epsilon. One thing did not fit: upstream takes the RoPE base of a windowed
+  layer from a hyper-parameter of its own that is 10,000 whatever the file says, so the
+  architecture copies the file's `rope.freq_base` into it.
+- **The epsilon** of every norm is `1.1920929e-07`, the machine epsilon of float32: the
+  reference builds its norms with `nn.RMSNorm()` and no epsilon, and PyTorch then uses that
+  value. It is not in `config.json`; the converter writes it.
+- Float formats: **F16 ships**; every norm weight (of the blocks, of Q and K, the final one)
+  stays float32. F32 validates the port and is never shipped. No tensor is transformed; the
+  checkpoint's `indexer.gate`, one number that the model's forward pass never reads, is left out.
+- **The vocabulary** has 4,097 tokens: the 4,096 of the tokenizer file (a byte-level BPE,
+  `tokenizer.ggml.model = gpt2` with the pre-tokenizer `gpt-2`, token for token the reference)
+  and `<bs>` at 4096, recorded as `shard2.backspace_token_id`. Four tokens are not text and are
+  typed as control tokens: text tokenised without special-token parsing never produces them,
+  and `llama_token_to_piece` gives nothing for them.
+  - `<bs>` is an ordinary token to the network and a frequent one (4% of what the reference
+    predicts over ordinary text). It is fed back like any other token; taking the token
+    before it out of what a reader sees is the application's business.
+  - Id 2 is, by its behaviour, the one special token the model was trained with: the boundary
+    between two texts. It is predicted where a text ends (up to 1% after a closing full stop)
+    and what follows it is the beginning of another text. The tokenizer calls it `<eos>`,
+    `config.json` lists it as `bos_token_id`; the file names it as both and adds neither to a
+    prompt (`add_bos_token = false`), as the reference does.
+  - Ids 0 (`<pad>`) and 1 (`<bos>`, and `eos_token_id` in `config.json`) are rows that training
+    evidently never used: the two embedding rows agree to three decimals (cosine 1.000, norms
+    6.229 and 6.231) and their logits are equal and low (never above a probability of 1.1e-4
+    in ordinary text). Feeding either does no harm beyond a slightly worse prediction.
+  - The reference stops on nothing and suppresses nothing: it writes a fixed number of tokens
+    and feeds every one of them back. Whether an application ends a reply at id 2, and whether
+    it bans ids 0 and 1, is its own decision; the file suppresses none.
+- **No chat format** (`shard2.chat.format = completion`): no template, no roles. The prompt is
+  the text, tokenised as it is.
+- **The context** is 8,192 tokens; the model was trained on 4,096
+  (`shard2.trained_sequence_length`). The port follows the reference over the whole 8,192. Its
+  distance from the reference grows with the position, 1e-3 in the first quarter and 3.6e-3
+  in the last against the limit of 5e-3, because RoPE angles are float32 on both sides and
+  lose absolute precision as positions grow; the 16-bit file is unaffected (its rounding is
+  larger than that everywhere).
+- Not supported, and refused when the file is loaded: grouped-query attention, a file without
+  windowed layers or without the two flag arrays.
+- Nothing was run on a GPU backend or on ARM.
+
+### The checkpoint is a pickle
+
+`Shard-2.pt` is a PyTorch pickle from a third party, and loading a pickle can run any code it
+contains. The rule, for the converter, the tests and anything written later:
+
+- load it with `torch.load(path, map_location="cpu", weights_only=True)` **and in no other
+  way**. That unpickler constructs tensors, dicts, lists and numbers, and refuses everything
+  else. If it ever refuses a checkpoint, the checkpoint holds something that is not weights:
+  do not fall back to `weights_only=False` and do not add types to an allow-list to get past it;
+- **never import or run the `infer.py`** that ships with the checkpoint: its loader unpickles
+  without that restriction. The tests' reference model is a copy of the script's architecture
+  in `tests/refgen/reference_shard2.py` (with the script's MIT notice), and the script itself
+  is only read as text, to check that the copy still is the script's, character for character;
+- treat the checkpoint directory as data: scripts live elsewhere, and the converter takes that
+  directory off Python's module search path before it imports anything.
+
+The pinned checkpoint needs no exception: its pickle refers to `collections.OrderedDict`,
+`torch.FloatStorage` and `torch._utils._rebuild_tensor_v2` and nothing else, and holds a state
+dict of 203 float32 tensors, a step count, a loss and a configuration of plain values.
+
+### Cutting the memory back: what an application must do to rewind
+
+For this cache `llama_memory_seq_rm(mem, seq, n, -1)` **always returns true**. Whether the cut
+is right depends on what the local layers' cell store still holds, because the token decoded
+next, at position `n`, looks at the 255 positions before it:
+
+```c
+// A cut to n tokens (n > 0) is right when, and only when:
+llama_memory_seq_pos_min(mem, seq) <= max(0, n - (llama_model_n_swa(model) - 1))
+```
+
+`llama_memory_seq_pos_min` is the first position the local layers hold; llama.cpp guarantees
+that they hold every position from there to the end. How far back that is depends on the
+context parameter `swa_full`:
+
+| | `swa_full = true` (llama.cpp's default, and what the session library uses) | `swa_full = false` |
+| --- | --- | --- |
+| Cells of the local layers | as many as the context | the window plus one micro-batch, rounded up to 256: 512 for micro-batches up to 256 tokens |
+| Their first position | 0, until a checkpoint or a full state is restored | moves forward as the text grows: a cell is reused once the window has passed it |
+| A cut is right | at any length, until a checkpoint or a full state is restored | back to about 256 tokens before the end (about 512 with micro-batches of 512 tokens), and no further |
+| KV memory, F16, context 4,096 | 168 MB | 50 MB |
+| KV memory, F16, context 8,192 | 336 MB | 84 MB |
+
+A cut made against the test is not refused and not reported by anything: every logit after it
+is wrong, by 1.6 and more against a limit of 0.005 in the tests' controls (by 0.02 when a
+single key is missing, so the test is exact, not cautious).
+
+The state to save for a later cut is the partial sequence state, which for this cache is the
+window of the local layers and nothing of the global ones: **8,392,096 bytes** with an F16
+cache once the text is longer than the window (256 cells x 16 layers x 1,024 values x 2 bytes,
+plus 3,488 bytes of framing; less for a shorter text).
+
+```c
+// Save, when the memory holds exactly n tokens of the sequence:
+size_t size = llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+llama_state_seq_get_data_ext(ctx, buffer, size, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);   // returns size
+
+// Rewind to n tokens, in this order:
+llama_state_seq_set_data_ext(ctx, buffer, size, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);   // returns size
+llama_memory_seq_rm(llama_get_memory(ctx), seq, n, -1);                                     // returns true
+// then decode from position n
+```
+
+The discipline:
+
+1. **Before every cut, make the test above.** When it holds, cut and decode.
+2. **When it fails**, restore the latest checkpoint at or before the wanted length, cut at
+   the checkpoint's length, and decode forward from there. The memory must still begin with
+   the tokens it held when the checkpoint was saved: the global layers are not part of a
+   checkpoint, their cells are simply kept.
+3. **No checkpoint that early**: remove the whole sequence and decode from position 0.
+4. **A restore narrows the store.** Restoring a checkpoint (or a full sequence state) leaves
+   the local layers with the saved window and nothing older, whatever the size of their
+   store. With `swa_full = true` this is the only way the test can come to fail, and it then
+   fails for every cut more than one token below the restored length.
+
+`pp_session_rewind_to` makes the test and answers "not removed" when it fails, so that the
+caller falls back to a checkpoint exactly as it does for a model with recurrent state; the
+session test shows what happens without it (the cut is made and the continuation differs).
+
+A full sequence state (`llama_state_seq_get_data`, without the flag) holds every cell of the
+global layers and the same window of the local ones (14 MB for 700 tokens with an F16 cache),
+and restores into a new context; the continuation is then equal within the limits of the
+format but not bit for bit, because the restored cells land in other slots than they had.
+
 ## The native library
 
 `lib/include/proseplow_native.h` is the whole interface: plain C, no JNI, no logging, no
@@ -437,43 +676,91 @@ phone runs. The header is the reference for every function; this is the outline:
 | Call | What it stands for in llama.cpp |
 | --- | --- |
 | `pp_runtime_init` | Once per process: logging off, numeric locale `C`, the compute backend loaded. With the backends linked in (the host) there is nothing to choose; given the names of the CPU backend variants (Android), the one that scores highest on this processor is loaded with `ggml_backend_load` |
-| `pp_session_open_path`, `pp_session_open_fd` | `llama_model_load_from_file`, or `llama_model_load_from_file_ptr` on a duplicate of the descriptor positioned at the offset; then `llama_init_from_model` with the given `n_ctx`, batch size and threads. Always the CPU: `n_gpu_layers = 0` and an empty device list. Read into memory or mapped (`pp_load_mode`) |
-| `pp_session_tokenize`, `pp_session_token_to_bytes` | The front-end of `lib/` for a peacebell model with the SentencePiece tokenizer, `llama_tokenize` with `add_special = false` for every other model; `llama_token_to_piece` with `special = false`, bytes returned raw |
+| `pp_session_open_path`, `pp_session_open_fd` | `llama_model_load_from_file`, or `llama_model_load_from_file_ptr` on a duplicate of the descriptor positioned at the offset, after the GGUF header there has been read and found to end, tensors included, within the given length; then `llama_init_from_model` with the given `n_ctx`, batch size and threads, each held to its limit first. Always the CPU: `n_gpu_layers = 0` and an empty device list. Read into memory or mapped (`pp_load_mode`) |
+| `pp_session_tokenize`, `pp_session_token_to_bytes` | The front-end of `lib/` for a peacebell model with the SentencePiece tokenizer, `llama_tokenize` with `add_special = false` for every other model, for a text of at most 256 KiB; `llama_token_to_piece` with `special = false`, bytes returned raw |
 | `pp_session_evaluate` | Chunks through `llama_batch_ext` and `llama_process` with explicit positions and output for the last token only; a progress and a cancel callback |
-| `pp_session_rewind_to` | `llama_memory_seq_rm(mem, 0, n, -1)` and its own answer, which is "no" for a model with recurrent state. Nothing ever calls `llama_memory_seq_add` or `llama_memory_seq_div` |
+| `pp_session_rewind_to` | `llama_memory_seq_rm(mem, 0, n, -1)` and its own answer, which is "no" for a model with recurrent state. For a model with windowed layers the session answers "no" itself when those layers no longer hold the window before the cut (see below). Nothing ever calls `llama_memory_seq_add` or `llama_memory_seq_div` |
 | `pp_session_save_checkpoint`, `..._restore_checkpoint`, `..._drop_checkpoint` | The partial sequence state (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) kept in native memory with the token count it belongs to; restoring is the state, then the cut, in that order (see "Checkpoints" above) |
-| `pp_session_clear_memory` | `llama_memory_clear(mem, true)`, every checkpoint zeroed and freed, `llama_sampler_reset`, and the last prediction and token buffer overwritten |
-| `pp_session_configure_sampler`, `pp_session_sample_next` | A chain in a fixed order: banned tokens (logit bias of minus infinity), penalties, then for a temperature above 0 temperature, top-k, top-p, min-p and the random choice, otherwise greedy; `llama_sampler_sample`, once per complete evaluation |
-| `pp_session_close` | Everything freed, checkpoints zeroed first |
+| `pp_session_clear_memory` | Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens, the sampler's record of the reply); the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
+| `pp_session_configure_sampler`, `pp_session_sample_next` | A chain in a fixed order: banned tokens (logit bias of minus infinity), penalties, then for a temperature of a millionth or more temperature, top-k, top-p, min-p and the random choice, otherwise greedy; then what `llama_sampler_sample` does (`llama_sampler_apply` on the scores, `llama_sampler_accept`), once per complete evaluation, on a candidate list of the session's own, with the sampler that chooses applied after the others and only when there is something to choose from |
+| `pp_session_close` | Everything freed, after the same overwriting as a clear |
 
 A failure is a status code, and the codes are the ones of the Kotlin `NativeLlamaException`,
-one for one. No function logs anything, llama.cpp's own log is switched off for the whole
-process, and buffers of ours that held text, tokens or model state are overwritten before they
-are freed.
+one for one. No function logs anything, and llama.cpp's own log is switched off for the whole
+process. The buffers the session and the front-end allocate themselves for text, tokens,
+predictions or model state are overwritten before they are freed; llama.cpp's are not, which
+is the subject of "Forgetting" below.
 
 Things the session does that llama.cpp alone would not, each because the plain call would be
 wrong on a phone or for one of the models:
 
-- **Cancelling.** For a model whose memory is attention only (peacebell), the cancel callback is
-  also polled from llama.cpp's abort callback, about once a millisecond, so a chunk that is
-  being computed stops within a graph node, and llama.cpp takes the interrupted chunk out of the
-  memory again. A model with recurrent state (Boris-2, Qwen3.5) cannot give an interrupted chunk
-  back: after an abort its memory claims every token of the chunk while their state is half
-  computed, and nothing short of clearing repairs that. For such a model the callback is
-  therefore only polled between chunks, and a cancellation waits for the chunk in progress.
+- **Cancelling.** For a model whose memory is attention only (peacebell, Shard-2), the cancel
+  callback is also polled from llama.cpp's abort callback, about once a millisecond, so a
+  chunk that is being computed stops within a graph node, and llama.cpp takes the interrupted
+  chunk out of the memory again. A model with recurrent state (Boris-2, Qwen3.5) cannot give
+  an interrupted chunk back: after an abort its memory claims every token of the chunk while
+  their state is half computed, and nothing short of clearing repairs that. For such a model
+  the callback is therefore only polled between chunks, and a cancellation waits for the
+  chunk in progress.
 - **The token Boris-2 cannot take.** That model's graph asserts that its end-of-text token is
   never an input, and a failed assertion ends the process. `pp_session_evaluate` answers
   `PP_STATUS_INVALID_ARGUMENT` for it instead and leaves the memory alone.
+- **The cut Shard-2 cannot serve.** llama.cpp cuts the memory of a model with windowed layers
+  at any length and says it did, also when those layers no longer hold the keys the next token
+  will look at; every prediction after such a cut is wrong and nothing reports it. A session
+  keeps every key of those layers (it does not set `swa_full` to false), so this can only
+  happen after a checkpoint was restored, which leaves them with the window before the
+  checkpoint's end. `pp_session_rewind_to` therefore makes the test of "The shard2
+  architecture" before it cuts, and answers "not removed" with the memory untouched when it
+  fails. To the caller that is the answer of a model with recurrent state, and the same
+  fallback serves: a checkpoint, or clearing.
 - **Threads.** A session can be given the CPUs to pin one thread to each (the big cores of a
   phone) and a smaller number of threads to run when that is not allowed. Android confines a
   process to a set of cores according to whether its app is in front and replaces every thread
   affinity when it moves the process to another set, so the session checks the calling thread's
-  affinity at the start of each evaluation and rebuilds its thread pool when it has changed:
-  pinned when every listed CPU is allowed, unpinned otherwise. A replaced pool is kept until
-  the next computation has run, because ggml's CPU backend still pauses it then.
+  affinity before every chunk of an evaluation and rebuilds its thread pool when it has
+  changed: pinned when every listed CPU is allowed, unpinned otherwise. Before every chunk and
+  not once per call, because a long prompt is one call of many seconds, and a move during it
+  would leave pinned threads sharing cores until it ends. A replaced pool is kept until the
+  next computation has run, because ggml's CPU backend still pauses it then. The pool outlives
+  the context: forgetting a conversation creates a new context and hands it the same threads.
 - **Giving memory back.** Android's allocator keeps the pages of freed blocks for reuse;
-  closing a session asks it to release them (`mallopt(M_PURGE)`), or a closed model would stay
-  in the app's memory figures until the allocator is next used.
+  closing a session and forgetting a conversation ask it to release them
+  (`mallopt(M_PURGE_ALL)`, or `M_PURGE` before Android 14; `malloc_trim` with glibc), or a
+  closed model would stay in the app's memory figures until the allocator is next used.
+- **Sizes from outside.** llama.cpp allocates for whatever size it is handed, at once: a
+  context of 2,147,483,647 tokens is 104 GiB of bookkeeping before the first buffer is asked
+  for, and a phone ends the process long before any call returns. So every size is held to a
+  limit before llama.cpp sees it, and a value beyond its limit comes back as a status:
+
+  | Size | Limit | Beyond it |
+  | --- | --- | --- |
+  | Context (`n_ctx`) | 32768 tokens (`PP_CONTEXT_TOKENS_MAX`), and the context the model was trained for | `PP_STATUS_INVALID_ARGUMENT`, the first before the file is opened, the second once the model is loaded and before a context exists |
+  | Batch (`n_batch`) | 32768 tokens | `PP_STATUS_INVALID_ARGUMENT`; more than the context is taken as the context |
+  | Model embedded in a file | The header and every tensor end within offset + length | `PP_STATUS_LOAD_FAILED`, before anything is loaded |
+  | Text to tokenise | 262144 bytes (`PP_TOKENIZE_BYTES_MAX`) | `PP_ERROR` (`PP_STATUS_TOKENIZE_FAILED`) |
+  | Checkpoints held at once | 8 (`PP_CHECKPOINTS_MAX`) | -1, until one is dropped |
+  | Penalty window | The context size | Taken as the context size: there are no more tokens to see |
+  | Banned tokens | The size of the vocabulary | `PP_STATUS_INVALID_ARGUMENT` |
+
+  The ceiling of 32768 is the largest context any model of the kind this app bundles was
+  trained for (peacebell), eight times what the app runs, and about 2 GiB at the 64 KiB per
+  token such a model needs; Qwen3.5 was trained for 262144, which no phone holds, so the
+  trained context alone would not protect it. The text limit is a limit and not tokenising in
+  pieces with a way to stop in between, for two reasons: where a piece ends changes the tokens
+  on both sides of the cut, so pieces are only right at places the tokenizer knows and the
+  session does not; and the call has nobody to ask whether to stop. With patch 0004 the
+  slowest 256 KiB measured take 0.7 seconds on a desktop processor.
+- **A sampler that is never asked to choose among nothing.** A banned token is a score of
+  minus infinity, and llama.cpp's samplers take it for granted that some token is left: with
+  every token banned the random choice names the last candidate in a release build and ends
+  the process on an assertion in a build that has assertions, and the greedy one names token
+  0. The session therefore applies the chain in two steps, everything that changes and narrows
+  the scores first, and looks at them before it lets the last sampler choose:
+  `pp_session_sample_next` answers `PP_STATUS_SAMPLING_FAILED` when no score is a finite
+  number or one is not a number at all. A temperature below a millionth, a denormal for
+  instance, would divide the scores into infinities; it selects greedy decoding, which is what
+  it means.
 
 What a caller must know beyond the header is little: one thread should make all the calls of a
 session, a prediction exists only between a complete evaluation and the next call that changes
@@ -485,7 +772,71 @@ The tests are `session/tests/test_session.cpp`, registered as `<model>.session` 
 the rest by `ctest` and `tools/host-check.sh` (`ctest -R session` for these alone). Each takes
 between ten seconds and two minutes, depending on the model and on what else the machine is
 doing, and writes up to 2.2 GB into the build directory while it runs, the file that holds the
-model next to another model, and deletes it afterwards.
+model next to another model, and deletes it afterwards. The checks that hand the session a
+size no machine can serve run inside a limit on the address space of the test process
+(`address_space_limit` in that file), so that a session which tried to serve one fails the
+check instead of taking the machine down; keep new checks of that kind inside it.
+
+### Forgetting
+
+`pp_session_clear_memory` is what runs when the app locks. It frees the sampler chain, the
+batch and the context and creates them again from the parameters they were created with; the
+model stays loaded and the thread pool is kept. Before each is freed, what it holds of the
+conversation and can be reached is overwritten: every checkpoint, the scores of the last
+prediction (which are also overwritten as soon as a token has been sampled from them, and when
+the next evaluation begins), the session's candidate list, the tokens in the batch, the
+sampler's record of the sampled tokens (by accepting token 0 once for every place of its ring
+buffer, which `llama_sampler_reset` leaves as it is), and the key-value and state buffers of
+the memory. The front-end overwrites its normalised copy of a text and the token ids it
+produced before it frees them, and the JNI binding its copies of the arrays it was handed.
+Then the allocator is asked to give its free pages back.
+
+**That does not remove the conversation from the process, and nothing here claims it does.**
+llama.cpp copies what it is given into allocations of its own and frees them as they are:
+
+| What stays readable | Which allocation of llama.cpp it is in |
+| --- | --- |
+| The text of every piece that was tokenised | The `std::string` that `llama_tokenize` makes of its argument (`llama_vocab::tokenize`, `src/llama-vocab.cpp`), the fragment's text in `llama_vocab::impl::tokenize`, and for a SentencePiece vocabulary the string that `llama_escape_whitespace` builds from it. Three copies of a text for peacebell, two for the others, each time it is tokenised |
+| Token ids of the prompt | The vector the tokenizer collects its result in, each time it grows, and the result vector of `llama_tokenize`; `token_vec` of the context's batch allocator (`llama_batch_allocr::init`, `src/llama-batch.cpp`), which holds the tokens of the largest chunk evaluated; the copy each micro-batch makes of its tokens (`llama_batch_allocr::ubatch_add`; this one by reading the code, the others were found) |
+| Not searched for by the test below | The activations of the last chunk in the context's compute buffers, from which the rows of the embedding table give back the tokens; words of the text, shorter than a whole window, in the temporaries of the BPE tokenizers; whatever a call left on a stack |
+
+A freed block stays readable until the allocator hands it out again or gives its page back,
+and the last step above only achieves that for pages that are free as a whole. What is found
+therefore depends on what the allocator did with those blocks, which changes with the program
+and the build. `session/tests/test_residue.cpp` (`ctest -R residue`) measures it: it evaluates
+a text, samples a reply, forgets, and searches every writable page of its own process for 16
+consecutive bytes of the text, 6 consecutive token ids of the prompt and 4 of the reply. It
+requires that no token ids of the reply are found, which the session can promise, and reports
+the rest. On a desktop with glibc, as windows found after `pp_session_clear_memory` (the
+figures after `pp_session_close` are the same or lower):
+
+| Model | Text, before this was done | Text, now | Prompt ids, before | Prompt ids, now | Reply ids, before | Reply ids, now |
+| --- | --- | --- | --- | --- | --- | --- |
+| peacebell-v1-291m | 914 | 705 | 69 | 21 | 9 | 0 |
+| boris-2-instruct | 162 | 162 | 69 | 0 | 9 | 0 |
+| qwen3.5-0.8b | 34 | 0 | 74 | 0 | 16 | 0 |
+
+"Before" is a session that reset the context and the sampler instead of freeing them and
+overwrote only the checkpoints, measured by the program this test was made from. The figures
+are the same from run to run and not from build to build: that program, with the same search
+and another heap, finds no prompt ids for peacebell where this test finds 21, and an earlier
+build of this test found 21 for Qwen3.5. The zeros in the text and prompt columns are
+therefore the allocator's doing, not the session's, and nothing to rely on; the 705 and the
+162 are the copies of the first table, untouched. On Android the allocator is a different one
+(scudo) and none of these figures has been measured there.
+
+What would remove the rest is not in this library. Two things can: ending the process, which
+is the only one that is certain; or overwriting every block as it is freed, in every library
+built here. The second was tried on the host by linking a replacement of the global `operator
+delete` that zeroes a block before it frees it: the same test then finds no text at any
+stage, not even straight after tokenising, and nothing at all once the conversation is
+forgotten, for all three models. It costs a pass over every freed block, which on the host did
+not show: the session test ran at the same speeds with it, prompt and generation, within the
+noise between two runs. It is not part of the build, because the place where it has to work
+has not been tried: on Android the replacement must be the one the dynamic linker resolves
+for `libllama.so`, for the CPU backend loaded later and for `libc++_shared.so`, and whether to
+go that way or to end the process at a lock is a decision about the app, not about this
+library.
 
 ## The Android build
 
@@ -663,10 +1014,25 @@ reads the names of the `libggml-cpu-*.so` entries from the APK instead (or from 
 directory, on an installation that did extract them), and `pp_runtime_init` loads the best of
 them by name, which the dynamic loader resolves inside the APK.
 
-The settings are checked on the result, not trusted: the application module applies
-`../llama/apk-checks.gradle.kts`, which makes every task that writes an APK fail unless each
-model in it is stored and starts on a 16 KiB boundary and each native library has its loadable
-segments aligned to 16 KiB. The findings are in `app/build/reports/native-packaging/`.
+The settings are checked on the result, not trusted, and so is the identity of the models: the
+application module applies `../llama/apk-checks.gradle.kts` (and `../llama/` applies it to
+itself, for the test APK of "On the phone"), which makes every task of the module that writes
+an APK, an app bundle or an APK set fail unless
+
+- each model in it is one the manifest accounts for: an asset `models/<id>.gguf.so` for an entry
+  that is `ready` and `bundled`, whose SHA-256, computed on the bytes **as they are in the
+  archive**, is the pinned one. Anything else under `assets/models/`, and any file named
+  `*.gguf` or `*.gguf.so` anywhere in the archive, fails the build: an asset of that name in
+  another source directory would otherwise be packaged with nothing vouching for it;
+- in an APK, each model is stored and starts on a 16 KiB boundary;
+- each native library has its loadable segments aligned to 16 KiB.
+
+A bundle is checked for the first and the last; where its models lie is decided when APKs are
+made from it, and an APK set is unpacked and each APK in it checked. The tasks are not found by
+name or class: every task of the module looks at its own outputs when it has run. Hashing adds
+about a second per gigabyte of models to the packaging task. The findings are in
+`app/build/reports/native-packaging/` (`llama/build/...` for the test APK), one file per task
+that wrote an archive.
 
 What packaging costs, measured for a debug build on a desktop with an SSD:
 
@@ -746,7 +1112,16 @@ What is checked, for each model that is present:
 | `PeacebellDeviceTest`, `BorisDeviceTest` | Tokenising the 7,642 committed texts and the committed conversations gives the host's token ids, as plain text and with special tokens parsed; the greedy replies to the committed prompts equal the PyTorch reference's token for token; the memory is shortened (peacebell) or refuses and comes back through a checkpoint (Boris-2) with a continuation identical to a fresh evaluation; a cancellation interrupts a chunk (peacebell) or waits for it (Boris-2) and leaves the memory usable; load time, memory and speed are reported; memory is given back on close. Boris-2 further: the end-of-text token is refused as input, and the reference's chat session of eight requests through the engine of `core` gives the reference's prompt lengths and replies |
 | `QwenDeviceTest` | A greedy reply to a ChatML prompt is sane and the same twice; the ChatML markers are single tokens when the app writes them and text inside a message; the removal of the end of the memory is refused and a checkpoint brings it back with an identical continuation, twice; cancelling; load time and memory, mapped and read; speed with pinned and unpinned threads, in front and not |
 | all three | The engine of `core` (`LlamaEngine`) holds a chat of two turns on the real native layer and reuses its memory for the second |
-| `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code |
+| `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code; a size beyond its limit (a context, a text, a number of tokens or of banned tokens) arrives as an exception with its code and allocates nothing, a penalty window beyond the context costs nothing, the ninth checkpoint is refused, and forgetting a conversation leaves a session that is whole |
+| `ThreadMoveDeviceTest` | With the smallest model present: the test's activity leaves the front while one long prompt is being evaluated, and when that same call returns the session runs the plan's free threads and no longer claims to be pinned; the time of each chunk before and after the move is reported |
+
+Three of these were written after the measurements below and have been built but **not yet
+run on a phone**: the size-limit and forgetting checks of `JniBoundaryDeviceTest`
+(`aSizeBeyondItsLimitIsAnExceptionWithItsCode`), its timing of the longest text
+(`theLongestTextIsTokenisedWithoutAStall`, which the table leaves out: 256 KiB of line breaks in
+under five seconds for every model present) and `ThreadMoveDeviceTest`. Until they have been,
+the checks of that kind to trust are the host's (`session/tests/test_session.cpp` checks the
+same limits, the same timing, and a move of the threads in the middle of one call, on Linux).
 
 ### What was measured
 
@@ -826,9 +1201,13 @@ becomes:
    boris2 is listed as hybrid (`llm_arch_is_hybrid`), gets both layer filters in
    `llama_model::create_memory`, is excluded from the model saver (`llama_arch_supports_save`,
    which does not know its lookup arrays) and makes the KV cache write the token id of each
-   cell into a saved state (`llama_kv_cache::has_cell_ext`).
+   cell into a saved state (`llama_kv_cache::has_cell_ext`). shard2 adds none: its RoPE type
+   `case` goes into the list of the architectures that rotate neighbouring pairs, and its
+   memory follows from hyper-parameters.
 3. A driver in `convert/` if the model cannot go through upstream's `convert_hf_to_gguf.py`,
-   and an entry in `../models/manifest.json`.
+   an entry for it in `CONVERTERS` of `../models/convert_models.py`, and an entry in
+   `../models/manifest.json`. A checkpoint that is a pickle is loaded with `weights_only=True`
+   and nothing else (see "The checkpoint is a pickle").
 4. Reference data and tests: a PyTorch reference loader and generators in `tests/refgen/`, the
    committed data in `tests/data/`, the architecture's tensor map in `tests/check_gguf.py`
    (`ARCHITECTURES`), and the tests registered in `tests/CMakeLists.txt`. The F32 comparison
@@ -837,7 +1216,11 @@ becomes:
 
 Bring an architecture up in pieces that can each be compared with the reference. boris2 was
 done in two: first with every token on the miss row of the n-gram table (Canon and the hybrid
-memory alone, against a reference with the lookup switched off), then with the lookup.
+memory alone, against a reference with the lookup switched off), then with the lookup. For
+shard2 the pieces were upstream's: the model was first written in PyTorch in the shape
+llama.cpp would compute it (the two cell stores, a mask made from cell positions, the float32
+RoPE angles of ggml, upstream's rule for reusing a windowed cell) and compared with the
+reference, which settled the memory's behaviour before any C++ existed.
 
 Make it data-driven: read every dimension from metadata, and prefer a metadata key that the
 converter writes over a constant in C++.
@@ -865,7 +1248,15 @@ converter writes over a constant in C++.
    token id kept in every KV cell and `get_prev_tokens`, the partial sequence state
    (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`), and the tensor names `per_layer_token_embd`,
    `per_layer_model_proj` and `shortconv.conv` with what upstream ties to them (operation,
-   float type at conversion). For Qwen it is upstream's whole converter and graph; the tests
+   float type at conversion). shard2 relies on upstream for everything it computes: the
+   interleaved sliding-window cache and the rule that makes `create_memory` choose it
+   (`hparams.swa_type`), the meaning of `LLAMA_SWA_TYPE_STANDARD` (`llama_hparams::is_masked_swa`),
+   the two per-layer arrays and `get_rope_params` honouring the RoPE one, the RoPE base of a
+   windowed layer (`rope_freq_base_train_swa`), `build_attn_inp_kv_iswa`, the tensor names
+   `attn_q_norm`, `attn_k_norm`, `post_attention_norm` and `post_ffw_norm`, the promise that
+   the windowed store holds every position from `llama_memory_seq_pos_min` on, what a partial
+   and a full sequence state contain for that store, and the default of `swa_full`; its tests
+   pin every one of them. For Qwen it is upstream's whole converter and graph; the tests
    there pin the result. One test also runs upstream's
    `gguf-py/gguf/scripts/gguf_new_metadata.py`. The two other patches rely on the shape of the
    code they change: the branch for half-float arithmetic in `llamafile_sgemm` and the guard

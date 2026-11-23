@@ -22,7 +22,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import us.theworkmans.proseplow.R
-import us.theworkmans.proseplow.ui.ExcludeWindowFromAutofill
+import us.theworkmans.proseplow.ui.ProtectWindow
+import us.theworkmans.proseplow.ui.plainSelectionMenu
 
 /** The typed confirmation of a reset. */
 object ResetConfirmation {
@@ -46,8 +47,8 @@ fun ResetDataDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.reset_title)) },
         text = {
-            ExcludeWindowFromAutofill()
-            Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            ProtectWindow()
+            Column(modifier = Modifier.plainSelectionMenu().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(stringResource(R.string.reset_message, stringResource(R.string.app_name)))
                 Text(stringResource(R.string.reset_confirm_message, word))
                 OutlinedTextField(

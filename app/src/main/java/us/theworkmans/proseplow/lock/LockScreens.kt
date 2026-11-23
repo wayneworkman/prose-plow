@@ -54,6 +54,7 @@ import us.theworkmans.proseplow.security.PassphraseProblem
 import us.theworkmans.proseplow.security.ResetReport
 import us.theworkmans.proseplow.security.UnrecoverableReason
 import us.theworkmans.proseplow.ui.PassphraseField
+import us.theworkmans.proseplow.ui.ProtectWindow
 import us.theworkmans.proseplow.ui.takeChars
 
 /**
@@ -272,6 +273,7 @@ private fun ResetIncompleteDialog(report: ResetReport, onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.reset_incomplete_title)) },
         text = {
+            ProtectWindow()
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!report.keysDeleted) Text(stringResource(R.string.reset_incomplete_keys))
                 if (!report.dataDeleted) Text(stringResource(R.string.reset_incomplete_data))
@@ -292,7 +294,10 @@ fun FingerprintOfferDialog(offer: FingerprintOffer, onAccept: () -> Unit, onDecl
     AlertDialog(
         onDismissRequest = onDecline,
         title = { Text(stringResource(if (first) R.string.offer_fingerprint_title else R.string.offer_fingerprint_again_title)) },
-        text = { Text(stringResource(if (first) R.string.offer_fingerprint_message else R.string.offer_fingerprint_again_message)) },
+        text = {
+            ProtectWindow()
+            Text(stringResource(if (first) R.string.offer_fingerprint_message else R.string.offer_fingerprint_again_message))
+        },
         confirmButton = { TextButton(onClick = onAccept) { Text(stringResource(if (first) R.string.use_fingerprint else R.string.turn_on)) } },
         dismissButton = { TextButton(onClick = onDecline) { Text(stringResource(R.string.not_now)) } },
     )

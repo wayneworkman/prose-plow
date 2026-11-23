@@ -1,34 +1,53 @@
+import groovy.json.JsonSlurper
+import java.io.InputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
 // Checks on a finished APK that only the module which builds the APK can run, kept here because
 // what they protect belongs to this module: the models and the native libraries. The application
-// module applies this file with one line:
+// module applies this file with one line (through file(): a bare string makes lint follow it
+// into this script and fail, see the end of build.gradle.kts next to this file):
 //
-//     apply(from = "../llama/apk-checks.gradle.kts")
+//     apply(from = file("../llama/apk-checks.gradle.kts"))
 //
-// Every task that packages an APK then checks what it wrote as its last action, so that no APK
-// leaves the build with a model that cannot be mapped: the packaging task itself fails.
+// Every task of that module which writes an APK, an app bundle (.aab) or an APK set (.apks) then
+// checks what it wrote as its last action, so that no such file leaves the build with a model
+// that cannot be mapped or that is not the pinned one: the task itself fails.
 //
-// A script applied this way cannot see the classes of the Android Gradle plugin (Gradle compiles
-// it apart from the build file that applies it), so it finds the packaging tasks by the name of
-// their class instead of through the plugin's variant API. If a future plugin renames that
-// class, the last block of this file notices that nothing would be checked and says so.
+// The tasks are not looked up by name or by class. Which tasks of the Android Gradle plugin
+// write an installable file changes between its versions, and a list kept here would be right
+// until it silently was not. Instead every task of the module looks at its own outputs when it
+// has run, and checks the archives it finds among them; for nearly all tasks that is a glance at
+// a list of file names. (Gradle waits for the work a task action handed to its workers before
+// it runs the next action, so the archive is complete when this one looks at it.)
 
 /**
- * The checks. [verify] fails unless, in every APK it is given,
+ * The checks. [verify] fails unless, in every archive it is given,
  *
- * - each model (`assets/models/` and below) is **stored**, not deflated, and its data begins on a
- *   **16 KiB boundary** of the file. Only then can the app open it with `AssetManager.openFd`
- *   and map it in place, on devices with 4 KB and with 16 KB pages alike. Both properties come
- *   from the packaging settings of the application module (`androidResources.noCompress` and
+ * - each model is **one that `models/manifest.json` accounts for**: its name is
+ *   `assets/models/<id>.gguf.so` for an entry of the manifest that is ready and bundled, and the
+ *   SHA-256 of its bytes, **as they are in the archive**, is the one pinned there. The task that
+ *   puts the models among the assets verifies the same hash on the file it copies; this verifies
+ *   what was packaged, whatever road it took. Anything else under `assets/models/`, and any
+ *   file named `*.gguf` or `*.gguf.so` anywhere, is a model that nothing vouches for (an asset
+ *   of that name in another source directory would get there) and fails the build;
+ * - in an APK, each model is **stored**, not deflated, and its data begins on a **16 KiB
+ *   boundary** of the file. Only then can the app open it with `AssetManager.openFd` and map it
+ *   in place, on devices with 4 KB and with 16 KB pages alike. Both properties come from the
+ *   packaging settings of the application module (`androidResources.noCompress` and
  *   `packaging.jniLibs.useLegacyPackaging = false`), which is why they are checked on the
  *   result instead of trusted;
- * - each native library (`lib/`) has all of its loadable segments aligned to at least 16 KiB,
- *   the requirement for devices with 16 KB pages. The NDK links that way from r28 on; a
- *   prebuilt library pulled in by a dependency might not.
+ * - each native library has all of its loadable segments aligned to at least 16 KiB, the
+ *   requirement for devices with 16 KB pages. The NDK links that way from r28 on; a prebuilt
+ *   library pulled in by a dependency might not.
+ *
+ * An app bundle is checked for the first and the last of these. Where a model lies in an APK
+ * is only decided when APKs are made from the bundle, and it is checked on those: an APK set is
+ * unpacked and each APK in it is checked like any other.
  *
  * The findings are written to the report file whether the checks pass or not.
  */
@@ -38,56 +57,167 @@ class NativePackaging {
     class Entry(val name: String, val stored: Boolean, val size: Long, val dataOffset: Long)
 
     companion object {
-        const val MODEL_PREFIX = "assets/models/"
+        const val MODEL_DIRECTORY = "assets/models/"
+        const val MODEL_SUFFIX = ".gguf.so"
         const val PAGE = 16384L
 
         /** Enough of an ELF file for its header and program headers. */
         const val ELF_HEAD = 4096
 
-        fun verify(apks: List<File>, report: File) {
-            if (apks.isEmpty()) throw GradleException("The packaging task wrote no APK that could be checked")
+        /**
+         * The models an app may carry: the id and the pinned SHA-256 of every entry of the
+         * manifest that is ready and bundled, which is the set that `package<Variant>Models`
+         * of this module chooses from.
+         */
+        fun pinnedModels(manifest: File): Map<String, String> {
+            @Suppress("UNCHECKED_CAST") // The manifest's shape is fixed by models/README.md.
+            val models = (JsonSlurper().parse(manifest) as Map<String, Any?>)["models"] as List<Map<String, Any?>>
+            return models
+                .filter { it["status"] == "ready" && it["purpose"] == "bundled" && it["output_sha256"] is String }
+                .associate { (it["id"] as String) to (it["output_sha256"] as String) }
+        }
+
+        /**
+         * Checks [archives] (APKs, bundles, APK sets) against [manifest]. [scratch] is a directory
+         * the caller owns, used for the APKs of an APK set while they are looked at.
+         */
+        fun verify(archives: List<File>, manifest: File, scratch: File, report: File) {
+            val pinned = pinnedModels(manifest)
             val problems = ArrayList<String>()
             val lines = ArrayList<String>()
-            for (apk in apks.sortedBy { it.name }) {
-                inspect(apk, lines, problems)
+            for (archive in archives.sortedBy { it.path }) {
+                when (archive.extension) {
+                    "apk" -> inspectApk(archive, archive.name, pinned, lines, problems)
+                    "aab" -> inspectBundle(archive, pinned, lines, problems)
+                    "apks" -> inspectApkSet(archive, scratch, pinned, lines, problems)
+                }
             }
             report.parentFile.mkdirs()
             report.writeText(lines.joinToString(separator = "\n", postfix = "\n"))
             if (problems.isNotEmpty()) {
                 throw GradleException(
-                    "The APK is not packaged as the native code needs it:\n" + problems.joinToString("\n") { "- $it" } +
+                    "What was packaged is not what the native code needs:\n" + problems.joinToString("\n") { "- $it" } +
                         "\nSee native/README.md, \"Models in the APK\".",
                 )
             }
         }
 
-        private fun inspect(apk: File, lines: MutableList<String>, problems: MutableList<String>) {
-            lines += "${apk.name}: ${apk.length()} bytes"
+        private fun inspectApk(apk: File, label: String, pinned: Map<String, String>, lines: MutableList<String>, problems: MutableList<String>) {
+            lines += "$label: ${apk.length()} bytes"
+            val placement = entries(apk).associateBy { it.name }
             var models = 0
-            for (entry in entries(apk)) {
-                if (!entry.name.startsWith(MODEL_PREFIX)) continue
-                models++
-                val misplaced = entry.dataOffset % PAGE
-                lines += "  ${entry.name}: ${if (entry.stored) "stored" else "COMPRESSED"}, ${entry.size} bytes at offset ${entry.dataOffset}" +
-                    if (misplaced == 0L) " (a multiple of $PAGE)" else " ($misplaced past a multiple of $PAGE)"
-                if (!entry.stored) {
-                    problems += "${apk.name}: ${entry.name} is compressed. Add its suffix to androidResources.noCompress in the application module."
-                } else if (misplaced != 0L) {
-                    problems += "${apk.name}: ${entry.name} starts at offset ${entry.dataOffset}, not on a 16 KiB boundary. " +
-                        "The application module needs packaging.jniLibs.useLegacyPackaging = false, and the asset's name must end in .so."
-                }
-            }
-            if (models == 0) lines += "  no model is bundled"
             ZipFile(apk).use { zip ->
-                for (entry in zip.entries().asSequence().filter { it.name.startsWith("lib/") && it.name.endsWith(".so") }.sortedBy { it.name }) {
-                    val alignment = zip.getInputStream(entry).use { smallestLoadAlignment(it.readNBytes(ELF_HEAD)) }
-                    lines += "  ${entry.name}: loadable segments aligned to ${alignment ?: "?"}"
-                    when {
-                        alignment == null -> problems += "${apk.name}: ${entry.name} is not a 64-bit little-endian ELF file this check can read."
-                        alignment < PAGE -> problems += "${apk.name}: ${entry.name} has a loadable segment aligned to $alignment bytes; devices with 16 KB pages need $PAGE."
+                for (entry in zip.entries().asSequence().filter { !it.isDirectory }.sortedBy { it.name }) {
+                    if (isModel(entry.name)) {
+                        models++
+                        // Where a file lies only matters for one that may be there at all.
+                        if (!checkIdentity(zip, entry, entry.name, label, pinned, lines, problems)) continue
+                        val placed = placement.getValue(entry.name)
+                        val misplaced = placed.dataOffset % PAGE
+                        lines += "    ${if (placed.stored) "stored" else "COMPRESSED"}, ${placed.size} bytes at offset ${placed.dataOffset}" +
+                            if (misplaced == 0L) " (a multiple of $PAGE)" else " ($misplaced past a multiple of $PAGE)"
+                        if (!placed.stored) {
+                            problems += "$label: ${entry.name} is compressed. Add its suffix to androidResources.noCompress in the application module."
+                        } else if (misplaced != 0L) {
+                            problems += "$label: ${entry.name} starts at offset ${placed.dataOffset}, not on a 16 KiB boundary. " +
+                                "The application module needs packaging.jniLibs.useLegacyPackaging = false, and the asset's name must end in .so."
+                        }
+                    } else if (entry.name.startsWith("lib/") && entry.name.endsWith(".so")) {
+                        checkLibrary(zip, entry, entry.name, label, lines, problems)
                     }
                 }
             }
+            if (models == 0) lines += "  no model is bundled"
+        }
+
+        /** A bundle holds each module in a directory of its own, laid out inside like an APK. */
+        private fun inspectBundle(bundle: File, pinned: Map<String, String>, lines: MutableList<String>, problems: MutableList<String>) {
+            lines += "${bundle.name}: ${bundle.length()} bytes (a bundle: where its models lie is decided when APKs are made from it, and checked on those)"
+            var models = 0
+            ZipFile(bundle).use { zip ->
+                for (entry in zip.entries().asSequence().filter { !it.isDirectory && '/' in it.name }.sortedBy { it.name }) {
+                    val inModule = entry.name.substringAfter('/')
+                    if (isModel(inModule)) {
+                        models++
+                        checkIdentity(zip, entry, inModule, bundle.name, pinned, lines, problems)
+                    } else if (inModule.startsWith("lib/") && inModule.endsWith(".so")) {
+                        checkLibrary(zip, entry, entry.name, bundle.name, lines, problems)
+                    }
+                }
+            }
+            if (models == 0) lines += "  no model is bundled"
+        }
+
+        /** An APK set is an archive of APKs; each is copied out, checked and deleted again. */
+        private fun inspectApkSet(set: File, scratch: File, pinned: Map<String, String>, lines: MutableList<String>, problems: MutableList<String>) {
+            lines += "${set.name}: ${set.length()} bytes (an APK set)"
+            scratch.mkdirs()
+            ZipFile(set).use { zip ->
+                for (entry in zip.entries().asSequence().filter { !it.isDirectory && it.name.endsWith(".apk") }.sortedBy { it.name }) {
+                    val copy = File(scratch, "apk-set-member.apk")
+                    try {
+                        zip.getInputStream(entry).use { input -> copy.outputStream().use { input.copyTo(it, 1 shl 20) } }
+                        inspectApk(copy, "${set.name}!${entry.name}", pinned, lines, problems)
+                    } finally {
+                        copy.delete()
+                    }
+                }
+            }
+        }
+
+        /** Whether an entry (named as it is inside an APK) is, or passes itself off as, a model. */
+        private fun isModel(name: String): Boolean = name.startsWith(MODEL_DIRECTORY) || name.endsWith(MODEL_SUFFIX) || name.endsWith(".gguf")
+
+        /**
+         * The first check: the entry is a model of the manifest, and its bytes are the pinned
+         * ones. Returns whether the manifest accounts for a file of this name at all.
+         */
+        private fun checkIdentity(
+            zip: ZipFile,
+            entry: ZipEntry,
+            name: String,
+            label: String,
+            pinned: Map<String, String>,
+            lines: MutableList<String>,
+            problems: MutableList<String>,
+        ): Boolean {
+            val id = name.removePrefix(MODEL_DIRECTORY).removeSuffix(MODEL_SUFFIX)
+            val expected = if (name.startsWith(MODEL_DIRECTORY) && name.endsWith(MODEL_SUFFIX) && '/' !in id) pinned[id] else null
+            if (expected == null) {
+                lines += "  $name: NOT a model of models/manifest.json"
+                problems += "$label: $name is a model file that models/manifest.json does not account for. An app carries only " +
+                    "$MODEL_DIRECTORY<id>$MODEL_SUFFIX for the ids it lists as ready and bundled (${pinned.keys.sorted().joinToString()}), " +
+                    "put there by the package<Variant>Models task of :llama. Remove the file from the assets it came from."
+                return false
+            }
+            val actual = sha256(zip.getInputStream(entry))
+            lines += "  $name: SHA-256 $actual, ${if (actual == expected) "as pinned" else "NOT the pinned $expected"}"
+            if (actual != expected) {
+                problems += "$label: $name has SHA-256 $actual as packaged, and models/manifest.json pins $expected for $id. It is not the pinned conversion."
+            }
+            return true
+        }
+
+        private fun checkLibrary(zip: ZipFile, entry: ZipEntry, name: String, label: String, lines: MutableList<String>, problems: MutableList<String>) {
+            val alignment = zip.getInputStream(entry).use { smallestLoadAlignment(it.readNBytes(ELF_HEAD)) }
+            lines += "  $name: loadable segments aligned to ${alignment ?: "?"}"
+            when {
+                alignment == null -> problems += "$label: $name is not a 64-bit little-endian ELF file this check can read."
+                alignment < PAGE -> problems += "$label: $name has a loadable segment aligned to $alignment bytes; devices with 16 KB pages need $PAGE."
+            }
+        }
+
+        private fun sha256(stream: InputStream): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(1 shl 20)
+            stream.use { input ->
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
         }
 
         private fun ByteBuffer.u16(at: Int): Int = getShort(at).toInt() and 0xFFFF
@@ -161,26 +291,14 @@ class NativePackaging {
     }
 }
 
-// AGP's task that writes an application's APK (package<Variant>) is of this class.
-val packagingTaskClass = "com.android.build.gradle.tasks.PackageApplication"
+val modelManifest: File = rootProject.layout.projectDirectory.file("models/manifest.json").asFile
 
 tasks.configureEach {
-    if (javaClass.name.startsWith(packagingTaskClass)) {
-        val reportFile = layout.buildDirectory.file("reports/native-packaging/$name.txt").get().asFile
-        doLast {
-            NativePackaging.verify(outputs.files.asFileTree.matching { include("**/*.apk") }.files.toList(), reportFile)
+    val reportFile = layout.buildDirectory.file("reports/native-packaging/$name.txt").get().asFile
+    doLast {
+        val archives = outputs.files.asFileTree.matching { include("**/*.apk", "**/*.aab", "**/*.apks") }.files.toList()
+        if (archives.isNotEmpty()) {
+            NativePackaging.verify(archives, modelManifest, temporaryDir, reportFile)
         }
-    }
-}
-
-// The safety net for the lookup by class name above: an assemble task that is about to run
-// without any packaging task of that class means the checks are no longer attached.
-gradle.taskGraph.whenReady {
-    val assembling = allTasks.any { it.project == project && it.name.startsWith("assemble") && !it.name.contains("Test") }
-    if (assembling && allTasks.none { it.project == project && it.javaClass.name.startsWith(packagingTaskClass) }) {
-        throw GradleException(
-            "llama/apk-checks.gradle.kts found no task of class $packagingTaskClass in $path: the Android Gradle plugin has changed, " +
-                "and the checks on the APK's models and native libraries would silently not run. Update the class name in that file.",
-        )
     }
 }

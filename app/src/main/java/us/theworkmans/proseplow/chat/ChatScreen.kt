@@ -1,22 +1,20 @@
 package us.theworkmans.proseplow.chat
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -50,6 +48,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -68,6 +67,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -104,14 +104,16 @@ import us.theworkmans.proseplow.data.SessionStore
 import us.theworkmans.proseplow.data.SettingsStore
 import us.theworkmans.proseplow.ui.Links
 import us.theworkmans.proseplow.ui.NoticeCard
+import us.theworkmans.proseplow.ui.ProtectWindow
+import us.theworkmans.proseplow.ui.plainSelectionMenu
 import us.theworkmans.proseplow.ui.rememberCopyToClipboard
 
 /**
  * The chat, which is also the app's home: the conversation, the field to write in, and around
  * them everything that is one tap away. The list of chats is a drawer that slides over the
  * conversation (from the menu button or a swipe), so switching chats never leaves this screen;
- * the top bar names the chat and its model, and tapping it switches the model. Under the field
- * to write in, one line reminds the reader that what a model writes may be wrong.
+ * the top bar names the chat and its model, and tapping it switches the model. Directly under
+ * the bar, one line reminds the reader that what a model writes may be wrong.
  *
  * Nothing shown here is put into saved instance state except whether the list follows the newest
  * message and how far it is scrolled.
@@ -177,9 +179,12 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
             )
         },
     ) {
+        // Named once, so that the line under the bar has the very colour the bar has.
+        val barColors = TopAppBarDefaults.topAppBarColors()
         Scaffold(
             topBar = {
                 TopAppBar(
+                    colors = barColors,
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
                             Icon(painterResource(R.drawable.ic_menu), contentDescription = stringResource(R.string.open_chats))
@@ -222,6 +227,7 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                     .consumeWindowInsets(innerPadding)
                     .imePadding(),
             ) {
+                AiNotice(barColors.containerColor)
                 Banners(
                     state = state,
                     onSettingsIssueShown = viewModel::settingsIssueShown,
@@ -256,6 +262,7 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                 if (session != null) {
                     InputBar(
                         text = viewModel.inputText,
+                        hint = stringResource(ModelText.messageHintRes(session.modelId)),
                         onTextChange = viewModel::onInputChange,
                         editing = state.editingMessageId != null,
                         generating = state.generating,
@@ -268,7 +275,6 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                         onCancelEdit = viewModel::cancelEdit,
                     )
                 }
-                AiNotice()
             }
         }
     }
@@ -364,6 +370,7 @@ private fun ChatTitle(
             }
         }
         DropdownMenu(expanded = expanded && enabled && modelId != null, onDismissRequest = { onExpandedChange(false) }) {
+            ProtectWindow()
             for (model in models) {
                 val current = model.id == modelId
                 DropdownMenuItem(
@@ -394,6 +401,7 @@ private fun OverflowMenu(canDelete: Boolean, onSettings: () -> Unit, onDelete: (
             Icon(painterResource(R.drawable.ic_more_vert), contentDescription = stringResource(R.string.more_options))
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            ProtectWindow()
             DropdownMenuItem(
                 text = { Text(stringResource(R.string.settings)) },
                 leadingIcon = { Icon(painterResource(R.drawable.ic_settings), contentDescription = null) },
@@ -523,11 +531,11 @@ private fun EmptyState(modelId: String?) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(stringResource(R.string.empty_title), style = MaterialTheme.typography.titleMedium)
+        Text(stringResource(ModelText.emptyTitleRes(modelId)), style = MaterialTheme.typography.titleMedium)
         if (modelId == null) return@Column
         Spacer(Modifier.height(8.dp))
         Text(
-            text = stringResource(R.string.empty_hint, modelName(modelId)),
+            text = stringResource(ModelText.emptyHintRes(modelId), modelName(modelId)),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -694,11 +702,13 @@ private fun MessageList(
  *
  * [text] comes from the ViewModel and is never saved by this composable. The cursor is the
  * field's own: when the text is replaced from outside (another chat's draft, a message to edit)
- * it goes to the end.
+ * it goes to the end. [hint] is what the empty field says, which depends on the kind of model
+ * the chat has: a model that continues text is not sent a message.
  */
 @Composable
 private fun InputBar(
     text: String,
+    hint: String,
     onTextChange: (String) -> Unit,
     editing: Boolean,
     generating: Boolean,
@@ -758,7 +768,7 @@ private fun InputBar(
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester),
-                placeholder = { Text(stringResource(R.string.message_hint)) },
+                placeholder = { Text(hint) },
                 maxLines = 6,
                 shape = RoundedCornerShape(24.dp),
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
@@ -791,23 +801,22 @@ private fun InputBar(
 }
 
 /**
- * The line at the very bottom of the chat, under the field to write in: a standing reminder that
- * what a model says may be wrong. It is the last thing in the screen's column, so it is there in
- * every state of the chat (also where there is no field), and above the navigation bar, whose
- * inset the column already keeps clear.
+ * The line directly under the top bar: a standing reminder that what a model says may be wrong.
+ * It is the first thing in the screen's column, above the model's status and the conversation,
+ * so it is there in every state of the chat (an empty one, one that cannot be read, while an
+ * answer is written or a message edited) and it never moves: what comes and goes on this screen
+ * does so below it. That includes the on-screen keyboard, which takes its room from the bottom
+ * of the column; the line is always composed and does not ask whether the keyboard is open.
  *
- * While the on-screen keyboard is open the line is not composed at all: the room it would take
- * is worth more to the conversation then. It comes and goes with the keyboard without any
- * animation of its own; the list above only ever sees its viewport change, which it follows by
- * layout as it does for the keyboard itself.
+ * It has the bar's own colour behind it ([barColor]), so that bar and line read as one, and it
+ * is kept slim: small type and little padding. At a large font size it wraps rather than being
+ * cut short.
  *
  * It is plain text and nothing else: no click, and no live region, so a screen reader says it
- * when the user moves to it and never because it reappeared.
+ * when the user moves to it and never by itself.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun AiNotice() {
-    if (WindowInsets.isImeVisible) return
+private fun AiNotice(barColor: Color) {
     Text(
         text = stringResource(R.string.ai_notice),
         style = MaterialTheme.typography.bodySmall,
@@ -815,7 +824,8 @@ private fun AiNotice() {
         textAlign = TextAlign.Center,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+            .background(barColor)
+            .padding(horizontal = 16.dp, vertical = 4.dp),
     )
 }
 
@@ -825,6 +835,7 @@ private fun DeleteChatDialog(request: DeleteRequest, onConfirm: () -> Unit, onDi
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.delete_chat_title)) },
         text = {
+            ProtectWindow()
             Text(
                 if (request.title.isEmpty()) {
                     stringResource(R.string.delete_chat_message_untitled)
@@ -855,7 +866,8 @@ private fun LinkDialog(link: String, onOpen: () -> Unit, onCopy: () -> Unit, onD
         onDismissRequest = onDismiss,
         title = { Text(stringResource(if (canOpen) R.string.link_title else R.string.link_title_cannot_open)) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            ProtectWindow()
+            Column(modifier = Modifier.plainSelectionMenu(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(stringResource(if (canOpen) R.string.link_message else R.string.link_message_cannot_open))
                 SelectionContainer {
                     Text(link, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)

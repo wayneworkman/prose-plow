@@ -121,6 +121,18 @@ def symbol_cases(symbols: list[str], rng: random.Random) -> list[str]:
     return out
 
 
+def special_token_cases(names: list[str], seed: int = 2468) -> list[str]:
+    """Text that spells the special tokens of a vocabulary, for the committed vectors of one model.
+
+    For a model some of whose tokens are not text at all (a padding token, an end-of-text token,
+    a deletion token): each name alone, doubled, glued to letters and digits, cut short, in the
+    wrong case and next to another, then random sentences that contain them. Typed by a
+    person, every one of these must stay plain characters.
+    """
+    rng = random.Random(seed)
+    return _unique(symbol_cases(names, rng) + fuzz(rng, 400, names))
+
+
 def upstream_texts(llama_src: Path) -> list[str]:
     """Text from the pinned llama.cpp tree: its tokenizer fixture inputs and two documents."""
     out: list[str] = []

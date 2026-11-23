@@ -1,0 +1,264 @@
+{
+  "format": "completion",
+  "note": "Written by hand. A model that only continues text has no chat template, so there is nothing to render and generate_golden.py neither writes nor checks this file. Each expected prompt follows the reference script of Glint-Research/Shard-2 (infer.py): it tokenises the prompt text exactly as given, adds no token of its own, and prints the prompt followed directly by what the model wrote. So the prompt is the latest user message as it is, and for a continued message that text followed directly by the partial answer.",
+  "cases": [
+    {
+      "name": "single message",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "The capital of France is"
+        }
+      ],
+      "rendered": "The capital of France is"
+    },
+    {
+      "name": "a space at the end is kept",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Once upon a time "
+        }
+      ],
+      "rendered": "Once upon a time "
+    },
+    {
+      "name": "whitespace at both ends is kept",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\n  Dear diary,\n\n"
+        }
+      ],
+      "rendered": "\n  Dear diary,\n\n"
+    },
+    {
+      "name": "whitespace that a chat template would strip is kept",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\u00a0\u3000text\u0085\t"
+        }
+      ],
+      "rendered": "\u00a0\u3000text\u0085\t"
+    },
+    {
+      "name": "earlier turns are not part of the prompt",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "First text"
+        },
+        {
+          "role": "assistant",
+          "content": " and what was written after it"
+        },
+        {
+          "role": "user",
+          "content": "Second text"
+        }
+      ],
+      "rendered": "Second text"
+    },
+    {
+      "name": "a system prompt is ignored",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant."
+        },
+        {
+          "role": "user",
+          "content": "Roses are red,"
+        }
+      ],
+      "rendered": "Roses are red,"
+    },
+    {
+      "name": "an answer after the latest message is not part of the prompt",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Roses are red,"
+        },
+        {
+          "role": "assistant",
+          "content": " violets are blue"
+        }
+      ],
+      "rendered": "Roses are red,"
+    },
+    {
+      "name": "consecutive user messages: only the latest",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "first"
+        },
+        {
+          "role": "user",
+          "content": "second"
+        }
+      ],
+      "rendered": "second"
+    },
+    {
+      "name": "text that spells special tokens is plain text",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<bs><eos><bos><pad><|im_end|>"
+        }
+      ],
+      "rendered": "<bs><eos><bos><pad><|im_end|>"
+    },
+    {
+      "name": "unicode",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Voil\u00e0 \ud83d\ude00 \u2014 \u65e5\u672c\u8a9e"
+        }
+      ],
+      "rendered": "Voil\u00e0 \ud83d\ude00 \u2014 \u65e5\u672c\u8a9e"
+    },
+    {
+      "name": "multi-line text",
+      "mode": "generate",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Shopping list:\n- eggs\n- "
+        }
+      ],
+      "rendered": "Shopping list:\n- eggs\n- "
+    },
+    {
+      "name": "continue a partial answer",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "The capital of France is"
+        },
+        {
+          "role": "assistant",
+          "content": " Nice. However,"
+        }
+      ],
+      "rendered": "The capital of France is Nice. However,"
+    },
+    {
+      "name": "continue keeps whitespace on every side",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A list:\n"
+        },
+        {
+          "role": "assistant",
+          "content": "- one\n- "
+        }
+      ],
+      "rendered": "A list:\n- one\n- "
+    },
+    {
+      "name": "continue keeps whitespace at the start of the partial answer",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "word"
+        },
+        {
+          "role": "assistant",
+          "content": "  and more "
+        }
+      ],
+      "rendered": "word  and more "
+    },
+    {
+      "name": "continue an empty answer",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": ""
+        }
+      ],
+      "rendered": "Hello"
+    },
+    {
+      "name": "continue after earlier turns",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "An old text"
+        },
+        {
+          "role": "assistant",
+          "content": " with its old ending"
+        },
+        {
+          "role": "user",
+          "content": "The new text"
+        },
+        {
+          "role": "assistant",
+          "content": " goes on"
+        }
+      ],
+      "rendered": "The new text goes on"
+    },
+    {
+      "name": "continue ignores a system prompt",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "user",
+          "content": "Dear Sir,"
+        },
+        {
+          "role": "assistant",
+          "content": "\n\nI write"
+        }
+      ],
+      "rendered": "Dear Sir,\n\nI write"
+    },
+    {
+      "name": "continue unicode",
+      "mode": "continue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\u00e9moji "
+        },
+        {
+          "role": "assistant",
+          "content": "\ud83d\ude00 et"
+        }
+      ],
+      "rendered": "\u00e9moji \ud83d\ude00 et"
+    }
+  ]
+}

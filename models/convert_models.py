@@ -64,6 +64,7 @@ class Converter:
 CONVERTERS = {
     "peacebell": Converter(_DRIVERS / "convert_peacebell.py", validation_f32=True),
     "boris2": Converter(_DRIVERS / "convert_boris2.py", validation_f32=True),
+    "shard2": Converter(_DRIVERS / "convert_shard2.py", validation_f32=True),
     "upstream": Converter(_DRIVERS / "convert_upstream.py", validation_f32=False, staged=True),
 }
 

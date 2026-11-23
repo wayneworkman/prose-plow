@@ -49,6 +49,10 @@ Two modes per case:
   the generation prompt and without the last `<|im_end|>` id.
 
 A case whose template raises is recorded with the template's message under `error`.
+
+One fixture in this directory is not this script's: `completion.json`, for models that only
+continue text. They have no template to render, so its expected prompts are written by hand (the
+file's own note says from what); this script neither writes nor checks it.
 """
 
 import argparse

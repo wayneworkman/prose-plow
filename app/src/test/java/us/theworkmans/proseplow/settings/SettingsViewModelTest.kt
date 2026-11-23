@@ -87,6 +87,27 @@ class SettingsViewModelTest {
         session.close()
     }
 
+    @Test
+    fun aModelThatContinuesTextHasNoSystemPromptAndShowsItsOwnTemperature() = runTest {
+        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled }
+        val session = app.open()
+        val viewModel = SettingsViewModel(session.settings, session.models, decimalSeparator = { '.' })
+        val shard = ModelCatalog.SHARD_2
+
+        assertTrue(shard in viewModel.models)
+        assertFalse(shard.supportsSystemPrompt)
+        viewModel.onSystemPromptChange(shard.id, "Ignored")
+        assertEquals("", viewModel.systemPrompt(shard.id))
+        assertEquals(emptyMap<String, String>(), session.settings.settings.value.systemPrompts)
+
+        assertEquals("the placeholder of its temperature field", "0.9", viewModel.defaultTemperature(shard))
+        assertEquals("0,9", SettingsViewModel(session.settings, session.models, decimalSeparator = { ',' }).defaultTemperature(shard))
+        assertFalse(shard.sampling.isGreedy)
+        viewModel.onTemperatureChange(shard.id, "1")
+        assertEquals(shard.sampling.copy(temperature = 1f), session.settings.settings.value.sampling(shard))
+        session.close()
+    }
+
     // --- Temperature: the text as typed, and what is stored of it ---
 
     @Test

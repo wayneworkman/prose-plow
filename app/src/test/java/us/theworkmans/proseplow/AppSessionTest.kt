@@ -3,6 +3,7 @@ package us.theworkmans.proseplow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -46,6 +47,11 @@ import us.theworkmans.proseplow.security.SoftwareKeyVault
 import us.theworkmans.proseplow.security.UnlockedSession
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import us.theworkmans.proseplow.security.FakeClock as LockClock
 
 /**
@@ -242,6 +248,8 @@ class AppSessionTest {
             }
             log += if (usable) "closed, the key still works" else "closed, the key is gone"
         }
+
+        override suspend fun awaitStopped() = real.awaitStopped()
     }
 
     /** The app from the lock down to the files, on virtual time; only the engine is scripted. */
@@ -439,5 +447,196 @@ class AppSessionTest {
 
         unlock(app)
         assertEquals("the unlock found the model ready and loaded nothing", listOf(ModelCatalog.default.id), app.fake.loads)
+    }
+
+    // --- A disk that hangs ---------------------------------------------------------------------
+
+    /**
+     * The lock and the real session on real threads and real time, over a disk on which one
+     * write of the settings can be made to hang, as an fsync on failing storage hangs: the
+     * bytes are sealed, and the thread does not come back. Virtual time cannot show this, since
+     * a blocked thread is exactly what a test dispatcher does not have.
+     *
+     * Every wait in here is bounded, the hanging write included, so that a failure ends the
+     * test and leaves no thread behind; and the session's own bound is cut from ten seconds to
+     * [WRITE_BOUND_MILLIS].
+     */
+    private class HangingDiskApp(root: File) : AutoCloseable {
+        private val mainExecutor = Executors.newSingleThreadExecutor()
+        private val ioExecutor = Executors.newFixedThreadPool(4)
+        private val main = mainExecutor.asCoroutineDispatcher()
+        private val io = ioExecutor.asCoroutineDispatcher()
+        val files = AppFiles(File(root, "files").apply { mkdirs() }, File(root, "cache").apply { mkdirs() })
+        private val layout = DataLayout(files)
+        private val lockClock = LockClock()
+
+        /** Makes the next write of the settings hang until [release] is counted down. */
+        val hangNextWrite = AtomicBoolean(false)
+        val writeEntered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        /** True once the write that hung has come back from the disk. */
+        val writeReturned = AtomicBoolean(false)
+
+        /** The cipher the lock made for each unlock, oldest first. */
+        val ciphers = CopyOnWriteArrayList<BlobCipher>()
+
+        val lock: AppLock<AppSession> = AppLock(
+            manager = LockManager(
+                LockConfigStore(files.lockConfig),
+                SoftwareKeyVault(),
+                lockClock,
+                iterations = 1_000,
+                minIterations = 1,
+                encryptedDataExists = files::encryptedDataExists,
+            ),
+            files = files,
+            clock = lockClock,
+            openSession = { unlocked ->
+                ciphers += unlocked
+                // The cipher itself is untouched. The write "hangs" after its bytes were sealed,
+                // which is where the real code writes, syncs and renames.
+                val slowDisk = object : BlobCipher {
+                    override fun seal(purpose: String, plaintext: ByteArray): ByteArray {
+                        val sealed = unlocked.seal(purpose, plaintext)
+                        if (purpose == DataLayout.SETTINGS_PURPOSE && hangNextWrite.compareAndSet(true, false)) {
+                            writeEntered.countDown()
+                            release.await(HANG_LIMIT_SECONDS, TimeUnit.SECONDS)
+                            writeReturned.set(true)
+                        }
+                        return sealed
+                    }
+
+                    override fun open(purpose: String, blob: ByteArray): ByteArray = unlocked.open(purpose, blob)
+                }
+                AppSession(slowDisk, layout, FakeInferenceEngine(), ModelCatalog.bundled, main, io, FakeClock(), SequentialIds("u${ciphers.size}-"), WRITE_BOUND_MILLIS)
+            },
+            biometricStatus = { BiometricStatus.NONE_ENROLLED },
+            screenshots = ScreenshotAllowance(lockClock, FakeScreenOffWatch(), main),
+            mainDispatcher = main,
+            ioDispatcher = io,
+        )
+
+        /** Runs [block] on the thread that stands for the main thread, and waits for it. */
+        fun onMain(block: () -> Unit) {
+            mainExecutor.submit(Runnable { block() }).get(WAIT_SECONDS, TimeUnit.SECONDS)
+        }
+
+        /** Polls until [test] holds; fails when it does not within [WAIT_SECONDS]. */
+        fun await(what: String, test: () -> Boolean) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(WAIT_SECONDS)
+            while (System.nanoTime() < deadline) {
+                if (test()) return
+                Thread.sleep(10)
+            }
+            throw AssertionError("Never happened within $WAIT_SECONDS s: $what (the lock is ${lock.state.value})")
+        }
+
+        fun keyAlive(cipher: BlobCipher): Boolean = try {
+            cipher.seal("probe", byteArrayOf(1))
+            true
+        } catch (_: KeyDestroyedException) {
+            false
+        }
+
+        fun everyFile(): List<String> =
+            files.filesDir.walkTopDown().filter { it.isFile }.map { it.relativeTo(files.filesDir).path }.sorted().toList()
+
+        /** Set-up with [passphrase], then one write of the settings that hangs. Returns the session. */
+        fun setUpAndHangAWrite(passphrase: String): AppSession {
+            await("ready for set-up") { lock.state.value == LockState.SetupRequired }
+            onMain { lock.setUp(passphrase.toCharArray(), passphrase.toCharArray()) }
+            await("unlocked") { lock.state.value is LockState.Unlocked }
+            val session = (lock.state.value as LockState.Unlocked).session
+            hangNextWrite.set(true)
+            session.settings.update(urgent = true) { it.withSystemPrompt(ModelCatalog.default.id, "a system prompt") }
+            assertTrue("the write started", writeEntered.await(WAIT_SECONDS, TimeUnit.SECONDS))
+            return session
+        }
+
+        override fun close() {
+            release.countDown()
+            mainExecutor.shutdownNow()
+            ioExecutor.shutdownNow()
+            mainExecutor.awaitTermination(WAIT_SECONDS, TimeUnit.SECONDS)
+            ioExecutor.awaitTermination(WAIT_SECONDS, TimeUnit.SECONDS)
+        }
+
+        companion object {
+            const val WRITE_BOUND_MILLIS = 300L
+            const val WAIT_SECONDS = 20L
+            const val HANG_LIMIT_SECONDS = 45L
+        }
+    }
+
+    /**
+     * The independent review's finding: with a write stuck in the disk, the app showed its lock
+     * screen but the data key stayed in memory, the lock manager stayed held, and the right
+     * passphrase could not even be checked, for as long as the disk did not answer. Now the
+     * session's close gives up when its time is over, the key goes, and the owner can come back.
+     */
+    @Test(timeout = 90_000)
+    fun aWriteThatHangsDoesNotKeepTheKeyAliveForEver() {
+        HangingDiskApp(temp.root).use { app ->
+            app.setUpAndHangAWrite(passphrase)
+            val firstCipher = app.ciphers.single()
+
+            app.onMain { app.lock.lock() }
+            assertTrue("the screen is locked at once", app.lock.state.value is LockState.Locked)
+
+            app.await("the data key destroyed although the write has not returned") { !app.keyAlive(firstCipher) }
+            app.await("the lock manager free again") { !app.lock.managerInUse }
+            assertFalse("the write is still stuck", app.writeReturned.get())
+
+            // The owner comes back and types the right passphrase while that write still hangs.
+            app.onMain { app.lock.unlockWithPassphrase(passphrase.toCharArray()) }
+            app.await("unlocked again") { app.lock.state.value is LockState.Unlocked }
+            assertFalse(app.writeReturned.get())
+            assertEquals(2, app.ciphers.size)
+            assertTrue("the new unlock has a working key", app.keyAlive(app.ciphers[1]))
+            assertFalse("and the old cipher stays dead", app.keyAlive(firstCipher))
+
+            // Letting the write go changes nothing about that.
+            app.release.countDown()
+            app.await("the write returned") { app.writeReturned.get() }
+            assertFalse(app.keyAlive(firstCipher))
+            assertTrue(app.lock.state.value is LockState.Unlocked)
+
+            // And a lock without a hanging write is as it always was.
+            app.onMain { app.lock.lock() }
+            app.await("the second key destroyed") { !app.keyAlive(app.ciphers[1]) }
+            app.await("the lock manager free again") { !app.lock.managerInUse }
+        }
+    }
+
+    /**
+     * A reset is the one thing that does wait for such a write, however long it hangs: it
+     * deletes every file, and a write that came back afterwards would put one back, encrypted
+     * with a key that no longer exists, where the next set-up would find "data" it cannot read.
+     */
+    @Test(timeout = 90_000)
+    fun aResetWaitsForAWriteThatHangsSoThatNoFileComesBack() {
+        HangingDiskApp(temp.root).use { app ->
+            app.setUpAndHangAWrite(passphrase)
+            val firstCipher = app.ciphers.single()
+
+            app.onMain { app.lock.reset() }
+            assertEquals("the screens are gone at once", LockState.Starting, app.lock.state.value)
+            app.await("the data key destroyed although the write has not returned") { !app.keyAlive(firstCipher) }
+
+            // Well past the session's own bound nothing has been deleted: the write could still land.
+            Thread.sleep(HangingDiskApp.WRITE_BOUND_MILLIS * 4)
+            assertEquals(LockState.Starting, app.lock.state.value)
+            assertTrue(app.files.lockConfig.exists())
+            assertFalse(app.writeReturned.get())
+
+            app.release.countDown()
+            app.await("first-run set-up after the reset") { app.lock.state.value == LockState.SetupRequired }
+            assertTrue("the write had returned before anything was deleted", app.writeReturned.get())
+            assertEquals("every file is gone, the one that landed late included", emptyList<String>(), app.everyFile())
+            assertNull(app.lock.resetFailure.value)
+            Thread.sleep(HangingDiskApp.WRITE_BOUND_MILLIS)
+            assertEquals("and none comes back", emptyList<String>(), app.everyFile())
+        }
     }
 }

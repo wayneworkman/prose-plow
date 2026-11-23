@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -191,5 +192,35 @@ class CoalescingWriterTest {
         advanceTimeBy(5_000)
         runCurrent()
         assertEquals(emptyList<String>(), written)
+    }
+
+    /**
+     * What the session does when its time to close is up while a write is stuck in the disk: it
+     * cancels the scope. The write that is running cannot be interrupted and finishes; nothing
+     * that was queued behind it is started any more (the data key is gone by then), and the
+     * scope's job, which the reset waits for, completes only when that write has returned.
+     */
+    @Test
+    fun cancellingTheScopeWhileAWriteRunsLetsItFinishAndStartsNoOther() = runTest {
+        val (writer, scope) = writer()
+        val job = scope.coroutineContext.job
+        var completedInsideTheWrite: Boolean? = null
+        writer.submit("a") {
+            written += "a started"
+            scope.cancel() // Seen from inside the write that hangs: this happens while it is running.
+            completedInsideTheWrite = job.isCompleted
+            written += "a finished"
+        }
+        writer.put("b", "1")
+        writer.put("c", "lazy", urgent = false)
+
+        runCurrent()
+        advanceTimeBy(5_000)
+        runCurrent()
+
+        assertEquals(listOf("a started", "a finished"), written)
+        assertEquals("not while the write was still running", false, completedInsideTheWrite)
+        assertTrue("but once it had returned", job.isCompleted)
+        assertEquals(emptyList<String>(), failures)
     }
 }

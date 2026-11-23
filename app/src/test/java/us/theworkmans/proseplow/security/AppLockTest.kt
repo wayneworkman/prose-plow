@@ -79,6 +79,9 @@ class AppLockTest {
         /** What that write does once it gets to run (it still needs the cipher). */
         var lateWrite: () -> Unit = {}
 
+        /** A write that was still in the disk when [close] gave up waiting; [awaitStopped] waits until the test completes it. */
+        var hungWrite: CompletableDeferred<Unit>? = null
+
         override fun clearScreens() {
             screensCleared++
             log += "screens cleared"
@@ -90,6 +93,11 @@ class AppLockTest {
             lateWrite()
             closed = true
             log += "session closed"
+        }
+
+        override suspend fun awaitStopped() {
+            hungWrite?.await()
+            log += "session stopped"
         }
     }
 
@@ -304,7 +312,7 @@ class AppLockTest {
         runCurrent()
         assertTrue(session.closed)
         assertDestroyed(session.cipher)
-        assertEquals(listOf("screens cleared", "session closed"), log)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped"), log)
 
         lock.lock() // Nothing to lock.
         runCurrent()
@@ -344,6 +352,61 @@ class AppLockTest {
         assertEquals(2, sessions.size)
         assertFalse(next === session)
         assertArrayEquals("the queued write was sealed with the real key before it was destroyed", plaintext, next.cipher.open("p", written!!))
+    }
+
+    /**
+     * A session's close is bounded: when its time is up it returns although one write may still
+     * be stuck in the disk. The lock does not wait for that write (the key must go, and the
+     * owner must be able to come back in); a reset does, however long it takes, because it
+     * deletes the files and the write would put one back.
+     */
+    @Test
+    fun aLockDoesNotWaitForASessionThatIsStillStoppingButAResetDoes() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val stored = someStoredData()
+        val hung = CompletableDeferred<Unit>()
+        session.hungWrite = hung
+
+        lock.lock()
+        runCurrent()
+        assertTrue("its close returned", session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse("nothing holds the lock manager", lock.managerInUse)
+        assertFalse("although the session has not stopped", "session stopped" in log)
+
+        // The owner comes back in meanwhile.
+        enter(passphrase)
+        val next = session()
+        assertEquals(2, sessions.size)
+        assertArrayEquals(plaintext, next.cipher.open("p", next.cipher.seal("p", plaintext)))
+
+        // A reset now closes the new session, and then waits for the old one's write.
+        vault.afterDelete = { log += "key deleted" }
+        lock.reset()
+        runCurrent()
+        assertEquals(LockState.Starting, lock.state.value)
+        assertTrue(next.closed)
+        assertDestroyed(next.cipher)
+        pass(24 * 3_600_000L)
+        assertEquals("for as long as it hangs", LockState.Starting, lock.state.value)
+        assertTrue(files.lockConfig.exists())
+        assertEquals(1, vault.bindingKeys.size)
+        for (file in stored) assertTrue(file.path, file.exists())
+        assertFalse("key deleted" in log)
+
+        // The write lands at last; only then is everything deleted, that file with the rest.
+        val late = File(files.filesDir, "sessions/late.enc").apply { writeBytes(byteArrayOf(1)) }
+        hung.complete(Unit)
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertEquals(2, log.count { it == "session stopped" })
+        assertEquals("nothing was deleted before both had stopped", "key deleted", log.last())
+        assertTrue(log.lastIndexOf("session stopped") < log.indexOf("key deleted"))
+        assertFalse(late.exists())
+        for (file in stored) assertFalse(file.path, file.exists())
+        assertNull(lock.resetFailure.value)
+        nothingIsPersisted()
     }
 
     @Test
@@ -616,6 +679,77 @@ class AppLockTest {
     }
 
     @Test
+    fun aFingerprintUnlockEndsAStreakOfWrongPassphrasesAsTheRightPassphraseDoes() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.lock()
+        runCurrent()
+        repeat(5) { enter(wrongPassphrase) }
+        assertEquals(lock.elapsedNow() + 30_000, lock.unlockUi.value.retryAtElapsed)
+        assertEquals(5, LockConfigStore(files.lockConfig).read()!!.failedAttempts)
+
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+        val stored = LockConfigStore(files.lockConfig).read()!!
+        assertEquals(0, stored.failedAttempts)
+        assertEquals(0L, stored.lastFailureElapsedMillis)
+        assertEquals(0L, stored.lastFailureWallMillis)
+
+        // Locked again, nothing is left of the wait, and the free attempts are free again.
+        lock.lock()
+        runCurrent()
+        assertEquals(0L, lock.unlockUi.value.retryAtElapsed)
+        repeat(4) {
+            enter(wrongPassphrase)
+            assertEquals(0L, lock.unlockUi.value.retryAtElapsed)
+        }
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+
+        // The same in a new process: the reset was stored, not only remembered.
+        lock.lock()
+        runCurrent()
+        repeat(5) { enter(wrongPassphrase) }
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+        startApp()
+        assertEquals(0L, lock.unlockUi.value.retryAtElapsed)
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    @Test
+    fun anEnrolmentAuthorisedAfterTheAppLockedWrapsNothing() = runTest(dispatcher) {
+        biometric = BiometricStatus.AVAILABLE
+        val launcher = FakeLauncher()
+        startApp()
+        lock.attach(launcher)
+        val session = createPassphrase()
+        lock.declineFingerprintOffer()
+        val proof = (lock.checkPassphrase(passphrase.toCharArray()) as PassphraseCheck.Ok).proof
+        assertTrue(lock.startBiometricEnrollment(proof))
+        assertEquals(BiometricPurpose.ENROLL, launcher.purpose)
+
+        // The app locks with the prompt open; the fingerprint is accepted a moment later.
+        lock.lock()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+
+        assertDestroyed(session.cipher)
+        assertFalse(lock.status.value.biometricEnabled)
+        assertNull("no wrap of a key that is gone", LockConfigStore(files.lockConfig).read()!!.biometric)
+        assertTrue(vault.biometricKeys.isEmpty())
+        enter(passphrase)
+        assertTrue("the passphrase still opens the app", lock.state.value is LockState.Unlocked)
+    }
+
+    @Test
     fun usePassphraseOnThePromptLeavesTheLockScreenAsItWas() = runTest(dispatcher) {
         val launcher = FakeLauncher()
         setUpWithFingerprint(launcher)
@@ -769,7 +903,7 @@ class AppLockTest {
         write.complete(Unit)
         runCurrent()
         assertEquals(LockState.SetupRequired, lock.state.value)
-        assertEquals(listOf("screens cleared", "session closed", "key deleted"), log)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped", "key deleted"), log)
         assertFalse("the late write was deleted with the rest, not left behind", late.exists())
         for (file in stored) assertFalse(file.path, file.exists())
         assertFalse(files.encryptedDataExists())
@@ -930,30 +1064,44 @@ class AppLockTest {
     private fun everythingOnDisk(): Map<String, List<Byte>> =
         listOf(files.filesDir, files.cacheDir).flatMap { root -> root.walkTopDown().filter { it.isFile }.map { it.path to it.readBytes().toList() } }.toMap()
 
+    /** What the activity makes of its window, on an Android version that can honour an allowance. */
+    private fun windowIsSecure(): Boolean =
+        WindowSecurity.mustBeSecure(lock.state.value is LockState.Unlocked, lock.screenshots.current(), clock.elapsed, WindowSecurity.FIRST_SDK_HIDING_THE_PREVIEW_SEPARATELY)
+
     @Test
-    fun aScreenshotAllowanceOutlivesTheAppsOwnLockAndUnlock() = runTest(dispatcher) {
+    fun aScreenshotAllowanceRunsOnUnderALockButTheLockScreenIsNeverCapturable() = runTest(dispatcher) {
         startApp()
         createPassphrase()
+        assertTrue(windowIsSecure())
         assertTrue(lock.screenshots.grant())
         val allowed = lock.screenshots.allowed.value
         assertTrue(allowed != null)
+        assertFalse("the unlocked app can be captured", windowIsSecure())
 
-        // "Lock now": the lock screen can be captured as well while the allowance runs.
+        // "Lock now": the allowance goes on counting, but where the passphrase is typed nothing is captured.
         lock.lock()
+        assertTrue("from the moment the lock screen is the state, before anything else ran", windowIsSecure())
         runCurrent()
         assertTrue(lock.state.value is LockState.Locked)
         assertEquals(allowed, lock.screenshots.current())
+        assertTrue(windowIsSecure())
+        // A wrong passphrase, and the wait it may bring, change nothing about that.
+        enter(wrongPassphrase)
+        assertTrue(windowIsSecure())
         enter(passphrase)
         assertEquals(allowed, lock.screenshots.current())
+        assertFalse("and it applies again after the unlock, while its time lasts", windowIsSecure())
 
         // Nor does the background timeout end it, or coming back.
         lock.onBackground()
         pass(60_000)
         assertTrue(lock.state.value is LockState.Locked)
         assertEquals(allowed, lock.screenshots.current())
+        assertTrue(windowIsSecure())
         lock.onForeground()
         assertEquals(allowed, lock.screenshots.current())
         assertTrue(screenWatch.watching)
+        assertTrue(windowIsSecure())
 
         // Only its own time does.
         pass(ScreenshotAllowance.DURATION_MILLIS - 60_000 - 1)
@@ -961,6 +1109,47 @@ class AppLockTest {
         pass(1)
         assertNull(lock.screenshots.allowed.value)
         assertFalse(screenWatch.watching)
+        enter(passphrase)
+        assertTrue("an unlock after its time finds nothing allowed", windowIsSecure())
+    }
+
+    @Test
+    fun noScreenThatIsNotTheUnlockedAppCanBeCapturedWhateverTheAllowanceSays() = runTest(dispatcher) {
+        // The allowance is granted here without regard to the state, which the screens never do:
+        // the rule must hold even so.
+        startApp()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        lock.screenshots.grant()
+        assertTrue("the set-up screen, where a passphrase is typed twice", windowIsSecure())
+
+        createPassphrase()
+        lock.screenshots.grant()
+        assertFalse(windowIsSecure())
+
+        // The error screen, with Try again.
+        lock.lock()
+        runCurrent()
+        openFails = IOException("disk full")
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Failed)
+        assertTrue(lock.screenshots.allowed.value != null)
+        assertTrue(windowIsSecure())
+        openFails = null
+
+        // While the app starts.
+        lock.retry()
+        assertEquals(LockState.Starting, lock.state.value)
+        assertTrue(windowIsSecure())
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertTrue(windowIsSecure())
+
+        // A new process over a damaged configuration: the screen that only offers a reset.
+        files.lockConfig.writeText("{ not json")
+        startApp()
+        assertEquals(LockState.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), lock.state.value)
+        lock.screenshots.grant()
+        assertTrue(windowIsSecure())
     }
 
     @Test

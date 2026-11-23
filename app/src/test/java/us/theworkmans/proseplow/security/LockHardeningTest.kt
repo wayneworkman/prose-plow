@@ -14,6 +14,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.io.IOException
 import java.util.Base64
 import javax.crypto.Cipher
 import kotlin.random.Random
@@ -64,6 +65,12 @@ class LockHardeningTest {
 
     private fun fail(m: LockManager, times: Int) = repeat(times) { assertTrue(m.checkPassphrase(wrongPassphrase.toCharArray()) is PassphraseResult.Wrong) }
 
+    /** Wrong attempts beyond the free ones: each is made when the wait before it is over. */
+    private fun failPatiently(m: LockManager, times: Int) = repeat(times) {
+        clock.advance(m.backoffRemainingMillis())
+        assertTrue(m.checkPassphrase(wrongPassphrase.toCharArray()) is PassphraseResult.Wrong)
+    }
+
     // --- The back-off across reboots and clock changes ------------------------------------------
 
     @Test
@@ -110,38 +117,264 @@ class LockHardeningTest {
     }
 
     /**
-     * Random reboots, clock jumps (both ways) and app restarts: the time left is never less than
-     * the delay minus the real time since the failure.
+     * Random reboots, clock jumps (both ways, from seconds to years) and app restarts. After
+     * every step:
+     * - the wait is never shortened: the time left is never less than the delay minus the real
+     *   time since the failure;
+     * - the wait is never lengthened beyond one full delay: the time left is at most the delay;
+     *   while the phone runs it goes down exactly as fast as time passes; and so, once the phone
+     *   has run for a full delay since the app first looked at the wait in this boot (or since
+     *   the failure, when there was no restart), nothing is left;
+     * - a change of the wall clock alone changes nothing at all.
+     *
+     * A restart of the phone is the one thing that can put time back onto the wait, up to the
+     * full delay and never beyond: the clock that survives a restart is the one that can be set.
      */
     @Test
-    fun noCombinationOfRebootsAndClockChangesShortensTheWait() {
+    fun noCombinationOfRebootsAndClockChangesShortensOrLengthensTheWait() {
         val random = Random(42)
-        repeat(300) {
+        val year = 365 * 86_400_000L
+        repeat(400) {
             var config = testConfig(
-                failedAttempts = 5 + random.nextInt(6),
+                failedAttempts = 5 + random.nextInt(9),
                 lastFailureWallMillis = clock.wall,
                 lastFailureElapsedMillis = clock.elapsed,
             )
             val delay = Backoff.delayAfter(config.failedAttempts)
             var realSinceFailure = 0L
-            repeat(20) {
-                when (random.nextInt(4)) {
-                    0 -> random.nextLong(0, delay).let { clock.advance(it); realSinceFailure += it }
+            // Time the phone has been running since the app first looked at the wait in this boot (at the failure, in the first).
+            var runningSinceFirstLook = 0L
+            repeat(30) {
+                val before = Backoff.remaining(config, clock)
+                when (random.nextInt(5)) {
+                    0 -> random.nextLong(0, delay).let {
+                        clock.advance(it)
+                        realSinceFailure += it
+                        runningSinceFirstLook += it
+                        assertNull("time passing is not a restart", Backoff.reanchor(config, clock))
+                        assertEquals("the wait goes down exactly as fast as time passes", (before - it).coerceAtLeast(0), Backoff.remaining(config, clock))
+                    }
                     1 -> {
                         val down = random.nextLong(0, delay)
                         val up = random.nextLong(0, delay * 2)
                         clock.reboot(down, up)
                         realSinceFailure += down + up
+                        runningSinceFirstLook = 0 // The look below is the first of this boot.
                     }
-                    2 -> clock.wall += random.nextLong(-delay * 4, delay * 40)
+                    2 -> {
+                        clock.wall += random.nextLong(-delay * 40, delay * 40)
+                        assertNull("a clock change is not a restart", Backoff.reanchor(config, clock))
+                        assertEquals("a clock change alone changes nothing", before, Backoff.remaining(config, clock))
+                    }
+                    3 -> {
+                        clock.wall += if (random.nextBoolean()) -random.nextLong(1, 30 * year) else random.nextLong(1, 30 * year)
+                        assertNull(Backoff.reanchor(config, clock))
+                        assertEquals("nor does one of years", before, Backoff.remaining(config, clock))
+                    }
                     else -> Unit
                 }
+                // The app runs (or is started again) and looks at the wait.
                 Backoff.reanchor(config, clock)?.let { config = it }
                 val remaining = Backoff.remaining(config, clock)
                 assertTrue("remaining $remaining, real $realSinceFailure of $delay", remaining >= delay - realSinceFailure)
-                assertTrue(remaining <= delay)
+                assertTrue("remaining $remaining of $delay", remaining <= delay)
+                if (runningSinceFirstLook >= delay) assertEquals("one full delay has passed: nothing may be left", 0L, remaining)
+                assertTrue("remaining $remaining, running $runningSinceFirstLook of $delay", remaining <= (delay - runningSinceFirstLook).coerceAtLeast(0))
             }
         }
+    }
+
+    /**
+     * Five wrong attempts cost thirty seconds. The phone's clock, which was a week ahead, is
+     * then corrected (or the date is simply changed): no reboot, no further attempt. One full
+     * delay later, an hour later and a day later the right passphrase must be accepted, also by
+     * a process that was started afresh each time. (The independent review's finding: with the
+     * wall clock consulted, the right passphrase stayed refused for the whole week.)
+     */
+    @Test
+    fun aWallClockSetBackCannotLengthenTheWaitBeyondOneFullDelay() {
+        setUp()
+        val first = manager()
+        assertEquals(StartResult.Locked, first.start())
+        fail(first, 5)
+        assertEquals("five failures cost thirty seconds", 30_000L, first.backoffRemainingMillis())
+
+        clock.wall -= 7 * 86_400_000L
+
+        // During the delay it is still refused, by this process and by a new one.
+        clock.advance(29_999)
+        assertEquals(PassphraseResult.Throttled(1), first.checkPassphrase(passphrase.toCharArray()))
+        assertEquals(PassphraseResult.Throttled(1), manager().also { it.start() }.checkPassphrase(passphrase.toCharArray()))
+        clock.advance(1)
+
+        var waited = 30_000L
+        for (step in listOf(0L, 3_600_000L, 86_400_000L)) {
+            clock.advance(step)
+            waited += step
+            val m = manager()
+            assertEquals(StartResult.Locked, m.start())
+            assertEquals("after ${waited / 1000} s", 0L, m.backoffRemainingMillis())
+            val result = m.checkPassphrase(passphrase.toCharArray())
+            assertTrue("after ${waited / 1000} s of real time: $result", result is PassphraseResult.Success)
+            (result as PassphraseResult.Success).key.destroy()
+            // Put the streak back for the next round: the success above ended it.
+            fail(m, 5)
+            clock.wall -= 7 * 86_400_000L
+            clock.advance(30_000)
+            waited += 30_000
+        }
+    }
+
+    @Test
+    fun aWallClockSetAheadDoesNotEndTheWaitEither() {
+        setUp()
+        val m = manager()
+        m.start()
+        failPatiently(m, 12)
+        assertEquals(Backoff.MAX_DELAY_MILLIS, m.backoffRemainingMillis())
+        clock.wall += 365 * 86_400_000L
+        assertEquals(Backoff.MAX_DELAY_MILLIS, m.backoffRemainingMillis())
+        val restarted = manager()
+        restarted.start()
+        assertEquals(PassphraseResult.Throttled(Backoff.MAX_DELAY_MILLIS), restarted.checkPassphrase(passphrase.toCharArray()))
+        clock.advance(Backoff.MAX_DELAY_MILLIS)
+        assertTrue(restarted.checkPassphrase(passphrase.toCharArray()) is PassphraseResult.Success)
+    }
+
+    // --- A fingerprint unlock ends a streak of wrong passphrases ----------------------------------
+
+    @Test
+    fun aFingerprintUnlockResetsTheFailedAttemptsExactlyAsTheRightPassphraseDoes() {
+        val key = enrolled()
+        val m = manager()
+        m.start()
+        failPatiently(m, 7)
+        val failed = store.read()!!
+        assertEquals(7, failed.failedAttempts)
+        assertTrue(failed.lastFailureElapsedMillis != 0L && failed.lastFailureWallMillis != 0L)
+        assertEquals(120_000L, m.backoffRemainingMillis())
+
+        val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
+        val unlocked = m.unlockWithBiometric(cipher)!!
+        assertArrayEquals(key.bytes, unlocked.bytes)
+
+        val after = store.read()!!
+        assertEquals("what the right passphrase leaves behind", failed.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0), after)
+        assertEquals(0L, m.backoffRemainingMillis())
+
+        // So the passphrase is not refused afterwards, and the next wrong ones are the free ones again.
+        val restarted = manager()
+        restarted.start()
+        assertEquals(0L, restarted.backoffRemainingMillis())
+        fail(restarted, 4)
+        assertEquals(0L, restarted.backoffRemainingMillis())
+        assertTrue(restarted.checkPassphrase(passphrase.toCharArray()) is PassphraseResult.Success)
+
+        // And exactly as the passphrase: the same state it leaves after a streak of seven.
+        failPatiently(restarted, 7)
+        clock.advance(120_000)
+        restarted.unlock(passphrase).key.destroy()
+        assertEquals(after, store.read()!!)
+    }
+
+    @Test
+    fun aFingerprintUnlockThatFailsLeavesTheCountAsItWas() {
+        enrolled()
+        val m = manager()
+        m.start()
+        failPatiently(m, 6)
+        val before = store.read()!!
+        // A cipher the platform did not leave usable (here: never initialised).
+        assertNull(m.unlockWithBiometric(Cipher.getInstance("AES/GCM/NoPadding")))
+        assertEquals(before, store.read()!!)
+        assertEquals(60_000L, m.backoffRemainingMillis())
+    }
+
+    @Test
+    fun aFingerprintUnlockWithNothingToResetWritesNothing() {
+        enrolled()
+        var writeSteps = 0
+        val m = LockManager(LockConfigStore(configFile, onWriteStep = { writeSteps++ }), vault, clock, iterations = 1_000, minIterations = 1, encryptedDataExists = { false })
+        m.start()
+        val before = configFile.readBytes()
+        writeSteps = 0
+        val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
+        assertTrue(m.unlockWithBiometric(cipher) != null)
+        assertEquals("the configuration was not written", 0, writeSteps)
+        assertArrayEquals(before, configFile.readBytes())
+
+        // With a streak to end it is written, once.
+        fail(m, 1)
+        writeSteps = 0
+        val again = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
+        assertTrue(m.unlockWithBiometric(again) != null)
+        assertTrue("the reset was stored", writeSteps > 0)
+        assertEquals(0, store.read()!!.failedAttempts)
+    }
+
+    @Test
+    fun aFingerprintUnlockWhoseResetCannotBeStoredDoesNotUnlock() {
+        enrolled()
+        val m = manager()
+        m.start()
+        fail(m, 5)
+        val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
+        val directory = configFile.parentFile!!
+        directory.setWritable(false)
+        try {
+            assertThrows(IOException::class.java) { m.unlockWithBiometric(cipher) }
+        } finally {
+            directory.setWritable(true)
+        }
+        assertEquals("the streak stands", 5, store.read()!!.failedAttempts)
+    }
+
+    // --- A destroyed data key is never wrapped ------------------------------------------------------
+
+    /**
+     * The lock manager is handed the data key itself for a passphrase change and a fingerprint
+     * enrolment. A key that was destroyed is thirty-two zero bytes; wrapping those would replace
+     * the only wrap of the real key, and everything stored would be lost for good. (The
+     * independent review's finding: the change went through, and the old passphrase no longer
+     * opened anything.)
+     */
+    @Test
+    fun aDestroyedDataKeyIsNeverWrappedAsTheNewPassphrasesKey() {
+        val m = manager()
+        assertEquals(StartResult.SetupRequired, m.start())
+        val created = m.setUp(passphrase.toCharArray())
+        val crypto = DataCrypto(created.key)
+        val plaintext = "a chat".toByteArray()
+        val blob = crypto.seal("session:x", plaintext)
+        val before = configFile.readText()
+        val keysBefore = vault.aliases.keys.toSet()
+
+        // What the lock does when the app locks.
+        crypto.destroy()
+
+        assertThrows(KeyDestroyedException::class.java) { m.changePassphrase(created.proof, created.key, otherPassphrase.toCharArray()) }
+
+        assertEquals("nothing was written", before, configFile.readText())
+        assertEquals("and no key was made for it", keysBefore, vault.aliases.keys.toSet())
+        assertFalse("the new passphrase opens nothing", opens(otherPassphrase))
+        val again = manager().also { it.start() }.unlock(passphrase)
+        assertArrayEquals("the old one still opens the real key", plaintext, DataCrypto(again.key).open("session:x", blob))
+    }
+
+    @Test
+    fun aDestroyedDataKeyIsNeverWrappedForFingerprintUnlock() {
+        val key = setUp()
+        val (m, success) = unlocked()
+        val cipher = m.prepareBiometricEnrollment(success.proof)
+        val before = store.read()!!
+        key.destroy()
+
+        assertThrows(KeyDestroyedException::class.java) { m.completeBiometricEnrollment(success.proof, key, cipher) }
+
+        assertEquals("the configuration is as it was", before, store.read()!!)
+        assertNull("no wrap was stored", store.read()!!.biometric)
+        assertTrue("and the key made for the enrolment is gone again", vault.biometricKeys.isEmpty())
+        assertTrue("the passphrase still opens the real key", opens(passphrase))
     }
 
     // --- The stored configuration is validated ------------------------------------------------

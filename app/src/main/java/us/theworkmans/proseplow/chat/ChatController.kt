@@ -319,7 +319,7 @@ class ChatController(
     fun send(sessionId: String, text: String): Boolean {
         val session = sendable(sessionId) ?: return false
         if (PromptWhitespace.isBlank(text)) return false
-        return begin(session.withUserTurn(text.trim(), clock, ids))
+        return begin(session.withUserTurn(typed(session, text), clock, ids))
     }
 
     /**
@@ -350,7 +350,7 @@ class ChatController(
     fun edit(sessionId: String, userMessageId: String, newText: String): Boolean {
         val session = sendable(sessionId) ?: return false
         if (PromptWhitespace.isBlank(newText)) return false
-        return begin(session.editAndTruncate(userMessageId, newText.trim(), clock)?.withAssistantPlaceholder(clock, ids))
+        return begin(session.editAndTruncate(userMessageId, typed(session, newText), clock)?.withAssistantPlaceholder(clock, ids))
     }
 
     /**
@@ -420,6 +420,14 @@ class ChatController(
     /** The session [sessionId] if a reply may be asked for in it now. */
     private fun sendable(sessionId: String): ChatSession? =
         usable(sessionId)?.takeIf { !it.isGenerating && models.any { model -> model.id == it.modelId } }
+
+    /**
+     * What is stored of [text] the user sends in [session]: without the blanks around it for a
+     * chat model, and exactly as typed for a model that continues the text, where a space at the
+     * end decides what the model writes next.
+     */
+    private fun typed(session: ChatSession, text: String): String =
+        if (models.firstOrNull { it.id == session.modelId }?.family?.continuesText == true) text else text.trim()
 
     private fun newSession(preferredModelId: String?): ChatSession {
         val modelId = models.firstOrNull { it.id == preferredModelId }?.id
@@ -607,7 +615,7 @@ class ChatController(
             }
             // Read again: the draft may have changed while the model was loading.
             val settings = requestSettings(spec)
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(settings.systemPrompt, settings.sampling)
+            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling)
             engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
         } catch (e: CancellationException) {
             throw e
@@ -632,7 +640,8 @@ class ChatController(
             is GenerationEvent.HistoryTrimmed ->
                 _state.update { it.copy(trimmedMessages = it.trimmedMessages + (reply.sessionId to event.droppedMessages)) }
             is GenerationEvent.PromptProgress -> phase(reply, TurnPhase.ReadingPrompt(event.evaluatedTokens, event.totalTokens))
-            is GenerationEvent.TextDelta -> {
+            // Text added, or text the model took back: either way the message changes as it is written.
+            is GenerationEvent.TextDelta, is GenerationEvent.TextReplaced -> {
                 phase(reply, TurnPhase.Writing)
                 commit(session.applyEvent(reply.assistantId, event, clock), urgent = false)
             }

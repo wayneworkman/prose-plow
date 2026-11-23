@@ -28,10 +28,29 @@ class DataKey(bytes: ByteArray) {
 
     private val material = bytes.copyOf()
 
-    /** The key bytes. Callers must not keep or modify them. */
-    internal val bytes: ByteArray get() = material
+    @Volatile private var destroyed = false
 
-    fun destroy() = material.fill(0)
+    /**
+     * The key bytes. Callers must not keep or modify them.
+     *
+     * @throws KeyDestroyedException once the key has been destroyed. The array is all zeros
+     *   then, and zeros must never be taken for a key: sealed with them, data would be readable
+     *   by anyone, and wrapped by a new passphrase they would replace the only copy of the real
+     *   key.
+     */
+    internal val bytes: ByteArray
+        get() {
+            if (destroyed) throw KeyDestroyedException()
+            return material
+        }
+
+    /** True once [destroy] has been called; the key can be used for nothing then. */
+    val isDestroyed: Boolean get() = destroyed
+
+    fun destroy() {
+        destroyed = true
+        material.fill(0)
+    }
 
     /** Never prints the key. */
     override fun toString() = "DataKey(***)"

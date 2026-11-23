@@ -23,6 +23,8 @@ captures/
 
 # Model weights are never committed (converted at build time, see README)
 *.gguf
+# ... nor under the name a model has as an asset of the app (native/README.md, "Models in the APK")
+*.gguf.so
 *.safetensors
 
 # Signing material

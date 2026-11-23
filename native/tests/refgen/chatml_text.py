@@ -66,19 +66,24 @@ class ChatTokenizer:
         return self._tokenizer.decode(ids, skip_special_tokens=False)
 
 
-def greedy_reply(model, tokenizer: ChatTokenizer, prompt: list[int], eos: int, max_new_tokens: int) -> tuple[list[int], str | None]:
+def greedy_reply(model, tokenizer: ChatTokenizer, prompt: list[int], eos: int, max_new_tokens: int,
+                 banned: list[int] | None = None) -> tuple[list[int], str | None]:
     """Greedy continuation by recomputing the whole prefix for every token, as the reference generates.
 
     Returns the generated tokens and the reply text. Generation stops after the token that
     completes the end marker in the decoded text; those tokens are part of the result, because
     the marker has no token boundary of its own (its first character can merge with the text
     before it). It also stops before an end-of-text token, which is never part of the result,
-    and at max_new_tokens. The text is None when the reply was cut by max_new_tokens.
+    and at max_new_tokens. The text is None when the reply was cut by max_new_tokens. A banned
+    token is never chosen: the tokens a checkpoint's generation settings suppress.
     """
     ids = list(prompt)
     out: list[int] = []
     for _ in range(max_new_tokens):
-        token = int(torch.argmax(model(input_ids=torch.tensor([ids])).logits[0, -1].float()))
+        logits = model(input_ids=torch.tensor([ids])).logits[0, -1].float()
+        if banned:
+            logits[banned] = float("-inf")
+        token = int(torch.argmax(logits))
         if token == eos:
             return out, tokenizer.decode(out)
         out.append(token)

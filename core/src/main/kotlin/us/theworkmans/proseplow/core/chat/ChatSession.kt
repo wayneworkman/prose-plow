@@ -89,15 +89,23 @@ data class ChatSession(
 
     /**
      * Applies one event of the generation that fills the reply [assistantId]: text is appended,
-     * the end of the generation finishes the message ([finished]) and an error fails it
-     * ([failed]). Progress events change nothing here. Events for a reply that is no longer
-     * streaming (because it was stopped meanwhile) are ignored.
+     * text the model took back is removed from the end, the end of the generation finishes the
+     * message ([finished]) and an error fails it ([failed]). Progress events change nothing
+     * here. Events for a reply that is no longer streaming (because it was stopped meanwhile)
+     * are ignored.
+     *
+     * Text events describe only what the generation itself wrote. A message that is being
+     * continued keeps the text it had before: appended text goes after it, and text taken back
+     * comes off the end, which is always text of the same generation.
      */
     fun applyEvent(assistantId: String, event: GenerationEvent, clock: Clock): ChatSession = when (event) {
         is GenerationEvent.TextDelta -> updateMessage(assistantId) {
             if (it.status == MessageStatus.STREAMING) it.copy(text = it.text + event.text) else it
         }
-        is GenerationEvent.Done -> finished(assistantId, event.finishReason, clock)
+        is GenerationEvent.TextReplaced -> updateMessage(assistantId) {
+            if (it.status == MessageStatus.STREAMING && event.removed > 0) it.copy(text = it.text.dropLast(event.removed)) else it
+        }
+        is GenerationEvent.Done -> finished(assistantId, event.finishReason, clock, exactText = event.exactText)
         is GenerationEvent.Error -> failed(assistantId, event.error, clock)
         is GenerationEvent.PromptProgress, is GenerationEvent.HistoryTrimmed -> this
     }
@@ -109,15 +117,22 @@ data class ChatSession(
      * - The token limit was reached: complete as far as it goes, text kept exactly as written so
      *   that it can be continued from the same point.
      * - Cancelled: stopped, with the partial text kept exactly as written.
+     *
+     * @param exactText true for the reply of a model that continues text
+     *   ([GenerationEvent.Done.exactText]): nothing is removed from it however it ended.
      */
-    fun finished(assistantId: String, reason: FinishReason, clock: Clock): ChatSession = updateStreaming(assistantId, clock) {
-        when (reason) {
-            FinishReason.END_OF_TURN, FinishReason.STOP_STRING ->
-                it.copy(text = PromptWhitespace.stripEnd(it.text), status = MessageStatus.COMPLETE, finishReason = reason)
-            FinishReason.LENGTH -> it.copy(status = MessageStatus.COMPLETE, finishReason = reason)
-            FinishReason.CANCELLED -> it.copy(status = MessageStatus.STOPPED, finishReason = reason)
+    fun finished(assistantId: String, reason: FinishReason, clock: Clock, exactText: Boolean = false): ChatSession =
+        updateStreaming(assistantId, clock) {
+            when (reason) {
+                FinishReason.END_OF_TURN, FinishReason.STOP_STRING -> it.copy(
+                    text = if (exactText) it.text else PromptWhitespace.stripEnd(it.text),
+                    status = MessageStatus.COMPLETE,
+                    finishReason = reason,
+                )
+                FinishReason.LENGTH -> it.copy(status = MessageStatus.COMPLETE, finishReason = reason)
+                FinishReason.CANCELLED -> it.copy(status = MessageStatus.STOPPED, finishReason = reason)
+            }
         }
-    }
 
     /** The user pressed Stop: the partial reply is kept and marked as stopped. */
     fun stopped(assistantId: String, clock: Clock): ChatSession = finished(assistantId, FinishReason.CANCELLED, clock)

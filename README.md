@@ -3,7 +3,7 @@
 Prose Plow is an Android app that runs small language models entirely on the phone. The models
 are packaged inside the APK and run on the phone's processor through
 [llama.cpp](https://github.com/ggml-org/llama.cpp), which this project builds from source with
-three small patches. Nothing is downloaded while the app runs, and the app declares no network
+four small patches. Nothing is downloaded while the app runs, and the app declares no network
 permission at all. Every chat is stored encrypted behind a lock that cannot be switched off: a
 passphrase, or a fingerprint that the passphrase has set up, and never a PIN.
 
@@ -99,31 +99,39 @@ licence of llama.cpp.
 ## The models
 
 A model is part of the build: which of them an APK carries is decided when it is built, and the
-app offers exactly those. Three are ready to bundle.
+app offers exactly those. Four are ready to bundle.
 
 | `id` | Name in the app | Source repository on Hugging Face | Licence | Parameters | File in the APK |
 | --- | --- | --- | --- | --- | --- |
 | `qwen3.5-0.8b` | Qwen3.5 0.8B | `Qwen/Qwen3.5-0.8B` | Apache-2.0 | 0.8 billion in the checkpoint; 752 million in the file, which is text only | 1,516,742,752 bytes |
-| `peacebell-v1-291m` | Peacebell v1 291M | `wayneworkman2012/peacebell-v1-291M` | Apache-2.0; the name Peacebell is reserved by the model card | 291 million | 583,680,096 bytes |
+| `peacebell-v1-291m` | Peacebell v1 291M | `wayneworkman2012/peacebell-v1-291M` | Apache-2.0; the name Peacebell is reserved by the model card and is used here with its owner's permission | 291 million | 583,680,096 bytes |
 | `boris-2-instruct` | Boris-2-Instruct | `opencerebral/Boris-2-Instruct` | Apache-2.0 | 144 million | 291,853,184 bytes |
+| `shard-2` | Shard-2 | `Glint-Research/Shard-2` | MIT | 49.4 million | 99,048,160 bytes |
 
-All three together are 2,392,276,032 bytes (2.39 GB). The exact revision of each repository and
+All four together are 2,491,324,192 bytes (2.49 GB). The exact revision of each repository and
 the SHA-256 of every file that is read from it are pinned in `models/manifest.json`, together
 with the SHA-256 the converted file must have.
 
-| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
-| --- | --- | --- | --- |
-| What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts |
-| Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project |
-| Context on the phone, tokens | 4,096 | 4,096 | 2,048 |
-| Longest reply, tokens | 1,024 | 1,024 | 512 |
-| Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 |
-| System prompt | yes | no | yes |
+| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct | Shard-2 |
+| --- | --- | --- | --- | --- |
+| What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts | Not a chat model: it continues the text you write, and can take back words it has just written |
+| Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project | `shard2`, ported by this project |
+| Context on the phone, tokens | 4,096 | 4,096 | 2,048 | 4,096 |
+| Longest reply, tokens | 1,024 | 1,024 | 512 | 200 |
+| Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 | temperature 0.9, top-k 100 |
+| System prompt | yes | no | yes | no |
 
 The sampling values are each model's own reference settings, taken from its published files.
 The temperature can be changed for each model in Settings; the other values are fixed.
 The Qwen3.5 file leaves out the vision tower and the multi-token-prediction head of the
 checkpoint: the app is text only.
+
+Shard-2 is the one model here that is not a chat model. It is given only the latest message,
+exactly as written, and writes on from it. It has one token beyond its tokenizer that takes back
+the token before it: the app applies that as it happens, so words the model retracts disappear
+from the reply while the model itself still sees what it abandoned. Its checkpoint is published
+as a Python pickle; the converter loads it in PyTorch's weights-only mode and runs none of the
+code published with it.
 
 ### Precision: 16-bit floats, no quantisation
 
@@ -191,8 +199,9 @@ The key is a 256-bit **data key** made from the system's random generator at fir
 A new random nonce is drawn for every write. The additional authenticated data is the four-byte
 header followed by `proseplow:<purpose>`, where the purpose names what the blob is (for example
 `session:<id>`), so a file that is renamed, or moved into the place of another, does not
-decrypt. Files are replaced atomically (temporary file, `fsync`, rename, `fsync` of the
-directory).
+decrypt. The purpose says what a blob is, not which version of it: an older copy of the same
+file decrypts as well (see "What this does not protect against"). Files are replaced atomically
+(temporary file, `fsync`, rename, `fsync` of the directory).
 
 ### The key hierarchy
 
@@ -237,13 +246,19 @@ optionally a second time by a fingerprint key.
   clock that keeps counting while the phone sleeps, and it is checked again before anything is
   shown when the app comes back.
 - When it locks, the screens are torn down at once, a reply that is being written is stopped and
-  kept as a stopped message, the writes that are waiting are finished, the inference engine is
-  told to forget the conversation, and the data key is overwritten with zeros.
+  kept as a stopped message, the inference engine is told to forget the conversation, the
+  writes that are waiting get up to ten seconds to finish, and the data key is overwritten with
+  zeros whether or not they did. A write that the storage does not complete in that time is
+  not waited for, so that it cannot keep the key in memory; only a reset waits for it, because
+  a reset deletes the files.
 - **Wrong passphrases are slowed down.** The first four wrong attempts cost nothing. The fifth
   costs 30 seconds, and every further one doubles the wait, up to one hour. An attempt is
   counted on disk before it is checked, so killing the app in the middle of a check does not
-  avoid the count. Wrong passphrases entered in Settings count as well. A restart of the phone
-  during a wait starts the full wait again. There is no wipe after a number of failures.
+  avoid the count. Wrong passphrases entered in Settings count as well. The wait is timed on
+  the clock that counts from the phone's start and never on the date and time, so setting the
+  phone's clock, in either direction, neither ends a wait nor prolongs it. A restart of the
+  phone during a wait starts the full wait again. The right passphrase ends the count, and so
+  does a successful fingerprint unlock. There is no wipe after a number of failures.
   Fingerprint attempts are limited by Android itself.
 
 ### Reset, and no recovery
@@ -264,15 +279,18 @@ it or losing the phone loses the chats.
 
 - While the app is unlocked, the data key, the decrypted chats and settings, and the model's
   working memory of the conversation are in the app's memory.
-- At a lock, the data key's array is zeroed, and the engine clears the model's memory of the
-  conversation: the native session overwrites its buffers and the saved checkpoints before it
-  frees them.
-- Passphrases are handled as character arrays and wiped after use, and so are the keys derived
-  from them. A passphrase that contains characters which had to be normalised passes through one
-  Java string, which cannot be wiped.
+- At a lock, the data key's array is zeroed and the key refuses every further use, and the
+  engine clears the model's memory of the conversation: the native session overwrites its
+  buffers and the saved checkpoints before it frees them.
+- A passphrase is taken out of its text field as a character array, and that array and the keys
+  derived from it are wiped after use. The text field itself is not the app's to wipe: it is
+  emptied, but the buffers in which it held what was typed stay in memory, with what they
+  hold, until the garbage collector reuses them. A passphrase that contains characters which
+  had to be normalised also passes through one Java string, which cannot be wiped.
 - What cannot be wiped stays until the garbage collector reuses the memory or the process ends:
-  the copies of keys inside the Java cryptography classes, and the strings in which the text
-  fields, the Markdown renderer and the JSON codec held chat text.
+  the copies of keys inside the Java cryptography classes, the text fields' buffers just
+  mentioned, and the strings in which the text fields, the Markdown renderer and the JSON codec
+  held chat text.
 - The loaded model stays in memory across a lock. Its weights are no secret.
 - Nothing decrypted is put into the saved instance state, and the main code contains no logging
   call; both are checked by tests that read the sources.
@@ -280,17 +298,43 @@ it or losing the phone loses the chats.
 ### Other measures
 
 - The window is secure (`FLAG_SECURE`) from its first frame, which keeps it out of screenshots,
-  screen recordings and screen sharing, except while a screenshot allowance runs (see "What the
-  app does"). The allowance exists in memory only and is timed on the clock that counts from
-  the phone's start, so changing the date does not stretch it. The app's own lock does not end
-  it: during an allowance the lock screen can be captured as well (its passphrase field shows
-  bullets). The preview in the app switcher is switched off separately and always.
+  screen recordings and screen sharing, except while the app is unlocked and a screenshot
+  allowance runs (see "What the app does"). The allowance exists in memory only and is timed on
+  the clock that counts from the phone's start, so changing the date does not stretch it. When
+  it ends while the app is open, the screen is built again, so that a dialog or a menu that
+  was opened during it does not stay capturable. The preview in the app switcher is switched
+  off separately and always.
+- **Where a passphrase is typed, nothing is captured, allowance or not.** The set-up screen, the
+  lock screen and the error screens are secure whatever the allowance says: locking the app
+  does not end an allowance, but it has no effect until the app is unlocked again within its
+  time. The dialogs of the unlocked app in which a passphrase is typed (changing it, confirming
+  it) are secure by a setting of their own. A passphrase field shows a bullet for every
+  character from the moment it is typed, never the last character, and gives accessibility
+  services bullets instead of the typed text.
 - Every text field asks the keyboard not to learn from it
   (`IME_FLAG_NO_PERSONALIZED_LEARNING`). Keyboards may ignore the request.
-- The app's windows are excluded from autofill, and a passphrase field gives accessibility
-  services bullets instead of the typed text.
+- The app's windows are excluded from autofill.
 - Text copied out of the app is marked as sensitive, which hides it in the clipboard preview of
-  Android 13 and later.
+  Android 13 and later. That holds for the copy buttons and for Copy and Cut in the menu of a
+  text selection alike: every clip passes through one wrapper around the clipboard.
+- Selecting text hands it to nothing outside the app. The text library's "smart selection",
+  which gives a selection to the system's text classifier, is switched off, and the menu of a
+  selection offers Cut, Copy, Paste and Select all only: the entries that other apps register
+  for selected text (Translate, Search and the like), the classifier's suggestions and autofill
+  are left out.
+- A tap is discarded while another app's window covers the place that is tapped
+  (`filterTouchesWhenObscured`, on the app's screen and on each of its dialogs and menus), so
+  an overlay cannot pass a tap through to a button that the user does not see. The app says so
+  in a short message when it happens on its screen.
+- The app's one activity has an empty task affinity, which on Android 9 and 10 keeps another
+  app from joining this app's task by its name (see "What this does not protect against"). It
+  is the only exported component the app declares; a library adds one more, the receiver
+  through which the system's shell installs a start-up profile, which other apps cannot call
+  (it requires the `DUMP` permission). No build type contains the user interface library's
+  preview activity.
+- The check of the merged manifest against the permission allow-list is a step of the build and
+  not a task beside it: what is packaged is the manifest the check handed on, so no APK or
+  bundle can be built or installed from a manifest that did not pass.
 - The initialiser through which a library would ask Google Play Services for a downloadable
   emoji font is removed from the manifest, because that request would be made by another
   process on the app's behalf.
@@ -318,8 +362,25 @@ it or losing the phone loses the chats.
   pasted into. An accessibility service that you have enabled can read what is on the screen,
   chats included.
 - **Capture you allowed, and capture from outside.** During a screenshot allowance the screen
-  can be captured by anything that can capture a screen. A camera pointed at the phone is never
-  prevented.
+  of the unlocked app can be captured by anything that can capture a screen. A camera pointed
+  at the phone is never prevented.
+- **An older copy of a file put back.** The encryption proves what a file is (this chat, the
+  settings), not that it is the newest version of it. Someone who can write the app's private
+  storage, without knowing any key, can replace a chat or the settings with an older copy of
+  the same file, and can put back a chat that was deleted; the app accepts both without
+  notice. An older `lock.json` is accepted in the same way unless the passphrase was changed
+  after it was written. On a phone that is not rooted only the app itself can write there
+  (and, for a debug build, a computer that is authorised for USB debugging).
+- **Another app that imitates this one.** The app cannot show you that the screen in front is
+  its own. On Android 9 and 10 an installed app can make one of its screens appear when this
+  app is opened ("task hijacking") and ask for the passphrase there. The empty task affinity
+  takes away the documented way of doing that, which is to join the app's task by its name; it
+  is a mitigation and not a complete defence on those versions, and a phone on Android 9
+  without the security patches of May 2020 has a second flaw of this kind that no setting of
+  an app touches. Android 11 and later prevent task hijacking themselves. On every version, an
+  app that you allowed to draw over other apps can show a look-alike screen, or cover
+  everything except one button and so change what you believe you are pressing; discarding
+  covered taps does not help against what is drawn around a button.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
   sizes and the times they were changed, and the content of `lock.json` (whether fingerprint
@@ -342,11 +403,19 @@ it or losing the phone loses the chats.
   files are pinned by hash. Maven and Python packages are pinned by version only, and the
   Android SDK packages by name.
 
-The code has had no independent security review.
+The code has been reviewed for security once, within the project; what that review found is
+fixed, or is listed above as something the app does not protect against. No outside party has
+audited it.
 
 ## Build from source on Ubuntu 24.04
 
 ### What was verified, and how
+
+The check described here was made when the app carried three models, before Shard-2 (99 MB) was
+added: where this section says "all three models", and in its times, sizes and disk figures, it
+means Qwen3.5, Peacebell and Boris-2. Shard-2's download, conversion and host tests were run on
+the development machine, not in that clean-machine check; an APK with all four models is
+2,541 MB as a debug build.
 
 These instructions were followed literally, on 22 November 2026, on Ubuntu 24.04.5 (x86_64) in a
 clean clone, with a freshly downloaded JDK, a freshly installed Android SDK in an empty
@@ -554,7 +623,7 @@ source env.sh            # JAVA_HOME, ANDROID_HOME; java and adb on PATH
 
 ### Get the model checkpoints
 
-Nothing in this repository downloads a model. Fetch the three checkpoints yourself, each at the
+Nothing in this repository downloads a model. Fetch the four checkpoints yourself, each at the
 revision that `models/manifest.json` pins, into `$PROSEPLOW_MODEL_SRC/<id>`:
 
 ```sh
@@ -564,6 +633,8 @@ hf download wayneworkman2012/peacebell-v1-291M --revision a44de191d94e8bf944b31a
     --local-dir "$PROSEPLOW_MODEL_SRC/peacebell-v1-291m"
 hf download opencerebral/Boris-2-Instruct --revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d \
     --local-dir "$PROSEPLOW_MODEL_SRC/boris-2-instruct"
+hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
+    --local-dir "$PROSEPLOW_MODEL_SRC/shard-2"
 ```
 
 No account and no token were needed for the command that was run in the check (Boris-2); `hf`
@@ -572,7 +643,7 @@ each model's own licence (see the table above). How the files get there does not
 checkpoint in a Hugging Face hub cache is found as well, and the hashes decide whether the
 files are the right ones.
 
-The manifest lists a fourth model, `peacebell-v1-148m`, which is converted and tested but not
+The manifest lists a fifth model, `peacebell-v1-148m`, which is converted and tested but not
 bundled. It is optional: without it, six of the native tests report themselves as skipped. To
 run them too:
 
@@ -585,7 +656,7 @@ hf download wayneworkman2012/peacebell-v1-148M --revision 9155a36017601957565a56
 
 ```sh
 native/tools/prepare-llama-src.sh
-python3 models/convert_models.py peacebell-v1-291m boris-2-instruct qwen3.5-0.8b
+python3 models/convert_models.py peacebell-v1-291m boris-2-instruct shard-2 qwen3.5-0.8b
 ```
 
 The first command writes the patched copy of llama.cpp, which holds the converters, into
@@ -596,10 +667,11 @@ comes out differently. It prints one line per model:
 
     peacebell-v1-291m: wrote peacebell-v1-291m-f16.gguf, 583680096 bytes, sha256 df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868
     boris-2-instruct: wrote boris-2-instruct-f16.gguf, 291853184 bytes, sha256 758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6
+    shard-2: wrote shard-2-f16.gguf, 99048160 bytes, sha256 c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f
     qwen3.5-0.8b: wrote qwen3.5-0.8b-f16.gguf, 1516742752 bytes, sha256 91bcb80bb68c2a51e7eb4e28cf088f79678e236f9f16120060b84a57ae7f0978
 
 The files are `$PROSEPLOW_MODEL_OUT/<id>/<id>-f16.gguf`. Name the models as above, or pass
-`--available`: without either, the script also wants the optional fourth checkpoint and ends
+`--available`: without either, the script also wants the optional fifth checkpoint and ends
 with an error when it is not there, after converting the others.
 
 ### Run the native tests on the host
@@ -774,6 +846,14 @@ variable instead of asking. The reports of a release build are
 apply to the signed APK in the same way. In the clean-machine check the signed APK was verified
 with these tools; installing it on a phone was not part of that check.
 
+The project's own key is made and used by three small scripts, for a Linux desktop with a login
+keyring (GNOME Keyring through libsecret; the system Python's `gi` bindings): `tools/signing-key.sh`
+creates a 4096-bit RSA key once, in `~/.config/proseplow/` or where `PROSEPLOW_KEYSTORE` says, with
+a random password that goes into the keyring and is never typed or shown; `tools/sign-release.sh`
+signs the unsigned release APK with it (no v1 signature, alignment preserved) and verifies the
+result; `tools/keyring.py get` prints the password for a backup. They are a convenience, not a
+requirement: the commands above do the same by hand.
+
 Keep the keystore and its password. Android installs an update only over an app that was signed
 with the same key; without the key the only way to a newer build is to uninstall the app, and
 that deletes every chat. The release build installs as `us.theworkmans.proseplow`.
@@ -808,7 +888,7 @@ not touch a phone. Where something below was not done by the developers either, 
    adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 
-   The phone needs free storage for the APK, 2.4 GB with all three models. Over USB a 715 MB APK
+   The phone needs free storage for the APK, 2.5 GB with all four models. Over USB a 715 MB APK
    took 20 seconds and a 2.8 GiB test APK 87 seconds. `-r` replaces an installed build of the
    same kind and keeps its data.
 
@@ -913,8 +993,8 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 274 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 356 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies) | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 327 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 443 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies) | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint and the permission check | | `./gradlew check` |
 | Native host suite (29 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
@@ -956,7 +1036,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `app/` | The Android application: the Compose screens, the lock and the encryption (`security/`), the encrypted stores (`data/`), chat (`chat/`) and settings (`settings/`) |
 | `core/` | Plain Kotlin without any Android dependency: the chat model, the prompt format of each model, the model catalogue, and the inference engine above the native layer |
 | `llama/` | The Android library around the native code: the CMake build for arm64, the JNI binding, the packaging of the models, the checks on the finished APK, and the tests that run on a phone |
-| `native/` | Everything below the JVM: the patches to llama.cpp, the two architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md` |
+| `native/` | Everything below the JVM: the patches to llama.cpp, the three architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md` |
 | `models/` | `manifest.json` with the pinned revisions and hashes, and `convert_models.py`. See `models/README.md` |
 | `fastlane/` | The store metadata in the layout F-Droid reads (`metadata/android/en-US/`: title, descriptions, changelog, icon), and the script that renders the icon from the launcher artwork. See `fastlane/README.md` |
 | `third_party/llama.cpp` | Upstream llama.cpp as a git submodule at a pinned commit. It is never edited: builds work on a patched copy |

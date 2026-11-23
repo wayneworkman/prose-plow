@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.chat
 
 import us.theworkmans.proseplow.core.engine.GenerationRequest
+import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.core.prompt.PromptMessage
 import us.theworkmans.proseplow.core.prompt.PromptRole
@@ -30,8 +31,13 @@ data class PromptHistory(val messages: List<PromptMessage>, val continueFinalMes
  *   its start trimmed, because the model carries on from its exact end.
  *
  * The system prompt is not part of this: it is a setting of the model, added to the request.
+ *
+ * @param exactText true for a model that continues text
+ *   ([us.theworkmans.proseplow.core.model.ModelFamily.continuesText]). The same messages are
+ *   sent, but nothing is trimmed from any of them: such a model writes on from the very
+ *   characters it is given, and a space at the end of them decides what comes next.
  */
-fun ChatSession.promptHistory(): PromptHistory {
+fun ChatSession.promptHistory(exactText: Boolean = false): PromptHistory {
     val last = messages.lastOrNull()
     val continued = last?.takeIf {
         it.role == Role.ASSISTANT && it.status == MessageStatus.STREAMING && !PromptWhitespace.isBlank(it.text)
@@ -40,11 +46,12 @@ fun ChatSession.promptHistory(): PromptHistory {
     for (message in messages) {
         // A tool result will be mapped here, to a prompt role of its own.
         when (message.role) {
-            Role.USER -> sent += PromptMessage(PromptRole.USER, PromptWhitespace.strip(message.text))
+            Role.USER -> sent += PromptMessage(PromptRole.USER, if (exactText) message.text else PromptWhitespace.strip(message.text))
             Role.ASSISTANT -> when {
-                message === continued -> sent += PromptMessage(PromptRole.ASSISTANT, PromptWhitespace.stripStart(message.text))
+                message === continued ->
+                    sent += PromptMessage(PromptRole.ASSISTANT, if (exactText) message.text else PromptWhitespace.stripStart(message.text))
                 message.status == MessageStatus.STREAMING || PromptWhitespace.isBlank(message.text) -> Unit
-                else -> sent += PromptMessage(PromptRole.ASSISTANT, PromptWhitespace.strip(message.text))
+                else -> sent += PromptMessage(PromptRole.ASSISTANT, if (exactText) message.text else PromptWhitespace.strip(message.text))
             }
         }
     }
@@ -56,14 +63,19 @@ fun ChatSession.promptHistory(): PromptHistory {
  * streaming reply was stamped with, so the engine refuses it if another model has been loaded
  * since; without a streaming reply it is addressed to the session's current model.
  *
+ * @param model the model that is to write the reply. Its family decides whether the messages
+ *   are sent trimmed, as a chat model's own template would have them, or exactly as they are
+ *   (see [promptHistory]). It is asked for, rather than left to a default, so that no caller can
+ *   send a model that continues text a prompt with its last space missing.
  * @param systemPrompt the system prompt the settings hold for that model, or null.
  */
 fun ChatSession.generationRequest(
+    model: ModelSpec,
     systemPrompt: String?,
     sampling: SamplingParams? = null,
     maxNewTokens: Int? = null,
 ): GenerationRequest {
-    val history = promptHistory()
+    val history = promptHistory(exactText = model.family.continuesText)
     return GenerationRequest(
         modelId = messages.lastOrNull { it.status == MessageStatus.STREAMING }?.modelId ?: modelId,
         messages = history.messages,

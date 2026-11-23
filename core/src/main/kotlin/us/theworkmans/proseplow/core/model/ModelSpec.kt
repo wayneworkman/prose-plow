@@ -1,5 +1,6 @@
 package us.theworkmans.proseplow.core.model
 
+import us.theworkmans.proseplow.core.prompt.CompletionFormat
 import us.theworkmans.proseplow.core.prompt.PeacebellChatMlFormat
 import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
 import us.theworkmans.proseplow.core.prompt.PromptFormat
@@ -9,8 +10,19 @@ import us.theworkmans.proseplow.core.prompt.Qwen35ChatMlFormat
  * The families of bundled models, told apart by how a conversation has to be laid out for them.
  * Models of one family share a [promptFormat]; everything else that differs between two models is
  * a field of [ModelSpec].
+ *
+ * @property continuesText true for a family that is not a chat model at all: it writes on from
+ *   the text it is given. Three things follow, and each part of the app that depends on one of
+ *   them reads this property rather than the family's name:
+ *   - Only the latest message is the prompt. There is no history to send, and so none to leave
+ *     out when the context is short.
+ *   - The user's text is kept exactly as typed. Nothing is trimmed from it, because a space at
+ *     its end decides what the model writes next.
+ *   - The model's text is kept exactly as written, from its first character to its last,
+ *     because "Continue" appends to it. A chat model's reply, by contrast, loses the whitespace
+ *     around it.
  */
-enum class ModelFamily(val promptFormat: PromptFormat) {
+enum class ModelFamily(val promptFormat: PromptFormat, val continuesText: Boolean = false) {
     /** Qwen3.5: ChatML with control tokens, rendered as its Jinja template does. */
     QWEN35_CHATML(Qwen35ChatMlFormat),
 
@@ -19,6 +31,9 @@ enum class ModelFamily(val promptFormat: PromptFormat) {
 
     /** ChatML as ordinary text in one string, ended by a stop string: Boris-2-Instruct and alike. */
     PLAIN_CHATML(PlainChatMlFormat),
+
+    /** No layout at all: a base model that continues the user's text, such as Shard-2. */
+    COMPLETION(CompletionFormat, continuesText = true),
 }
 
 /**
@@ -43,6 +58,12 @@ enum class ModelFamily(val promptFormat: PromptFormat) {
  *   declares as end of generation. Listed here so that the reply ends correctly even if the
  *   file's metadata is incomplete.
  * @property bannedTokenIds tokens that must never be sampled.
+ * @property deletionTokenId the token with which the model takes back the token it wrote before
+ *   it, or null for a model that has none. To the model it is a token like any other: it is
+ *   evaluated and stays in the model's memory together with the token it took back. Only the
+ *   reader's view changes: the engine drops the last token of the visible reply, never reaching
+ *   back beyond the start of the reply, and says so with
+ *   [us.theworkmans.proseplow.core.engine.GenerationEvent.TextReplaced].
  * @property supportsSystemPrompt false for a model that was trained without a system message;
  *   the engine then leaves the system prompt out instead of showing the model a role it has
  *   never seen.
@@ -69,12 +90,16 @@ data class ModelSpec(
     val bundled: Boolean = true,
     val sourceRepository: String,
     val licence: String?,
+    val deletionTokenId: Int? = null,
 ) {
     init {
         require(id.isNotBlank()) { "A model needs an id" }
         require(contextLength > 0) { "contextLength must be positive" }
         require(defaultMaxNewTokens in 1..contextLength) { "defaultMaxNewTokens must fit in the context" }
         require(stopStrings.none { it.isEmpty() }) { "A stop string cannot be empty" }
+        require(deletionTokenId == null || (deletionTokenId !in stopTokenIds && deletionTokenId !in bannedTokenIds)) {
+            "The deletion token cannot also end the reply or be banned"
+        }
     }
 
     /** The layout of a conversation for this model. */

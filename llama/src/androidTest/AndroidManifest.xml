@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- The test APK only, never the app. One measurement (ScreenOffSpeedDeviceTest) is taken
+         with the screen off, once without and once with a partial wake lock held, to see what
+         a lock would have to hold for an answer to finish after the phone was locked. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application>
         <!-- The test APK only. An empty activity that the model tests put in front while they
              measure: Android confines a process without a visible activity to fewer cores (and

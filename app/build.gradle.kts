@@ -138,6 +138,11 @@ kotlin {
  * The app's promise is that it never uses the network. Its own manifest asks for no permission at
  * all, but every dependency's manifest is merged into it and can add one unnoticed, so it is the
  * merged result, the manifest that is packaged, that is checked.
+ *
+ * The task is not a check beside the build but a step of it: it takes the merged manifest in and
+ * hands the same manifest on as [checkedManifest], and everything that packages or installs the
+ * app (an APK, a bundle, an install, the instrumented tests) is given that copy and no other.
+ * There is therefore no task that can produce an artifact from a manifest this has not passed.
  */
 abstract class VerifyManifestPermissions : DefaultTask() {
 
@@ -151,12 +156,18 @@ abstract class VerifyManifestPermissions : DefaultTask() {
     @get:Input
     abstract val allowed: SetProperty<String>
 
+    /** The manifest as it came in, written only when it passed. What gets packaged is this file. */
+    @get:OutputFile
+    abstract val checkedManifest: RegularFileProperty
+
     @get:OutputFile
     abstract val report: RegularFileProperty
 
     @TaskAction
     fun verify() {
         val manifest = mergedManifest.get().asFile
+        // What an earlier run let through is no answer for this one.
+        checkedManifest.get().asFile.delete()
         val factory = DocumentBuilderFactory.newInstance()
         factory.isNamespaceAware = true
         factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
@@ -182,6 +193,7 @@ abstract class VerifyManifestPermissions : DefaultTask() {
             )
         }
         report.get().asFile.writeText(found.joinToString(separator = "\n", postfix = "\n"))
+        manifest.copyTo(checkedManifest.get().asFile, overwrite = true)
     }
 
     private companion object {
@@ -203,21 +215,23 @@ androidComponents {
         "android.permission.USE_FINGERPRINT",
     )
 
-    // verifyDebugManifest and verifyReleaseManifest. `check` runs both, and each assemble task runs
-    // its own, so that no APK is built (here or on F-Droid's build server) from a manifest that
-    // was not checked.
+    // verifyDebugManifest and verifyReleaseManifest. Each is put into the build as a transform of
+    // its variant's merged manifest: whatever consumes that manifest (processing the resources,
+    // and through it every package, bundle, install and connected-test task) consumes the output
+    // of the check, so none of them can run, here or on F-Droid's build server, before the check
+    // has passed, and when it fails nothing is packaged. `check` runs both as well.
     onVariants { variant ->
         val verify = tasks.register<VerifyManifestPermissions>("verify${variant.name.replaceFirstChar(Char::uppercaseChar)}Manifest") {
             group = "verification"
             description = "Fails if the merged ${variant.name} manifest has a permission outside the allow-list."
             variantName.set(variant.name)
-            mergedManifest.set(variant.artifacts.get(SingleArtifact.MERGED_MANIFEST))
             allowed.set(variant.applicationId.map { id -> libraryPermissions + "$id.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" })
             report.set(layout.buildDirectory.file("reports/manifest-permissions/${variant.name}.txt"))
         }
+        variant.artifacts.use(verify)
+            .wiredWithFiles(VerifyManifestPermissions::mergedManifest, VerifyManifestPermissions::checkedManifest)
+            .toTransform(SingleArtifact.MERGED_MANIFEST)
         tasks.named("check") { dependsOn(verify) }
-        val assembleName = "assemble${variant.name.replaceFirstChar(Char::uppercaseChar)}"
-        tasks.matching { it.name == assembleName }.configureEach { dependsOn(verify) }
     }
 }
 
@@ -229,8 +243,8 @@ dependencies {
     implementation(composeBom)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
-    implementation(libs.androidx.compose.ui.tooling.preview)
-    debugImplementation(libs.androidx.compose.ui.tooling)
+    // No Compose tooling, in any build type: nothing here is ever previewed in an IDE, and the
+    // tooling library adds an exported activity (PreviewActivity) to the build it is in.
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
@@ -266,6 +280,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.core)
 }
 
-// The checks on the finished APK that the native code depends on: models stored on 16 KiB
-// boundaries, native libraries built for 16 KB pages. They live with the module they protect.
-apply(from = "../llama/apk-checks.gradle.kts")
+// The checks on every APK and bundle this module writes that the native code depends on: each
+// model in it is, byte for byte, one that models/manifest.json pins, and is stored on a 16 KiB
+// boundary; the native libraries are built for 16 KB pages. They live with the module they protect.
+// Named through file() for the reason given where llama/build.gradle.kts applies the same script.
+apply(from = file("../llama/apk-checks.gradle.kts"))

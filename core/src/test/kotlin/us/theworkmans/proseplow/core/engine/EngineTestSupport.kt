@@ -38,6 +38,7 @@ internal fun testModel(
     bannedTokenIds: List<Int> = emptyList(),
     supportsSystemPrompt: Boolean = true,
     id: String = TEST_MODEL_ID,
+    deletionTokenId: Int? = null,
 ) = ModelSpec(
     id = id,
     displayName = "Test model",
@@ -53,6 +54,7 @@ internal fun testModel(
     supportsSystemPrompt = supportsSystemPrompt,
     sourceRepository = "example/test-model",
     licence = "Apache-2.0",
+    deletionTokenId = deletionTokenId,
 )
 
 internal fun request(

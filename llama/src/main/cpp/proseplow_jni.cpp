@@ -14,7 +14,9 @@
 //   Kotlin threw, the work is wound down without further calls into the VM and the method
 //   returns, so that the Kotlin exception is the one the caller sees.
 // - No local reference is created inside a loop: the callbacks pass and return primitives only.
-// - Copies of prompt tokens and text are overwritten before they are freed.
+// - The copies of text and tokens that this file makes are overwritten before they are freed,
+//   also when the call fails. That is this file's copies only: llama.cpp makes its own of what
+//   it is handed and frees them as they are (see pp_session_clear_memory in the header).
 // - A callback is made on the thread that called the native method, with that call's JNIEnv.
 //   Should llama.cpp ever call back from another thread, the callback answers without touching
 //   the VM.
@@ -59,6 +61,24 @@ void wipe(void * data, size_t size) {
     std::memset(data, 0, size);
     __asm__ __volatile__("" : : "r"(data) : "memory");
 }
+
+// A buffer for text or tokens of a conversation that is overwritten when it goes out of scope,
+// on every path out, an exception included. It is sized once and never grows: growing would
+// free the old storage as it is.
+template <typename T> class wiped {
+  public:
+    explicit wiped(size_t size) : storage(size) {}
+    ~wiped() { wipe(storage.data(), storage.size() * sizeof(T)); }
+    wiped(const wiped &) = delete;
+    wiped & operator=(const wiped &) = delete;
+
+    T *    data() { return storage.data(); }
+    size_t size() const { return storage.size(); }
+    bool   empty() const { return storage.empty(); }
+
+  private:
+    std::vector<T> storage;
+};
 
 // Throws NativeLlamaException(code, message) unless an exception is already on its way up.
 void throw_native(JNIEnv * env, int32_t code, const char * message) {
@@ -260,29 +280,41 @@ void close_session(JNIEnv *, jclass, jlong handle) {
 jintArray tokenize(JNIEnv * env, jclass, jlong handle, jbyteArray utf8, jboolean parse_special) {
     return guarded(env, PP_STATUS_TOKENIZE_FAILED, (jintArray) nullptr, [&]() -> jintArray {
         pp_session * s = session_of(env, handle);
-        std::string text;
-        if (s == nullptr || utf8 == nullptr || !bytes_of(env, utf8, text)) {
-            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "tokenize needs a session and a byte array");
+        if (s == nullptr) {
             return nullptr;
         }
-        const bool special = parse_special == JNI_TRUE;
-        std::vector<llama_token> tokens;
-        int32_t n = pp_session_tokenize(s, text.data(), (int32_t) text.size(), special, nullptr, 0);
-        if (n != PP_ERROR && n < 0) {
-            tokens.resize((size_t) -n);
-            n = pp_session_tokenize(s, text.data(), (int32_t) text.size(), special, tokens.data(), (int32_t) tokens.size());
+        if (utf8 == nullptr) {
+            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "tokenize needs a byte array");
+            return nullptr;
         }
-        wipe(text.data(), text.size());
+        const jsize length = env->GetArrayLength(utf8);
+        // Refused before it is copied: the session would refuse it too, after the copy.
+        if (length > PP_TOKENIZE_BYTES_MAX) {
+            throw_native(env, PP_STATUS_TOKENIZE_FAILED, "the text is longer than the most that is tokenised in one call");
+            return nullptr;
+        }
+        wiped<char> text((size_t) length);
+        if (length > 0) {
+            env->GetByteArrayRegion(utf8, 0, length, (jbyte *) text.data());
+        }
+        const bool special = parse_special == JNI_TRUE;
+        // Room for any result, so that one call does it: a token stands for at least one byte of
+        // the text as the tokenizer sees it, and the peacebell front-end makes the text up to
+        // three times as long as it came (a space becomes a character of three bytes) and puts
+        // one such character in front. Not "measure, then fill": llama.cpp copies the text each
+        // time it tokenises it and frees the copies as they are, so every call that can be
+        // spared is a set of copies that never exists.
+        wiped<llama_token> tokens(3 * (size_t) length + 8);
+        const int32_t n = pp_session_tokenize(s, text.data(), (int32_t) text.size(), special, tokens.data(), (int32_t) tokens.size());
         jintArray out = nullptr;
         if (n == PP_ERROR || n < 0) {
-            throw_native(env, PP_STATUS_TOKENIZE_FAILED, n == PP_ERROR ? pp_session_last_error(s) : "the tokenizer changed its mind about the size");
+            throw_native(env, PP_STATUS_TOKENIZE_FAILED, n == PP_ERROR ? pp_session_last_error(s) : "the tokenizer produced more tokens than the text has room for");
         } else {
             out = env->NewIntArray((jsize) n);
             if (out != nullptr && n > 0) {
                 env->SetIntArrayRegion(out, 0, (jsize) n, (const jint *) tokens.data());
             }
         }
-        wipe(tokens.data(), tokens.size() * sizeof(llama_token));
         return out;
     });
 }
@@ -344,7 +376,13 @@ jint evaluate(JNIEnv * env, jclass, jlong handle, jintArray tokens, jint chunk_s
             throw_native(env, PP_STATUS_INVALID_ARGUMENT, "evaluate needs tokens and an observer");
             return 0;
         }
-        std::vector<llama_token> copy((size_t) env->GetArrayLength(tokens));
+        const jsize count = env->GetArrayLength(tokens);
+        // More tokens than any context holds cannot be evaluated; refused before they are copied.
+        if (count > PP_CONTEXT_TOKENS_MAX) {
+            throw_native(env, PP_STATUS_CONTEXT_FULL, "more tokens than the largest context holds");
+            return 0;
+        }
+        wiped<llama_token> copy((size_t) count);
         if (!copy.empty()) {
             env->GetIntArrayRegion(tokens, 0, (jsize) copy.size(), (jint *) copy.data());
         }
@@ -352,7 +390,6 @@ jint evaluate(JNIEnv * env, jclass, jlong handle, jintArray tokens, jint chunk_s
         const pp_evaluation_observer callbacks = {evaluation_is_cancelled, evaluation_on_progress, &call};
         int32_t n_in_memory = 0;
         const int32_t status = pp_session_evaluate(s, copy.data(), (int32_t) copy.size(), chunk_size, &callbacks, &n_in_memory);
-        wipe(copy.data(), copy.size() * sizeof(llama_token));
         if (call.threw) {
             return 0; // the observer's exception is pending and is what the caller gets
         }
@@ -390,8 +427,17 @@ void drop_checkpoint(JNIEnv *, jclass, jlong handle, jint checkpoint) {
     pp_session_drop_checkpoint((pp_session *) handle, checkpoint);
 }
 
-void clear_memory(JNIEnv *, jclass, jlong handle) {
-    pp_session_clear_memory((pp_session *) handle);
+void clear_memory(JNIEnv * env, jclass, jlong handle) {
+    if (handle == 0) {
+        return; // a closed session holds no conversation: nothing to forget, as before
+    }
+    pp_session * s = (pp_session *) handle;
+    // The conversation is gone either way; a failure says that the session can no longer be
+    // used and must be closed, which is what the engine does with an exception from here.
+    const int32_t status = pp_session_clear_memory(s);
+    if (status != PP_STATUS_OK) {
+        throw_native(env, status, pp_session_last_error(s));
+    }
 }
 
 //

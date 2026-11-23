@@ -47,7 +47,9 @@ import kotlin.random.Random
  * 4. **Samples** token by token with the model's sampling defaults (or the request's) and the
  *    model's banned tokens, until the model ends its turn, a stop string appears, the token
  *    limit is reached or the generation is cancelled. Text is assembled from token bytes so that
- *    no partial character and no part of a stop string is ever emitted ([ReplyAssembler]).
+ *    no partial character and no part of a stop string is ever emitted ([ReplyAssembler]). When
+ *    the model has a deletion token and samples it, the token is evaluated like any other and
+ *    the reply the reader sees loses its last token ([GenerationEvent.TextReplaced]).
  *
  * Invariants:
  * - All calls into [NativeLlama] and [NativeLlamaFactory] are made on [nativeDispatcher], one at
@@ -289,6 +291,7 @@ class LlamaEngine(
         private var reusedTokens = 0
         private var generatedTokens = 0
         private var droppedMessages = 0
+        private var deletions = 0
 
         /** True once [forget], [unload] or a [load] has asked this generation to end. */
         private fun interrupted(): Boolean = epoch.get() != startEpoch
@@ -345,9 +348,12 @@ class LlamaEngine(
             val extraSystemText = request.extraSystemText.takeIf { model.supportsSystemPrompt }.nonBlank()
             val tokeniser = PromptTokeniser(native)
             this.tokeniser = tokeniser
+            // A model that continues text is only ever given the latest message: there are no
+            // older turns to leave out, and none must be reported as left out.
+            val starts = if (model.family.continuesText) listOf(0) else ContextBudget.startCandidates(messages)
             return ContextBudget.fit(
                 messageCount = messages.size,
-                starts = ContextBudget.startCandidates(messages),
+                starts = starts,
                 contextSize = contextSize,
                 reserve = minOf(requestedNewTokens, contextSize / 2),
                 minimum = minOf(requestedNewTokens, settings.minReplyTokens),
@@ -474,9 +480,13 @@ class LlamaEngine(
                     bannedTokenIds = model.bannedTokenIds,
                 ),
             )
-            // A continued message already has its first word; only a new reply loses leading space.
+            // A continued message already has its first word; only a new reply loses leading space,
+            // and only a chat model's: a model that continues text keeps every character it writes.
             val continuing = request.continueFinalMessage && !PromptWhitespace.isBlank(request.messages.last().content)
-            val reply = ReplyAssembler(model.stopStrings + request.stopStrings, dropLeadingWhitespace = !continuing)
+            val reply = ReplyAssembler(
+                stopStrings = model.stopStrings + request.stopStrings,
+                dropLeadingWhitespace = !continuing && !model.family.continuesText,
+            )
             this.reply = reply
             val single = IntArray(1)
             val observer = object : EvaluationObserver {
@@ -494,13 +504,25 @@ class LlamaEngine(
                 // collector has gone; this does.
                 job.ensureActive()
                 val token = native.sampleNext()
-                if (native.isEndOfGeneration(token) || token in model.stopTokenIds) {
+                // The deletion token is asked about first: the catalogue's word on what a token
+                // means goes before what the model file says about ending a turn.
+                val change = if (token == model.deletionTokenId) {
+                    deletions++
+                    reply.deleteLast()
+                } else if (native.isEndOfGeneration(token) || token in model.stopTokenIds) {
                     reason = FinishReason.END_OF_TURN
                     break
+                } else {
+                    reply.accept(native.tokenToBytes(token))
                 }
+                // A deletion counts towards the limit and is evaluated below like any other
+                // token: to the model it is one, and it must find it in its memory.
                 generatedTokens++
-                val text = reply.accept(native.tokenToBytes(token))
-                if (text.isNotEmpty()) out.send(GenerationEvent.TextDelta(text))
+                when (change) {
+                    is ReplyAssembler.Change.Appended -> out.send(GenerationEvent.TextDelta(change.text))
+                    is ReplyAssembler.Change.Replaced -> out.send(GenerationEvent.TextReplaced(change.text, change.removed))
+                    ReplyAssembler.Change.None -> Unit
+                }
                 if (reply.matchedStop != null) {
                     reason = FinishReason.STOP_STRING
                     break
@@ -545,7 +567,9 @@ class LlamaEngine(
                         promptMillis = ((if (generating) promptReadyAt else now) - startedAt) / NANOS_PER_MILLI,
                         generationMillis = if (generating) (now - promptReadyAt) / NANOS_PER_MILLI else 0,
                         droppedMessages = droppedMessages,
+                        deletions = deletions,
                     ),
+                    exactText = model.family.continuesText,
                 ),
             )
         }

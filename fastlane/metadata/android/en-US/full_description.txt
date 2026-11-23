@@ -24,11 +24,12 @@ The models in this version, each with its licence:
 * Qwen3.5 0.8B (Apache-2.0): a general assistant in many languages, and the default for a new chat.
 * Peacebell v1 291M (Apache-2.0): answers questions about the Second World War from memory; not a general assistant.
 * Boris-2-Instruct (Apache-2.0): a very small chat model, fluent and often wrong on facts.
+* Shard-2 (MIT): not a chat model. It continues the text you write and can take back words it has just written.
 
-Every model ships as 16-bit floats; nothing is quantised to fewer bits. That costs size and speed. With the models listed above the APK is about 2.4 GB, and it needs a 64-bit ARM phone (arm64-v8a) with Android 9 or later. Only the processor is used, not the GPU. The app is text only.
+Every model ships as 16-bit floats; nothing is quantised to fewer bits. That costs size and speed. With the models listed above the APK is about 2.5 GB, and it needs a 64-bit ARM phone (arm64-v8a) with Android 9 or later. Only the processor is used, not the GPU. The app is text only.
 
 <b>Limits</b>
-Small models are often wrong. The chat screen says so under the message box: "This app uses AI, and AI can make mistakes." Check anything that matters.
+Small models are often wrong. The chat screen says so at all times, under its title bar: "This app uses AI, and AI can make mistakes." Check anything that matters.
 
 Speed depends on the phone. The app was tested on one phone, a Samsung Galaxy XCover7 Pro with Android 17, where in tests Qwen3.5 0.8B wrote about 9 tokens per second and Boris-2-Instruct about 52. That is no promise for any other phone. When a conversation no longer fits a model's context, the oldest messages are left out of the latest answer and the app says how many.
 

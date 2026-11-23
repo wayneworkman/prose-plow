@@ -9,10 +9,17 @@ import us.theworkmans.proseplow.core.engine.SamplerConfig
  *
  * Every method is a single native call; the contract of each is the one written on the
  * interface, and what the native side does to honour it is described in
- * `native/session/include/proseplow_session.h`. One behaviour differs from the letter of the
- * interface and is worth knowing here: a model with recurrent state (Qwen3.5, Boris-2) is only
- * asked whether to stop between chunks, never in the middle of one, because llama.cpp cannot
- * take a half-computed chunk out of such a model's state again.
+ * `native/session/include/proseplow_session.h`. Two behaviours differ from the letter of the
+ * interface and are worth knowing here:
+ * - A model with recurrent state (Qwen3.5, Boris-2) is only asked whether to stop between
+ *   chunks, never in the middle of one, because llama.cpp cannot take a half-computed chunk out
+ *   of such a model's state again.
+ * - [clearMemory] frees the context, the batch and the sampler and creates them again, after
+ *   overwriting what the session itself holds of the conversation. It cannot overwrite the
+ *   copies of the text and of the tokens that llama.cpp made and freed, and those stay readable
+ *   in the process until the allocator reuses their memory (the header states what was
+ *   measured). It throws [us.theworkmans.proseplow.core.engine.NativeLlamaException] when the
+ *   new context could not be created; the session must then be closed.
  *
  * Invariant: [handle] is the native session until [close] and 0 afterwards. A call after
  * [close] is a bug in the caller and fails with [IllegalStateException] rather than reaching

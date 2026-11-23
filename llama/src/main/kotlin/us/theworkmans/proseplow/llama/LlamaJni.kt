@@ -90,6 +90,11 @@ internal object LlamaJni {
     @JvmStatic
     external fun dropCheckpoint(handle: Long, checkpoint: Int)
 
+    /**
+     * `pp_session_clear_memory`. Throws `NativeLlamaException` when the context could not be
+     * created again after the old one was freed: the conversation is gone all the same, and the
+     * session can then only be closed.
+     */
     @JvmStatic
     external fun clearMemory(handle: Long)
 

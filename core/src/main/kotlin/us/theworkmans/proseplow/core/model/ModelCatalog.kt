@@ -14,7 +14,7 @@ import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
 object ModelCatalog {
 
     /**
-     * How much context the larger models get on the phone. All three were trained with far more
+     * How much context the larger models get on the phone. Both were trained with far more
      * (32,768 tokens and up); the key-value memory for that would run to gigabytes. 4,096 tokens
      * is a few pages of conversation and stays within what a mid-range phone can spare.
      */
@@ -116,39 +116,48 @@ object ModelCatalog {
     )
 
     /**
-     * boris2-peacebell-think: the Peacebell architecture with a 32,768-token byte-level BPE
-     * vocabulary. It is still being trained, so it is not bundled and the app does not list it;
-     * what is fixed about it is written down here so that shipping it is a one-line change.
-     * - Prompt: ChatML as plain text, the same template as Boris-2-Instruct, with `<|im_end|>`
-     *   as a stop string because the vocabulary has no such token.
-     * - Banned token: id 188, the token of the raw byte 0xFF. Training used it as padding and
-     *   never as a target, so its output row is untrained.
-     * - Stop token: id 0, `<|endoftext|>`, the vocabulary's only special token.
-     * - Sampling: greedy, as for peacebell-v1. The model's own `generation_config.json` does not
-     *   exist yet; replace this when it does.
-     * - Context: 32,768 trained; [PHONE_CONTEXT] here.
-     * - Licence: not stated until the model is published.
+     * Glint-Research Shard-2: a 49.4M-parameter base model that continues text and can take back
+     * what it has just written. It is not a chat model: it has no template, no roles and no
+     * system prompt.
+     * - Sampling: the defaults of the model's reference script `infer.py`, `--temperature 0.9`
+     *   and `--top-k 100`, with no nucleus and no penalties. The model card explains that the
+     *   deletions depend on them: with a tighter sampler the model rarely writes a token it
+     *   would want to take back.
+     * - Deletion token: id 4096, `<bs>` (`backspace_token_id` in `config.json`), the one token
+     *   beyond the 4,096 of its tokenizer.
+     * - Stop tokens: ids 1 and 2. They are the begin and end markers, and the model's files do
+     *   not agree which is which (`tokenizer.json` calls 1 `<bos>` and 2 `<eos>`, `config.json`
+     *   has `eos_token_id: 1` and `bos_token_id: 2`). Neither is text, so either ends the reply.
+     *   The reference script itself never stops early; it writes a fixed number of tokens.
+     * - Reply length: 200 tokens, this app's choice. The reference script's default is 80, a
+     *   couple of sentences; "Continue" carries on from wherever the limit fell.
+     * - Context: 4,096, the length the model was trained at (`trained_sequence_length` in
+     *   `config.json`). Its positions reach 8,192, which the model card calls untested.
+     * - Licence: `license: mit` in the model card.
      */
-    val BORIS2_PEACEBELL_THINK: ModelSpec = ModelSpec(
-        id = "boris2-peacebell-think",
-        displayName = "Boris2 Peacebell Think",
-        description = "A small chat model that is still being trained.",
-        family = ModelFamily.PLAIN_CHATML,
-        ggufFileName = "boris2-peacebell-think.gguf",
-        contextLength = PHONE_CONTEXT,
-        defaultMaxNewTokens = PHONE_MAX_NEW_TOKENS,
-        sampling = SamplingParams(temperature = 0.0f),
-        stopStrings = listOf(PlainChatMlFormat.IM_END),
-        stopTokenIds = listOf(0),
-        bannedTokenIds = listOf(188),
-        supportsSystemPrompt = true,
-        bundled = false,
-        sourceRepository = "wayneworkman2012/boris2-peacebell-think",
-        licence = null,
+    val SHARD_2: ModelSpec = ModelSpec(
+        id = "shard-2",
+        displayName = "Shard-2",
+        description = "Continues the text you write; not a chat model. It can take back words it has just written.",
+        family = ModelFamily.COMPLETION,
+        ggufFileName = "shard-2.gguf",
+        contextLength = 4096,
+        defaultMaxNewTokens = 200,
+        sampling = SamplingParams(temperature = 0.9f, topK = 100, topP = 1.0f, minP = 0.0f),
+        stopTokenIds = listOf(1, 2),
+        deletionTokenId = 4096,
+        supportsSystemPrompt = false,
+        bundled = true,
+        sourceRepository = "Glint-Research/Shard-2",
+        licence = "MIT",
     )
 
-    /** Every known model, bundled or not, in the order the model picker shows them. */
-    val all: List<ModelSpec> = listOf(QWEN35_0_8B, PEACEBELL_V1_291M, BORIS_2_INSTRUCT, BORIS2_PEACEBELL_THINK)
+    /**
+     * Every known model, bundled or not, in the order the model picker shows them. Today every
+     * one of them is bundled; an entry with [ModelSpec.bundled] false is known (a chat can name
+     * it, [find] returns it) but is not offered.
+     */
+    val all: List<ModelSpec> = listOf(QWEN35_0_8B, PEACEBELL_V1_291M, BORIS_2_INSTRUCT, SHARD_2)
 
     /** The models whose files ship with the app: the only ones a user can choose. */
     val bundled: List<ModelSpec> = all.filter { it.bundled }

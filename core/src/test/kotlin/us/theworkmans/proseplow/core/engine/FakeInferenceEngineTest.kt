@@ -142,6 +142,28 @@ class FakeInferenceEngineTest {
     }
 
     @Test
+    fun `text a script takes back is not part of what an interrupted generation reports`() = runTest {
+        val engine = FakeInferenceEngine()
+        engine.load(model)
+        engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.TextDelta("one two")),
+                Step.Emit(GenerationEvent.TextReplaced("one", removed = 4)),
+                Step.Emit(GenerationEvent.TextDelta(" three")),
+                Step.Hang,
+            ),
+        )
+        val received = ArrayList<GenerationEvent>()
+        val collecting = launch { engine.generate(request(user("Hi"))).collect { received += it } }
+        runCurrent()
+        assertEquals(GenerationEvent.TextReplaced("one", removed = 4), received[1])
+        engine.forget()
+        collecting.join()
+        assertEquals(FinishReason.CANCELLED, received.done().finishReason)
+        assertEquals("one three", received.done().text)
+    }
+
+    @Test
     fun `a hanging generation runs until it is cancelled or the engine unloads`() = runTest {
         val engine = FakeInferenceEngine()
         engine.load(model)

@@ -6,6 +6,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -480,5 +481,213 @@ class QwenDeviceTest {
     fun theEngineHoldsATwoTurnChat() {
         val first = checkEngineChat(model, systemPrompt = "You are a helpful assistant.", first = "What is the capital of Australia?", second = "And of New Zealand?")
         assertTrue("the first reply names the capital", "Canberra" in first)
+    }
+}
+
+/**
+ * Shard-2: attention only, with windowed layers; llama.cpp's own tokenizer; a model that
+ * continues text, so there is no chat layout and a "prompt" is the beginning of a text.
+ */
+@RunWith(AndroidJUnit4::class)
+class ShardDeviceTest {
+
+    private val model: ModelSpec = ModelCatalog.SHARD_2
+
+    /** The window of the model's windowed layers in tokens (`shard2.attention.sliding_window` in the model file). */
+    private val window = 256
+
+    @get:Rule
+    val inFront = ActivityScenarioRule(ForegroundActivity::class.java)
+
+    @Before
+    fun needsTheModel() = assumePresent(model)
+
+    /** The begin and end markers are not text; either ends a reply. */
+    private val isEnd: (Int) -> Boolean = { it in model.stopTokenIds }
+
+    @Test
+    fun tokenisationEqualsTheHostVectors() {
+        val vectors = readTokenVectors("${model.id}-tokens.bin")
+        val native = open(model)
+        try {
+            var plain = 0
+            var special = 0
+            var tokens = 0
+            for (vector in vectors.texts) {
+                if (!native.tokens(vector.text, false).contentEquals(vector.safe)) plain++
+                if (!native.tokens(vector.text, true).contentEquals(vector.exact)) special++
+                tokens += vector.exact.size
+            }
+            report("${model.id} tokenisation: ${vectors.texts.size} texts ($tokens tokens), $plain differ as plain text, $special with special parsing")
+            assertEquals("texts as plain text", 0, plain)
+            assertEquals("texts with special tokens parsed", 0, special)
+        } finally {
+            native.close()
+        }
+    }
+
+    @Test
+    fun greedyRepliesEqualTheHostReference() {
+        val references = readGreedyReferences("${model.id}-logits.bin")
+        val native = open(model)
+        try {
+            var same = 0
+            var promptTokens = 0
+            var promptNanos = 0L
+            var replyTokens = 0
+            var replyNanos = 0L
+            var firstDivergence = "none"
+            references.forEachIndexed { index, reference ->
+                // The model has no end marker to wait for (the reference writes a fixed number of
+                // tokens, its deletion token among them), so a reply is compared at its length.
+                val reply = native.freshReply(reference.prompt, reference.reply.size, model.bannedTokenIds) { false }
+                if (reply.tokens == reference.reply.toList()) {
+                    same++
+                } else if (firstDivergence == "none") {
+                    val common = reply.tokens.zip(reference.reply.toList()).takeWhile { it.first == it.second }.size
+                    firstDivergence = "text $index, reply token $common"
+                }
+                promptTokens += reference.prompt.size
+                promptNanos += reply.promptNanos
+                replyTokens += reply.tokens.size
+                replyNanos += reply.generationNanos
+            }
+            report(
+                "${model.id} greedy replies equal to the host reference: $same of ${references.size} (first divergence: $firstDivergence); " +
+                    "prompt %.1f tokens/s ($promptTokens tokens), generation %.1f tokens/s ($replyTokens tokens)".format(
+                        promptTokens * 1e9 / promptNanos, replyTokens * 1e9 / replyNanos,
+                    ),
+            )
+            assertEquals("greedy replies identical to the reference, token for token ($firstDivergence)", references.size, same)
+        } finally {
+            native.close()
+        }
+    }
+
+    /** Within the window the model behaves like any attention-only one: the end of its memory can be removed. */
+    @Test
+    fun theEndOfTheMemoryCanBeRemoved() {
+        val references = readGreedyReferences("${model.id}-logits.bin")
+        val native = open(model)
+        try {
+            checkRewind(native, references[0].prompt, references[3].prompt, references[2].prompt.copyOfRange(0, 12), recurrent = false, isEnd = isEnd)
+        } finally {
+            native.close()
+        }
+    }
+
+    /**
+     * The model's own rule, on a text several windows long. A checkpoint of this model is the
+     * window of its windowed layers, so once one was restored those layers hold nothing older:
+     * a cut that needs older keys must be refused with the memory untouched (llama.cpp would
+     * make it and answer "done", and every prediction after it would be wrong), while a cut the
+     * restored window covers is made and is exact. Before any restore the layers hold every
+     * key, and a cut many windows back is exact as well.
+     */
+    @Test
+    fun afterARestoreACutBelowTheRestoredWindowIsRefused() {
+        val sequences = readGreedyReferences("${model.id}-long-logits.bin").map { it.sequence }.sortedByDescending { it.size }
+        val text = sequences[0]
+        val other = sequences[1]
+        assertTrue("the reference has a text of five windows and one of two", text.size >= 5 * window && other.size >= 2 * window)
+        val next = other.copyOfRange(window, window + 48)
+        val replyLength = 24
+        // Lengths, in windows: a checkpoint where the window is long full, a cut far below it,
+        // a cut below the checkpoint by most of a window, and one just below the checkpoint.
+        val all = text.size
+        val saved = 3 * window + window / 2
+        val far = window + window / 6
+        val lost = saved - (window - window / 16)
+        val near = saved - 1
+        val native = open(model)
+        try {
+            assertTrue("the context holds the text and what follows it", native.contextSize() >= all + next.size + replyLength)
+            fun after(length: Int): List<Int> = native.freshReply(text.copyOfRange(0, length) + next, replyLength) { false }.tokens
+            val afterAll = after(all)
+            val afterFar = after(far)
+            val afterSaved = after(saved)
+            val afterNear = after(near)
+            fun replyAfterNext(): List<Int> {
+                native.mustEvaluate(next)
+                native.configureSampler(greedy(native.contextSize()))
+                return native.continueReply(replyLength) { false }
+            }
+            // The memory holds the whole text, with a checkpoint taken on the way.
+            fun fill(): Int {
+                native.clearMemory()
+                native.mustEvaluate(text.copyOfRange(0, saved))
+                val handle = native.saveCheckpoint()
+                assertTrue("a checkpoint can be saved", handle >= 0)
+                native.mustEvaluate(text.copyOfRange(saved, all))
+                return handle
+            }
+
+            // A cut far back, before anything was restored. Whatever the session answers must be
+            // true: "removed" and the continuation of a fresh evaluation, or "not removed" and a
+            // memory that goes on as if nothing had been asked.
+            var checkpoint = fill()
+            val removedFar = native.rewindTo(far)
+            val countFar = native.memoryTokenCount()
+            val replyFar = replyAfterNext()
+            if (removedFar) {
+                assertEquals(far, countFar)
+                assertEquals("a cut from $all to $far tokens is exact", afterFar, replyFar)
+            } else {
+                assertEquals(all, countFar)
+                assertEquals("a refused cut leaves the memory as it was", afterAll, replyFar)
+            }
+
+            // Through the checkpoint: always possible, always exact.
+            checkpoint = fill()
+            assertTrue("the checkpoint restores", native.restoreCheckpoint(checkpoint))
+            assertEquals(saved, native.memoryTokenCount())
+            assertEquals("the continuation after the restore equals a fresh evaluation", afterSaved, replyAfterNext())
+
+            // Below what the restored window reaches: refused, and nothing changed.
+            assertTrue(native.restoreCheckpoint(checkpoint))
+            val removedLost = native.rewindTo(lost)
+            assertFalse("after a restore a cut to $lost tokens, below what the restored window reaches, is refused", removedLost)
+            assertEquals(saved, native.memoryTokenCount())
+            assertEquals("and the memory continues as an undisturbed one does", afterSaved, replyAfterNext())
+
+            // Within the restored window: made, and exact.
+            assertTrue(native.restoreCheckpoint(checkpoint))
+            assertTrue("after a restore a cut to $near tokens, within the restored window, is made", native.rewindTo(near))
+            assertEquals(near, native.memoryTokenCount())
+            assertEquals("and the continuation equals a fresh evaluation", afterNear, replyAfterNext())
+            report(
+                "${model.id} windowed layers (window $window): a cut from $all to $far tokens ${if (removedFar) "made and exact" else "refused"}; " +
+                    "after a restore at $saved a cut to $lost refused and a cut to $near made, each with the continuation of a fresh evaluation",
+            )
+        } finally {
+            native.close()
+        }
+    }
+
+    @Test
+    fun aChunkIsInterruptedWhenCancelled() {
+        val native = open(model)
+        try {
+            val prompt = native.tokens(LONG_QUESTION, false)
+            val latency = checkCancellation(native, prompt, recurrent = false, isEnd = isEnd)
+            report("${model.id} cancellation: returned %.2f ms after the observer first said stop, in the middle of a chunk of ${prompt.size} tokens".format(latency))
+            assertTrue("cancellation is prompt (%.1f ms)".format(latency), latency < 250.0)
+        } finally {
+            native.close()
+        }
+    }
+
+    @Test
+    fun loadTimeMemoryAndSpeed() {
+        val probe = open(model)
+        val prompt = try {
+            probe.tokens(LONG_QUESTION, false)
+        } finally {
+            probe.close()
+        }
+        checkLoadAndMemory("${model.id} mapped", model, NativeSettings(mapModel = true), prompt)
+        report("${model.id} speeds: ${schedulingGroup()}")
+        reportSpeeds("${model.id} pinned", measureSpeeds(model, NativeSettings(pinThreads = true), prompt, 48), prompt.size)
+        reportSpeeds("${model.id} unpinned", measureSpeeds(model, NativeSettings(pinThreads = false), prompt, 48), prompt.size)
     }
 }

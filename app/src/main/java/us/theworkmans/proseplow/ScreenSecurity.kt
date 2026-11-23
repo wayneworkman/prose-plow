@@ -34,9 +34,16 @@ class ScreenSecurity(context: Context) : ScreenOffWatch {
 
     /**
      * Makes [activity]'s window secure or not, as the policy has decided. A secure window
-     * (`FLAG_SECURE`) is left out of screenshots, screen recordings and screen sharing. Compose
-     * dialogs, menus and popups take the flag over from this window (SecureFlagPolicy.Inherit,
-     * their default) when they open.
+     * (`FLAG_SECURE`) is left out of screenshots, screen recordings and screen sharing.
+     *
+     * Compose dialogs, menus and popups are windows of their own. They take the flag over from
+     * this window (SecureFlagPolicy.Inherit, their default) at the moment they open, and keep
+     * what they took: so the activity builds them again when this window turns secure under
+     * them (MainActivity.renewWindows). The dialogs in which a passphrase is typed do not
+     * inherit at all; they are secure by their own setting (the lock package's
+     * PassphraseDialog), because the window is not secure while a screenshot allowance runs.
+     * The policy itself never lets this window be anything but secure while the app is not
+     * unlocked, so the set-up and lock screens need nothing of their own.
      *
      * The app switcher's preview is turned off here as well, always and whatever [secure] says:
      * that picture of the app is shown without the user doing anything, so no allowance covers

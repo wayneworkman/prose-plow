@@ -12,6 +12,11 @@ the script that converts them.
 Model weights are never committed: `*.gguf` and `*.safetensors` are git-ignored, and both the
 checkpoints and the converted files live outside the source directories.
 
+A checkpoint is data from somebody else. Keep each in a directory of its own, never run
+anything from it, and note which kind of file the weights are: safetensors is data by
+construction, while a PyTorch `.pt` file is a pickle that can run code when it is loaded
+carelessly (see "shard-2" below for the one model here that has one).
+
 ## The manifest
 
 ```json
@@ -38,13 +43,13 @@ checkpoints and the converted files live outside the source directories.
 | `purpose` | `bundled`: goes into the app. `validation`: converted and tested only |
 | `name` | Written into the GGUF as `general.name`. For the `upstream` converter it is the name of the directory that converter is shown, from which it derives `general.name` (`Qwen3.5-0.8B` becomes "Qwen3.5 0.8B"), `general.basename` and `general.size_label` |
 | `repository`, `revision` | The model repository on the Hugging Face hub and the exact commit of it |
-| `converter` | Which converter turns the checkpoint into a GGUF; the names are the keys of `CONVERTERS` in `convert_models.py`: `peacebell` and `boris2` for the architectures this project ported, `upstream` for a model that upstream llama.cpp supports as it is |
+| `converter` | Which converter turns the checkpoint into a GGUF; the names are the keys of `CONVERTERS` in `convert_models.py`: `peacebell`, `boris2` and `shard2` for the architectures this project ported, `upstream` for a model that upstream llama.cpp supports as it is |
 | `converter_args` | Only with `upstream`: arguments passed through to upstream's `convert_hf_to_gguf.py`, for example `["--no-mtp"]` |
 | `ftype` | The float type of the file that ships. Always `f16`: models ship at 16-bit precision, and no other quantisation is used |
 | `output` | The file name of the result, under `<output directory>/<id>/` |
 | `output_sha256` | The SHA-256 the converted file must have. Conversion is deterministic, so anyone who converts the pinned files with the pinned tools gets these bytes; a conversion that produces others fails. Leave it out while adding a model, then record the hash the script prints |
 | `files` | Every file the converter reads, with its SHA-256. A conversion is refused unless all of them match. With `upstream` these are also the only files the converter gets to see (see "The models" below) |
-| `reference_files` | Files that only the validation tests read (the PyTorch reference code that ships with a checkpoint). They are verified before the tests execute them |
+| `reference_files` | Files that only the validation tests read (the PyTorch reference code that ships with a checkpoint). They are verified before the tests execute them. For `shard-2` the file is never executed: the tests read it as text, to check that their own copy of its architecture is still the same |
 
 ## Getting the checkpoints
 
@@ -99,7 +104,7 @@ same change, so the new hash is reviewed with its cause.
    SHA-256 (`sha256sum`) of every file the converter reads. List under `reference_files` what
    only the tests read.
 3. Choose the converter. A model of an architecture that already has one (`peacebell`,
-   `boris2`) needs nothing else: the converters are driven by `config.json`. A model that
+   `boris2`, `shard2`) needs nothing else: the converters are driven by `config.json`. A model that
    upstream llama.cpp already loads uses `upstream`: list under `files` everything upstream's
    converter reads for it (the weights and their index, `config.json`, the tokenizer files, the
    chat template and `README.md`, whose front matter becomes `general.*` metadata), and put any
@@ -131,6 +136,7 @@ can go too, but nothing breaks if they stay.
 | --- | --- | --- | --- | --- |
 | `peacebell-v1-291m`, `peacebell-v1-148m` | `peacebell` (ported) | `peacebell` | 583,680,096 and 297,831,072 bytes | SentencePiece tokenizer through the front-end of our native library; the chat markers are tokens |
 | `boris-2-instruct` | `boris2` (ported) | `boris2` | 291,853,184 bytes | ChatML is plain text and a reply ends on a stop string; the memory can only be rewound through checkpoints. Both are described under "The boris2 architecture" in `native/README.md` |
+| `shard-2` | `shard2` (ported) | `shard2` | 99,048,160 bytes | It continues text and has no chat format; one of its tokens deletes the token before it, which is for the application to show; its memory can be cut back freely until a checkpoint is restored. See below, and "The shard2 architecture" in `native/README.md` |
 | `qwen3.5-0.8b` | `qwen35` (upstream) | `upstream` | 1,516,742,752 bytes | See below |
 
 ### boris-2-instruct
@@ -143,6 +149,54 @@ In the 16-bit file the matrices and the n-gram table are F16; the norm weights, 
 kernels and the n-gram projection are F32; the n-gram lookup keys and rows are integer metadata
 arrays (2.8 MB). The F32 file equals the checkpoint byte for byte except for the 31 Canon
 kernels, which are stored in the order and with the identity term the C++ convolution expects.
+
+### shard-2
+
+Glint-Research/Shard-2, 49.4 M parameters, MIT. The converter reads three files:
+`config.json`, `tokenizer.json` and the weights, `Shard-2.pt`.
+
+**The weights are a pickle.** `Shard-2.pt` is a PyTorch checkpoint, and a pickle can run code
+when it is loaded. The converter and the tests load it with
+`torch.load(path, map_location="cpu", weights_only=True)` and in no other way: that unpickler
+constructs tensors and plain containers and refuses everything else. Never load it with
+`weights_only=False`, and never run the `infer.py` that the repository ships beside it, whose
+loader does exactly that. `infer.py` is listed under `reference_files` because the tests read
+it as text: their reference model is a copy of its architecture, and the copy is compared with
+the pinned script character for character. The pinned checkpoint loads under the restriction
+as it is; its pickle refers to three library names (an ordered dict, a float storage and the
+tensor rebuild function) and holds the state dict, a step count, a loss and a configuration of
+plain values.
+
+In the 16-bit file the 81 matrices are F16 and the 121 norm weights F32. The F32 file equals
+the checkpoint byte for byte in every tensor it carries; it carries all but one,
+`indexer.gate`, a single number that the model's forward pass never reads.
+
+What the app's side relies on, and the tests check:
+
+- **No chat format** (`shard2.chat.format = completion`): the prompt is the text as it is, and
+  nothing is added at either end. Tokenizer `gpt2` with pre-tokenizer `gpt-2`; 4,097 tokens.
+- **The deletion token** `<bs>` is id 4096 (`shard2.backspace_token_id`), the one token beyond
+  the tokenizer file's 4,096. To the model it is a token like any other and is fed back like
+  any other; removing the token before it from what a reader sees is the application's work.
+  With the reference's settings (temperature 0.9, the 100 most likely tokens) it was 6.3% of
+  4,000 sampled tokens here; the model card reports 5.4% for its own prompts.
+- **Four tokens are not text**: `<pad>` (0), `<bos>` (1), `<eos>` (2) and `<bs>`. They are
+  control tokens: a message that spells one of them stays plain characters, and none of them
+  has a piece when tokens are turned into text.
+- **Id 2 ends a text.** By its behaviour it is the only special token the model was trained
+  with, the boundary between two texts: `tokenizer.ggml.eos_token_id` and `bos_token_id` are
+  both 2 (the tokenizer calls it `<eos>`, `config.json` calls it the beginning marker). In
+  those 4,000 sampled tokens it came once. Ids 0 and 1 are rows that training evidently never
+  used (the two are the same vector to three decimals); they were never sampled. The
+  reference itself stops on nothing: it writes a fixed number of tokens.
+- **The context** is 8,192 tokens and the model was trained on 4,096
+  (`shard2.trained_sequence_length`). The port follows the reference over all 8,192, but the
+  reference itself predicts text slightly worse with more than about 5,000 tokens in front of
+  it than with a context that stays inside the trained length, so 4,096 is the size to give it.
+- **The memory**: attention only, so a cancelled evaluation is taken back and the end of the
+  memory can be removed, at any length; but a checkpoint of this model is the window of its
+  local layers (8.4 MB), and after one was restored only cuts that this window covers are
+  right. The session library refuses the others. Key-value memory for 4,096 tokens: 168 MB.
 
 ### qwen3.5-0.8b
 

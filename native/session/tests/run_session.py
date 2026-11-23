@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Runs the session conformance test (test_session) for one model of models/manifest.json.
 
-    run_session.py --bin-dir DIR --work-dir DIR --llama-src DIR MODEL_ID
+    run_session.py --bin-dir DIR --work-dir DIR --llama-src DIR [--residue] MODEL_ID
 
 ctest calls this (see CMakeLists.txt next to it). Finding the model follows the rules of
 native/tests/run.py, whose Runner is reused: the GGUF is located from PROSEPLOW_MODEL_OUT,
 converted on demand when the checkpoint is under PROSEPLOW_MODEL_SRC, and a model whose weights
 are not on this machine makes the test exit with 77, which ctest reports as skipped.
 
+With --residue it runs test_residue on the model file instead, which needs nothing else.
+
 Besides the model file the test gets:
-- for an architecture ported by this project (peacebell, boris2), the committed logit reference
-  (its prompts and greedy replies) and the committed token vectors of native/tests/data;
+- for an architecture ported by this project (peacebell, boris2, shard2), the committed logit
+  reference (its prompts and greedy replies) and the committed token vectors of
+  native/tests/data; for a model with windowed layers (shard2) also its committed reference of
+  sequences longer than the window;
 - two scratch files that hold the model the way an APK holds an asset, written here and deleted
   afterwards: one with the model at a 16 KiB-aligned offset between other data (another model
   of the manifest when its GGUF is already on the machine, else the head of the same file), and
@@ -99,6 +103,8 @@ def main() -> int:
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--llama-src", type=Path, required=True)
+    parser.add_argument("--residue", action="store_true",
+                        help="run test_residue (what a forgotten conversation leaves in memory) instead of test_session")
     parser.add_argument("model")
     args = parser.parse_args()
 
@@ -107,12 +113,17 @@ def main() -> int:
         runner = harness.Runner(args)
         entry = models.find_entry(args.model)
         gguf = runner.gguf(entry, entry["ftype"])  # exits with 77 when the weights are not here
+        if args.residue:
+            return runner.binary("test_residue", "--gguf", gguf)
         size = gguf.stat().st_size
 
         command = ["--gguf", gguf]
         if models.CONVERTERS[entry["converter"]].validation_f32:
             # A port of ours: it has reference data, and the harness knows which vector file is its own.
             command += ["--ref", harness.DATA / f"{entry['id']}-logits.bin", "--vectors", harness.Runner.programs(entry)["vectors"]]
+            longer = harness.DATA / f"{entry['id']}-long-logits.bin"
+            if longer.is_file():
+                command += ["--long-ref", longer]
 
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)

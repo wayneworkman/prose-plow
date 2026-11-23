@@ -102,10 +102,28 @@ class EnvelopeTest {
         val crypto = DataCrypto(dataKey)
         val blob = crypto.seal("p", plaintext)
         assertArrayEquals(plaintext, crypto.open("p", blob))
+        // The array inside the key, as whoever used it a moment ago may still hold it.
+        val material = dataKey.bytes
+        assertFalse(dataKey.isDestroyed)
         crypto.destroy()
-        assertTrue(dataKey.bytes.all { it == 0.toByte() })
+        assertTrue("the bytes are zeroed in place", material.all { it == 0.toByte() })
+        assertTrue(dataKey.isDestroyed)
         assertThrows(KeyDestroyedException::class.java) { crypto.seal("p", plaintext) }
         assertThrows(KeyDestroyedException::class.java) { crypto.open("p", blob) }
+    }
+
+    @Test
+    fun aDestroyedKeyHandsOutNoBytesSoZerosAreNeverTakenForAKey() {
+        val dataKey = DataKey.generate(random)
+        assertEquals(DataKey.SIZE, dataKey.bytes.size)
+        dataKey.destroy()
+        assertTrue(dataKey.isDestroyed)
+        assertThrows(KeyDestroyedException::class.java) { dataKey.bytes }
+        // A cipher made from it afterwards is of no use either, and sealing directly with it is impossible.
+        assertThrows(KeyDestroyedException::class.java) { DataCrypto(dataKey).seal("p", plaintext) }
+        assertThrows(KeyDestroyedException::class.java) { Envelope.seal(dataKey.bytes, "p", plaintext, random) }
+        dataKey.destroy() // Destroying twice is harmless.
+        assertThrows(KeyDestroyedException::class.java) { dataKey.bytes }
     }
 
     @Test
@@ -287,22 +305,27 @@ class BackoffTest {
     }
 
     @Test
-    fun bothClocksMustAgreeThatTheDelayHasPassed() {
+    fun theWaitFollowsTheTimeSinceBootAndNothingElse() {
         val clock = FakeClock()
         val config = testConfig(failedAttempts = 5, lastFailureWallMillis = clock.wall, lastFailureElapsedMillis = clock.elapsed)
         assertEquals(30_000L, Backoff.remaining(config, clock))
         clock.advance(10_000)
         assertEquals(20_000L, Backoff.remaining(config, clock))
 
-        // Setting the wall clock forward does not help within the same boot.
+        // Setting the wall clock forward does not shorten the wait, and setting it back does not lengthen it.
         clock.wall += 3_600_000
         assertEquals(20_000L, Backoff.remaining(config, clock))
+        clock.wall -= 10 * 365 * 86_400_000L
+        assertEquals(20_000L, Backoff.remaining(config, clock))
+        assertNull("a clock that was set is not a restart: nothing to re-anchor", Backoff.reanchor(config, clock))
 
-        // After a reboot (monotonic clock restarted) the full delay applies again, whatever the
-        // wall clock says, and re-anchoring starts it from the new boot.
+        // After a reboot (the clock since boot restarted) the full delay applies again, whatever
+        // the wall clock says, and re-anchoring starts it from the new boot.
         val rebooted = FakeClock(wall = config.lastFailureWallMillis + 5_000, elapsed = 1_000)
         assertEquals(30_000L, Backoff.remaining(config, rebooted))
         rebooted.wall += 86_400_000
+        assertEquals(30_000L, Backoff.remaining(config, rebooted))
+        rebooted.wall -= 2 * 86_400_000L
         assertEquals(30_000L, Backoff.remaining(config, rebooted))
         val reanchored = Backoff.reanchor(config, rebooted)!!
         assertEquals(1_000L, reanchored.lastFailureElapsedMillis)
@@ -311,12 +334,25 @@ class BackoffTest {
         assertEquals(0L, Backoff.remaining(reanchored, rebooted))
         assertNull("nothing to re-anchor in the same boot", Backoff.reanchor(reanchored, rebooted))
 
-        // A wall clock set back restarts the delay, but never makes it longer than one delay.
-        val setBack = FakeClock(wall = config.lastFailureWallMillis - 86_400_000, elapsed = 1_000)
-        assertEquals(30_000L, Backoff.remaining(config, setBack))
-
-        clock.advance(20_000)
-        clock.wall -= 3_600_000
+        // The delay is over when its time has passed since boot, wherever the wall clock stands by then.
+        clock.advance(19_999)
+        assertEquals(1L, Backoff.remaining(config, clock))
+        clock.advance(1)
         assertEquals(0L, Backoff.remaining(config, clock))
+        clock.wall = 0
+        assertEquals(0L, Backoff.remaining(config, clock))
+        clock.wall = Long.MAX_VALUE
+        assertEquals(0L, Backoff.remaining(config, clock))
+    }
+
+    @Test
+    fun aStoredWallClockTimeDecidesNothing() {
+        val clock = FakeClock()
+        for (storedWall in listOf(0L, clock.wall, clock.wall + 365 * 86_400_000L, Long.MAX_VALUE)) {
+            val config = testConfig(failedAttempts = 7, lastFailureWallMillis = storedWall, lastFailureElapsedMillis = clock.elapsed)
+            assertEquals("stored wall time $storedWall", 120_000L, Backoff.remaining(config, clock))
+            val later = FakeClock(wall = clock.wall, elapsed = clock.elapsed + 120_000)
+            assertEquals("stored wall time $storedWall", 0L, Backoff.remaining(config, later))
+        }
     }
 }

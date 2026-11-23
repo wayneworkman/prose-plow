@@ -210,6 +210,12 @@ class AppLock<S : UnlockedSession>(
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
     private val retired = ConcurrentLinkedQueue<Live<S>>()
 
+    /**
+     * One job for every closed session, which ends when that session has really stopped
+     * ([UnlockedSession.awaitStopped]); normally at once. Only touched under the mutex.
+     */
+    private val stopping = ArrayList<Job>()
+
     /** Main thread only. */
     private var lockGeneration = 0
     private var autoPromptedGeneration = -1
@@ -336,12 +342,17 @@ class AppLock<S : UnlockedSession>(
 
     /**
      * Under the mutex: closes every session that has ended, then destroys its data key. The only
-     * place either happens. The session gets to finish its queued writes first (they still need
-     * the key); the key is destroyed whatever the close did, so anything it left running fails
-     * from then on. Everything that opens a session, reads the configuration afresh or deletes
-     * files calls this first, so no two sessions overlap and nothing writes behind a reset.
+     * place either happens. The session gets a bounded time to finish its queued writes (they
+     * still need the key); the key is destroyed whatever the close did and however it ended, so
+     * a write that hangs cannot keep the key alive, and anything left running fails from then
+     * on. Everything that opens a session, reads the configuration afresh or deletes files calls
+     * this first.
+     *
+     * What a closed session may still be doing (one write that was already on its way to the
+     * disk when its time ran out) is remembered in [stopping], for the reset.
      */
     private suspend fun closeRetired() {
+        stopping.removeAll { it.isCompleted }
         while (true) {
             val ended = retired.poll() ?: return
             try {
@@ -353,7 +364,27 @@ class AppLock<S : UnlockedSession>(
             } finally {
                 ended.crypto.destroy()
             }
+            val session = ended.session
+            stopping += work.launch {
+                try {
+                    session.awaitStopped()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Whatever it was doing has ended, if not well.
+                }
+            }
         }
+    }
+
+    /**
+     * Under the mutex: returns only when no closed session can touch a file any more, however
+     * long that takes. A lock does not wait for this (it must not: the key is to go); a reset
+     * does, because it deletes the files, and a write that landed afterwards would put one back.
+     */
+    private suspend fun awaitSessionsStopped() {
+        for (job in stopping.toList()) job.join()
+        stopping.clear()
     }
 
     /**
@@ -362,7 +393,8 @@ class AppLock<S : UnlockedSession>(
      * case the session is ended again unseen. [offer] is made with the new session.
      */
     private suspend fun open(key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
-        // The session of the unlock before may still be closing: its last writes land before this one reads.
+        // The session of the unlock before may still be closing: its last writes get their
+        // (bounded) time to land before this one reads.
         closeRetired()
         val crypto = DataCrypto(key)
         val session = try {
@@ -405,7 +437,8 @@ class AppLock<S : UnlockedSession>(
      * Locks now (main thread): "Lock now" in Settings, the background timer, and the check on
      * coming back to the foreground. The state changes at once, so the activity tears the
      * screens down before this returns; then, off the main thread, the session's queued writes
-     * finish, it closes, and the data key is zeroed. No-op unless unlocked.
+     * get their (bounded) time to finish, it closes, and the data key is zeroed whether or not
+     * they did. No-op unless unlocked.
      */
     fun lock() {
         if (_state.value !is LockState.Unlocked) return
@@ -432,8 +465,12 @@ class AppLock<S : UnlockedSession>(
         enrollmentProof = null
         offerProof = null
         _fingerprintOffer.value = null
-        live?.let { endSession(it, reason) }
+        // The reference goes before the session is retired: from this line on nothing can pick
+        // its key up for a new wrap (a passphrase change, a fingerprint enrolment), whatever
+        // order the work that follows runs in.
+        val ending = live
         live = null
+        ending?.let { endSession(it, reason) }
         _sessionGeneration.update { it + 1 }
     }
 
@@ -827,9 +864,11 @@ class AppLock<S : UnlockedSession>(
      * file it has stored and the lock configuration, then starts again, which leads to the
      * first-run set-up.
      *
-     * An unlocked session ends here first, and the deletion only begins once it is closed and
-     * its key destroyed, so no late write can put a file back. What could not be deleted is
-     * published in [resetFailure]; the start that follows then finds what is left and says so.
+     * An unlocked session ends here first, and the deletion only begins once it is closed, its
+     * key destroyed, and every session before it has really stopped writing, so no late write
+     * can put a file back. Unlike a lock, this waits for a write that hangs for as long as it
+     * hangs. What could not be deleted is published in [resetFailure]; the start that follows
+     * then finds what is left and says so.
      */
     fun reset() {
         if (_state.value == LockState.Starting) return
@@ -844,6 +883,7 @@ class AppLock<S : UnlockedSession>(
             val report = try {
                 withManager { m ->
                     closeRetired()
+                    awaitSessionsStopped()
                     m.reset { DataReset.deleteAllData(files) }
                 }
             } catch (e: CancellationException) {

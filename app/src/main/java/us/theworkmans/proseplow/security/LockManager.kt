@@ -261,6 +261,9 @@ class LockManager(
     fun changePassphrase(proof: PassphraseProof, key: DataKey, newPassphrase: CharArray) {
         requireFresh(proof)
         val current = checkNotNull(config) { "No passphrase has been set up" }
+        // Before any key is made: a destroyed key is all zeros, and wrapping those would replace
+        // the only wrap of the real key with one of nothing.
+        if (key.isDestroyed) throw KeyDestroyedException()
         withNfc(newPassphrase) { text ->
             require(PassphraseRules.check(text) == null) { "The passphrase does not meet the rules" }
             val binding = newBindingKey()
@@ -307,6 +310,8 @@ class LockManager(
         val current = checkNotNull(config) { "No passphrase has been set up" }
         val generation = checkNotNull(pendingBiometric) { "No fingerprint enrolment is in progress" }
         try {
+            // Before the authorised cipher is used up on it: a destroyed key is never wrapped.
+            if (key.isDestroyed) throw KeyDestroyedException()
             cipher.updateAAD(BIOMETRIC_AAD)
             val wrapped = cipher.iv + cipher.doFinal(key.bytes)
             save(
@@ -357,10 +362,18 @@ class LockManager(
      * Unwraps the data key with [cipher] after the biometric prompt authorised it; null if that
      * fails. Only a wrap that its own, authorised key cannot open is removed (it is of no further
      * use); any other failure may be passing and keeps fingerprint unlock as it is.
+     *
+     * A success ends a streak of wrong passphrases exactly as the right passphrase does: the
+     * count goes back to zero and no wait is left. Someone who only ever unlocks by fingerprint
+     * would otherwise carry failures from months ago, and one more wrong passphrase would start
+     * at the long waits.
+     *
+     * @throws IOException if that reset could not be stored; the app is not unlocked then.
      */
+    @Throws(IOException::class)
     fun unlockWithBiometric(cipher: Cipher): DataKey? {
         val wrap = config?.biometric ?: return null
-        return try {
+        val key = try {
             val blob = wrap.wrappedKey.unbase64()
             cipher.updateAAD(BIOMETRIC_AAD)
             val dek = cipher.doFinal(blob, GCM_IV_SIZE, blob.size - GCM_IV_SIZE)
@@ -371,14 +384,24 @@ class LockManager(
             }
         } catch (_: AEADBadTagException) {
             biometricLost()
-            null
+            return null
         } catch (_: GeneralSecurityException) {
-            null
+            return null
         } catch (_: IllegalStateException) {
-            null
+            return null
         } catch (_: IllegalArgumentException) {
-            null
+            return null
         }
+        val current = checkNotNull(config)
+        if (current.failedAttempts != 0 || current.lastFailureWallMillis != 0L || current.lastFailureElapsedMillis != 0L) {
+            try {
+                save(current.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0))
+            } catch (e: Exception) {
+                key.destroy()
+                throw e
+            }
+        }
+        return key
     }
 
     /**

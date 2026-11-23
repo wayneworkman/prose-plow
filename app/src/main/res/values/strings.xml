@@ -12,6 +12,7 @@
     <string name="copied">Copied</string>
     <string name="copy_failed">That could not be copied.</string>
     <string name="error_detail">Something went wrong: %1$s</string>
+    <string name="touch_discarded">Another app is drawing over %1$s, so taps are ignored. Close or pause that app to go on.</string>
 
     <!-- Passphrases: rules and what is wrong with one -->
     <string name="passphrase_rules">Use at least 10 characters, and not only digits.</string>
@@ -98,7 +99,7 @@
         <item quantity="other">Allow screenshots for %1$d minutes</item>
     </plurals>
     <string name="security_screenshots_off">Screenshots and screen recordings are blocked.</string>
-    <string name="security_screenshots_on">On until %1$s. It also ends when the screen turns off or the app is closed. While it is on, screenshots and screen recordings can capture your chats; the preview in the app switcher stays hidden.</string>
+    <string name="security_screenshots_on">On until %1$s. It also ends when the screen turns off or the app is closed. While it is on, screenshots and screen recordings can capture your chats; the preview in the app switcher stays hidden. The lock screen and anything that asks for your passphrase are never captured.</string>
     <string name="security_screenshots_unavailable">Needs Android 13 or later. On this version of Android the preview in the app switcher cannot be hidden by itself, so screenshots stay blocked.</string>
     <string name="security_screenshots_failed">Screenshots could not be allowed: the phone did not let the app watch for the screen turning off.</string>
     <string name="security_always_on">The app\'s content is always hidden in the app switcher, and the keyboard is always asked not to learn from what you type.</string>
@@ -125,11 +126,11 @@
     <string name="model_name_qwen3_5_0_8b" translatable="false">Qwen3.5 0.8B</string>
     <string name="model_name_peacebell_v1_291m" translatable="false">Peacebell v1 291M</string>
     <string name="model_name_boris_2_instruct" translatable="false">Boris-2-Instruct</string>
-    <string name="model_name_boris2_peacebell_think" translatable="false">Boris2 Peacebell Think</string>
+    <string name="model_name_shard_2" translatable="false">Shard-2</string>
     <string name="model_description_qwen3_5_0_8b">A general assistant that speaks many languages. The most capable model here.</string>
     <string name="model_description_peacebell_v1_291m">Answers questions about the Second World War from memory. Not a general assistant.</string>
     <string name="model_description_boris_2_instruct">A very small chat model for everyday questions. Fluent, but often wrong on facts.</string>
-    <string name="model_description_boris2_peacebell_think">A small chat model that is still being trained.</string>
+    <string name="model_description_shard_2">Continues the text you write. It is not a chat model and does not answer questions. It can take back words it has just written. Its facts are often invented.</string>
 
     <!-- Chat: top bar -->
     <string name="open_chats">Open the list of chats</string>
@@ -168,6 +169,10 @@
     <string name="empty_title">Start a conversation</string>
     <string name="empty_hint">%1$s answers on this phone. Nothing you write leaves it.</string>
     <string name="message_hint">Message</string>
+    <!-- The same three lines for a model that continues text instead of answering -->
+    <string name="empty_title_completion">Start a text</string>
+    <string name="empty_hint_completion">%1$s writes on from what you write, on this phone. Nothing you write leaves it.</string>
+    <string name="message_hint_completion">Write the beginning of a text</string>
     <string name="send">Send</string>
     <string name="send_edit">Send the edited message</string>
     <string name="stop">Stop</string>
@@ -244,6 +249,7 @@
     <string name="system_prompt_support">Given to the model at the start of every conversation, before your first message.</string>
     <string name="system_prompt_hint">None</string>
     <string name="system_prompt_unsupported">%1$s was trained without a system prompt, so there is none to set.</string>
+    <string name="system_prompt_unsupported_completion">%1$s is not a chat model: it continues the text you write and is given nothing else, so there is no system prompt to set.</string>
     <string name="temperature_label">Temperature</string>
     <string name="temperature_support">0 always picks the most likely word; higher values make answers more varied. Default for this model: %1$s.</string>
     <string name="temperature_support_greedy">0 always picks the most likely word; higher values make answers more varied. Default for this model: %1$s, so any value above 0 turns on sampling.</string>

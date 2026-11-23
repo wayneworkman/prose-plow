@@ -84,8 +84,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // These two shape this module's own test APK; the app must say the same for its APK, and
-    // the checks of apk-checks.gradle.kts, which the app applies, fail its build if it does not.
+    // These two shape this module's own test APK; the app must say the same for its APK. The
+    // checks of apk-checks.gradle.kts, which the app applies and this module applies at the end
+    // of this file for its test APK, fail the build of either if it does not.
     packaging {
         jniLibs {
             // Native libraries stored in the APK, page-aligned, and mapped from there instead of
@@ -335,3 +336,14 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.core)
 }
+
+// The test APK of this module carries the models too (the instrumented tests run them from its
+// assets), so it is held to the same checks as the app's APK: every model in it the pinned one,
+// stored on a 16 KiB boundary, and every native library built for 16 KB pages.
+//
+// The script is named through file() and not by a bare string, on purpose. Lint analyses this
+// build script too, and when apply(from = ...) is given a string that names a script beside
+// this one, it follows the string, reads that script and fails on it: the analysis ends with
+// "findFirCompiledSymbol only works on compiled declarations", lintAnalyze<Variant> fails and
+// `check` with it. A File is not followed.
+apply(from = file("apk-checks.gradle.kts"))

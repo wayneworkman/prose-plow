@@ -9,10 +9,11 @@ import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * The one line under the message box that says the app uses AI: its exact wording, that it is a
- * string resource kept once, and that the chat screen alone shows it. These are rules about the
- * sources and resources, checked by reading them; how the line looks, and that it leaves with the
- * keyboard, can only be seen on a device.
+ * The one line under the chat screen's top bar that says the app uses AI: its exact wording,
+ * that it is a string resource kept once, that the chat screen alone shows it, and that it is
+ * there in every state of that screen, with the keyboard open or not. These are rules about the
+ * sources and resources, checked by reading them; how the line looks under the bar, and that it
+ * stays put while the keyboard opens, can only be seen on a device.
  */
 class AiNoticeTest {
 
@@ -38,8 +39,8 @@ class AiNoticeTest {
 
     /** The notice's composable, from its signature to its closing brace, without the comment above it. */
     private val composable: String by lazy {
-        assertTrue(chatScreen.contains("private fun AiNotice() {"))
-        chatScreen.substringAfter("private fun AiNotice() {").substringBefore("\n}\n")
+        assertTrue(chatScreen.contains("private fun AiNotice(barColor: Color) {"))
+        chatScreen.substringAfter("private fun AiNotice(barColor: Color) {").substringBefore("\n}\n")
     }
 
     @Test
@@ -72,21 +73,31 @@ class AiNoticeTest {
     }
 
     @Test
-    fun itIsTheLastThingInTheChatsColumnInEveryStateOfTheChat() {
-        val calls = Regex("^ +AiNotice\\(\\)$", RegexOption.MULTILINE).findAll(chatScreen).toList()
+    fun itSitsUnderTheTopBarAboveEverythingElseInEveryStateOfTheChat() {
+        val calls = Regex("^ +AiNotice\\(.*\\)$", RegexOption.MULTILINE).findAll(chatScreen).toList()
         assertEquals("composed in exactly one place", 1, calls.size)
         val call = calls.single().range.first
-        assertTrue("under the field to write in", chatScreen.indexOf("InputBar(") in 0 until call)
-        // Not inside the block that holds the field, which an unreadable chat does not have: the
-        // call is indented as that block's `if` is, one level out from the field itself.
-        val indentOfCall = calls.single().value.takeWhile { it == ' ' }.length
-        val indentOfInputBarBlock = Regex("^( +)if \\(session != null\\) \\{\\n +InputBar\\(", RegexOption.MULTILINE).find(chatScreen)!!.groupValues[1].length
-        assertEquals(indentOfInputBarBlock, indentOfCall)
+        val positionOf = { marker: String -> chatScreen.indexOf(marker).also { assertTrue("$marker is in the chat screen", it >= 0) } }
+        assertTrue("after the top bar", positionOf("TopAppBar(") < call)
+        assertTrue("above what the model is doing", call < positionOf("                Banners("))
+        assertTrue("above the conversation", call < positionOf("MessageList("))
+        assertTrue("above an empty chat's invitation and a chat that cannot be read", call < positionOf("UnreadableChat(") && call < positionOf("EmptyState("))
+        assertTrue("above the field to write in", call < positionOf("InputBar("))
+        // Directly in the screen's column, as its first child: not inside the choice between the
+        // kinds of chat, nor inside the block that an unreadable chat does not have.
+        val column = Regex("\\.imePadding\\(\\),\\n +\\) \\{\\n( +)AiNotice\\(").find(chatScreen)
+        assertTrue("the first thing in the column that holds the conversation", column != null)
+        val indentOfBanners = Regex("^( +)Banners\\($", RegexOption.MULTILINE).find(chatScreen)!!.groupValues[1].length
+        assertEquals(indentOfBanners, column!!.groupValues[1].length)
     }
 
     @Test
-    fun itIsPlainStaticTextThatLeavesWhileTheKeyboardIsOpen() {
-        assertTrue("not composed while the on-screen keyboard is open", composable.contains("if (WindowInsets.isImeVisible) return"))
+    fun itDoesNotDependOnTheKeyboardAndIsPlainStaticText() {
+        // Always composed: neither the notice nor the screen around it asks whether the keyboard is open.
+        for (keyboard in listOf("isImeVisible", "WindowInsets", "imePadding", "LocalSoftwareKeyboardController", "if (", "return")) {
+            assertFalse("the notice depends on $keyboard", composable.contains(keyboard))
+        }
+        assertFalse("the chat screen asks whether the keyboard is open", chatScreen.contains("isImeVisible"))
         // Static: nothing that makes it a button, or makes a screen reader say it by itself.
         for (forbidden in listOf("liveRegion", "clickable", "selectable", "SelectionContainer", "semantics", "contentDescription", "Animated")) {
             assertFalse("the notice uses $forbidden", composable.contains(forbidden))
@@ -96,5 +107,15 @@ class AiNoticeTest {
         assertTrue(composable.contains("MaterialTheme.colorScheme.onSurfaceVariant"))
         assertTrue(composable.contains("TextAlign.Center"))
         assertFalse("it may wrap; it is never cut short", composable.contains("maxLines"))
+        assertTrue("slim: four units of room above and below", composable.contains("vertical = 4.dp"))
+    }
+
+    @Test
+    fun itHasTheTopBarsOwnColourBehindIt() {
+        // One set of colours is named, given to the bar, and its container colour to the notice.
+        assertTrue(chatScreen.contains("val barColors = TopAppBarDefaults.topAppBarColors()"))
+        assertTrue(Regex("TopAppBar\\(\\n +colors = barColors,").containsMatchIn(chatScreen))
+        assertTrue(chatScreen.contains("AiNotice(barColors.containerColor)"))
+        assertTrue(composable.contains(".background(barColor)"))
     }
 }

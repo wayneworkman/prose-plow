@@ -9,6 +9,7 @@ import us.theworkmans.proseplow.core.engine.EngineError
 import us.theworkmans.proseplow.core.engine.FinishReason
 import us.theworkmans.proseplow.core.engine.GenerationEvent
 import us.theworkmans.proseplow.core.engine.GenerationStats
+import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.core.prompt.PromptMessage
 import us.theworkmans.proseplow.core.prompt.PromptRole
@@ -99,6 +100,49 @@ class PromptHistoryTest {
     }
 
     @Test
+    fun `for a model that continues text nothing is trimmed from any message`() {
+        val session = newSession()
+            .withUserTurn("  Once upon a time \n", clock, ids)
+            .applyEvent("m2", GenerationEvent.TextDelta(" there was \n"), clock)
+            .finished("m2", FinishReason.LENGTH, clock)
+            .withUserTurn("Dear Sir, ", clock, ids)
+        assertEquals(
+            listOf(user("  Once upon a time \n"), assistant(" there was \n"), user("Dear Sir, ")),
+            session.promptHistory(exactText = true).messages,
+        )
+        // The same chat as a chat model is to see it.
+        assertEquals(
+            listOf(user("Once upon a time"), assistant("there was"), user("Dear Sir,")),
+            session.promptHistory().messages,
+        )
+    }
+
+    @Test
+    fun `a continued message of a model that continues text keeps its leading whitespace too`() {
+        val stopped = newSession().withUserTurn("The capital of France is", clock, ids)
+            .applyEvent("m2", GenerationEvent.TextDelta(" Nice. "), clock)
+            .stopped("m2", clock)
+        val reopened = checkNotNull(stopped.forContinuation("m2", clock))
+        val exact = reopened.promptHistory(exactText = true)
+        assertTrue(exact.continueFinalMessage)
+        assertEquals(listOf(user("The capital of France is"), assistant(" Nice. ")), exact.messages)
+        // A chat model's continued answer loses the whitespace at its start, as before.
+        assertEquals(assistant("Nice. "), reopened.promptHistory().messages.last())
+    }
+
+    @Test
+    fun `the request takes the text rules from the model it is for`() {
+        val session = newSession().withUserTurn(" A trailing space matters ", clock, ids)
+        assertEquals(
+            listOf(user(" A trailing space matters ")),
+            session.generationRequest(ModelCatalog.SHARD_2, systemPrompt = null).messages,
+        )
+        for (chatModel in listOf(ModelCatalog.QWEN35_0_8B, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.BORIS_2_INSTRUCT)) {
+            assertEquals(chatModel.id, listOf(user("A trailing space matters")), session.generationRequest(chatModel, systemPrompt = null).messages)
+        }
+    }
+
+    @Test
     fun `an empty conversation has an empty history`() {
         val history = newSession().promptHistory()
         assertTrue(history.messages.isEmpty())
@@ -109,7 +153,8 @@ class PromptHistoryTest {
     fun `the request is addressed to the model stamped on the reply and carries the settings`() {
         val sampling = SamplingParams(temperature = 0.5f)
         val session = newSession().withUserTurn("Hello", clock, ids)
-        val request = session.withModel("model-b").generationRequest(systemPrompt = "Be brief.", sampling = sampling, maxNewTokens = 99)
+        val request = session.withModel("model-b")
+            .generationRequest(ModelCatalog.QWEN35_0_8B, systemPrompt = "Be brief.", sampling = sampling, maxNewTokens = 99)
         assertEquals("the reply was started for model-a", "model-a", request.modelId)
         assertEquals(listOf(user("Hello")), request.messages)
         assertEquals("Be brief.", request.systemPrompt)
@@ -124,7 +169,7 @@ class PromptHistoryTest {
     fun `the request for a continuation says so`() {
         val started = newSession().withUserTurn("Count", clock, ids)
         val stopped = started.applyEvent("m2", GenerationEvent.TextDelta("One"), clock).stopped("m2", clock)
-        val request = checkNotNull(stopped.forContinuation("m2", clock)).generationRequest(systemPrompt = null)
+        val request = checkNotNull(stopped.forContinuation("m2", clock)).generationRequest(ModelCatalog.QWEN35_0_8B, systemPrompt = null)
         assertTrue(request.continueFinalMessage)
         assertEquals(listOf(user("Count"), assistant("One")), request.messages)
         assertEquals("model-a", request.modelId)

@@ -69,6 +69,26 @@ class SessionCodecTest {
     }
 
     @Test
+    fun `a reply that had text taken back is stored as the text that is left, in the same form as before`() {
+        val session = ChatSession.create("shard-2", clock, SequentialIds("s"))
+            .withUserTurn("The capital of France is ", clock, SequentialIds())
+            .applyEvent("m2", GenerationEvent.TextDelta(" Nice. 198"), clock)
+            .applyEvent("m2", GenerationEvent.TextReplaced(" Nice.", removed = 4), clock)
+            .applyEvent("m2", GenerationEvent.Done(FinishReason.LENGTH, text = " Nice.", stats = stats, exactText = true), clock)
+        val text = SessionCodec.encode(session)
+        val decoded = readable(text)
+        assertEquals(session, decoded.session)
+        assertTrue(decoded.complete)
+        assertEquals(" Nice.", decoded.session.messages[1].text)
+        assertEquals("The capital of France is ", decoded.session.messages[0].text)
+        // Nothing about the retraction is stored: the schema and the keys are what they were.
+        assertEquals(1, decoded.schemaVersion)
+        val message = Json.parseToJsonElement(text).jsonObject.getValue("session").jsonObject.getValue("messages").jsonArray[1].jsonObject
+        assertEquals(setOf("id", "role", "text", "status", "finishReason", "modelId", "createdAtMillis"), message.keys)
+        assertFalse("198" in text)
+    }
+
+    @Test
     fun `encoding is stable`() {
         assertEquals(SessionCodec.encode(richSession()), SessionCodec.encode(richSession()))
     }

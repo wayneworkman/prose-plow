@@ -17,9 +17,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ProsePlow">
 
+        <!-- taskAffinity is empty on purpose. With the default affinity (the package name),
+             another app on Android 9 or 10 can declare an activity with the same affinity and
+             have it placed in this app's task, where it comes up in place of the lock screen and
+             can ask for the passphrase ("task hijacking"; Android 11 closed this). An activity
+             without an affinity belongs to no task but its own. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:taskAffinity=""
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.ProsePlow">
             <intent-filter>

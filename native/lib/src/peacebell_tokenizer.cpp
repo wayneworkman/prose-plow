@@ -15,6 +15,12 @@
 // Step 3 relies on the model file: add_space_prefix is off (the dummy prefix is ours), and the
 // two chat markers are typed CONTROL, so llama_tokenize with parse_special = false never
 // produces them. The constructor checks all of that and refuses a file it cannot serve exactly.
+//
+// The text is a conversation, so the copies this file makes of it (the normalised stretches and
+// the token ids) are overwritten before they are freed, and neither is allowed to grow by
+// itself: a string or vector that grows frees its old storage as it is. That covers this file's
+// copies only; llama_tokenize makes its own of every stretch it is handed and frees them as
+// they are.
 
 #include "proseplow_native.h"
 
@@ -105,6 +111,48 @@ size_t utf8_char_len(std::string_view s) {
     return 0;
 }
 
+// Overwrites memory in a way the compiler may not remove although the buffer is freed next.
+void wipe(void * data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return;
+    }
+    std::memset(data, 0, size);
+    __asm__ __volatile__("" : : "r"(data) : "memory");
+}
+
+// Overwrites the whole storage of a string or a vector, also the part beyond its present size,
+// which holds what it held before it was last shortened.
+template <typename Container> void wipe_storage(Container & c) {
+    c.resize(c.capacity()); // within the capacity: nothing is allocated, so nothing can throw
+    wipe(c.data(), c.size() * sizeof(*c.data()));
+    c.clear();
+}
+
+// Overwrites a string or a vector when the scope ends, whichever way it ends.
+template <typename Container> class wiped_at_exit {
+  public:
+    explicit wiped_at_exit(Container & container) : c(container) {}
+    ~wiped_at_exit() { wipe_storage(c); }
+    wiped_at_exit(const wiped_at_exit &) = delete;
+    wiped_at_exit & operator=(const wiped_at_exit &) = delete;
+
+  private:
+    Container & c;
+};
+
+// Makes room for n_more tokens. When that takes new storage, the old one is overwritten before
+// it is given up, which a vector growing by itself would not do.
+void reserve_wiped(std::vector<llama_token> & ids, size_t n_more) {
+    if (ids.capacity() - ids.size() >= n_more) {
+        return;
+    }
+    std::vector<llama_token> grown;
+    grown.reserve(std::max(ids.size() + n_more, 2 * ids.capacity()));
+    grown.assign(ids.begin(), ids.end());
+    wipe_storage(ids);
+    ids.swap(grown);
+}
+
 bool ends_with(const std::string & s, std::string_view suffix) {
     return s.size() >= suffix.size() && std::memcmp(s.data() + s.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
 }
@@ -154,6 +202,7 @@ struct pp_peacebell_tokenizer {
         // A token covers at least one byte, so the run's length bounds the token count.
         const size_t base = out.size();
         const int32_t capacity = (int32_t) run.size();
+        reserve_wiped(out, run.size());
         out.resize(base + run.size());
         const int32_t n = llama_tokenize(vocab, run.data(), capacity, out.data() + base, capacity, false, false);
         if (n < 0) {
@@ -177,7 +226,16 @@ struct pp_peacebell_tokenizer {
             return true;
         }
 
-        std::string run(k_escaped_space); // the one dummy prefix of the whole text
+        // All the storage either of the two will need, taken once: the normalised text is the
+        // prefix plus the text with every space as three bytes at most, and each token, a
+        // symbol's or a merged one, stands for at least one byte of that.
+        const size_t n_normalised = k_escaped_space.size() + text.size() + 2 * (size_t) std::count(text.begin(), text.end(), ' ');
+        std::string run;
+        const wiped_at_exit<std::string> wiped_run(run);
+        run.reserve(n_normalised);
+        reserve_wiped(out, n_normalised);
+
+        run.assign(k_escaped_space);      // the one dummy prefix of the whole text
         bool prev_space = true;           // a space is dropped when the output already ends in one
         while (i < text.size()) {
             const std::string_view rest = text.substr(i);
@@ -349,6 +407,7 @@ int32_t pp_peacebell_tokenize(
             return PP_ERROR;
         }
         std::vector<llama_token> ids;
+        const wiped_at_exit<std::vector<llama_token>> wiped_ids(ids);
         if (!tokenizer->encode(view(text, text_len), mode, ids)) {
             return PP_ERROR;
         }
@@ -372,12 +431,14 @@ int32_t pp_peacebell_chat_tokenize(
             return PP_ERROR;
         }
         std::vector<llama_token> ids;
+        const wiped_at_exit<std::vector<llama_token>> wiped_ids(ids);
         std::string header;
         // The role line is one text of its own ("user\n"), encoded apart from the content: that is
         // how the training data was built, and one joined string would merge differently.
         const auto add_header = [&](std::string_view role) {
             header.assign(role);
             header.push_back('\n');
+            reserve_wiped(ids, 1);
             ids.push_back(tokenizer->im_start);
             return tokenizer->encode(header, mode, ids);
         };
@@ -389,6 +450,7 @@ int32_t pp_peacebell_chat_tokenize(
             if (!add_header(view(m.role, m.role_len)) || !tokenizer->encode(view(m.content, m.content_len), mode, ids)) {
                 return PP_ERROR;
             }
+            reserve_wiped(ids, 1);
             ids.push_back(tokenizer->im_end);
         }
         if (add_generation_prompt && !add_header(k_assistant)) {

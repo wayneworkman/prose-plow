@@ -49,10 +49,12 @@ data class ScreenshotsAllowed(
  *   only, so a fresh start is always secure from its first frame, and there is nothing in any
  *   file that could turn screenshots on.
  *
- * The app's own lock does not end it, and that is deliberate: "Lock now" and the background
- * timeout leave a running allowance alone, so the lock screen can be captured during it as
- * well (its passphrase field shows bullets in any case). Giving it again while it runs starts
- * the full time afresh.
+ * The app's own lock does not end it: "Lock now" and the background timeout leave a running
+ * allowance alone, and it applies again after the next unlock for as long as it has left. But
+ * it has no effect while the app is locked. An allowance only ever opens the unlocked app:
+ * wherever a passphrase is entered or set (the lock screen, first-time set-up, the error
+ * screens around them) the window is secure whatever is allowed, see
+ * [WindowSecurity.mustBeSecure]. Giving it again while it runs starts the full time afresh.
  *
  * The time is measured on the clock that counts since boot ([Clock.elapsedMillis]), so changing
  * the phone's date or time cannot stretch it. A timer ends the allowance when it is due, but a
@@ -144,11 +146,17 @@ class ScreenshotAllowance(
  * and screen recordings (`FLAG_SECURE` on Android). Plain Kotlin, so the whole rule is unit
  * tested; the Android side only applies the answer.
  *
- * The window is secure unless an allowance is running at this very moment: it is secure from
- * the first frame of every start, before the app is set up, and at every time at which no
- * [ScreenshotAllowance] has been given or the one given is over. The answer is for the whole
- * window, the set-up and lock screens included, and dialogs and menus take it over from the
- * window when they open.
+ * The window is secure unless the app is unlocked and an allowance is running at this very
+ * moment. So it is secure from the first frame of every start; whenever the app is not
+ * unlocked, allowance or not, which covers every screen on which a passphrase is typed in the
+ * activity's own window (first-time set-up and the lock screen) and the error screens beside
+ * them; and, in the unlocked app, at every time at which no [ScreenshotAllowance] has been
+ * given or the one given is over. Dialogs and menus take the answer over from the window when
+ * they open. A dialog that asks for a passphrase does not: it is secure by its own setting,
+ * whatever the window is (the lock package's PassphraseDialog).
+ *
+ * A dialog or menu keeps what it took when it opened. When the window turns secure under an
+ * unlocked app, what is open must therefore be built again ([mustRenewWindows]).
  *
  * The preview that the app switcher shows of every app is a different matter and is never
  * allowed: it appears without the user doing anything, so it stays hidden whatever is allowed
@@ -165,8 +173,17 @@ object WindowSecurity {
 
     /**
      * Whether the window must be secure at [nowElapsedMillis] ([Clock.elapsedMillis]) on Android
-     * version [sdk], given the allowance that is known of ([allowed], null: none).
+     * version [sdk], given whether the app is [unlocked] and the allowance that is known of
+     * ([allowed], null: none).
      */
-    fun mustBeSecure(allowed: ScreenshotsAllowed?, nowElapsedMillis: Long, sdk: Int): Boolean =
-        !(allowed != null && nowElapsedMillis < allowed.untilElapsedMillis && screenshotsCanBeAllowed(sdk))
+    fun mustBeSecure(unlocked: Boolean, allowed: ScreenshotsAllowed?, nowElapsedMillis: Long, sdk: Int): Boolean =
+        !(unlocked && allowed != null && nowElapsedMillis < allowed.untilElapsedMillis && screenshotsCanBeAllowed(sdk))
+
+    /**
+     * Whether the dialogs and menus that are open have to be built again: when the window has
+     * just turned secure ([wasSecure] false, [secure] true) while the app stays [unlocked]. They
+     * were opened under a window that could be captured, and would stay capturable until closed.
+     * When the app locks instead, its screens are torn down in any case.
+     */
+    fun mustRenewWindows(wasSecure: Boolean, secure: Boolean, unlocked: Boolean): Boolean = secure && !wasSecure && unlocked
 }

@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.Context
 import android.os.SystemClock
 import androidx.biometric.BiometricManager
+import androidx.compose.foundation.ComposeFoundationFlags
+import androidx.compose.foundation.ExperimentalFoundationApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import us.theworkmans.proseplow.core.engine.InferenceEngine
@@ -25,6 +27,23 @@ import java.util.concurrent.Executors
  */
 class ProsePlowApp : Application() {
     val container: AppContainer by lazy { AppContainer(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        turnSmartSelectionOff()
+    }
+
+    /**
+     * Selecting text in a chat must not hand that text to the system's text classifier. The text
+     * library does that by default ("smart selection": it asks the classifier where the
+     * selection should end and what could be done with it), and the classifier is another
+     * component of the phone, on some phones one that the manufacturer or another app supplies.
+     * It is switched off for the whole process, before any screen exists.
+     */
+    @OptIn(ExperimentalFoundationApi::class)
+    private fun turnSmartSelectionOff() {
+        ComposeFoundationFlags.isSmartSelectionEnabled = false
+    }
 }
 
 /**

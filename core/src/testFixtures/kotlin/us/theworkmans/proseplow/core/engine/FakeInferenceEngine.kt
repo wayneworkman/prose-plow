@@ -177,7 +177,11 @@ class FakeInferenceEngine : InferenceEngine {
                     break
                 }
                 if (step is Step.Emit) {
-                    if (step.event is GenerationEvent.TextDelta) emitted.append(step.event.text)
+                    when (val event = step.event) {
+                        is GenerationEvent.TextDelta -> emitted.append(event.text)
+                        is GenerationEvent.TextReplaced -> emitted.setLength(maxOf(0, emitted.length - event.removed))
+                        else -> Unit
+                    }
                     emit(step.event)
                     if (step.event is GenerationEvent.Done || step.event is GenerationEvent.Error) break
                 }

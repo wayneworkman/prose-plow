@@ -13,10 +13,12 @@ cmake==4.4.5
 ninja==1.13.2
 
 # The converters: llama.cpp's conversion framework imports torch and transformers; the peacebell
-# converter parses the SentencePiece model with sentencepiece and protobuf; the boris2 converter
-# reads tokenizer.json with tokenizers; upstream's converter, which converts Qwen, loads the
-# tokenizer through transformers (which files it reads, and so the output, depend on this
-# version). The reference-data generators run the PyTorch reference models with the same torch.
+# converter parses the SentencePiece model with sentencepiece and protobuf; the boris2 and shard2
+# converters read tokenizer.json with tokenizers; upstream's converter, which converts Qwen,
+# loads the tokenizer through transformers (which files it reads, and so the output, depend on
+# this version). The reference-data generators run the PyTorch reference models with the same
+# torch. The Shard-2 checkpoint is a pickle and is only ever read with torch.load(...,
+# weights_only=True), which this torch version supports for it as it is.
 numpy==2.5.5
 torch==2.15.0+cpu
 transformers==5.24.0

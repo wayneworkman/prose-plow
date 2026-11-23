@@ -15,8 +15,13 @@ Two tokenizer kinds exist in the family and the checkpoint's config.json says wh
 
 - no `train_pad_id`: a SentencePiece BPE model (sentencepiece.model) and ChatML built by
   injecting the two marker ids around separately encoded segments ("chatml-ids");
-- `train_pad_id` present: a byte-level BPE (tokenizer.json), ChatML as plain text
-  ("chatml-text"), and a training pad token that must never be sampled.
+- `train_pad_id` present: a byte-level BPE (tokenizer.json) and a training pad token that must
+  never be sampled. Such a checkpoint is a chat model when its tokenizer_config.json carries
+  the plain-text ChatML template ("chatml-text"), and a model that continues text, with no
+  roles and no template, when it carries none ("completion").
+
+The result is recorded as `peacebell.chat.format`, which is what tells the native library and
+the application how a prompt for this file is built.
 
 The output depends only on the files named in INPUT_FILES and on the arguments: not on the
 directory's name, the model card or the clock. The same input therefore gives the same bytes.
@@ -52,6 +57,12 @@ _SP_MODEL_TYPE_BPE = 2
 # text upstream's converter uses, repeated here so that the hashes below stay meaningful if
 # upstream ever changes its copy.
 _PRE_CHECK_TEXT = '\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶‍🌫️ (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 កាន់តែពិសេសអាច😁 ?我想在apple工作1314151天～ ------======= нещо на Български \'\'\'\'\'\'```````""""......!!!!!!?????? I\'ve been \'told he\'s there, \'RE you sure? \'M not sure I\'ll make it, \'D you like some tea? We\'Ve a\'lL'
+
+# The chat template of the byte-level BPE chat checkpoints: the one template that the native
+# plain-text encoder (pp_chatml_text_tokenize) writes out. A checkpoint with another template
+# would be rendered by that encoder in a way it was not trained on, so it is refused here.
+_CHATML_TEXT_TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] | trim }}<|im_end|>\n{% endfor %}"
+                         "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
 
 # Byte-level BPE tokenizers whose llama.cpp tokenisation was verified token for token against
 # the reference, with the pre-tokenizer name that reproduces them. An unknown hash stops the
@@ -96,7 +107,11 @@ class PeacebellModel(TextModel):
         has_bpe = (self.dir_model / "tokenizer.json").is_file()
         if self.tokenizer_kind == "bpe":
             _require(has_bpe and not has_spm, "config.json has train_pad_id, so the directory must hold tokenizer.json and no sentencepiece.model")
+            self.chat_template = self._read_chat_template()
+            self.chat_format = "chatml-text" if self.chat_template is not None else "completion"
         else:
+            self.chat_template = None
+            self.chat_format = "chatml-ids"
             _require(has_spm and not has_bpe, "config.json has no train_pad_id, so the directory must hold sentencepiece.model and no tokenizer.json")
             _require(hp.get("im_start_id") is not None and hp.get("im_end_id") is not None, "config.json has no im_start_id / im_end_id")
 
@@ -111,6 +126,20 @@ class PeacebellModel(TextModel):
         self.dir_model_card = None  # type: ignore[assignment]
         if self.model_name is None:
             self.model_name = "peacebell"
+
+    def _read_chat_template(self) -> str | None:
+        """The chat template of a byte-level BPE checkpoint, or None for one that continues text."""
+        tokenizer_config = self.dir_model / "tokenizer_config.json"
+        if not tokenizer_config.is_file():
+            return None
+        with open(tokenizer_config, encoding="utf-8") as f:
+            chat_template = json.load(f).get("chat_template")
+        if chat_template is None:
+            return None
+        _require(chat_template == _CHATML_TEXT_TEMPLATE,
+                 "tokenizer_config.json has a chat template other than the plain-text ChatML one that the native encoder "
+                 "implements; conversations of this checkpoint cannot be rendered as it was trained")
+        return chat_template
 
     def _check_tensors(self) -> None:
         """Every tensor the graph needs is present with the expected shape, and nothing else is."""
@@ -157,7 +186,7 @@ class PeacebellModel(TextModel):
         w.add_array(f"{arch}.attention.output_scale", list(self._attn_scale))
         w.add_array(f"{arch}.feed_forward.output_scale", list(self._mlp_scale))
 
-        w.add_string(f"{arch}.chat.format", "chatml-text" if self.tokenizer_kind == "bpe" else "chatml-ids")
+        w.add_string(f"{arch}.chat.format", self.chat_format)
 
     def set_vocab(self):
         if self.tokenizer_kind == "bpe":
@@ -251,8 +280,8 @@ class PeacebellModel(TextModel):
     def _set_vocab_bpe(self) -> None:
         """A GPT-2 style byte-level BPE whose only special token is the end-of-text token.
 
-        ChatML is plain text for these checkpoints: the markers are not in the vocabulary, the
-        whole conversation is tokenised in one call and generation stops on the marker string.
+        ChatML, where a checkpoint has it, is plain text: the markers are not in the vocabulary,
+        the whole conversation is tokenised in one call and generation stops on the marker string.
         """
         from tokenizers import Tokenizer
 
@@ -307,12 +336,8 @@ class PeacebellModel(TextModel):
         w.add_clean_spaces(False)
         w.add_suppress_tokens(sorted(suppress))
 
-        tokenizer_config = self.dir_model / "tokenizer_config.json"
-        if tokenizer_config.is_file():
-            with open(tokenizer_config, encoding="utf-8") as f:
-                chat_template = json.load(f).get("chat_template")
-            if isinstance(chat_template, str) and chat_template:
-                w.add_chat_template(chat_template)
+        if self.chat_template is not None:
+            w.add_chat_template(self.chat_template)
 
         arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
         w.add_string(f"{arch}.tokenizer.kind", "byte-bpe")

@@ -9,7 +9,7 @@
 find_program(PROSEPLOW_PYTHON NAMES python3 python REQUIRED)
 message(STATUS "Python for the tests: ${PROSEPLOW_PYTHON}")
 
-foreach (_test test_peacebell_logits test_peacebell_tokenizer test_plain_tokenizer test_qwen test_boris2_logits test_boris2_chat)
+foreach (_test test_peacebell_logits test_peacebell_tokenizer test_plain_tokenizer test_qwen test_boris2_logits test_boris2_chat test_shard2_logits)
     add_executable(${_test} ${_test}.cpp)
     target_include_directories(${_test} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(${_test} PRIVATE proseplow_native llama)
@@ -49,6 +49,11 @@ proseplow_add_test(peacebell-v1-291m.tokenizer-live tokenizer-live peacebell-v1-
 # its documented shape stands in for it.
 proseplow_add_test(peacebell-bpe-random random-bpe)
 
+# The real byte-level BPE members exist before they are published, as packages of the training
+# pipeline on the machine that makes them. Where PROSEPLOW_PEACEBELL_PACKAGES names such
+# directories this runs every peacebell check on each of them; everywhere else it is skipped.
+proseplow_add_test(peacebell-bpe-packages bpe-packages)
+
 # Boris-2: the same gates as peacebell (llama.cpp's own tokenizer is exact here, so the tokenizer
 # tests also cover the plain-text ChatML encoder of our library), then what its memory needs: a
 # chat session that keeps one context across requests through checkpoints of the recurrent
@@ -56,6 +61,15 @@ proseplow_add_test(peacebell-bpe-random random-bpe)
 # in Canon or the memory from a fault in the n-gram input.
 foreach (_test convert-determinism gguf-f32 gguf-f16 tokenizer tokenizer-live logits-f32 logits-f16 chat-f32 chat-f16 no-ngram-lookup)
     proseplow_add_test(boris-2-instruct.${_test} ${_test} boris-2-instruct)
+endforeach()
+
+# Shard-2: a model that continues text. Its layers are of two kinds, local ones with a window of
+# 256 keys and global ones, so its reference sequences are longer than that window and its logit
+# tests also pin what a cut of the memory needs to be right (see test_shard2_logits.cpp). Both
+# precisions are judged against the whole logit vector at every position, over the model's
+# whole context of 8,192 tokens as well.
+foreach (_test convert-determinism gguf-f32 gguf-f16 tokenizer tokenizer-live logits-f32 logits-f16)
+    proseplow_add_test(shard-2.${_test} ${_test} shard-2)
 endforeach()
 
 # A stock architecture: upstream's converter and upstream's graph. Nothing of ours is validated

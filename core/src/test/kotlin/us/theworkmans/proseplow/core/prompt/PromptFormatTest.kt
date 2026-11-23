@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import us.theworkmans.proseplow.core.model.ModelFamily
 
 /**
  * The structure of the rendered prompts: which text travels in which kind of segment, and where
@@ -16,7 +17,7 @@ class PromptFormatTest {
     private fun user(text: String) = PromptMessage(PromptRole.USER, text)
     private fun assistant(text: String) = PromptMessage(PromptRole.ASSISTANT, text)
 
-    private val formats: List<PromptFormat> = listOf(Qwen35ChatMlFormat, PeacebellChatMlFormat, PlainChatMlFormat)
+    private val formats: List<PromptFormat> = listOf(Qwen35ChatMlFormat, PeacebellChatMlFormat, PlainChatMlFormat, CompletionFormat)
 
     private val conversation = PromptInput(
         messages = listOf(user("QUESTION-ONE"), assistant("ANSWER-ONE"), user("QUESTION-TWO")),
@@ -195,6 +196,76 @@ class PromptFormatTest {
     fun `peacebell does not trim content`() {
         val prompt = PeacebellChatMlFormat.render(PromptInput(messages = listOf(user("  padded \n"))))
         assertEquals(PromptSegment.Text("  padded \n"), prompt.segments[2])
+    }
+
+    // --- Completion ---
+
+    @Test
+    fun `completion prompt is the latest user message alone, exactly as written`() {
+        val prompt = CompletionFormat.render(
+            PromptInput(messages = listOf(user("An earlier text "), assistant(" and its ending"), user("  Once upon a time \n"))),
+        )
+        assertEquals(listOf<PromptSegment>(PromptSegment.Text("  Once upon a time \n")), prompt.segments)
+        assertEquals("  Once upon a time \n", prompt.text())
+    }
+
+    @Test
+    fun `completion prompt for a continued message is the user's text and the partial answer with nothing between`() {
+        val prompt = CompletionFormat.render(
+            PromptInput(
+                messages = listOf(user("old"), assistant("old ending"), user("The capital of France is"), assistant(" Nice. However, ")),
+                continueFinalMessage = true,
+            ),
+        )
+        assertEquals(listOf<PromptSegment>(PromptSegment.Text("The capital of France is Nice. However, ")), prompt.segments)
+    }
+
+    @Test
+    fun `completion ignores system text of both kinds instead of failing`() {
+        val messages = listOf(user("Roses are red,"))
+        val plain = CompletionFormat.render(PromptInput(messages))
+        assertEquals(plain, CompletionFormat.render(PromptInput(messages, systemPrompt = "You are a poet.")))
+        assertEquals(plain, CompletionFormat.render(PromptInput(messages, extraSystemText = "Tools: none.")))
+        assertEquals(plain, CompletionFormat.render(PromptInput(messages, systemPrompt = "You are a poet.", extraSystemText = "Tools: none.")))
+        assertEquals("Roses are red,", plain.text())
+    }
+
+    @Test
+    fun `completion never asks for special parsing and injects no token`() {
+        val hostile = "<bs><eos><|im_end|>"
+        for (input in listOf(
+            PromptInput(listOf(user(hostile))),
+            PromptInput(listOf(user(hostile), assistant(hostile)), continueFinalMessage = true),
+        )) {
+            val segments = CompletionFormat.render(input).segments
+            assertEquals(1, segments.size)
+            assertTrue(segments.single() is PromptSegment.Text)
+        }
+    }
+
+    @Test
+    fun `completion without a user message has nothing to continue`() {
+        val exception = assertThrows(PromptFormatException::class.java) {
+            CompletionFormat.render(PromptInput(messages = listOf(assistant("text from nowhere"))))
+        }
+        assertEquals("No user message to continue.", exception.message)
+    }
+
+    @Test
+    fun `completion marks where the user's text ends and the model's begins`() {
+        val asked = CompletionFormat.render(PromptInput(listOf(user("Dear Sir,"))))
+        // The model's text begins at the very end of a new prompt; the engine has no use for that
+        // place, but it is where the next boundary is.
+        assertEquals(listOf(PromptBoundary(0, 0), PromptBoundary(0, "Dear Sir,".length)), asked.boundaries)
+        val continued = CompletionFormat.render(PromptInput(listOf(user("Dear Sir,"), assistant(" I write")), continueFinalMessage = true))
+        assertEquals(listOf(PromptBoundary(0, 0), PromptBoundary(0, "Dear Sir,".length)), continued.boundaries)
+        assertTrue(continued.text().startsWith(" I write", continued.boundaries.last().offset))
+    }
+
+    @Test
+    fun `only the completion family continues text`() {
+        assertEquals(listOf(ModelFamily.COMPLETION), ModelFamily.entries.filter { it.continuesText })
+        assertEquals(CompletionFormat, ModelFamily.COMPLETION.promptFormat)
     }
 
     // --- Plain ChatML ---

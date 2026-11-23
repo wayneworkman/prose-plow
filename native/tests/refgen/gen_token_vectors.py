@@ -16,6 +16,12 @@ retyped from user-defined to control, so that the library itself, not a re-imple
 says what the text becomes without them. For tokenizers it is the same file without its added
 tokens.
 
+Shard-2 has one token that its tokenizer file does not: the deletion token, the id after the
+tokenizer's last. For the "exact" reference it is added to the tokenizers library's vocabulary
+as a fourth special token, so that "special tokens recognised in the text" means the same four
+tokens on both sides; the "safe" reference knows none of them. Its texts are the common ones
+plus text that spells the four names in every awkward position (corpus.special_token_cases).
+
 The committed file is generated without --live from text that belongs to this project and
 contains only the symbols common to the family; strings that happen to contain a symbol
 specific to one tokenizer file are left out of it and covered by the live vectors instead.
@@ -55,11 +61,26 @@ def sentencepiece_encoders(model_file: Path):
     return exact.encode, safe.encode, symbols, (start, end)
 
 
-def bpe_encoders(tokenizer_file: Path):
-    from tokenizers import Tokenizer
+def model_only_token(model_dir: Path) -> tuple[str, int] | None:
+    """The token a model has beyond its tokenizer file, as (text, id): Shard-2's deletion token. None for every other model."""
+    config_file = model_dir / "config.json"
+    if not config_file.is_file():
+        return None
+    with open(config_file, encoding="utf-8") as f:
+        config = json.load(f)
+    if config.get("model_type") != "shard2":
+        return None
+    return config["backspace_token"], config["backspace_token_id"]
+
+
+def bpe_encoders(tokenizer_file: Path, extra: tuple[str, int] | None = None):
+    from tokenizers import AddedToken, Tokenizer
 
     text = tokenizer_file.read_text(encoding="utf-8")
     exact = Tokenizer.from_str(text)
+    if extra is not None:
+        exact.add_special_tokens([AddedToken(extra[0], special=True, normalized=False)])
+        assert exact.token_to_id(extra[0]) == extra[1], "the model's own token did not get the id the model gives it"
     stripped = json.loads(text)
     stripped["added_tokens"] = []
     safe = Tokenizer.from_str(json.dumps(stripped))
@@ -101,8 +122,14 @@ def main() -> int:
                                               chat(encode_safe, conversation, add_generation_prompt)))
     elif bpe_file.is_file():
         source = bpe_file
-        encode_exact, encode_safe = bpe_encoders(bpe_file)
-        texts = corpus.live(args.llama_src, []) if args.live else corpus.committed()
+        extra = model_only_token(args.model_dir)
+        encode_exact, encode_safe = bpe_encoders(bpe_file, extra)
+        if extra is None:
+            texts = corpus.live(args.llama_src, []) if args.live else corpus.committed()
+        else:
+            # The names of every token of this model that is not text: the tokenizer's specials and the model's own.
+            names = [t["content"] for t in json.loads(bpe_file.read_text(encoding="utf-8"))["added_tokens"]] + [extra[0]]
+            texts = corpus.live(args.llama_src, names) if args.live else list(dict.fromkeys(corpus.committed() + corpus.special_token_cases(names)))
         if chatml_text.has_chat_template(args.model_dir):
             renderer = chatml_text.ChatTokenizer(args.model_dir)
             for conversation in corpus.text_chatml_conversations():

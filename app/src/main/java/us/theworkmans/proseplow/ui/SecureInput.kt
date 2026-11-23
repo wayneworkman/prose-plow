@@ -6,6 +6,7 @@ import android.view.inputmethod.InputConnection
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.KeyboardActionHandler
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.TextObfuscationMode
 import androidx.compose.foundation.text.input.clearText
 import androidx.compose.material3.OutlinedSecureTextField
 import androidx.compose.material3.Text
@@ -59,6 +60,15 @@ fun NoPersonalizedLearning(content: @Composable () -> Unit) {
  * from autofill, and its [state] is not saved in the instance state: callers make it with
  * `remember { TextFieldState() }`, never `rememberSaveable`.
  *
+ * Every character is a bullet from the moment it is typed. The text field's own default shows
+ * the last typed character for a moment, which is enough for a camera, a screen recording or
+ * someone watching to read a passphrase one character at a time; so the fully hidden mode is
+ * asked for explicitly, and there is no way to reveal what was typed.
+ *
+ * A passphrase field is only ever shown where the screen cannot be captured: on the set-up and
+ * lock screens, whose window is always secure, or in a PassphraseDialog (the lock package),
+ * which is secure by itself. A test that reads the sources holds every use to that.
+ *
  * What it tells the accessibility framework is obscured as well. The secure text field draws
  * bullets, but on its own it describes itself to that framework with the text that was typed
  * (marked as a password), so any accessibility service the user has enabled could read the
@@ -78,10 +88,11 @@ fun PassphraseField(
     /** What the keyboard's action key does; null leaves it to the keyboard (Next moves on, Done closes it). */
     onAction: (() -> Unit)? = null,
 ) {
-    ExcludeWindowFromAutofill()
+    ProtectWindow()
     NoPersonalizedLearning {
         OutlinedSecureTextField(
             state = state,
+            textObfuscationMode = TextObfuscationMode.Hidden,
             // The outermost semantics of the field's own node, so these values replace the ones
             // the field sets itself (the typed text, under both names it is published as).
             modifier = modifier.semantics {
@@ -112,20 +123,27 @@ fun PassphraseField(
 internal fun obscuredForAccessibility(length: Int): AnnotatedString = AnnotatedString("\u2022".repeat(length))
 
 /**
- * Keeps autofill services away from the window this is composed in. The activity's window is
- * excluded in MainActivity; a Compose dialog is a separate window with its own view tree, so
- * every dialog with a text field calls this. It sets
- * `IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS` on the window's root view and on the parent of
- * the Compose view: the platform then treats every view below as not important for autofill
- * (`View.isImportantForAutofill()` checks the ancestors first), whatever Compose sets on its own
- * view, and leaves it out of the structure given to an autofill service.
+ * Gives the window this is composed in the two protections the activity's own window gets in
+ * MainActivity. A Compose dialog is a separate window with its own view tree, so every dialog
+ * with a text field, or with a button that must not be pressed by a trick, calls this.
+ *
+ * - Autofill services are kept away. It sets `IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS` on
+ *   the window's root view and on the parent of the Compose view: the platform then treats every
+ *   view below as not important for autofill (`View.isImportantForAutofill()` checks the
+ *   ancestors first), whatever Compose sets on its own view, and leaves it out of the structure
+ *   given to an autofill service.
+ * - Touches that arrive while another app's window covers the place that was touched are
+ *   discarded (`filterTouchesWhenObscured`), so an overlay drawn over the dialog cannot make
+ *   the user press something in it without seeing it.
  */
 @Composable
-fun ExcludeWindowFromAutofill() {
+fun ProtectWindow() {
     val view = LocalView.current
     DisposableEffect(view) {
         (view.parent as? View)?.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         view.rootView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        view.rootView.filterTouchesWhenObscured = true
+        view.filterTouchesWhenObscured = true
         onDispose { }
     }
 }

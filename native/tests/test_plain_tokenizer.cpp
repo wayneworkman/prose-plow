@@ -1,6 +1,6 @@
 // Token-exactness of llama.cpp's own tokenizer for a model whose reference tokenizer it is
-// expected to reproduce without a front-end (Boris-2 and the byte-level BPE members of the
-// peacebell family), and of the plain-text ChatML encoder of our library on top of it.
+// expected to reproduce without a front-end (Boris-2, Shard-2 and the byte-level BPE members of
+// the peacebell family), and of the plain-text ChatML encoder of our library on top of it.
 //
 //   test_plain_tokenizer --gguf FILE --vectors FILE
 //
@@ -9,8 +9,13 @@
 // parse_special = true, and "safe" is the reference with them treated as plain characters,
 // which is parse_special = false and what message content must go through.
 //
+// A vocabulary's control tokens (an end-of-text token; for Shard-2 also a padding token, a
+// second marker and the deletion token, which its tokenizer file does not even contain) are
+// not text. The test holds every one of them to that: typed as text its name stays plain
+// characters, and turned back into text it contributes nothing.
+//
 // The conversations of the file are the reference's chat template rendered and tokenised in
-// one call. pp_chatml_text_tokenize must reproduce the safe variant, which differs from the
+// one call. A model without a chat template has none, and the checks on them do not run. pp_chatml_text_tokenize must reproduce the safe variant, which differs from the
 // exact one only where a message contains the end-of-text literal.
 
 #include "support/test_support.h"
@@ -30,6 +35,13 @@ std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string &
     }
     out.resize(n < 0 ? 0 : (size_t) n);
     return out;
+}
+
+// The text a token contributes when a reply is shown (special = false) or when a prompt is printed with its markers.
+std::string piece(const llama_vocab * vocab, llama_token token, bool special) {
+    char buf[64];
+    const int32_t n = llama_token_to_piece(vocab, token, buf, (int32_t) sizeof(buf), 0, special);
+    return n > 0 ? std::string(buf, (size_t) n) : std::string();
 }
 
 struct chat {
@@ -93,16 +105,30 @@ int main(int argc, char ** argv) {
         const std::string arch = pp_test::meta(model.get(), "general.architecture");
         r.check(pp_test::meta(model.get(), arch + ".tokenizer.source_sha256") == sha, "the vectors were generated from the model's tokenizer file (%.12s...)", sha.c_str());
 
+        // The tokens of this vocabulary that are not text.
+        std::vector<llama_token> control;
+        for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); id++) {
+            if (llama_vocab_is_control(vocab, id)) {
+                control.push_back(id);
+            }
+        }
+        const auto n_control_in = [&](const std::vector<llama_token> & ids) {
+            return (size_t) std::count_if(ids.begin(), ids.end(), [&](llama_token t) { return std::binary_search(control.begin(), control.end(), t); });
+        };
+
         const uint32_t n_text = in.u32();
-        size_t bad_special = 0, bad_plain = 0, n_tokens = 0, n_differ = 0, n_eos_plain = 0;
+        size_t bad_special = 0, bad_plain = 0, n_tokens = 0, n_differ = 0, n_eos_plain = 0, n_control_plain = 0, n_control_special = 0;
         for (uint32_t i = 0; i < n_text; i++) {
             const std::string text = in.sized_bytes();
             const std::vector<llama_token> exact = in.ids_u16();
             const std::vector<llama_token> safe = in.u8() != 0 ? in.ids_u16() : exact;
             const std::vector<llama_token> plain = tokenize(vocab, text, false);
-            bad_special += tokenize(vocab, text, true) != exact ? 1 : 0;
+            const std::vector<llama_token> special = tokenize(vocab, text, true);
+            bad_special += special != exact ? 1 : 0;
             bad_plain += plain != safe ? 1 : 0;
             n_eos_plain += (size_t) std::count(plain.begin(), plain.end(), eos);
+            n_control_plain += n_control_in(plain);
+            n_control_special += n_control_in(special);
             n_tokens += exact.size();
             n_differ += exact != safe ? 1 : 0;
         }
@@ -111,6 +137,29 @@ int main(int argc, char ** argv) {
         // What makes "one conversation is one document" exact for Boris-2: text never becomes the end-of-text token.
         r.check(n_eos_plain == 0 && n_differ > 0, "the end-of-text token %d occurs %zu times in text tokenised as plain characters (%zu texts contain its literal)",
                 eos, n_eos_plain, n_differ);
+
+        // Every control token, by its own name: plain characters when typed, the token only
+        // when special tokens are parsed, and nothing at all when a reply is turned into text.
+        size_t n_stays_text = 0, n_parsed = 0, n_silent = 0;
+        std::string names;
+        for (const llama_token id : control) {
+            const std::string name = llama_vocab_get_text(vocab, id);
+            const std::vector<llama_token> typed = tokenize(vocab, name, false);
+            std::string back;
+            for (const llama_token t : typed) {
+                back += piece(vocab, t, false);
+            }
+            n_stays_text += n_control_in(typed) == 0 && typed.size() > 1 && back == name ? 1 : 0;
+            n_parsed += tokenize(vocab, name, true) == std::vector<llama_token>{id} ? 1 : 0;
+            n_silent += piece(vocab, id, false).empty() && piece(vocab, id, true) == name ? 1 : 0;
+            names += (names.empty() ? "" : " ") + name;
+        }
+        r.check(!control.empty() && n_control_plain == 0 && n_control_special > 0,
+                "the %zu control token(s) of the vocabulary occur %zu times in the texts tokenised as plain characters and %zu times with special tokens parsed",
+                control.size(), n_control_plain, n_control_special);
+        r.check(n_stays_text == control.size() && n_parsed == control.size() && n_silent == control.size(),
+                "%s: typed as text, %zu of %zu stay plain characters that read back as typed; parsed, %zu are their one token; turned into text, %zu contribute nothing",
+                names.c_str(), n_stays_text, control.size(), n_parsed, n_silent);
 
         const uint32_t n_chat = in.u32();
         std::vector<chat> chats(n_chat);

@@ -374,6 +374,112 @@ class ChatControllerTest {
     }
 
     @Test
+    fun textTheModelTakesBackGoesFromTheMessageWhileItIsBeingWritten() = runTest {
+        val session = unlocked()
+        val id = session.id
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.TextDelta("Nice.")),
+                Step.Emit(GenerationEvent.TextDelta(" 198")),
+                Step.Wait(100),
+                Step.Emit(GenerationEvent.TextReplaced("Nice.", removed = 4)),
+                Step.Wait(100),
+                Step.Emit(GenerationEvent.TextDelta(" However,")),
+                Step.Emit(GenerationEvent.Done(FinishReason.LENGTH, text = "Nice. However,", stats = noStats)),
+            ),
+        )
+        session.chat.send(id, "The capital of France is")
+        runCurrent()
+        assertEquals("Nice. 198", session.openSession.messages[1].text)
+        assertEquals(TurnPhase.Writing, session.state.turn?.phase)
+
+        advanceTimeBy(100)
+        runCurrent()
+        assertEquals("what was taken back is gone from the message on screen", "Nice.", session.openSession.messages[1].text)
+        assertTrue("and the reply is still being written", session.openSession.isGenerating)
+        assertEquals(TurnPhase.Writing, session.state.turn?.phase)
+
+        advanceTimeBy(100)
+        runCurrent()
+        val reply = session.openSession.messages[1]
+        assertEquals("Nice. However,", reply.text)
+        assertEquals(FinishReason.LENGTH, reply.finishReason)
+        assertEquals("what is stored is the text that was left", session.openSession, app.stored(id))
+    }
+
+    @Test
+    fun textTakenBackFromAContinuedReplyLeavesWhatWasThereBefore() = runTest {
+        val session = unlocked()
+        val id = session.id
+        app.engine.enqueueReply(listOf("Once upon"), finishReason = FinishReason.LENGTH)
+        session.chat.send(id, "Tell me a story")
+        runCurrent()
+        val cut = session.openSession.messages.last()
+
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.TextDelta(" a mattress")),
+                Step.Emit(GenerationEvent.TextReplaced(" a", removed = 9)),
+                Step.Emit(GenerationEvent.TextDelta(" time.")),
+                Step.Emit(GenerationEvent.Done(FinishReason.END_OF_TURN, text = " a time.", stats = noStats)),
+            ),
+        )
+        assertTrue(session.chat.continueReply(id, cut.id))
+        runCurrent()
+        assertEquals("Once upon a time.", session.openSession.messages.last().text)
+    }
+
+    @Test
+    fun aModelThatContinuesTextIsGivenWhatWasTypedExactlyAndItsReplyIsKeptExactly() = runTest {
+        app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled }
+        val session = unlocked()
+        val id = session.id
+        val shard = ModelCatalog.SHARD_2.id
+        session.chat.selectModel(id, shard)
+        runCurrent()
+
+        app.engine.enqueue(
+            listOf(
+                Step.Emit(GenerationEvent.TextDelta(" there was \n")),
+                Step.Emit(GenerationEvent.Done(FinishReason.END_OF_TURN, text = " there was \n", stats = noStats, exactText = true)),
+            ),
+        )
+        assertTrue(session.chat.send(id, "  Once upon a time "))
+        runCurrent()
+
+        val request = app.engine.requests.last()
+        assertEquals(shard, request.modelId)
+        assertEquals("a space at the end decides what comes next", listOf(PromptMessage(PromptRole.USER, "  Once upon a time ")), request.messages)
+        assertNull("it has no system prompt", request.systemPrompt)
+        assertEquals(ModelCatalog.SHARD_2.sampling, request.sampling)
+        val chat = session.openSession
+        assertEquals("  Once upon a time ", chat.messages[0].text)
+        assertEquals("the reply keeps its first and its last character", " there was \n", chat.messages[1].text)
+        assertEquals(shard, chat.messages[1].modelId)
+        assertEquals(chat, app.stored(id))
+
+        // Editing keeps the text exactly as well.
+        app.engine.enqueueReply(listOf(" again"), finishReason = FinishReason.LENGTH)
+        assertTrue(session.chat.edit(id, chat.messages[0].id, "Once more \n"))
+        runCurrent()
+        assertEquals("Once more \n", session.openSession.messages[0].text)
+        assertEquals(listOf(PromptMessage(PromptRole.USER, "Once more \n")), app.engine.requests.last().messages)
+
+        // Text that is only blanks is still nothing to send.
+        assertFalse(session.chat.send(id, "  \n"))
+
+        // A chat model of the same build is sent its messages without the blanks around them, as before.
+        session.chat.selectModel(id, qwen)
+        runCurrent()
+        app.engine.enqueueReply(listOf("Yes."))
+        assertTrue(session.chat.send(id, "  And a question?  "))
+        runCurrent()
+        assertEquals("And a question?", session.openSession.messages[2].text)
+        assertEquals(PromptMessage(PromptRole.USER, "And a question?"), app.engine.requests.last().messages.last())
+        assertEquals(PromptMessage(PromptRole.USER, "Once more"), app.engine.requests.last().messages.first())
+    }
+
+    @Test
     fun theConversationCannotBeChangedWhileAReplyIsBeingWritten() = runTest {
         val session = unlocked()
         val id = session.id
@@ -598,7 +704,9 @@ class ChatControllerTest {
 
     @Test
     fun aChatWhoseModelIsNotInThisBuildWaitsForAnotherToBeChosen() = runTest {
-        app = SessionFixture(temp.root, testScheduler)
+        // A build made with all the catalogue's models but one, as a build with a subset is.
+        val leftOut = ModelCatalog.SHARD_2.id
+        app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled.filter { it.id != leftOut } }
         val old = ChatSession(id = "old", createdAtMillis = 1, modelId = "retired-model").withUserMessage("From an older build", app.clock)
         app.plant(old)
         val session = app.open()
@@ -620,8 +728,9 @@ class ChatControllerTest {
         assertEquals(listOf("From an older build", "Here."), session.openSession.messages.map { it.text })
         assertEquals(boris, session.openSession.messages.last().modelId)
 
-        // A model this build does not offer cannot be chosen either.
-        session.chat.selectModel("old", ModelCatalog.BORIS2_PEACEBELL_THINK.id)
+        // A model the catalogue knows but this build does not offer cannot be chosen either.
+        assertFalse(session.state.offers(leftOut))
+        session.chat.selectModel("old", leftOut)
         assertEquals(boris, session.openSession.modelId)
     }
 

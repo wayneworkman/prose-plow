@@ -1,0 +1,13 @@
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -189,7 +189,8 @@ private:
+ 
+             if (p == rev_merge.end()) {
+                 // output any symbols that did not form tokens as bytes.
+-                output.reserve(output.size() + cur.n);
++                // (no reserve here: asking for the exact size per symbol makes the vector grow
++                // by reallocating every time, which is quadratic in a text of such symbols)
+                 for (int j = 0; j < (int)cur.n; ++j) {
+                     llama_token id = vocab.byte_to_token(cur.text[j]);
+                     output.push_back(id);

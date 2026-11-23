@@ -8,6 +8,12 @@
 // - No exception leaves a function declared in the header: llama.cpp reports some failures by
 //   throwing, and the callers are C and JNI.
 // - Everything a session allocates is owned by its struct and released by pp_session_close.
+// - A buffer of this file that held text, tokens, scores or model state is overwritten before it
+//   is freed. llama.cpp's buffers are not this file's to overwrite, with the exceptions that
+//   destroy_context and destroy_sampler name; see pp_session_clear_memory in the header for what
+//   that leaves behind.
+// - No size from outside reaches llama.cpp unchecked: llama.cpp allocates for whatever it is
+//   given, and an allocation that cannot be met ends the process on a phone instead of failing.
 
 #include "proseplow_session.h"
 
@@ -33,8 +39,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#if defined(__ANDROID__)
+// Giving free pages back to the system has a call of its own on these two C libraries.
+#if defined(__ANDROID__) || defined(__GLIBC__)
 #include <malloc.h>
+#define PP_HAVE_MALLOC_H 1
 #endif
 
 // Thread affinity exists in this form on Linux and Android only. Elsewhere a session runs its
@@ -61,6 +69,23 @@ void wipe(void * data, size_t size) {
     }
     std::memset(data, 0, size);
     __asm__ __volatile__("" : : "r"(data) : "memory");
+}
+
+// Asks the allocator to give the pages it holds free back to the system, which discards what
+// was in them. Two reasons to ask: after a model, hundreds of megabytes which a phone needs
+// now and which Android's allocator would otherwise keep for some time; and after a
+// conversation, because a freed block that llama.cpp did not overwrite is readable for as long
+// as its page stays with the process. It only helps for pages that are free as a whole: a block
+// that shares its page with a live one stays as it is.
+void release_free_pages() {
+#if defined(__ANDROID__)
+    // M_PURGE_ALL (Android 14) also empties the per-thread caches; M_PURGE is what came before.
+    if (mallopt(M_PURGE_ALL, 0) == 0) {
+        mallopt(M_PURGE, 0);
+    }
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 //
@@ -277,11 +302,22 @@ struct pp_session {
     llama_context *          ctx = nullptr;
     const llama_vocab *      vocab = nullptr;
     llama_batch_ext *        batch = nullptr;
+    // The sampler, in two parts that are always there together or not at all: the chain that
+    // changes and narrows the scores (bans, penalties, temperature, truncations), and the
+    // sampler that chooses among what is left (random or greedy). They are applied one after
+    // the other where llama.cpp would apply one chain, so that the session can look at the
+    // scores in between: see pp_session_sample_next.
     llama_sampler *          sampler = nullptr;
+    llama_sampler *          chooser = nullptr;
     pp_peacebell_tokenizer * peacebell = nullptr; // set when the model needs the front-end
 
     int32_t n_vocab = 0;
     int32_t n_batch = 0;
+    int32_t n_ctx = 0; // of the context as created; kept when there is no context
+
+    // How the context is created. Kept because forgetting a conversation frees the context and
+    // creates it again (see destroy_context); the pointers in it are NULL or refer to the model.
+    llama_context_params cparams;
 
     // A token the model must never be given as input, or LLAMA_TOKEN_NULL. Boris-2 treats one
     // sequence as one document: its graph asserts that the end-of-text token is not an input,
@@ -292,11 +328,35 @@ struct pp_session {
     // the case for attention-only memory. Only then is the abort callback installed.
     bool can_abort = false;
 
+    // The window of the model's windowed layers in tokens (Shard-2: 256), 0 for a model without
+    // such layers. Those layers keep their keys from some position on, and a cut of the memory
+    // is only right while they still hold the window before it: see pp_session_rewind_to.
+    int32_t n_window = 0;
+
     // A prediction is ready from the end of a complete evaluation until it is sampled or the
-    // memory changes. has_prediction_data says that the context's output buffer holds a
-    // prediction at all, fresh or stale: clearing overwrites it.
+    // memory changes. has_prediction_data says that the context's output buffer holds scores
+    // that were not overwritten yet, which is the case exactly from a llama_process call that
+    // computed an output until wipe_prediction. Only while it is set may llama.cpp be asked for
+    // the buffer: after a call without output it has none to give, and a build of llama.cpp
+    // with assertions ends the process over the question.
     bool prediction_ready = false;
     bool has_prediction_data = false;
+
+    // The sampler as it was configured, kept so that the chain can be built again after a
+    // conversation is forgotten (banned_tokens in it points into banned_list), and what the
+    // session checks itself: the banned tokens as one flag per token of the vocabulary (empty
+    // when none is banned), and the length of the penalties' record of sampled tokens in the
+    // present chain (0 when the chain has no penalties).
+    bool                     sampler_configured = false;
+    pp_sampler_config        sampler_config = {};
+    std::vector<llama_token> banned_list;
+    std::vector<uint8_t>     banned;
+    int32_t                  penalty_window = 0;
+
+    // The candidate list a token is sampled from: every token with its score. The session's own,
+    // one per vocabulary and allocated when the session opens, so that sampling allocates nothing
+    // and the list can be overwritten as soon as the token is chosen.
+    std::vector<llama_token_data> candidates;
 
     std::unordered_map<int32_t, pp_checkpoint> checkpoints;
     int32_t next_checkpoint = 0;
@@ -352,8 +412,25 @@ int32_t fail(pp_session * s, int32_t status, const std::string & message) {
     return fail(s, status, message.c_str());
 }
 
+// The number of tokens in memory; none for a session whose context could not be created again.
 int32_t memory_count(const pp_session * s) {
-    return (int32_t) llama_memory_seq_pos_max(llama_get_memory(s->ctx), k_seq) + 1;
+    return s->ctx == nullptr ? 0 : (int32_t) llama_memory_seq_pos_max(llama_get_memory(s->ctx), k_seq) + 1;
+}
+
+// The answer of every call that needs a context when there is none (see pp_session_clear_memory).
+int32_t fail_no_context(pp_session * s) {
+    return fail(s, PP_STATUS_OUT_OF_MEMORY, "the session has no context: it could not be created again after the conversation was forgotten");
+}
+
+// Overwrites the scores of the latest prediction where llama.cpp keeps them.
+void wipe_prediction(pp_session * s) {
+    if (s->has_prediction_data && s->ctx != nullptr) {
+        float * logits = llama_get_logits_ith(s->ctx, -1);
+        if (logits != nullptr) {
+            wipe(logits, (size_t) s->n_vocab * sizeof(float));
+        }
+    }
+    s->has_prediction_data = false;
 }
 
 void free_checkpoint(pp_checkpoint & checkpoint) {
@@ -411,25 +488,44 @@ bool progress_trampoline(float fraction, void * data) {
 // An empty device list. Static for the reason given at pp_session::progress.
 ggml_backend_dev_t g_no_devices[] = {nullptr};
 
-bool valid_params(const pp_session_params * params) {
-    if (params == nullptr || params->n_ctx < 1 || params->n_batch < 1 || params->n_threads < 1 ||
-        params->n_threads > GGML_MAX_N_THREADS || params->n_pinned_cpus < 0 || params->n_pinned_cpus > GGML_MAX_N_THREADS ||
-        (params->pinned_cpus == nullptr && params->n_pinned_cpus > 0) ||
-        (params->load_mode != PP_LOAD_MODE_READ && params->load_mode != PP_LOAD_MODE_MMAP)) {
-        return false;
+#define PP_STRINGIFY_VALUE(value) #value
+#define PP_STRINGIFY(value) PP_STRINGIFY_VALUE(value)
+
+// What is wrong with the parameters of a session, or NULL when nothing is. This runs before a
+// file is opened, and it is where the sizes are held to their limits: llama.cpp would take a
+// context of two thousand million tokens as given and allocate for it until the system ends
+// the process.
+const char * params_problem(const pp_session_params * params) {
+    if (params == nullptr) {
+        return "no session parameters";
+    }
+    if (params->n_ctx < 1 || params->n_ctx > PP_CONTEXT_TOKENS_MAX) {
+        return "the context size is outside 1 to " PP_STRINGIFY(PP_CONTEXT_TOKENS_MAX) " tokens";
+    }
+    if (params->n_batch < 1 || params->n_batch > PP_CONTEXT_TOKENS_MAX) {
+        return "the batch size is outside 1 to " PP_STRINGIFY(PP_CONTEXT_TOKENS_MAX) " tokens";
+    }
+    if (params->n_threads < 1 || params->n_threads > GGML_MAX_N_THREADS) {
+        return "the number of threads is outside 1 to " PP_STRINGIFY(GGML_MAX_N_THREADS);
+    }
+    if (params->n_pinned_cpus < 0 || params->n_pinned_cpus > GGML_MAX_N_THREADS || (params->pinned_cpus == nullptr && params->n_pinned_cpus > 0)) {
+        return "the list of CPUs to pin to is missing or too long";
+    }
+    if (params->load_mode != PP_LOAD_MODE_READ && params->load_mode != PP_LOAD_MODE_MMAP) {
+        return "the load mode is not one of pp_load_mode";
     }
     for (int32_t i = 0; i < params->n_pinned_cpus; i++) {
         // ggml's CPU mask has GGML_MAX_N_THREADS entries; a CPU beyond it cannot be named.
         if (params->pinned_cpus[i] < 0 || params->pinned_cpus[i] >= GGML_MAX_N_THREADS) {
-            return false;
+            return "a CPU to pin to is outside the numbers ggml can name";
         }
         for (int32_t j = 0; j < i; j++) {
             if (params->pinned_cpus[j] == params->pinned_cpus[i]) {
-                return false;
+                return "a CPU to pin to is listed twice";
             }
         }
     }
-    return true;
+    return nullptr;
 }
 
 #ifdef PP_HAVE_AFFINITY
@@ -481,8 +577,9 @@ bool install_threadpool(pp_session * s, bool pin) {
     return pin;
 }
 
-// Makes the thread pool fit what the system allows at this moment. Called at the start of every
-// evaluation, on the evaluating thread; it returns at once while nothing has changed.
+// Makes the thread pool fit what the system allows at this moment. Called before every chunk
+// of an evaluation, on the evaluating thread; it returns after one system call while nothing
+// has changed.
 void prepare_threads(pp_session * s) {
 #ifdef PP_HAVE_AFFINITY
     if (s->threads_ready) {
@@ -543,6 +640,195 @@ void free_retired_threadpools(pp_session * s) {
     s->retired_threadpools.clear();
 }
 
+// Tells a context that was just created about the thread pool in use. The pool outlives a
+// context: it holds nothing of a conversation, and its threads are where they should be.
+void attach_threads(pp_session * s) {
+    if (!s->threads_ready) {
+        return; // no evaluation yet: the first one sets the threads up
+    }
+    if (s->threadpool != nullptr) {
+        llama_attach_threadpool(s->ctx, s->threadpool, s->threadpool);
+    }
+    llama_set_n_threads(s->ctx, s->n_threads_now, s->n_threads_now);
+}
+
+// Frees the batch and the context, after overwriting what they hold of a conversation and can
+// be reached: the token ids in the batch (a batch has no call for that, so it is refilled with
+// zeros), the scores of the last prediction, and the key-value and state buffers of the memory
+// (the true of llama_memory_clear). Everything else the context owns is freed as it is: the
+// copies of the tokens of the chunks it evaluated and the activations of the last chunk among
+// them. Never throws.
+void destroy_context(pp_session * s) {
+    try {
+        if (s->batch != nullptr) {
+            llama_batch_ext_clear(s->batch);
+            for (int32_t i = 0; i < s->n_batch; i++) {
+                if (llama_batch_ext_add_token(s->batch, k_seq, 0) < 0) {
+                    break;
+                }
+            }
+            llama_batch_ext_clear(s->batch);
+        }
+    } catch (...) {
+        // The batch is freed below either way.
+    }
+    try {
+        if (s->batch != nullptr) {
+            llama_batch_ext_free(s->batch);
+        }
+        s->batch = nullptr;
+        if (s->ctx != nullptr) {
+            wipe_prediction(s);
+            llama_memory_clear(llama_get_memory(s->ctx), true);
+            llama_free(s->ctx);
+        }
+    } catch (...) {
+        // Nothing more can be done for whatever threw; the session no longer refers to it.
+    }
+    s->batch = nullptr;
+    s->ctx = nullptr;
+    s->prediction_ready = false;
+    s->has_prediction_data = false;
+    // The backend that knew the replaced pools went with the context.
+    if (s->threadpool_free != nullptr) {
+        free_retired_threadpools(s);
+    }
+}
+
+// Creates the context from the kept parameters, and the batch that belongs to it. Returns false,
+// with nothing created, when llama.cpp cannot.
+bool create_context(pp_session * s) {
+    try {
+        s->ctx = llama_init_from_model(s->model, s->cparams);
+        if (s->ctx != nullptr) {
+            s->n_ctx   = (int32_t) llama_n_ctx(s->ctx);
+            s->n_batch = (int32_t) llama_n_batch(s->ctx);
+            s->batch   = llama_batch_ext_init(s->ctx);
+        }
+        if (s->ctx != nullptr && s->batch != nullptr && s->n_batch > 0) {
+            // The batch is brought to its full size now, with zeros. One that grew while a
+            // prompt was put into it would move the tokens it already holds and free their old
+            // place as it is.
+            for (int32_t i = 0; i < s->n_batch; i++) {
+                if (llama_batch_ext_add_token(s->batch, k_seq, 0) < 0) {
+                    break;
+                }
+            }
+            llama_batch_ext_clear(s->batch);
+            if (s->can_abort) {
+                llama_set_abort_callback(s->ctx, abort_callback, s);
+            }
+            attach_threads(s);
+            return true;
+        }
+    } catch (...) {
+        // Whatever exists of the two is freed below.
+    }
+    destroy_context(s);
+    return false;
+}
+
+// The two parts of a sampler (see pp_session::sampler), owned until they are released.
+struct sampler_parts {
+    llama_sampler * chain = nullptr;
+    llama_sampler * chooser = nullptr;
+    bool with_penalties = false; // whether the chain has the penalties in it
+
+    sampler_parts() = default;
+    sampler_parts(const sampler_parts &) = delete;
+    sampler_parts & operator=(const sampler_parts &) = delete;
+    ~sampler_parts() {
+        if (chain != nullptr) {
+            llama_sampler_free(chain);
+        }
+        if (chooser != nullptr) {
+            llama_sampler_free(chooser);
+        }
+    }
+};
+
+// Builds a sampler: see pp_session_configure_sampler in the header for its order. Throws
+// std::bad_alloc when llama.cpp cannot create a part of it; nothing stays allocated then.
+void build_sampler(int32_t n_vocab, const pp_sampler_config & config, sampler_parts & parts) {
+    parts.chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (parts.chain == nullptr) {
+        throw std::bad_alloc();
+    }
+    // The chain owns what is added to it; freeing the chain frees the whole of it.
+    const auto add = [&](llama_sampler * sampler) {
+        if (sampler == nullptr) {
+            throw std::bad_alloc();
+        }
+        llama_sampler_chain_add(parts.chain, sampler);
+    };
+
+    if (config.n_banned_tokens > 0) {
+        std::vector<llama_logit_bias> biases;
+        biases.reserve((size_t) config.n_banned_tokens);
+        for (int32_t i = 0; i < config.n_banned_tokens; i++) {
+            biases.push_back({config.banned_tokens[i], -std::numeric_limits<float>::infinity()});
+        }
+        add(llama_sampler_init_logit_bias(n_vocab, (int32_t) biases.size(), biases.data()));
+    }
+    parts.with_penalties = config.repetition_penalty != 1.0f || config.frequency_penalty != 0.0f || config.presence_penalty != 0.0f;
+    if (parts.with_penalties) {
+        add(llama_sampler_init_penalties(n_vocab, config.penalty_window, config.repetition_penalty, config.frequency_penalty, config.presence_penalty));
+    }
+    if (config.temperature >= PP_TEMPERATURE_MIN) {
+        add(llama_sampler_init_temp(config.temperature));
+        if (config.top_k != 0) {
+            add(llama_sampler_init_top_k(config.top_k));
+        }
+        if (config.top_p < 1.0f) {
+            add(llama_sampler_init_top_p(config.top_p, 1));
+        }
+        if (config.min_p > 0.0f) {
+            add(llama_sampler_init_min_p(config.min_p, 1));
+        }
+        parts.chooser = llama_sampler_init_dist(config.seed);
+    } else {
+        parts.chooser = llama_sampler_init_greedy();
+    }
+    if (parts.chooser == nullptr) {
+        throw std::bad_alloc();
+    }
+}
+
+// Hands the parts of a new sampler to the session, which has none at this point.
+void install_sampler(pp_session * s, sampler_parts & parts, int32_t penalty_window) {
+    s->sampler = parts.chain;
+    s->chooser = parts.chooser;
+    s->penalty_window = parts.with_penalties ? penalty_window : 0;
+    parts.chain = nullptr;
+    parts.chooser = nullptr;
+}
+
+// Frees the sampler after overwriting its record of the sampled tokens. That record is the ring
+// buffer of the penalties, which neither llama_sampler_reset nor llama_sampler_free overwrites;
+// accepting a token pushes it into the buffer, so accepting token 0 once for every place of the
+// buffer leaves nothing but zeros in it. Never throws.
+void destroy_sampler(pp_session * s) {
+    try {
+        for (int32_t i = 0; s->sampler != nullptr && i < s->penalty_window; i++) {
+            llama_sampler_accept(s->sampler, 0);
+        }
+    } catch (...) {
+        // The chain is freed below either way.
+    }
+    try {
+        if (s->sampler != nullptr) {
+            llama_sampler_free(s->sampler);
+        }
+        if (s->chooser != nullptr) {
+            llama_sampler_free(s->chooser);
+        }
+    } catch (...) {
+    }
+    s->sampler = nullptr;
+    s->chooser = nullptr;
+    s->penalty_window = 0;
+}
+
 // Undoes prepare_threads: frees the pools and, if the calling thread was pinned, lets it go.
 // The context must already be freed: its backend still knows the pool it last computed with.
 void release_threads(pp_session * s) {
@@ -571,10 +857,9 @@ struct session_closer {
     void operator()(pp_session * s) const { pp_session_close(s); }
 };
 
-// Loads the model through load(), then builds everything else a session needs. model_limit is
-// the number of bytes the model may occupy in its file, or -1 when the file is the model.
+// Loads the model through load(), then builds everything else a session needs.
 template <typename Load>
-int32_t open_session(const pp_session_params * params, int64_t model_limit, pp_session ** session, char * error, size_t error_size, Load && load) {
+int32_t open_session(const pp_session_params * params, pp_session ** session, char * error, size_t error_size, Load && load) {
     try {
         if (!g_runtime_ready) {
             put_error(error, error_size, "pp_runtime_init has not succeeded: " + g_runtime_description);
@@ -615,37 +900,37 @@ int32_t open_session(const pp_session_params * params, int64_t model_limit, pp_s
             put_error(error, error_size, log.empty() ? std::string("llama.cpp could not load the model") : tidy(log));
             return mentions_memory(log) ? PP_STATUS_OUT_OF_MEMORY : PP_STATUS_LOAD_FAILED;
         }
-        if (model_limit >= 0 && llama_model_size(s->model) > (uint64_t) model_limit) {
-            put_error(error, error_size, "the model's tensors do not fit in the given length of the file");
-            return PP_STATUS_LOAD_FAILED;
+
+        // The other limit on the context, which only the model can state. Asked before any
+        // context exists: llama.cpp would create one of any size.
+        const int32_t n_ctx_train = llama_model_n_ctx_train(s->model);
+        if (n_ctx_train > 0 && params->n_ctx > n_ctx_train) {
+            put_error(error, error_size, "a context of " + std::to_string(params->n_ctx) + " tokens was asked for, and the model was trained for " +
+                                         std::to_string(n_ctx_train));
+            return PP_STATUS_INVALID_ARGUMENT;
         }
 
-        llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx           = (uint32_t) params->n_ctx;
+        s->cparams = llama_context_default_params();
+        s->cparams.n_ctx           = (uint32_t) params->n_ctx;
         // One llama_process call is one micro-batch, so that "a chunk" means the same thing to
         // the caller, to the abort callback and to llama.cpp's own roll-back of a failed batch.
-        cparams.n_batch         = (uint32_t) params->n_batch;
-        cparams.n_ubatch        = (uint32_t) params->n_batch;
-        cparams.n_seq_max       = 1;
-        cparams.n_threads       = params->n_threads;
-        cparams.n_threads_batch = params->n_threads;
-        cparams.no_perf         = true;
+        s->cparams.n_batch         = (uint32_t) std::min(params->n_batch, params->n_ctx);
+        s->cparams.n_ubatch        = s->cparams.n_batch;
+        s->cparams.n_seq_max       = 1;
+        s->cparams.n_threads       = params->n_threads;
+        s->cparams.n_threads_batch = params->n_threads;
+        s->cparams.no_perf         = true;
+
+        s->vocab     = llama_model_get_vocab(s->model);
+        s->n_vocab   = llama_vocab_n_tokens(s->vocab);
+        s->can_abort = !llama_model_is_hybrid(s->model) && !llama_model_is_recurrent(s->model);
 
         log.clear();
-        s->ctx = llama_init_from_model(s->model, cparams);
-        if (s->ctx == nullptr) {
+        if (s->n_vocab <= 0 || !create_context(s)) {
             put_error(error, error_size, log.empty() ? std::string("llama.cpp could not create the context") : tidy(log));
             return mentions_memory(log) ? PP_STATUS_OUT_OF_MEMORY : PP_STATUS_LOAD_FAILED;
         }
-
-        s->vocab   = llama_model_get_vocab(s->model);
-        s->n_vocab = llama_vocab_n_tokens(s->vocab);
-        s->n_batch = (int32_t) llama_n_batch(s->ctx);
-        s->batch   = llama_batch_ext_init(s->ctx);
-        if (s->batch == nullptr || s->n_vocab <= 0 || s->n_batch <= 0) {
-            put_error(error, error_size, "llama.cpp could not create the batch");
-            return PP_STATUS_LOAD_FAILED;
-        }
+        s->candidates.resize((size_t) s->n_vocab);
 
         // A peacebell model with the SentencePiece tokenizer is only tokenised correctly by the
         // front-end. If the front-end refuses the file, the model must not be run through
@@ -662,6 +947,7 @@ int32_t open_session(const pp_session_params * params, int64_t model_limit, pp_s
         if (meta(s->model, "general.architecture") == "boris2") {
             s->refused_input = llama_vocab_eos(s->vocab);
         }
+        s->n_window = llama_model_n_swa(s->model);
 
         // With the backends built as modules, the thread pool functions are only reachable
         // through the CPU backend that was loaded; the same lookup works when it is linked in.
@@ -676,11 +962,6 @@ int32_t open_session(const pp_session_params * params, int64_t model_limit, pp_s
             }
         }
 
-        s->can_abort = !llama_model_is_hybrid(s->model) && !llama_model_is_recurrent(s->model);
-        if (s->can_abort) {
-            llama_set_abort_callback(s->ctx, abort_callback, s);
-        }
-
         *session = owner.release();
         return PP_STATUS_OK;
     } catch (const std::bad_alloc &) {
@@ -689,6 +970,38 @@ int32_t open_session(const pp_session_params * params, int64_t model_limit, pp_s
     } catch (...) {
         put_error(error, error_size, "llama.cpp failed while opening the model");
         return PP_STATUS_LOAD_FAILED;
+    }
+}
+
+// Reads the GGUF header that begins at offset of the stream and answers whether the model it
+// describes lies within length bytes from there: NULL when it does, otherwise what is wrong.
+// The header is read a second time by the load that follows; it is the metadata only, and the
+// alternative is to find out from a model that answers with nonsense.
+const char * model_extent_problem(FILE * file, int64_t offset, int64_t length) {
+    try {
+        if (fseeko(file, (off_t) offset, SEEK_SET) != 0) {
+            return "the file cannot be positioned at the given offset";
+        }
+        struct gguf_init_params header_only = {/* no_alloc */ true, /* ctx */ nullptr};
+        struct gguf_context * header = gguf_init_from_file_ptr(file, header_only);
+        if (header == nullptr) {
+            return "the file holds no complete GGUF header at the given offset";
+        }
+        // Absolute in the file: the reader counts from where the stream stood.
+        const uint64_t data_begin = (uint64_t) gguf_get_data_offset(header);
+        const uint64_t limit = (uint64_t) offset + (uint64_t) length;
+        bool fits = data_begin <= limit;
+        const int64_t n_tensors = gguf_get_n_tensors(header);
+        for (int64_t i = 0; i < n_tensors && fits; i++) {
+            const uint64_t begin = (uint64_t) gguf_get_tensor_offset(header, i);
+            const uint64_t size = (uint64_t) gguf_get_tensor_size(header, i);
+            // In this order: none of the three subtractions can wrap.
+            fits = begin <= limit - data_begin && size <= limit - data_begin - begin;
+        }
+        gguf_free(header);
+        return fits ? nullptr : "the model's header and tensors do not fit in the given length of the file";
+    } catch (...) {
+        return "the GGUF header at the given offset could not be read";
     }
 }
 
@@ -721,11 +1034,12 @@ int32_t pp_session_open_path(const char * path, const struct pp_session_params *
         return PP_STATUS_INVALID_ARGUMENT;
     }
     *session = nullptr;
-    if (path == nullptr || !valid_params(params)) {
-        put_error(error, error_size, "invalid arguments to pp_session_open_path");
+    const char * problem = path == nullptr ? "no path" : params_problem(params);
+    if (problem != nullptr) {
+        put_error(error, error_size, problem);
         return PP_STATUS_INVALID_ARGUMENT;
     }
-    return open_session(params, -1, session, error, error_size, [&](const llama_model_params & mparams) {
+    return open_session(params, session, error, error_size, [&](const llama_model_params & mparams) {
         return llama_model_load_from_file(path, mparams);
     });
 }
@@ -736,8 +1050,12 @@ int32_t pp_session_open_fd(int fd, int64_t offset, int64_t length, const struct 
         return PP_STATUS_INVALID_ARGUMENT;
     }
     *session = nullptr;
+    if (const char * problem = params_problem(params)) {
+        put_error(error, error_size, problem);
+        return PP_STATUS_INVALID_ARGUMENT;
+    }
     struct stat info;
-    if (fd < 0 || !valid_params(params) || offset < 0 || length < 4 || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+    if (fd < 0 || offset < 0 || length < 4 || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
         offset > (int64_t) info.st_size || length > (int64_t) info.st_size - offset) {
         put_error(error, error_size, "invalid arguments to pp_session_open_fd: not a regular file, or the range lies outside it");
         return PP_STATUS_INVALID_ARGUMENT;
@@ -759,7 +1077,15 @@ int32_t pp_session_open_fd(int fd, int64_t offset, int64_t length, const struct 
         put_error(error, error_size, "the file descriptor could not be duplicated");
         return PP_STATUS_LOAD_FAILED;
     }
-    const int32_t status = open_session(params, length, session, error, error_size, [&](const llama_model_params & mparams) -> llama_model * {
+    // The stated length is all of the file that is the model's. llama.cpp is not told the length:
+    // it reads each tensor from where the header says it is.
+    const char * extent_problem = model_extent_problem(file, offset, length);
+    if (extent_problem != nullptr) {
+        fclose(file);
+        put_error(error, error_size, extent_problem);
+        return PP_STATUS_LOAD_FAILED;
+    }
+    const int32_t status = open_session(params, session, error, error_size, [&](const llama_model_params & mparams) -> llama_model * {
         // llama.cpp reads the GGUF from the stream's current position and addresses the tensors
         // by absolute file offset from there on.
         if (fseeko(file, (off_t) offset, SEEK_SET) != 0) {
@@ -776,20 +1102,13 @@ void pp_session_close(struct pp_session * session) {
     if (session == nullptr) {
         return;
     }
+    destroy_sampler(session);
+    free_all_checkpoints(session);
+    wipe(session->candidates.data(), session->candidates.size() * sizeof(llama_token_data));
+    destroy_context(session);
     try {
-        if (session->sampler != nullptr) {
-            llama_sampler_free(session->sampler);
-        }
-        free_all_checkpoints(session);
-        if (session->batch != nullptr) {
-            llama_batch_ext_free(session->batch);
-        }
         if (session->peacebell != nullptr) {
             pp_peacebell_tokenizer_free(session->peacebell);
-        }
-        if (session->ctx != nullptr) {
-            llama_free(session->ctx);
-            session->ctx = nullptr;
         }
         // After the context, whose backend refers to the thread pool it last used.
         release_threads(session);
@@ -800,12 +1119,7 @@ void pp_session_close(struct pp_session * session) {
         // Nothing more can be done for whatever threw; the struct is released regardless.
     }
     delete session;
-#if defined(__ANDROID__)
-    // Android's allocator keeps the pages of freed blocks for reuse and only gives them back to
-    // the system some time later, when it is next used. After a model that is hundreds of
-    // megabytes which the phone needs now, so they are given back at once.
-    mallopt(M_PURGE, 0);
-#endif
+    release_free_pages();
 }
 
 const char * pp_session_last_error(const struct pp_session * session) {
@@ -835,6 +1149,10 @@ int32_t pp_session_tokenize(struct pp_session * session, const char * text, int3
     }
     if (text_len == 0) {
         return 0;
+    }
+    if (text_len > PP_TOKENIZE_BYTES_MAX) {
+        fail(session, PP_STATUS_TOKENIZE_FAILED, "the text is longer than " PP_STRINGIFY(PP_TOKENIZE_BYTES_MAX) " bytes, the most that is tokenised in one call");
+        return PP_ERROR;
     }
     try {
         const int32_t n = session->peacebell != nullptr
@@ -880,7 +1198,7 @@ int32_t pp_session_vocab_size(const struct pp_session * session) {
 //
 
 int32_t pp_session_context_size(const struct pp_session * session) {
-    return session == nullptr ? 0 : (int32_t) llama_n_ctx(session->ctx);
+    return session == nullptr || session->ctx == nullptr ? 0 : (int32_t) llama_n_ctx(session->ctx);
 }
 
 int32_t pp_session_memory_token_count(const struct pp_session * session) {
@@ -909,12 +1227,18 @@ int32_t pp_session_evaluate(struct pp_session * session, const llama_token * tok
         }
     }
 
-    // Whatever happens below, the old prediction no longer belongs to the end of the memory.
+    if (s->ctx == nullptr) {
+        return fail_no_context(s);
+    }
+
+    // Whatever happens below, the old prediction no longer belongs to the end of the memory. Its
+    // scores are overwritten here and not later: this is the last moment at which llama.cpp is
+    // certain to still have the buffer they are in (see pp_session::has_prediction_data).
     s->prediction_ready = false;
     int32_t status = PP_STATUS_OK;
     int32_t start = 0;
     try {
-        prepare_threads(s);
+        wipe_prediction(s);
         start = memory_count(s);
         const int32_t chunk = std::min(chunk_size, s->n_batch);
         s->observer = observer;
@@ -925,6 +1249,11 @@ int32_t pp_session_evaluate(struct pp_session * session, const llama_token * tok
             if (poll_cancelled(s)) {
                 break;
             }
+            // Before every chunk, not once per call: a long prompt is one call of many seconds,
+            // and when the system moves the process to other cores during it, pinned threads
+            // would share cores for the rest of the call. It costs one system call when nothing
+            // has changed.
+            prepare_threads(s);
             const int32_t n_chunk = std::min(chunk, n_tokens - done);
             const int32_t before = memory_count(s);
 
@@ -948,6 +1277,8 @@ int32_t pp_session_evaluate(struct pp_session * session, const llama_token * tok
                 // The backend has computed with the present pool and let go of any earlier one.
                 free_retired_threadpools(s);
                 done += n_chunk;
+                // The chunk with the call's last token is the one that asked for an output.
+                s->has_prediction_data = done == n_tokens;
                 observer->on_progress(done, observer->user_data);
                 continue;
             }
@@ -970,7 +1301,6 @@ int32_t pp_session_evaluate(struct pp_session * session, const llama_token * tok
 
         if (status == PP_STATUS_OK && done == n_tokens) {
             s->prediction_ready = true;
-            s->has_prediction_data = true;
         }
     } catch (const std::bad_alloc &) {
         status = fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory during evaluation");
@@ -995,6 +1325,9 @@ int32_t pp_session_rewind_to(struct pp_session * session, int32_t n_tokens, bool
     if (removed != nullptr) {
         *removed = false;
     }
+    if (s->ctx == nullptr) {
+        return fail_no_context(s);
+    }
     try {
         const int32_t count = memory_count(s);
         if (removed == nullptr || n_tokens < 0 || n_tokens > count) {
@@ -1003,6 +1336,20 @@ int32_t pp_session_rewind_to(struct pp_session * session, int32_t n_tokens, bool
         if (n_tokens == count) {
             *removed = true;
             return PP_STATUS_OK;
+        }
+        // Windowed layers hold their keys from some position on: from the first, until a
+        // checkpoint is restored, which brings back the window before its own end and nothing
+        // older. llama.cpp cuts such a memory wherever it is asked to and answers true, and the
+        // tokens evaluated next would then attend to keys that are not there: every prediction
+        // after the cut would be wrong and nothing would say so. The token at position n_tokens
+        // looks at the n_window - 1 positions before it; when the windowed layers no longer
+        // hold all of them the cut is refused here, the way llama.cpp refuses to cut a
+        // recurrent state, and the caller goes back to a checkpoint or starts over.
+        if (s->n_window > 0 && n_tokens > 0) {
+            const llama_pos first_held = llama_memory_seq_pos_min(llama_get_memory(s->ctx), k_seq);
+            if (first_held > std::max<llama_pos>(0, (llama_pos) n_tokens - (s->n_window - 1))) {
+                return PP_STATUS_OK;
+            }
         }
         if (llama_memory_seq_rm(llama_get_memory(s->ctx), k_seq, (llama_pos) n_tokens, -1)) {
             s->prediction_ready = false;
@@ -1027,6 +1374,14 @@ int32_t pp_session_save_checkpoint(struct pp_session * session) {
         return -1;
     }
     pp_session * s = session;
+    if (s->ctx == nullptr) {
+        fail_no_context(s);
+        return -1;
+    }
+    if (s->checkpoints.size() >= (size_t) PP_CHECKPOINTS_MAX) {
+        fail(s, PP_STATUS_INVALID_ARGUMENT, "the session already holds " PP_STRINGIFY(PP_CHECKPOINTS_MAX) " checkpoints, the most it keeps: drop one first");
+        return -1;
+    }
     pp_checkpoint checkpoint;
     try {
         if (s->next_checkpoint == std::numeric_limits<int32_t>::max()) {
@@ -1060,6 +1415,10 @@ bool pp_session_restore_checkpoint(struct pp_session * session, int32_t checkpoi
         return false;
     }
     pp_session * s = session;
+    if (s->ctx == nullptr) {
+        fail_no_context(s);
+        return false;
+    }
     try {
         const auto it = s->checkpoints.find(checkpoint);
         if (it == s->checkpoints.end()) {
@@ -1105,39 +1464,37 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
     return it == session->checkpoints.end() ? -1 : (int64_t) it->second.size;
 }
 
-void pp_session_clear_memory(struct pp_session * session) {
+int32_t pp_session_clear_memory(struct pp_session * session) {
     if (session == nullptr) {
-        return;
+        return PP_STATUS_INVALID_ARGUMENT;
     }
     pp_session * s = session;
     s->prediction_ready = false;
     free_all_checkpoints(s);
+    wipe(s->candidates.data(), s->candidates.size() * sizeof(llama_token_data));
+    // Freed and created again, not reset: llama_sampler_reset leaves the sampled tokens in the
+    // chain, and a context that is only cleared keeps its copies of the tokens it evaluated.
+    // Freeing does not overwrite them either (see the header for what remains), but it ends
+    // their being part of a live object, and it is the only way to the buffers that
+    // destroy_sampler and destroy_context do overwrite.
+    destroy_sampler(s);
+    destroy_context(s);
+
+    int32_t status = PP_STATUS_OK;
     try {
-        // true: the key-value and state buffers themselves, not only the bookkeeping.
-        llama_memory_clear(llama_get_memory(s->ctx), true);
-        if (s->sampler != nullptr) {
-            llama_sampler_reset(s->sampler);
+        if (!create_context(s)) {
+            status = fail(s, PP_STATUS_OUT_OF_MEMORY, "the context could not be created again after the conversation was forgotten");
         }
-        // Two things outside the memory are still derived from the conversation: the scores of
-        // the last prediction and the token ids of the last chunk. Neither has a clearing call,
-        // so both are overwritten in place.
-        if (s->has_prediction_data) {
-            float * logits = llama_get_logits_ith(s->ctx, -1);
-            if (logits != nullptr) {
-                wipe(logits, (size_t) s->n_vocab * sizeof(float));
-            }
-            s->has_prediction_data = false;
+        if (s->sampler_configured) {
+            sampler_parts parts;
+            build_sampler(s->n_vocab, s->sampler_config, parts);
+            install_sampler(s, parts, s->sampler_config.penalty_window);
         }
-        llama_batch_ext_clear(s->batch);
-        for (int32_t i = 0; i < s->n_batch; i++) {
-            if (llama_batch_ext_add_token(s->batch, k_seq, 0) < 0) {
-                break;
-            }
-        }
-        llama_batch_ext_clear(s->batch);
     } catch (...) {
-        // The memory's own clear cannot fail; whatever threw was one of the extras above.
+        status = fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while creating the context and the sampler again");
     }
+    release_free_pages();
+    return status;
 }
 
 //
@@ -1151,7 +1508,7 @@ int32_t pp_session_configure_sampler(struct pp_session * session, const struct p
     pp_session * s = session;
     if (config == nullptr || !finite(config->temperature) || config->top_k < 0 || !finite(config->top_p) || !finite(config->min_p) ||
         !finite(config->repetition_penalty) || config->repetition_penalty <= 0.0f || !finite(config->presence_penalty) ||
-        !finite(config->frequency_penalty) || config->penalty_window < 1 || config->n_banned_tokens < 0 ||
+        !finite(config->frequency_penalty) || config->penalty_window < 1 || config->n_banned_tokens < 0 || config->n_banned_tokens > s->n_vocab ||
         (config->banned_tokens == nullptr && config->n_banned_tokens > 0)) {
         return fail(s, PP_STATUS_INVALID_ARGUMENT, "a sampler setting is outside its documented range");
     }
@@ -1161,58 +1518,36 @@ int32_t pp_session_configure_sampler(struct pp_session * session, const struct p
         }
     }
 
-    llama_sampler * chain = nullptr;
+    sampler_parts parts;
+    pp_sampler_config kept = *config;
+    std::vector<llama_token> list;
+    std::vector<uint8_t> flags;
     try {
-        chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        if (chain == nullptr) {
-            return fail(s, PP_STATUS_OUT_OF_MEMORY, "the sampler could not be created");
+        // The penalties allocate their record of sampled tokens at once and in full, so the
+        // window is held to the context size before llama.cpp sees it: the memory cannot hold
+        // more tokens than that for the penalties to look at.
+        kept.penalty_window = std::min(config->penalty_window, std::max(1, s->n_ctx));
+        list.assign(config->banned_tokens, config->banned_tokens + config->n_banned_tokens);
+        if (!list.empty()) {
+            flags.assign((size_t) s->n_vocab, 0);
+            for (const llama_token token : list) {
+                flags[(size_t) token] = 1;
+            }
         }
-        // The chain owns what is added to it; freeing the chain frees the whole of it.
-        const auto add = [&](llama_sampler * sampler) {
-            if (sampler == nullptr) {
-                throw std::bad_alloc();
-            }
-            llama_sampler_chain_add(chain, sampler);
-        };
-
-        if (config->n_banned_tokens > 0) {
-            std::vector<llama_logit_bias> biases;
-            biases.reserve((size_t) config->n_banned_tokens);
-            for (int32_t i = 0; i < config->n_banned_tokens; i++) {
-                biases.push_back({config->banned_tokens[i], -std::numeric_limits<float>::infinity()});
-            }
-            add(llama_sampler_init_logit_bias(s->n_vocab, (int32_t) biases.size(), biases.data()));
-        }
-        if (config->repetition_penalty != 1.0f || config->frequency_penalty != 0.0f || config->presence_penalty != 0.0f) {
-            add(llama_sampler_init_penalties(s->n_vocab, config->penalty_window, config->repetition_penalty,
-                                             config->frequency_penalty, config->presence_penalty));
-        }
-        if (config->temperature > 0.0f) {
-            add(llama_sampler_init_temp(config->temperature));
-            if (config->top_k != 0) {
-                add(llama_sampler_init_top_k(config->top_k));
-            }
-            if (config->top_p < 1.0f) {
-                add(llama_sampler_init_top_p(config->top_p, 1));
-            }
-            if (config->min_p > 0.0f) {
-                add(llama_sampler_init_min_p(config->min_p, 1));
-            }
-            add(llama_sampler_init_dist(config->seed));
-        } else {
-            add(llama_sampler_init_greedy());
-        }
+        kept.banned_tokens = list.data();
+        build_sampler(s->n_vocab, kept, parts);
     } catch (...) {
-        if (chain != nullptr) {
-            llama_sampler_free(chain);
-        }
         return fail(s, PP_STATUS_OUT_OF_MEMORY, "the sampler could not be created");
     }
 
-    if (s->sampler != nullptr) {
-        llama_sampler_free(s->sampler);
-    }
-    s->sampler = chain;
+    // Nothing below can fail: the previous sampler is only given up for a complete new one.
+    destroy_sampler(s);
+    install_sampler(s, parts, kept.penalty_window);
+    s->banned_list.swap(list);
+    s->banned.swap(flags);
+    s->sampler_config = kept;
+    s->sampler_config.banned_tokens = s->banned_list.data();
+    s->sampler_configured = true;
     return PP_STATUS_OK;
 }
 
@@ -1225,7 +1560,7 @@ int32_t pp_session_sample_next(struct pp_session * session, llama_token * token)
         return fail(s, PP_STATUS_INVALID_ARGUMENT, "invalid arguments to pp_session_sample_next");
     }
     *token = LLAMA_TOKEN_NULL;
-    if (s->sampler == nullptr) {
+    if (s->sampler == nullptr || s->chooser == nullptr) {
         return fail(s, PP_STATUS_SAMPLING_FAILED, "no sampler is configured");
     }
     if (!s->prediction_ready) {
@@ -1233,16 +1568,67 @@ int32_t pp_session_sample_next(struct pp_session * session, llama_token * token)
     }
     // One prediction, one token: sampling it again would record the token twice in the sampler.
     s->prediction_ready = false;
+    int32_t status = PP_STATUS_OK;
     try {
-        const llama_token sampled = llama_sampler_sample(s->sampler, s->ctx, -1);
-        if (sampled < 0 || sampled >= s->n_vocab) {
-            return fail(s, PP_STATUS_SAMPLING_FAILED, "the sampler produced no token");
+        // What llama_sampler_sample does, with two differences. The candidate list is the
+        // session's own, in place of the one inside the chain, which nothing outside the chain
+        // can overwrite afterwards. And the scores are looked at before a token is chosen among
+        // them: llama.cpp's samplers assume that there is always something to choose from, and
+        // where there is not (every token banned, or scores that have stopped being numbers)
+        // they name a token all the same, or end the process on an assertion, depending on how
+        // llama.cpp was built.
+        const float * logits = llama_get_logits_ith(s->ctx, -1);
+        if (logits == nullptr || s->candidates.size() != (size_t) s->n_vocab) {
+            status = fail(s, PP_STATUS_SAMPLING_FAILED, "the context holds no prediction");
+        } else {
+            for (llama_token id = 0; id < s->n_vocab; id++) {
+                s->candidates[(size_t) id] = llama_token_data{id, logits[id], 0.0f};
+            }
+            llama_token_data_array array = {s->candidates.data(), s->candidates.size(), -1, false};
+            llama_sampler_apply(s->sampler, &array);
+            // The samplers may have moved the array's start and shortened it; what follows
+            // looks at the array as it is now.
+            bool any_finite = false, all_usable = array.data != nullptr && array.size > 0;
+            for (size_t i = 0; all_usable && i < array.size; i++) {
+                const float score = array.data[i].logit;
+                any_finite = any_finite || std::isfinite(score);
+                // Minus infinity is a token that is ruled out; the other two are not scores.
+                all_usable = !std::isnan(score) && score != std::numeric_limits<float>::infinity();
+            }
+            llama_token chosen = LLAMA_TOKEN_NULL;
+            if (!all_usable) {
+                status = fail(s, PP_STATUS_SAMPLING_FAILED, "the scores are not numbers a token can be chosen by");
+            } else if (!any_finite) {
+                status = fail(s, PP_STATUS_SAMPLING_FAILED, "every token is ruled out: nothing is left to choose from");
+            } else {
+                llama_sampler_apply(s->chooser, &array);
+                if (array.selected >= 0 && (size_t) array.selected < array.size) {
+                    chosen = array.data[array.selected].id;
+                }
+                if (chosen < 0 || chosen >= s->n_vocab) {
+                    status = fail(s, PP_STATUS_SAMPLING_FAILED, "the sampler produced no token");
+                } else if (!s->banned.empty() && s->banned[(size_t) chosen] != 0) {
+                    // The random choice can land on a token of probability zero when it draws
+                    // exactly 0, once in 2^53 draws; a banned token is never returned for it.
+                    status = fail(s, PP_STATUS_SAMPLING_FAILED, "the sampler chose a banned token");
+                } else {
+                    llama_sampler_accept(s->sampler, chosen);
+                    llama_sampler_accept(s->chooser, chosen);
+                    *token = chosen;
+                }
+            }
         }
-        *token = sampled;
-        return PP_STATUS_OK;
     } catch (const std::bad_alloc &) {
-        return fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while sampling");
+        status = fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while sampling");
     } catch (...) {
-        return fail(s, PP_STATUS_SAMPLING_FAILED, "the sampler failed");
+        status = fail(s, PP_STATUS_SAMPLING_FAILED, "the sampler failed");
     }
+    // The prediction is used up either way: its scores go, here and where llama.cpp keeps them.
+    wipe(s->candidates.data(), s->candidates.size() * sizeof(llama_token_data));
+    try {
+        wipe_prediction(s);
+    } catch (...) {
+        s->has_prediction_data = false;
+    }
+    return status;
 }

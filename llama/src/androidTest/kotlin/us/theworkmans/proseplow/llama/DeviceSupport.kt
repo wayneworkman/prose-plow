@@ -181,8 +181,12 @@ internal fun readTokenVectors(assetName: String): TokenVectors {
     return TokenVectors(texts, chats)
 }
 
-/** A conversation of a logit reference: the prompt's tokens and the reference model's greedy reply. */
-internal class GreedyReference(val prompt: IntArray, val reply: IntArray)
+/**
+ * A conversation of a logit reference: the prompt's tokens, the reference model's greedy reply,
+ * and the whole token sequence the reference's logits were computed for (which begins with the
+ * prompt and, in the references made for windowed layers, is a long text and nothing else).
+ */
+internal class GreedyReference(val prompt: IntArray, val reply: IntArray, val sequence: IntArray)
 
 /** Reads the prompts and greedy replies of a PPLOGIT1 file; the logits are skipped. */
 internal fun readGreedyReferences(assetName: String): List<GreedyReference> {
@@ -199,7 +203,7 @@ internal fun readGreedyReferences(assetName: String): List<GreedyReference> {
         val ids = reader.idsI32(tokens)
         val greedy = reader.idsI32(greedyTokens)
         reader.skip(8L * tokens * topK + 4L * fullRows + 4L * fullRows * vocabulary)
-        GreedyReference(ids.copyOfRange(0, promptTokens), greedy)
+        GreedyReference(ids.copyOfRange(0, promptTokens), greedy, ids)
     }
     check(reader.atEnd) { "$assetName has trailing bytes" }
     return out

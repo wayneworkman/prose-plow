@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -20,7 +21,10 @@ import kotlinx.coroutines.launch
  * [lazyMillis] for a newer one to replace it. Lazy is for what changes many times a second (a
  * reply that is being streamed, a draft that is being typed): the file then follows at most that
  * far behind. [flush] makes everything lazy urgent; [closeAndJoin] does the same and returns when
- * all of it is on the disk, which is what the lock waits for before it destroys the data key.
+ * all of it is on the disk. The lock waits for that before it destroys the data key, but only
+ * for a bounded time: a write that is stuck in the disk cannot be interrupted, so whoever closes
+ * the writer decides how long to wait and then cancels the scope. The write that is running
+ * still ends when the disk lets it, and the scope's job only completes then.
  *
  * @param scope where the writes run: an I/O scope. Cancelling it abandons what was not written.
  * @param lazyMillis the longest a lazy write waits.
@@ -93,7 +97,9 @@ class CoalescingWriter(
 
     /**
      * Accepts nothing more, and returns when every write asked for so far has run. Cancelling
-     * the caller stops the waiting, not the writes; cancelling the writer's scope stops those.
+     * the caller (a timeout) stops the waiting, not the writes. Cancelling the writer's scope
+     * abandons the writes that have not started; the one that is running cannot be interrupted
+     * and finishes first.
      */
     suspend fun closeAndJoin() {
         synchronized(lock) {
@@ -115,6 +121,9 @@ class CoalescingWriter(
 
     private fun drain() {
         while (true) {
+            // Nothing is started once the scope is cancelled: the write that was running when
+            // that happened was the last one, and what is still queued is abandoned.
+            if (!scope.isActive) return
             val next = synchronized(lock) {
                 val first = queued.entries.firstOrNull()?.toPair()
                 if (first != null) {

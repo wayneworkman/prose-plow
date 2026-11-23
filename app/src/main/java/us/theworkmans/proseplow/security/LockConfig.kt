@@ -28,8 +28,13 @@ data class LockConfig(
     val lockTimeoutSeconds: Int = DEFAULT_TIMEOUT_SECONDS,
     /** Passphrase attempts that have not (yet) succeeded since the last success. */
     val failedAttempts: Int = 0,
-    /** When the current wait started (the last failure, or the first start after a reboot during a wait). */
+    /**
+     * When the current wait started (the last failure, or the first start after a reboot during a
+     * wait), by the wall clock. A record only: the wait is timed by [lastFailureElapsedMillis],
+     * because the wall clock can be set by anyone holding the phone (see [Backoff]).
+     */
     val lastFailureWallMillis: Long = 0,
+    /** The same moment on the clock that counts since boot ([Clock.elapsedMillis]). */
     val lastFailureElapsedMillis: Long = 0,
     /** Fingerprint unlock was removed because its key was invalidated; offer to set it up again. */
     val fingerprintInvalidated: Boolean = false,
@@ -194,13 +199,23 @@ interface Clock {
  * The delay after failed passphrase attempts: the first [FREE_ATTEMPTS] failures cost nothing,
  * then 30 s, doubling per failure up to one hour. There is no wipe after N failures.
  *
- * The wait is timed with the time since boot, which changing the wall clock does not affect. A
- * reboot restarts that clock: when the time since boot is below the stored start of the wait, the
- * phone was restarted during the wait, and [reanchor] starts the full delay again from that
- * moment (the caller stores it). When the time since boot is not below it, the elapsed time it
- * shows is never more than the real time since the failure (a reboot only adds time the clock did
- * not count), so the wait is never shortened either way. The wall clock is checked as well and
- * the longer wait wins; setting it back cannot lengthen the wait beyond one full delay.
+ * The wait is timed with the time since boot and with nothing else. Within one boot that clock
+ * runs exactly as fast as real time, asleep or awake, so the wait ends one delay after the
+ * failure. A reboot restarts the clock: when the time since boot is below the stored start of
+ * the wait, the phone was restarted during the wait, and [reanchor] starts the full delay again
+ * from that moment (the caller stores it). When it is not below it (the phone has since been up
+ * for longer than it had been at the failure), the stored start stays, and what is left of the
+ * delay on the new clock applies. In both cases the time the clock shows as passed is never
+ * more than the real time since the failure (a reboot only adds time the clock did not count),
+ * so the wait is never shortened; and from whatever moment the app looks at it, it never lasts
+ * longer than one full delay. A restart of the phone is the only thing that can put time back
+ * onto it.
+ *
+ * The wall clock is deliberately not consulted. It cannot make the wait any safer, since the
+ * clock since boot already never runs ahead of real time; and it can be set by anyone, or
+ * corrected by the network, in either direction. A wait that followed it would be cut short by
+ * setting the date ahead, or, worse in an app without any recovery, held for as long as the date
+ * was set back: the right passphrase refused for days because a clock was corrected.
  */
 object Backoff {
     const val FREE_ATTEMPTS = 4
@@ -230,8 +245,6 @@ object Backoff {
         if (delay == 0L) return 0
         val now = clock.elapsedMillis()
         if (now < config.lastFailureElapsedMillis) return delay // A new boot not yet re-anchored.
-        val byElapsed = (config.lastFailureElapsedMillis + delay - now).coerceIn(0, delay)
-        val byWall = (config.lastFailureWallMillis + delay - clock.wallMillis()).coerceIn(0, delay)
-        return maxOf(byWall, byElapsed)
+        return (config.lastFailureElapsedMillis + delay - now).coerceIn(0, delay)
     }
 }

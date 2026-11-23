@@ -68,6 +68,27 @@
       }
     },
     {
+      "id": "shard-2",
+      "status": "ready",
+      "purpose": "bundled",
+      "note": "Architecture shard2 (a port of ours): a model that continues text and has a deletion token. The checkpoint is a pickle; the converter loads it with weights_only=True and in no other way, and infer.py is never run (the tests read it as text). Converted and tested as the file that would ship; the purpose becomes bundled in the same change that switches the model on in the app's catalogue.",
+      "name": "Shard-2",
+      "repository": "Glint-Research/Shard-2",
+      "revision": "46b9eb99c475694a1129ad8f3a9825d244a8ec79",
+      "converter": "shard2",
+      "ftype": "f16",
+      "output": "shard-2-f16.gguf",
+      "output_sha256": "c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f",
+      "files": {
+        "Shard-2.pt": "32f91fa3255f1abd65aa0c7964461c1f46d74f599fd82323d7a8d30ea11a87de",
+        "config.json": "72925a8510982608d8782423b60c1089c01337a37a10dc058efc8905e77fa230",
+        "tokenizer.json": "0184b4ac069df87a9fa64489e1e2e41d264f091ff38cd0310baf486d44b37dba"
+      },
+      "reference_files": {
+        "infer.py": "8b0995c18447346dd4ba69d9581de575aa1fcf6cbaed3bb36f178a2b836dc1c2"
+      }
+    },
+    {
       "id": "qwen3.5-0.8b",
       "status": "ready",
       "purpose": "bundled",

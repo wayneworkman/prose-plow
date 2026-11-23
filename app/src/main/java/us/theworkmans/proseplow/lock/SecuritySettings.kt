@@ -2,13 +2,10 @@ package us.theworkmans.proseplow.lock
 
 import android.os.Build
 import android.text.format.DateFormat
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.input.TextFieldState
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -36,7 +33,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -61,8 +57,7 @@ import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SecurityStatus
 import us.theworkmans.proseplow.security.WindowSecurity
 import us.theworkmans.proseplow.security.wipe
-import us.theworkmans.proseplow.ui.PassphraseField
-import us.theworkmans.proseplow.ui.takeChars
+import us.theworkmans.proseplow.ui.ProtectWindow
 import java.util.Date
 
 /** What a passphrase check in Settings is for. */
@@ -328,7 +323,7 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
 }
 
 @Composable
-private fun errorText(error: SecurityError?): String = when (error) {
+internal fun errorText(error: SecurityError?): String = when (error) {
     SecurityError.MISMATCH -> stringResource(R.string.passphrase_mismatch)
     SecurityError.EMPTY -> stringResource(R.string.passphrase_empty)
     SecurityError.TOO_SHORT -> stringResource(R.string.passphrase_too_short)
@@ -340,74 +335,6 @@ private fun errorText(error: SecurityError?): String = when (error) {
     SecurityError.FAILED -> stringResource(R.string.security_failed)
     SecurityError.SCREENSHOTS_NOT_ALLOWED -> stringResource(R.string.security_screenshots_failed)
     null -> ""
-}
-
-@Composable
-private fun NewPassphraseDialog(state: SecurityUiState, onSubmit: (CharArray, CharArray) -> Unit, onDismiss: () -> Unit) {
-    val first = remember { TextFieldState() }
-    val second = remember { TextFieldState() }
-    val submit = { onSubmit(first.takeChars(), second.takeChars()) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.change_passphrase_title)) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    stringResource(R.string.passphrase_rules) + " " + stringResource(R.string.change_passphrase_no_recovery),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                PassphraseField(
-                    state = first,
-                    label = stringResource(R.string.passphrase_new),
-                    enabled = !state.busy,
-                    isError = state.error != null,
-                    imeAction = ImeAction.Next,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                PassphraseField(
-                    state = second,
-                    label = stringResource(R.string.passphrase_repeat),
-                    enabled = !state.busy,
-                    isError = state.error != null,
-                    supportingText = state.error?.let { errorText(it) },
-                    onAction = submit,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                if (state.busy) Working(stringResource(R.string.passphrase_working))
-            }
-        },
-        confirmButton = { TextButton(onClick = submit, enabled = !state.busy) { Text(stringResource(R.string.passphrase_save)) } },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !state.busy) { Text(stringResource(R.string.cancel)) } },
-    )
-}
-
-@Composable
-private fun ConfirmPassphraseDialog(message: String, state: SecurityUiState, onSubmit: (CharArray) -> Unit, onDismiss: () -> Unit) {
-    val field = remember { TextFieldState() }
-    val submit = {
-        if (field.text.isNotEmpty()) onSubmit(field.takeChars())
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.confirm_passphrase_title)) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(message, style = MaterialTheme.typography.bodyMedium)
-                PassphraseField(
-                    state = field,
-                    label = stringResource(R.string.lock_passphrase),
-                    enabled = !state.busy,
-                    isError = state.error != null,
-                    supportingText = state.error?.let { errorText(it) },
-                    onAction = submit,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                if (state.busy) Working(stringResource(R.string.lock_checking))
-            }
-        },
-        confirmButton = { TextButton(onClick = submit, enabled = !state.busy) { Text(stringResource(R.string.passphrase_continue)) } },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !state.busy) { Text(stringResource(R.string.cancel)) } },
-    )
 }
 
 /**
@@ -471,6 +398,8 @@ private fun TimeoutPicker(seconds: Int, onSelect: (Int) -> Unit) {
                 .fillMaxWidth(),
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            // The menu is a window of its own, and what is chosen in it is how long the app stays open.
+            ProtectWindow()
             for (choice in LockConfig.TIMEOUT_CHOICES_SECONDS) {
                 DropdownMenuItem(
                     text = { Text(labels[choice].orEmpty()) },

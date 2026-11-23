@@ -163,6 +163,80 @@ class ChatSessionTest {
         assertSame(stopped, stopped.applyEvent("no-such-message", GenerationEvent.TextDelta("x"), clock))
     }
 
+    // --- Text the model takes back ---
+
+    @Test
+    fun `text the model takes back disappears from the streaming reply and later text follows what is left`() {
+        val started = newSession().withUserTurn("The capital of France is", clock, ids)
+        val written = started
+            .applyEvent("m2", GenerationEvent.TextDelta(" Nice."), clock)
+            .applyEvent("m2", GenerationEvent.TextDelta(" 198"), clock)
+        assertEquals(" Nice. 198", written.messages[1].text)
+
+        val retracted = written.applyEvent("m2", GenerationEvent.TextReplaced(" Nice.", removed = 4), clock)
+        assertEquals(" Nice.", retracted.messages[1].text)
+        assertEquals(MessageStatus.STREAMING, retracted.messages[1].status)
+        assertSame("the question is untouched", started.messages[0], retracted.messages[0])
+
+        val carriedOn = retracted.applyEvent("m2", GenerationEvent.TextDelta(" However,"), clock)
+        assertEquals(" Nice. However,", carriedOn.messages[1].text)
+    }
+
+    @Test
+    fun `a reply can be taken back to nothing`() {
+        val emptied = newSession().withUserTurn("Hello", clock, ids)
+            .applyEvent("m2", GenerationEvent.TextDelta("Hm"), clock)
+            .applyEvent("m2", GenerationEvent.TextReplaced("", removed = 2), clock)
+        assertEquals("", emptied.messages[1].text)
+        assertEquals(MessageStatus.STREAMING, emptied.messages[1].status)
+    }
+
+    @Test
+    fun `text taken back from a continued message never reaches what was there before`() {
+        // The answer had " Nice." when it was stopped. The continuation writes " 198" and takes
+        // it back: the event speaks of the continuation only, and the earlier text stays.
+        val stopped = newSession().withUserTurn("The capital of France is", clock, ids)
+            .applyEvent("m2", GenerationEvent.TextDelta(" Nice."), clock)
+            .stopped("m2", clock)
+        val continued = checkNotNull(stopped.forContinuation("m2", clock))
+            .applyEvent("m2", GenerationEvent.TextDelta(" 198"), clock)
+            .applyEvent("m2", GenerationEvent.TextReplaced("", removed = 4), clock)
+        assertEquals(" Nice.", continued.messages[1].text)
+        val done = continued
+            .applyEvent("m2", GenerationEvent.TextDelta(" However,"), clock)
+            .applyEvent("m2", GenerationEvent.Done(FinishReason.LENGTH, text = " However,", stats = stats, exactText = true), clock)
+        assertEquals(" Nice. However,", done.messages[1].text)
+    }
+
+    @Test
+    fun `taking text back does not count as a change of the conversation and is ignored once the reply has ended`() {
+        val written = newSession().withUserTurn("Hello", clock, ids).applyEvent("m2", GenerationEvent.TextDelta("Hi there"), clock)
+        clock.advance(10_000)
+        val retracted = written.applyEvent("m2", GenerationEvent.TextReplaced("Hi", removed = 6), clock)
+        assertEquals("like appended text, it leaves the time of the last change alone", written.updatedAtMillis, retracted.updatedAtMillis)
+
+        val stopped = written.stopped("m2", clock)
+        assertSame(stopped, stopped.applyEvent("m2", GenerationEvent.TextReplaced("Hi", removed = 6), clock))
+        assertSame(written, written.applyEvent("no-such-message", GenerationEvent.TextReplaced("Hi", removed = 6), clock))
+        assertSame("an event that takes nothing back changes nothing", written, written.applyEvent("m2", GenerationEvent.TextReplaced("Hi there", removed = 0), clock))
+    }
+
+    @Test
+    fun `the reply of a model that continues text is kept exactly, however it ended`() {
+        for (reason in listOf(FinishReason.END_OF_TURN, FinishReason.STOP_STRING, FinishReason.LENGTH, FinishReason.CANCELLED)) {
+            val done = newSession().withUserTurn("Dear Sir,", clock, SequentialIds("x"))
+                .applyEvent("x2", GenerationEvent.TextDelta("\n\n I write \n"), clock)
+                .applyEvent("x2", GenerationEvent.Done(reason, text = "\n\n I write \n", stats = stats, exactText = true), clock)
+            assertEquals(reason.name, "\n\n I write \n", done.messages[1].text)
+            assertEquals(reason, done.messages[1].finishReason)
+        }
+        // The same ending without the mark is a chat model's, and loses the whitespace at its end.
+        val chat = newSession().withUserTurn("Hello", clock, ids)
+            .applyEvent("m2", GenerationEvent.TextDelta("Hi there \n"), clock)
+            .applyEvent("m2", GenerationEvent.Done(FinishReason.END_OF_TURN, text = "Hi there \n", stats = stats), clock)
+        assertEquals("Hi there", chat.messages[1].text)
+    }
+
     // --- Failing ---
 
     @Test
