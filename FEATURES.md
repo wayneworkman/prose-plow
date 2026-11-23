@@ -1139,7 +1139,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | Context at the start, tokens (ENG-28) | 4,096 | 4,096 | 2,048 |
   | The most the context can become, tokens: what the model was trained with | 262,144 | 32,768 | 2,048 |
   | Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 |
-  | Reading speed assumed until one is measured, tokens per second (ENG-30) | 90 | 184 | 380 |
+  | Reading times on the tested phone, assumed until the device the app runs on is measured: seconds to read so many tokens from nothing (ENG-30) | 2,048 in 30.4; 4,096 in 63.5; 6,144 in 99.6; 8,192 in 138.8; 10,240 in 181.9; 12,288 in 227.2; 14,336 in 275.4; 15,872 in 313.5 | 2,048 in 15.5; 4,096 in 35.5; 6,144 in 60.1; 8,192 in 89.2; 10,240 in 125.1; 12,288 in 163.5; 14,336 in 206.4; 15,872 in 241.6 | 512 in 1.3; 1,024 in 2.9; 1,536 in 5.1 |
+  | Chunk of a deep read, tokens (ENG-11) | 128 | 256 | 128 |
   | Longest reply, tokens: default; allowed range (MSET-11) | 1,024; 16 to at most 4,096 | 1,024; 16 to at most 4,096 | 512; 16 to 1,024 |
   | Temperature | 1.0 | 0 (always the most likely token) | 0.7 |
   | Top-k; top-p | 20; off | 50; 0.9 (both only matter once the temperature is raised) | 50; 0.9 |
@@ -1151,8 +1152,13 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 
   The trained context and the bytes for each token are also in `models/manifest.json`
   (`trained_context`, `context_bytes_per_token`), where a test of the native build holds them to the
-  model files; a test of the app holds the catalogue to the manifest. The reading speeds were
-  measured on the one phone that was tested, with the app in front.
+  model files; a test of the app holds the catalogue to the manifest. The reading times were
+  measured on the one phone that was tested, with the test's activity in front and the app's own
+  settings (the device run `ReadingDepthDeviceTest`), in each model's chunk of a deep read
+  (ENG-11). The phone had been measuring for an hour by then and was warm (battery at 34 degrees
+  Celsius); cool, it began about a quarter faster. Boris-2's run leaves room for a short reply, so
+  its last point is below its 2,048 tokens and the rest is extrapolated. Shard-2's chunk of a deep
+  read is 256.
 
 - **MODEL-05** The model of a chat is chosen by tapping the title of the chat screen (the action
   is described as "Switch model"). A menu lists every offered model with its name and its
@@ -1373,25 +1379,35 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   left out of an answer." Under it one size is chosen from a list:
   - first "Automatic: up to {n} tokens on this phone", which is the default and stores nothing. The
     number is the limit the context has when it is left to itself (ENG-29), worked out with the
-    reading speed of MODEL-04;
+    reading times of MODEL-04;
   - then "Up to {n} tokens" for each fixed size: the size the context starts with, twice that, four
     times, and so on, and as the last one the most the device's memory allows the model, which is
     what the model was trained with when the memory holds that, and otherwise need not be a power of
     two.
 
-  With 5,500,000,000 bytes of memory the list for Qwen3.5 is automatic up to 10,240 and the fixed
-  sizes 4,096, 8,192, 16,384, 32,768, 65,536 and 111,616; for Peacebell it is automatic up to 20,480
+  With 5,500,000,000 bytes of memory the list for Qwen3.5 is automatic up to 7,168 and the fixed
+  sizes 4,096, 8,192, 16,384, 32,768, 65,536 and 111,616; for Peacebell it is automatic up to 9,216
   and the fixed sizes 4,096, 8,192, 16,384 and 20,480.
 - **MSET-20** Every size in that list says under its name what it costs, when the catalogue knows
   the model's bytes for each token: "About {memory} of memory when full, and about {time} to read it
-  all again.", or for a model without a known reading speed "About {memory} of memory when full."
+  all again.", or for a model without known reading times "About {memory} of memory when full."
   The memory is the size times the model's bytes for each token (MODEL-04), in the platform's short
-  form for an amount of bytes. The time is the size divided by the model's reading speed (MODEL-04),
-  rounded up to whole seconds. Below 90 seconds it is said in seconds, "{n} seconds" (for one, "{n}
-  second"); from there on in minutes, rounded to the nearest, "{n} minutes" (the form for one, "{n}
-  minute", exists and is never produced, because the least is 2). Both figures come from the
-  catalogue and from one phone, which is why the sentences say "about"; the engine itself decides
-  with what the loaded model reports and with the speed it has measured (ENG-30, ENG-31).
+  form for an amount of bytes. The time is what the model's reading times (MODEL-04) give for the
+  size, by the arithmetic of FMT-20, rounded up to whole seconds. Below 90 seconds it is said in
+  seconds, "{n} seconds" (for one, "{n} second"); from there on, below 5,400 seconds (an hour and a
+  half), in minutes rounded to the nearest, "{n} minutes" (the form for one, "{n} minute", exists
+  and is never produced, because the least is 2); from 5,400 seconds on in hours rounded to the
+  nearest, "{n} hours" (the form for one, "{n} hour", exists and is never produced, because the
+  least is 2). Because reading slows as more has been read (ENG-30), the time grows much faster
+  than the size. With 5,500,000,000 bytes of memory and the reading times of MODEL-04 the times
+  for Qwen3.5 are: automatic (7,168) 120 seconds, "about 2 minutes"; 4,096, "about 64 seconds";
+  8,192, 139 seconds, "about 2 minutes"; 16,384, 327 seconds, "about 5 minutes"; 32,768, "about 14
+  minutes"; 65,536, "about 41 minutes"; 111,616, 5,988 seconds, "about 2 hours" (the last four
+  extrapolated beyond the last measured length, 15,872). For Peacebell: automatic (9,216) 108
+  seconds, "about 2 minutes"; 4,096, "about 36 seconds"; 8,192, 90 seconds, "about 2 minutes";
+  16,384, "about 4 minutes"; 20,480, "about 6 minutes". Both figures come from the catalogue and from one
+  phone, which is why the sentences say "about"; the engine itself decides with what the loaded
+  model reports and with the reading times scaled to its own measurement (ENG-30, ENG-31).
   - **On Android:** `Formatter.formatShortFileSize`, which writes the amount in the user's locale
     with its unit, such as 50 MB.
 - **MSET-21** A model whose context cannot grow on this device has nothing to choose, and one
@@ -1688,8 +1704,17 @@ is what a port has to reproduce, whatever it is written in.
   save a checkpoint is tolerated; it costs time, never correctness.
 - **ENG-10** If the native memory and the engine's copy of it ever disagree in length, the
   memory is cleared and rebuilt.
-- **ENG-11** The part of the prompt that is not in memory is read in chunks of 32 tokens, with a
-  progress report after each chunk and a chance to stop between chunks.
+- **ENG-11** The part of the prompt that is not in memory is read in chunks, with a progress
+  report after each chunk and a chance to stop between chunks. The prompt is read in parts that
+  end at its checkpoints (ENG-09); a part that leaves fewer than 1,024 tokens in memory is read in
+  chunks of 32 tokens, and a part that ends at or beyond 1,024 tokens in the model's chunk of a deep
+  read (MODEL-04): 128 tokens for a model with recurrent state (Qwen3.5, Boris-2), the session's
+  whole batch of 256 for a model with attention only (Peacebell, Shard-2). The reason: every chunk
+  costs time in proportion to the tokens already in memory, on top of its tokens' own cost, so small
+  chunks make a long conversation slow to read (on the tested phone, with 7,168 tokens read, a token
+  cost Qwen3.5 33.7 ms in chunks of 32 and 19.3 ms in chunks of 128, Peacebell 48.7 ms in chunks of
+  32 and 14.5 ms in chunks of 256; with nothing read the chunk makes no difference). A model with
+  recurrent state can be stopped only between chunks (NAT-07), so it gets the smaller chunk.
 - **ENG-12** The reply is sampled token by token with the model's sampling values, or with the
   request's in their place, and always with the model's banned tokens. The sampler is set up
   once at the start of every reply, which is where a reply begins for the penalties (FMT-15). No
@@ -1754,7 +1779,9 @@ is what a port has to reproduce, whatever it is written in.
   A context that had grown is back at the size it was opened with afterwards (ENG-35).
 - **ENG-22** A reply stands aside while a passphrase key is being derived (PASS-11): it pauses
   between two chunks of the prompt or between two tokens of the reply, never inside a
-  computation (where its worker threads would keep the processor as busy as computing does),
+  computation (so while a long conversation is read, the chunk in progress, up to 128 or 256 tokens
+  by ENG-11, is finished first: on the tested phone about 1.4 to 2.5 s for 128 tokens of Qwen3.5,
+  and more the longer the conversation) (where its worker threads would keep the processor as busy as computing does),
   and goes on from where it was when the derivation has returned, whatever its result. A paused
   reply has not ended and loses nothing. While paused it asks at least every 25 milliseconds
   whether it should end, so stopping it, locking and forgetting all work during a pause. The
@@ -1792,9 +1819,9 @@ is what a port has to reproduce, whatever it is written in.
   - what the device's memory allows: as many tokens as a quarter of the device's memory holds at the
     model's bytes for each token, in whole multiples of 1,024, and never less than the starting
     size;
-  - when the request names no size (the model's page says "Automatic"): what the model reads again
-    in 120 seconds at its reading speed (ENG-30), in whole multiples of 1,024, and never less than
-    the starting size;
+  - when the request names no size (the model's page says "Automatic"): the largest whole multiple
+    of 1,024 tokens that the model reads from nothing within 120 seconds by its reading times
+    (ENG-30), and never less than the starting size;
   - when the request names a size (MSET-22): that size, which then takes the place of the reading
     time;
   - a limit the engine has run into since the model was loaded (ENG-33).
@@ -1805,21 +1832,30 @@ is what a port has to reproduce, whatever it is written in.
   conversation reads all of it again; left to itself the app does not let that wait grow beyond
   about two minutes, and a longer one is the user's to choose.
 
-  With 5,500,000,000 bytes of memory and the figures of MODEL-04 the limits are 10,240 tokens for
-  Qwen3.5 left to itself (the time decides) and 111,616 at most by choice, 20,480 for Peacebell (the
-  memory decides) and 2,048 for Boris-2.
-- **ENG-30** The reading speed behind the automatic limit is one the engine has measured: after
-  every prompt of which at least 256 tokens had to be read, the tokens read divided by the time the
-  reading took, without the time spent standing aside (ENG-22) and without the fitting and growing
-  before it. Until there is such a measurement for the loaded model, the catalogue's figure is used
-  (MODEL-04); a model without one stays at its starting size when left to itself. A context that has
+  With 5,500,000,000 bytes of memory and the figures of MODEL-04 the limits are 7,168 tokens for
+  Qwen3.5 left to itself (the time decides: 7,168 tokens take 120 seconds, 8,192 take 139) and
+  111,616 at most by choice; 9,216 for Peacebell left to itself (the time decides: 108 seconds,
+  10,240 take 126) and 20,480 at most by choice (the memory decides); and 2,048 for Boris-2.
+- **ENG-30** Reading slows as a conversation gets longer: for every token it reads, the model
+  looks at every token already read, so a token costs more the more tokens are in memory, and the
+  time to read a conversation grows much faster than its length. The reading times behind the
+  automatic limit are therefore a curve: the catalogue's, measured on the tested phone (MODEL-04),
+  scaled by a factor the engine has measured on this device. After every prompt of which at least
+  256 tokens had to be read, taking the memory from `d0` to `d1` tokens in `t` seconds (without the
+  time spent standing aside, ENG-22, and without the fitting and growing before it), the factor is
+  `t` divided by what the catalogue's curve gives for reading from `d0` to `d1`, held between 0.25
+  and 4; the latest measurement replaces the earlier one, and until there is one the factor is 1.
+  Because the comparison is made at the depth the prompt was read at, a short prompt read deep in a
+  long conversation does not make the device look slower than it is. A model whose catalogue entry
+  has no reading times uses a constant speed instead, the tokens it last read divided by the time,
+  and stays at its starting size when left to itself until it has read such a prompt. A context that has
   grown is not cut back by a slower measurement: while the request names no size, the limit is never
   below the size the context has, so a conversation keeps what it was given until its memory is
   cleared (ENG-35). A size the request names holds at once, also below what the context has: the
   conversation is then fitted to it and what does not fit is left out (ENG-04).
-  - **Parity note:** the catalogue's speeds are those of one Android phone. A port needs figures
-    measured on its own devices for the time before the first measurement, and for what the
-    settings show (MSET-20).
+  - **Parity note:** the catalogue's reading times are those of one Android phone, with the engine
+    reading in the chunks of ENG-11. A port needs curves measured on its own devices for the time
+    before the first measurement, and for what the settings show (MSET-20).
 - **ENG-31** The device is asked before every step. Its memory is read at the moment a step is
   decided, never remembered from an earlier one: how much the device has, how much of it is counted
   as available now, the amount at which the system itself considers memory low, and whether it does
@@ -1962,7 +1998,9 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   computation that is under way stops within about a millisecond, and the interrupted chunk is
   taken out of the memory again. A model with recurrent state (Qwen3.5, Boris-2) cannot give an
   interrupted chunk back, so it is only asked between chunks and a stop waits for the chunk in
-  progress (at most about half a second on the phone that was tested).
+  progress: at most about half a second on the phone that was tested for a chunk of 32 tokens, and
+  for the chunk of 128 tokens of a deep read (ENG-11) about 1.4 s with nothing read and about
+  2.5 s with 7,000 read for Qwen3.5, more the longer the conversation. A lock waits for it too.
 - **NAT-08** Removing the end of the memory. Peacebell can. Qwen3.5 and Boris-2 cannot: they
   answer "no" with the memory untouched, and a checkpoint is restored instead. Shard-2 can,
   except after a checkpoint has been restored and the cut would need more of its window than is
@@ -2579,7 +2617,8 @@ This section is exact where the others describe. Each item carries one of three 
   token for token.
 - **FMT-19** *(Free)* How a model file is carried and opened (packaged inside the app, mapped
   from an offset, the fallback to reading it), the threads (NAT-03), the choice among processor
-  variants (NAT-04), the size of a chunk of prompt (32 tokens), the number of checkpoints (4),
+  variants (NAT-04), the size of a chunk of prompt (32 tokens, and from 1,024 tokens in memory on
+  the model's chunk of a deep read, ENG-11; both change the reading times of FMT-20), the number of checkpoints (4),
   the delays of the writer (1 second for lazy writes, 10 seconds at a lock), the names of files
   inside the private storage as far as FMT-03 does not fix them, and every matter of layout and
   colour.
@@ -2587,13 +2626,21 @@ This section is exact where the others describe. Each item carries one of three 
   memory in bytes, `available` the memory counted as available now and `low` the amount at which the
   system considers memory low (ENG-31); `start` is the size the context was opened with, `trained`
   the smaller of the catalogue's and the model file's trained context, `bytes` the model's bytes for
-  each token and `speed` its reading speed in tokens per second (ENG-30).
+  each token and `seconds(n)` the time its reading times (MODEL-04), scaled as ENG-30 says, give
+  for reading `n` tokens from nothing:
+  - the reading times are measured points (`n`, `s`) with both strictly increasing, and the point
+    (0, 0) in front. Between two points `seconds` is interpolated on a straight line. Beyond the
+    last point (`N`, `S`): with `c1` and `c2` the average seconds per token of the last two
+    segments and `m1` and `m2` their middles, `g` = the larger of 0 and (`c2` - `c1`) / (`m2` -
+    `m1`) (0 when there is only one segment), and `seconds(n)` = `S` + `c2` (`n` - `N`) + `g` / 2
+    ((`n` - `m2`)² - (`N` - `m2`)²);
+  - scaled by a factor `f`, every `s` is multiplied by `f`;
   - `cap` = a quarter of `total`; `floor` = the larger of a fifth of `total` and twice `low`;
   - `byMemory` = `trained` if `cap` holds that many tokens at `bytes` each, and otherwise the number
     of tokens `cap` holds, rounded down to a multiple of 1,024; in either case not less than the
     smaller of `start` and `trained`. With `bytes` not known, `byMemory` = `trained`;
-  - `byTime` = `speed` times 120, rounded down to a multiple of 1,024, and not less than `start`;
-    with no speed known, `start`;
+  - `byTime` = the largest `n` with `seconds(n)` not more than 120, rounded down to a multiple of
+    1,024, and not less than `start`; with no reading times known, `start`;
   - the limit with no size chosen = the smallest of `trained`, `byMemory`, `byTime` and a limit
     found by ENG-33, and then not less than the size the context has now; the limit with a size
     chosen = that size, held between 1 and `byMemory`, and not more than a limit found by ENG-33;

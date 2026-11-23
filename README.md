@@ -75,7 +75,9 @@ Chats:
   tokens (Boris-2 with its 2,048) and is given more only when a conversation needs it, up to
   a limit: what the model was trained with, what a quarter of the phone's memory holds, and,
   unless you choose a size yourself on the model's page, what the model can read again in
-  about two minutes. Before every step the app asks Android how much memory is available, and
+  about two minutes (reading slows as a conversation gets longer, so that is 7,168 tokens for
+  Qwen3.5 on the tested phone). Before every step the app asks Android how much memory is
+  available, and
   it takes no step that would leave too little. The chat says when the context has grown and
   when it could not. Locking the app gives the memory back, and so does the next answer in
   another conversation that needs no more than the starting size.
@@ -202,13 +204,35 @@ needs more.
 - **The limit** is the smallest of three. What the model was trained with. What a quarter of
   the phone's memory holds at the model's bytes for each token, in whole 1,024 tokens. And,
   only while the model's page says "Automatic", what the model reads again in about two
-  minutes: its reading speed times 120 seconds, in whole 1,024 tokens, and never less than
-  the starting size. The speed is the one the running app has measured once it has read a
-  prompt of 256 tokens or more, and before that the speed in the table under
-  [Speed on the one phone that was tested](#speed-on-the-one-phone-that-was-tested). A context
-  that has grown is not cut back by a slower measurement: it keeps its size until the
-  conversation is left. On the tested phone this makes 10,240 tokens for Qwen3.5, where the
-  time decides, and about 20,000 for Peacebell, where the memory does.
+  minutes: the largest whole multiple of 1,024 tokens that it reads from nothing within 120
+  seconds, and never less than the starting size.
+- **Reading slows as a conversation gets longer.** For every token it reads, a model looks at
+  every token it has already read (that is what attention does), so a token costs more the
+  longer the conversation already is, and reading a whole conversation takes much longer than
+  its length divided by the speed of a short prompt. Every chunk of tokens the model reads in
+  one go also costs time in proportion to what is already in memory, so long stretches are read
+  in larger chunks: up to 1,024 tokens in memory the app reads 32 tokens at a time, and beyond
+  that 128 (Qwen3.5, Boris-2) or 256 (Peacebell, Shard-2). With 7,168 tokens read that brought a
+  token of Qwen3.5 from 33.7 to 19.3 ms and one of Peacebell from 48.7 to 14.5 ms. The larger
+  chunk has a price: a model with recurrent state can be stopped only between chunks, and every
+  model makes way for a passphrase check only between chunks, so a stop, a lock, or an unlock
+  while a long conversation is being read can wait for one chunk longer, about 1.4 to 2.5
+  seconds for Qwen3.5 on the tested phone and more the longer the conversation. The app takes the
+  reading time from a curve measured on the tested phone with these chunks, kept in the model
+  catalogue: Qwen3.5 read 2,048 tokens from nothing in 30 seconds, 4,096 in 64, 8,192 in 139
+  and 15,872 in 314; Peacebell 2,048 in 16, 4,096 in 36, 8,192 in 89 and 15,872 in 242;
+  Boris-2 its first 1,536 in 5. The phone had been measuring for an hour by then and was warm
+  (battery at 34 degrees Celsius); cool, it began about a quarter faster. Between two measured
+  lengths the time is interpolated; beyond the longest one it is extrapolated, with the cost
+  of a token growing on at the rate the last measurements show, so the times of the largest
+  sizes are estimates. On another phone
+  the curve is scaled: once the running app has read a prompt of 256 tokens or more, it
+  compares the time that took with what the curve gives for the same stretch, at the depth it
+  was read at, and from then on uses the curve times that factor (held between a quarter and
+  four times). A context that has grown is not cut back by a slower measurement: it keeps its
+  size until the conversation is left. On the tested phone this makes 7,168 tokens for
+  Qwen3.5 (7,168 tokens take 120 seconds, 8,192 take 139) and 9,216 for Peacebell (108
+  seconds; its memory would allow 20,480), where the time decides for both.
 - **A size of your own.** Besides "Automatic", a model's page offers the fixed sizes from the
   starting size up to what the phone's memory allows, each with the memory it takes when it
   is full and the time the model needs to read it all again. A fixed size is not held to the
@@ -232,9 +256,12 @@ needs more.
   again from the start, and the chat says so.
 - **What a long conversation costs after a lock.** When the app is locked and left, its
   process ends (see [The lock](#the-lock)), and the next answer in a conversation reads all of
-  it again. At the speeds measured on the tested phone, 10,240 tokens take Qwen3.5 about two
-  minutes, 32,768 about six, and the 110,000 or so that the phone's memory allows it about
-  twenty. Behind the lock nothing changes for that: an answer that is still being read or
+  it again. By the curve measured on the tested phone, 7,168 tokens take Qwen3.5 about two
+  minutes, 10,240 about three, 16,384 about five and a half, 32,768 about fourteen, and the
+  111,616 that the phone's memory allows it about an hour and forty minutes (everything
+  beyond 15,872 tokens extrapolated). Peacebell reads 9,216 tokens in under two minutes,
+  16,384 in about four, and the 20,480 that the phone's memory allows it in about six.
+  Behind the lock nothing changes for that: an answer that is still being read or
   written ten minutes after the app locked is stopped. A conversation that takes longer than
   that to read has to be read with the app open.
 - **Giving it back.** Clearing the model's memory returns the context to its starting size.
@@ -319,6 +346,9 @@ cores and the test in front. With three unpinned threads, which is what the engi
 to when it may not pin, the prompt speeds were 67, 140 and 289 tokens per second; the writing
 speed, measured that way for Qwen3.5, did not change. Speeds varied by a few per cent between
 runs. `native/README.md` ("On the phone") has the full table and how to repeat it.
+The prompt speeds are those of a short prompt read from nothing. A long conversation is read
+more slowly, every token more slowly than the one before; the times the app works with are in
+[The context grows with the conversation](#the-context-grows-with-the-conversation).
 
 Only the CPU is used. The GPU of this phone wrote more slowly than its CPU, and the NPU would
 need a proprietary SDK, which this project does not use.
@@ -445,8 +475,10 @@ optionally a second time by a fingerprint key.
   take a second or two of one processor core, and next to a model that keeps the fast cores
   busy it took several times as long. So while a passphrase is being checked (an unlock while
   an answer is finished behind the lock, a check or a change in Settings), the answer under way
-  pauses between two tokens, or between two chunks of the conversation it is reading, and goes
-  on when the check has returned, whatever its result. The pause is not an end: nothing of the
+  pauses between two tokens, or between two chunks of the conversation it is reading (beyond
+  1,024 tokens a chunk is 128 or 256 tokens, which can take a few seconds, more the longer the
+  conversation; see [The context grows with the conversation](#the-context-grows-with-the-conversation)),
+  and goes on when the check has returned, whatever its result. The pause is not an end: nothing of the
   answer is lost, the ten minutes above go on counting, and stopping the answer, "Lock now"
   and a reset work during it as always.
 - **Wrong passphrases are slowed down.** The first four wrong attempts cost nothing. The fifth
@@ -1258,7 +1290,9 @@ A model is a build change, never a download by the app. In outline:
    needs that architecture ported first, with reference data from its PyTorch implementation.
 4. Add it to the catalogue in `core` (`ModelCatalog.kt`) with its prompt format, sampling
    settings, context (the size it starts with, the size it was trained with, the bytes for
-   each token and its reading speed on the tested phone) and licence, and its name to the
+   each token and its reading times on the tested phone, measured with `ReadingDepthDeviceTest`
+   in `llama/src/androidTest`), its chunk of a deep read (128 tokens for a model with recurrent
+   state, 256 otherwise) and licence, and its name to the
    app's strings. A test compares the context numbers with the manifest's.
 5. Add it to the third-party notices (`app/notices/`): its licence, its copyright lines and
    what the conversion changed. A model is bundled only when its licence is established; a

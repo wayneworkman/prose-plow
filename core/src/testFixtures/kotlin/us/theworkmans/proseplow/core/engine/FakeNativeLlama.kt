@@ -68,6 +68,21 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     /** Virtual time: every evaluated token moves [nanos] on by this much. */
     var nanosPerToken: Long = 0
 
+    /**
+     * Virtual time that grows with depth, as attention does: every evaluated token moves
+     * [nanos] on by this much more for every token already in memory before it. With both set,
+     * a token read after `d` others costs `nanosPerToken + d * nanosPerTokenPerDepth`.
+     */
+    var nanosPerTokenPerDepth: Long = 0
+
+    /** One call of [evaluate]: the chunk size asked for, and the tokens in memory before it and once all its tokens are read. */
+    data class Evaluation(val chunkSize: Int, val from: Int, val to: Int)
+
+    private val evaluationsMade = ArrayList<Evaluation>()
+
+    /** Every call of [evaluate] since the last [clearCalls], in order. */
+    val evaluations: List<Evaluation> get() = evaluationsMade
+
     /** The virtual clock; pass `{ fake.nanos }` to the engine as its time source. */
     var nanos: Long = 0
 
@@ -102,6 +117,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     /** Forgets the recorded calls (not the memory), to look only at what happens next. */
     fun clearCalls() {
         recorded.clear()
+        evaluationsMade.clear()
     }
 
     // --- Vocabulary ---
@@ -301,6 +317,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         enter(Call.Evaluate(tokens.toList()))
         require(tokens.isNotEmpty()) { "evaluate needs at least one token" }
         require(chunkSize >= 1) { "chunkSize must be at least 1" }
+        evaluationsMade += Evaluation(chunkSize, memoryTokens.size, memoryTokens.size + tokens.size)
         predictionReady = false
         var done = 0
         while (done < tokens.size) {
@@ -309,9 +326,11 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
             if (memoryTokens.size + count > contextTokens) {
                 throw NativeLlamaException(NativeLlamaException.CONTEXT_FULL, "no room for $count more tokens")
             }
-            for (offset in 0 until count) memoryTokens += tokens[done + offset]
+            for (offset in 0 until count) {
+                nanos += nanosPerToken + memoryTokens.size * nanosPerTokenPerDepth
+                memoryTokens += tokens[done + offset]
+            }
             done += count
-            nanos += count * nanosPerToken
             observer.onProgress(done)
             afterChunk(memoryTokens.size)
         }

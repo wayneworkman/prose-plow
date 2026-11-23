@@ -39,6 +39,7 @@ internal fun testModel(
     supportsSystemPrompt: Boolean = true,
     id: String = TEST_MODEL_ID,
     deletionTokenId: Int? = null,
+    deepReadChunk: Int = 128,
 ) = ModelSpec(
     id = id,
     displayName = "Test model",
@@ -54,6 +55,7 @@ internal fun testModel(
     supportsSystemPrompt = supportsSystemPrompt,
     sourceRepository = "example/test-model",
     licence = "Apache-2.0",
+    deepReadChunk = deepReadChunk,
     deletionTokenId = deletionTokenId,
 )
 

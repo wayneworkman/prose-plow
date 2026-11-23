@@ -20,6 +20,18 @@ import us.theworkmans.proseplow.core.prompt.Qwen35ChatMlFormat
 class ModelCatalogTest {
 
     @Test
+    fun `a long conversation is read in 128s by a model with recurrent state and in the session's whole batch otherwise`() {
+        assertEquals(256, ModelSpec.MAX_EVALUATION_CHUNK)
+        assertEquals(128, ModelCatalog.QWEN35_0_8B.deepReadChunk)
+        assertEquals(128, ModelCatalog.BORIS_2_INSTRUCT.deepReadChunk)
+        assertEquals(256, ModelCatalog.PEACEBELL_V1_291M.deepReadChunk)
+        assertEquals(256, ModelCatalog.SHARD_2.deepReadChunk)
+        for (model in ModelCatalog.all) assertTrue("${model.id}: at most the session's batch", model.deepReadChunk in 1..ModelSpec.MAX_EVALUATION_CHUNK)
+        assertThrows(IllegalArgumentException::class.java) { ModelCatalog.QWEN35_0_8B.copy(deepReadChunk = 257) }
+        assertThrows(IllegalArgumentException::class.java) { ModelCatalog.QWEN35_0_8B.copy(deepReadChunk = 0) }
+    }
+
+    @Test
     fun `the catalogue has the four known models in picker order`() {
         assertEquals(
             listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),

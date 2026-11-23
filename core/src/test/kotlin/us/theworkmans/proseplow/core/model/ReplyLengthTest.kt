@@ -34,7 +34,7 @@ class ReplyLengthTest {
     fun `each model of the catalogue has a default inside its range, at the size it starts with and on the test phone`() {
         // The model's own default, the most at the size its context starts with, and the most left to itself on the phone the app was measured on.
         val expected = mapOf(
-            ModelCatalog.QWEN35_0_8B to Triple(1024, 2048, 4096),
+            ModelCatalog.QWEN35_0_8B to Triple(1024, 2048, 3584),
             ModelCatalog.PEACEBELL_V1_291M to Triple(1024, 2048, 4096),
             ModelCatalog.BORIS_2_INSTRUCT to Triple(512, 1024, 1024),
             ModelCatalog.SHARD_2 to Triple(200, 2048, 2048),

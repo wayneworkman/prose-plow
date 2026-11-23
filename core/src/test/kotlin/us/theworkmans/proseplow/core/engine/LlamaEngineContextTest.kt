@@ -12,6 +12,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReadingTimes
 import us.theworkmans.proseplow.core.prompt.PromptMessage
 
 /**
@@ -309,7 +310,7 @@ class LlamaEngineContextTest {
     @Test
     fun `left to itself the context grows only as far as the conversation can be read again in two minutes`() = runTest {
         // 20 tokens a second by the catalogue: 2,400 in two minutes, which is 2,048 in whole 1,024s.
-        val test = engine(small.copy(readTokensPerSecond = 20))
+        val test = engine(small.copy(readingTimes = ReadingTimes.flat(20.0)))
         val events = test.ask(talk(18, size = 100), limit = null)
         assertEquals(listOf(2048), events.grown().map { it.toTokens })
         assertEquals("beyond that the oldest turns go, although the model could hold more", 1, events.trimmed().size)
@@ -321,18 +322,95 @@ class LlamaEngineContextTest {
         assertTrue(stays.grown().isEmpty())
         assertEquals(1, stays.trimmed().size)
 
-        // The speed measured on this device takes the catalogue's place: 10 tokens a second read 1,024 in two minutes.
-        val measured = engine(small.copy(readTokensPerSecond = 20)) { it.nanosPerToken = 100_000_000 }
+        // What this device was measured to take scales the catalogue's times: twice as long reads 1,024 in two minutes.
+        val measured = engine(small.copy(readingTimes = ReadingTimes.flat(20.0))) { it.nanosPerToken = 100_000_000 }
         measured.ask(long, limit = null) // Reads some hundred tokens at ten a second.
         measured.engine.forget()
         val slow = measured.ask(talk(18, size = 100), limit = null)
         assertEquals(listOf(1024), slow.grown().map { it.toTokens })
+
+        // A model of which the catalogue knows no times reads by the speed it was seen to read at, as a constant.
+        val unknownMeasured = engine { it.nanosPerToken = 50_000_000 }
+        unknownMeasured.ask(long) // A size of the user's own, so that some 830 tokens are read at 20 a second.
+        unknownMeasured.engine.forget()
+        assertEquals("20 a second, measured", listOf(2048), unknownMeasured.ask(talk(18, size = 100), limit = null).grown().map { it.toTokens })
+    }
+
+    /** What the fake takes to read [tokens] from nothing when a token after `d` others costs [first] plus `d` times [perDepth] nanoseconds. */
+    private fun fakeSeconds(tokens: Int, first: Long, perDepth: Long): Double =
+        (first * tokens + perDepth * tokens.toLong() * (tokens - 1) / 2) / 1e9
+
+    /**
+     * A model whose catalogue curve is the fake's own times at 10 ms for a token with nothing
+     * read and 0.02 ms more for every token already read, with a point every 64 tokens: two
+     * minutes then read 3,000 tokens (2,048 in whole 1,024s), where the speed of a short
+     * prompt, 100 tokens a second, would promise 12,000.
+     */
+    private val deepening: ModelSpec = small.copy(
+        readingTimes = ReadingTimes((64..4096 step 64).map { ReadingTimes.Point(it, fakeSeconds(it, FIRST_TOKEN_NANOS, DEPTH_NANOS)) }),
+    )
+
+    @Test
+    fun `a part of a prompt that leaves a long conversation in memory is read in the model's deep chunk`() = runTest {
+        val test = engine()
+        test.ask(short)
+        val prompt = test.fake.evaluations.filter { it.to - it.from > 1 }
+        assertTrue(prompt.isNotEmpty())
+        assertTrue("a short prompt keeps the engine's chunk of 32", prompt.all { it.chunkSize == 32 })
+
+        // Some 3,800 tokens, read in parts between checkpoints: those that end below 1,024 in 32s, the others in the model's 128s.
+        test.fake.clearCalls()
+        test.ask(talk(18, size = 100), limit = 4096)
+        val long = test.fake.evaluations.filter { it.to - it.from > 1 }
+        assertTrue("the conversation reaches beyond 1,024 tokens", long.any { it.to >= 1024 })
+        for (part in long) assertEquals("the part from ${part.from} to ${part.to}", if (part.to >= 1024) 128 else 32, part.chunkSize)
+
+        // A model with attention only reads the same in the session's whole batch.
+        val wide = engine(small.copy(deepReadChunk = 256))
+        wide.ask(talk(18, size = 100), limit = 4096)
+        val deep = wide.fake.evaluations.filter { it.to - it.from > 1 && it.to >= 1024 }
+        assertTrue(deep.isNotEmpty() && deep.all { it.chunkSize == 256 })
+
+        assertEquals("the threshold is the engine's setting, 1,024 unless named", 1024, LlamaEngine.Settings().deepReadTokens)
+    }
+
+    @Test
+    fun `the device's reading is a factor over the catalogue's curve, measured at whatever depth`() = runTest {
+        // A device that reads as the catalogue says: the limit is the curve's, also after a prompt read deep in a conversation.
+        val same = engine(deepening) {
+            it.nanosPerToken = FIRST_TOKEN_NANOS
+            it.nanosPerTokenPerDepth = DEPTH_NANOS
+        }
+        assertEquals(listOf(1024), same.ask(long, limit = null).grown().map { it.toTokens })
+        val deeper = long + assistant("Yes.") + user("x".repeat(300))
+        val second = same.ask(deeper, limit = null)
+        assertTrue("some 300 tokens were read after some 830", second.done().stats.evaluatedPromptTokens >= 256)
+        same.engine.forget()
+        assertEquals("tokens read deep in cost more, and the curve knows it", listOf(2048), same.ask(talk(18, size = 100), limit = null).grown().map { it.toTokens })
+
+        // A device that takes twice as long for everything: 60 s of the curve, 2,000 tokens.
+        val slower = engine(deepening) {
+            it.nanosPerToken = 2 * FIRST_TOKEN_NANOS
+            it.nanosPerTokenPerDepth = 2 * DEPTH_NANOS
+        }
+        slower.ask(long, limit = null)
+        slower.engine.forget()
+        assertEquals(listOf(1024), slower.ask(talk(18, size = 100), limit = null).grown().map { it.toTokens })
+
+        // Ten times as long is held to four: 30 s of the curve, 1,302 tokens. At ten it would be 704, below one 1,024.
+        val slowest = engine(deepening) {
+            it.nanosPerToken = 10 * FIRST_TOKEN_NANOS
+            it.nanosPerTokenPerDepth = 10 * DEPTH_NANOS
+        }
+        slowest.ask(long, limit = null)
+        slowest.engine.forget()
+        assertEquals(listOf(1024), slowest.ask(talk(18, size = 100), limit = null).grown().map { it.toTokens })
     }
 
     @Test
     fun `a context that has grown by itself is not cut back when the model is then seen to read more slowly`() = runTest {
         // By the catalogue 20 tokens a second, so up to 2,048 tokens; in fact it reads 10 a second, which would be 1,024.
-        val test = engine(small.copy(readTokensPerSecond = 20)) { it.nanosPerToken = 100_000_000 }
+        val test = engine(small.copy(readingTimes = ReadingTimes.flat(20.0))) { it.nanosPerToken = 100_000_000 }
         val conversation = talk(9)
         val first = test.ask(conversation, limit = null)
         assertEquals(listOf(2048), first.grown().map { it.toTokens })
@@ -489,3 +567,9 @@ class LlamaEngineContextTest {
         assertEquals(EngineState.Failed(model.id, EngineError.LoadFailed(model.id, LlamaEngine.TOO_LITTLE_MEMORY)), refused.state.value)
     }
 }
+
+/** What a token costs the fake with nothing read, in nanoseconds: 100 tokens a second for a short prompt. */
+private const val FIRST_TOKEN_NANOS: Long = 10_000_000
+
+/** What every token already read adds to the cost of the next, in nanoseconds. */
+private const val DEPTH_NANOS: Long = 20_000

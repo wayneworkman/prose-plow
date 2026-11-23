@@ -30,6 +30,17 @@ class FakeNativeLlamaTest {
     )
 
     @Test
+    fun `virtual time can make a token cost more the more tokens are in memory`() {
+        fake.nanosPerToken = 10
+        evaluate("abcd")
+        assertEquals("a flat cost: 10 a token", 40L, fake.nanos)
+        fake.nanosPerTokenPerDepth = 1
+        evaluate("efgh")
+        // Read after 4, 5, 6 and 7 tokens: 14 + 15 + 16 + 17.
+        assertEquals(40L + 62, fake.nanos)
+    }
+
+    @Test
     fun `text is one token per byte and round-trips`() {
         val text = "h" + String(Character.toChars(0x1F600))
         val tokens = fake.tokenize(utf8(text), parseSpecial = false)

@@ -135,7 +135,7 @@ class SettingsViewModelTest {
         assertEquals("", viewModel.replyLength(qwen))
         assertNull(stored())
         assertEquals("the default is named", "1,024", viewModel.defaultReplyLength(model))
-        assertEquals("a context that may grow leaves room for the longest reply there is", "16" to "4,096", viewModel.replyLengthLimits(model))
+        assertEquals("a context that grows by itself to 7,168 leaves room for a reply of half that", "16" to "3,584", viewModel.replyLengthLimits(model))
         assertEquals("half of a context that cannot", "16" to "1,024", viewModel.replyLengthLimits(ModelCatalog.BORIS_2_INSTRUCT))
 
         // "300", one key at a time: "3" is below the least and is not saved, "30" and "300" are.
@@ -217,22 +217,34 @@ class SettingsViewModelTest {
         val session = app.open()
         val viewModel = viewModelOver(session)
 
-        // Qwen3.5: left to itself as far as two minutes of reading; by choice as far as a quarter of the phone's memory.
+        // Qwen3.5: left to itself as far as two minutes of reading (120 s for 7,168 tokens); by choice as far as a quarter of the phone's memory.
         val qwenOptions = viewModel.contextOptions(ModelCatalog.QWEN35_0_8B)
-        assertEquals(SettingsViewModel.ContextOption(tokens = null, limitTokens = 10_240, memoryBytes = 125_829_120, rereadSeconds = 114), qwenOptions.first())
+        assertEquals(SettingsViewModel.ContextOption(tokens = null, limitTokens = 7168, memoryBytes = 88_080_384, rereadSeconds = 120), qwenOptions.first())
         assertEquals(listOf(null, 4096, 8192, 16_384, 32_768, 65_536, 111_616), qwenOptions.map { it.tokens })
         assertEquals("a fixed size is its own limit", qwenOptions.drop(1).map { it.tokens }, qwenOptions.drop(1).map { it.limitTokens })
-        assertEquals(SettingsViewModel.ContextOption(4096, 4096, 50_331_648, 46), qwenOptions[1])
-        assertEquals(SettingsViewModel.ContextOption(111_616, 111_616, 1_371_537_408, 1241), qwenOptions.last())
-        assertEquals("said in seconds below a minute and a half, in minutes from there", listOf(2, null, 2, 3, 6, 12, 21), qwenOptions.map { it.rereadMinutes })
+        assertEquals(SettingsViewModel.ContextOption(4096, 4096, 50_331_648, 64), qwenOptions[1])
+        assertEquals(
+            "the measured curve: reading slows the more was read, so twice the size takes far more than twice the time",
+            listOf(120, 64, 139, 327, 843, 2447, 5988),
+            qwenOptions.map { it.rereadSeconds },
+        )
+        assertEquals(SettingsViewModel.ContextOption(111_616, 111_616, 1_371_537_408, 5988), qwenOptions.last())
+        assertEquals("said in seconds below a minute and a half, in minutes from there", listOf(2, null, 2, 5, 14, 41, null), qwenOptions.map { it.rereadMinutes })
+        assertEquals("and the largest, at an hour and forty minutes, in hours", listOf(null, null, null, null, null, null, 2), qwenOptions.map { it.rereadHours })
+        fun time(seconds: Int) = SettingsViewModel.ContextOption(null, 1, 1, seconds).let { Triple(it.rereadSeconds, it.rereadMinutes, it.rereadHours) }
+        assertEquals("from an hour and a half on, in hours to the nearest", Triple(5399, 90, null), time(5399))
+        assertEquals(Triple(5400, null, 2), time(5400))
+        assertEquals(Triple(9160, null, 3), time(9160))
+        assertEquals(Triple(89, null, null), time(89))
 
-        // Peacebell: the phone's memory is the limit, with or without a choice.
+        // Peacebell: left to itself the time is the limit, by choice the phone's memory.
         val peacebellOptions = viewModel.contextOptions(ModelCatalog.PEACEBELL_V1_291M)
         assertEquals(listOf(null, 4096, 8192, 16_384, 20_480), peacebellOptions.map { it.tokens })
-        assertEquals(SettingsViewModel.ContextOption(null, 20_480, 1_363_148_800, 112), peacebellOptions.first())
+        assertEquals(SettingsViewModel.ContextOption(null, 9216, 613_416_960, 108), peacebellOptions.first())
+        assertEquals(listOf(108, 36, 90, 254, 363), peacebellOptions.map { it.rereadSeconds })
 
         // Models whose context cannot grow have nothing to choose: one fact to state.
-        assertEquals(listOf(SettingsViewModel.ContextOption(null, 2048, 2048L * 63_488, 6)), viewModel.contextOptions(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals(listOf(SettingsViewModel.ContextOption(null, 2048, 2048L * 63_488, 8)), viewModel.contextOptions(ModelCatalog.BORIS_2_INSTRUCT))
         assertEquals(listOf(null), viewModel.contextOptions(ModelCatalog.SHARD_2).map { it.tokens })
         assertEquals(4096, viewModel.contextOptions(ModelCatalog.SHARD_2).single().limitTokens)
 
@@ -250,7 +262,7 @@ class SettingsViewModelTest {
         fun stored() = session.settings.settings.value.contextTokens(qwen)
         assertNull("automatic until something is chosen", viewModel.contextChoice(model))
         assertNull(stored())
-        assertEquals(10_240, viewModel.contextLimit(model))
+        assertEquals(7168, viewModel.contextLimit(model))
         assertFalse(viewModel.hasOwnValues(qwen))
 
         // A reply as long as the automatic context allows.

@@ -164,11 +164,20 @@ class SettingsViewModel(
      * @property limitTokens how large the context may become with it on this device.
      * @property memoryBytes what a context of that size costs in memory; 0 when that is not known.
      * @property rereadSeconds how long the model takes to read a conversation of that size
-     *   again, at the speed it was measured with; null when that is not known.
+     *   again, by the reading times measured on the tested phone; null when they are not known.
      */
     data class ContextOption(val tokens: Int?, val limitTokens: Int, val memoryBytes: Long, val rereadSeconds: Int?) {
-        /** The time in whole minutes, for a time that is better said so: from a minute and a half on. Null below that. */
-        val rereadMinutes: Int? get() = rereadSeconds?.takeIf { it >= SECONDS_SAID_AS_MINUTES }?.let { (it + 30) / 60 }
+        /**
+         * The time in whole minutes, for a time that is better said so: from a minute and a half
+         * up to an hour and a half. Null outside that, where seconds or hours say it.
+         */
+        val rereadMinutes: Int? get() = rereadSeconds?.takeIf { it >= SECONDS_SAID_AS_MINUTES && it < SECONDS_SAID_AS_HOURS }?.let { (it + 30) / 60 }
+
+        /**
+         * The time in whole hours, for a time that is better said so: from an hour and a half on,
+         * which the largest sizes of a model can take to read. Null below that.
+         */
+        val rereadHours: Int? get() = rereadSeconds?.takeIf { it >= SECONDS_SAID_AS_HOURS }?.let { (it + 1800) / 3600 }
     }
 
     /**
@@ -252,5 +261,6 @@ class SettingsViewModel(
 
     private companion object {
         const val SECONDS_SAID_AS_MINUTES = 90
+        const val SECONDS_SAID_AS_HOURS = 90 * 60
     }
 }

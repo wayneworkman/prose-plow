@@ -302,6 +302,10 @@
         <item quantity="one">%1$d minute</item>
         <item quantity="other">%1$d minutes</item>
     </plurals>
+    <plurals name="duration_hours">
+        <item quantity="one">%1$d hour</item>
+        <item quantity="other">%1$d hours</item>
+    </plurals>
     <string name="model_restore_defaults_support">Sets the temperature and the longest reply back to this model\'s own values, and the context to automatic. The system prompt stays as it is.</string>
     <string name="model_restore_defaults_support_no_prompt">Sets the temperature and the longest reply back to this model\'s own values, and the context to automatic.</string>
 

@@ -21,6 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReadingTimes
 import us.theworkmans.proseplow.core.model.ReplyLength
 import us.theworkmans.proseplow.core.prompt.Prompt
 import us.theworkmans.proseplow.core.prompt.PromptFormatException
@@ -178,7 +179,12 @@ class LlamaEngine(
      *   megabytes) and next to nothing on other models. Four cover the usual actions: a new turn,
      *   regenerating the last answer, and editing either of the last two user messages.
      * @property evaluationChunk how many prompt tokens are evaluated between two progress
-     *   reports and cancellation checks.
+     *   reports and cancellation checks while the memory holds a short conversation.
+     * @property deepReadTokens from how many tokens in memory on a prompt is read in the model's
+     *   own larger chunk, [ModelSpec.deepReadChunk]: a part of the prompt whose end lies at or
+     *   beyond this many tokens is read in that chunk. Every chunk costs time in proportion to
+     *   the tokens already in memory, so a long conversation read in small chunks is read
+     *   slowly; a short one is not, and keeps the small chunk with its quick stops.
      * @property minReplyTokens the least room for a reply with which a generation is still
      *   started when the latest turn alone nearly fills the context.
      * @property giveBackRereadTokens the most tokens the engine reads again in order to give a
@@ -191,12 +197,14 @@ class LlamaEngine(
     data class Settings(
         val maxCheckpoints: Int = 4,
         val evaluationChunk: Int = 32,
+        val deepReadTokens: Int = 1024,
         val minReplyTokens: Int = ReplyLength.MIN_TOKENS,
         val giveBackRereadTokens: Int = ContextPolicy.GRANULARITY,
     ) {
         init {
             require(maxCheckpoints >= 0) { "maxCheckpoints must not be negative" }
             require(evaluationChunk >= 1) { "evaluationChunk must be at least 1" }
+            require(deepReadTokens >= 0) { "deepReadTokens must not be negative" }
             require(minReplyTokens >= 1) { "minReplyTokens must be at least 1" }
             require(giveBackRereadTokens >= 0) { "giveBackRereadTokens must not be negative" }
         }
@@ -228,7 +236,18 @@ class LlamaEngine(
     /** A limit that was found for the loaded model's context by being refused or failing; null until then. */
     private var foundContextLimit: Int? = null
 
-    /** How fast the loaded model has last been seen to read a prompt on this device, in tokens per second; 0 until measured. */
+    /**
+     * How many times as long as the catalogue's reading times the loaded model last took on
+     * this device to read a prompt, between [MIN_READING_FACTOR] and [MAX_READING_FACTOR]; 0
+     * until measured. Used for a model whose catalogue entry has reading times.
+     */
+    private var measuredReadingFactor = 0.0
+
+    /**
+     * How fast the loaded model has last been seen to read a prompt on this device, in tokens
+     * per second; 0 until measured. Used only for a model whose catalogue entry has no reading
+     * times, which then has no curve to scale.
+     */
     private var measuredReadSpeed = 0.0
 
     /** The limit the collector was last told of, so that the same one is not announced with every answer; null after a growth. */
@@ -332,6 +351,7 @@ class LlamaEngine(
                 return factory.open(model, progress, size, Long.MAX_VALUE).also {
                     openedContext = it.contextSize()
                     foundContextLimit = null
+                    measuredReadingFactor = 0.0
                     measuredReadSpeed = 0.0
                 }
             } catch (e: NativeLlamaException) {
@@ -349,6 +369,7 @@ class LlamaEngine(
         loaded = null
         openedContext = 0
         foundContextLimit = null
+        measuredReadingFactor = 0.0
         measuredReadSpeed = 0.0
         announcedContextLimit = null
         memory.wipe()
@@ -534,7 +555,7 @@ class LlamaEngine(
             }
             promptReadyAt = nanoTime()
             // The reading alone: not the fitting and the growing before it, and not the time spent standing aside.
-            noteReadSpeed(evaluated = tokens.size - reusedTokens, nanos = promptReadyAt - readingFrom - (asideBeforeReply - asideBeforeReading))
+            noteReading(from = reusedTokens, to = tokens.size, nanos = promptReadyAt - readingFrom - (asideBeforeReply - asideBeforeReading))
             out.send(GenerationEvent.PromptProgress(tokens.size, tokens.size))
 
             sample(maxNewTokens = minOf(requestedNewTokens, contextSize - tokens.size))
@@ -542,12 +563,37 @@ class LlamaEngine(
 
         // --- The size of the context ---
 
-        /** The speed this model reads at: as measured in this session, or the catalogue's until then. */
-        private fun readSpeed(): Double = if (measuredReadSpeed > 0) measuredReadSpeed else model.readTokensPerSecond.toDouble()
+        /**
+         * How long this model takes to read a conversation on this device: the catalogue's
+         * curve scaled by the factor last measured (1 until then). A model whose catalogue
+         * entry has no curve gets a flat one from the speed it was last seen to read at, and
+         * none at all before that.
+         */
+        private fun readingTimes(): ReadingTimes {
+            val catalogue = model.readingTimes
+            return when {
+                catalogue.isKnown -> if (measuredReadingFactor > 0) catalogue.scaled(measuredReadingFactor) else catalogue
+                measuredReadSpeed > 0 -> ReadingTimes.flat(measuredReadSpeed)
+                else -> ReadingTimes.UNKNOWN
+            }
+        }
 
-        /** Remembers how fast a prompt was read, when it was long enough to say. */
-        private fun noteReadSpeed(evaluated: Int, nanos: Long) {
-            if (evaluated >= MIN_TOKENS_FOR_SPEED && nanos > 0) measuredReadSpeed = evaluated * NANOS_PER_SECOND / nanos
+        /**
+         * Remembers how fast a prompt was read that took the memory from [from] to [to] tokens
+         * in [nanos], when it was long enough to say: as a factor over the catalogue's time
+         * for the same stretch, so that a short prompt read deep into a conversation is
+         * compared with what the curve says of that depth and not with the speed of a short
+         * prompt from nothing. The latest measurement replaces the earlier one.
+         */
+        private fun noteReading(from: Int, to: Int, nanos: Long) {
+            if (to - from < MIN_TOKENS_FOR_SPEED || nanos <= 0) return
+            val seconds = nanos / NANOS_PER_SECOND
+            val catalogue = model.readingTimes
+            if (catalogue.isKnown) {
+                measuredReadingFactor = (seconds / catalogue.secondsBetween(from, to)).coerceIn(MIN_READING_FACTOR, MAX_READING_FACTOR)
+            } else {
+                measuredReadSpeed = (to - from) / seconds
+            }
         }
 
         /**
@@ -592,7 +638,7 @@ class LlamaEngine(
                 bytesPerToken = bytesPerToken(),
                 totalBytes = memoryGauge.read().totalBytes,
                 chosen = request.maxContextTokens,
-                tokensPerSecond = readSpeed(),
+                readingTimes = readingTimes(),
             )
             val limit = minOf(allowed, foundContextLimit ?: Int.MAX_VALUE)
             return (if (request.maxContextTokens == null) maxOf(limit, native.contextSize()) else limit).coerceAtLeast(1)
@@ -798,7 +844,9 @@ class LlamaEngine(
                     val base = memory.size
                     val part = tokens.copyOfRange(base, stop)
                     standAside()
-                    val evaluated = native.evaluate(part, settings.evaluationChunk, PromptObserver(base, tokens.size))
+                    // A part that leaves a long conversation in memory is read in the model's deep chunk.
+                    val chunk = if (stop >= settings.deepReadTokens) model.deepReadChunk else settings.evaluationChunk
+                    val evaluated = native.evaluate(part, chunk, PromptObserver(base, tokens.size))
                     memory.addAll(part, evaluated)
                     if (evaluated < part.size) {
                         if (interrupted()) return false
@@ -971,6 +1019,14 @@ class LlamaEngine(
 
         /** A prompt shorter than this says too little about the reading speed. */
         private const val MIN_TOKENS_FOR_SPEED = 256
+
+        /**
+         * The bounds of the measured reading factor. A device four times faster or slower than
+         * the tested phone is beyond what one measurement should be trusted to say; a reading
+         * slowed by something passing (the system busy for a moment) is held to them.
+         */
+        private const val MIN_READING_FACTOR = 0.25
+        private const val MAX_READING_FACTOR = 4.0
 
         /** More rounds of fitting than a context has ways to shrink mean that something is wrong. */
         private const val MAX_FITTING_ROUNDS = 8

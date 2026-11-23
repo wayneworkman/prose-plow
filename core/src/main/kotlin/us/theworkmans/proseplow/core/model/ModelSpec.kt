@@ -56,9 +56,23 @@ enum class ModelFamily(val promptFormat: PromptFormat, val continuesText: Boolea
  * @property contextBytesPerToken the memory one token of context costs, in bytes, for showing
  *   what a context size costs before the model is loaded; 0 when not known. The loaded model
  *   itself is asked when a size is decided on.
- * @property readTokensPerSecond how fast the model reads a conversation on the phone it was
- *   measured on, in front; 0 when not known. It bounds how far the context grows by itself,
- *   until the speed on this very phone has been measured.
+ * @property readingTimes how long the model takes to read a conversation of a given length from
+ *   nothing on the phone it was measured on, in front; [ReadingTimes.UNKNOWN] when not known.
+ *   It bounds how far the context grows by itself and is the time the settings show for each
+ *   size; on another phone the engine scales it by how much faster or slower that phone was
+ *   seen to read.
+ * @property deepReadChunk how many prompt tokens the engine evaluates in one go once the memory
+ *   holds a long conversation (see the engine's `Settings.deepReadTokens`); short prompts are
+ *   read in the engine's small chunk. Every chunk costs time in proportion to the tokens already
+ *   in memory, on top of its tokens' own cost, so small chunks make a long conversation slow to
+ *   read: on the tested phone, with 7,168 tokens read, a token cost Qwen3.5 33.7 ms in chunks of
+ *   32 and 19.3 ms in chunks of 128, and Peacebell 48.7 ms in chunks of 32 and 14.5 ms in chunks
+ *   of 256. A larger chunk has a price only for a model with recurrent state (Qwen3.5, Boris-2):
+ *   such a model can be stopped only between chunks, so a stop, a lock, and an unlock that asks
+ *   the generation to make way each wait for the chunk in progress; it gets 128 tokens, which
+ *   take Qwen3.5 about 1.4 s with nothing read and about 2.5 s with 7,000 read on the tested
+ *   phone. A model with attention only is stopped inside a chunk and gets the session's whole
+ *   batch, [MAX_EVALUATION_CHUNK]. Never more than that.
  * @property defaultMaxNewTokens the longest reply, in tokens, when a request does not say. It is
  *   also the room the engine keeps free for the reply when it decides how much history fits.
  * @property sampling the model's reference sampling settings.
@@ -103,12 +117,14 @@ data class ModelSpec(
     val deletionTokenId: Int? = null,
     val maxContextLength: Int = contextLength,
     val contextBytesPerToken: Long = 0,
-    val readTokensPerSecond: Int = 0,
+    val readingTimes: ReadingTimes = ReadingTimes.UNKNOWN,
+    val deepReadChunk: Int,
 ) {
     init {
         require(id.isNotBlank()) { "A model needs an id" }
         require(contextLength > 0) { "contextLength must be positive" }
         require(defaultMaxNewTokens in 1..contextLength) { "defaultMaxNewTokens must fit in the context" }
+        require(deepReadChunk in 1..MAX_EVALUATION_CHUNK) { "deepReadChunk must be between 1 and the session's batch" }
         require(stopStrings.none { it.isEmpty() }) { "A stop string cannot be empty" }
         require(deletionTokenId == null || (deletionTokenId !in stopTokenIds && deletionTokenId !in bannedTokenIds)) {
             "The deletion token cannot also end the reply or be banned"
@@ -117,4 +133,13 @@ data class ModelSpec(
 
     /** The layout of a conversation for this model. */
     val promptFormat: PromptFormat get() = family.promptFormat
+
+    companion object {
+        /**
+         * The most tokens a session evaluates in one go: the batch every session is opened
+         * with (`NativeSettings.batchTokens` in the `llama` module, which must agree). No chunk
+         * the engine asks for can be larger.
+         */
+        const val MAX_EVALUATION_CHUNK: Int = 256
+    }
 }

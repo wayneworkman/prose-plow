@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.engine
 
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReadingTimes
 
 /**
  * What the device says about its memory at one moment, in bytes: Android's
@@ -51,8 +52,11 @@ class DeviceContextLimits(val policy: ContextPolicy = ContextPolicy(), val total
     /** The memory a context of [tokens] costs for [model], in bytes; 0 when the catalogue does not say. */
     fun bytes(model: ModelSpec, tokens: Int): Long = tokens.toLong() * model.contextBytesPerToken
 
-    /** How long [model] takes to read [tokens] again at the speed the catalogue gives, in seconds; null when it gives none. */
-    fun rereadSeconds(model: ModelSpec, tokens: Int): Int? = policy.rereadSeconds(tokens, model.readTokensPerSecond.toDouble())
+    /**
+     * How long [model] takes to read a conversation of [tokens] again, in whole seconds, by the
+     * reading times the catalogue gives for the tested phone; null when it gives none.
+     */
+    fun rereadSeconds(model: ModelSpec, tokens: Int): Int? = policy.rereadSeconds(tokens, model.readingTimes)
 }
 
 /**
@@ -70,8 +74,11 @@ class DeviceContextLimits(val policy: ContextPolicy = ContextPolicy(), val total
  *   [floorBytes] available to everything else ([budgetBytes]).
  * - **Time**, for the automatic setting. Whenever the process has ended (the app was locked and
  *   left), the whole conversation is read again before the next answer. Left to itself the
- *   context therefore grows only as far as can be read again in [rereadSeconds], at the speed
- *   this model reads on this phone. A larger size is the user's explicit choice.
+ *   context therefore grows only as far as can be read again in [rereadSeconds], by the time
+ *   this model takes on this phone. That time grows faster than the length, because every
+ *   token read looks at all the tokens before it, so it is taken from a measured curve
+ *   ([ReadingTimes]) and never from the speed of a short prompt. A larger size is the user's
+ *   explicit choice.
  *
  * @param maxShareOfTotal the largest share of the device's memory a context may take.
  * @param floorShareOfTotal the share of the device's memory that must stay available.
@@ -121,10 +128,14 @@ class ContextPolicy(
         return if (tokens >= maxContext) maxContext else roundDown(tokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
     }
 
-    /** As many tokens as are read again in [rereadSeconds] at [tokensPerSecond], rounded down; 0 for a speed nobody knows. */
-    fun timeLimit(tokensPerSecond: Double): Int {
-        if (!(tokensPerSecond > 0)) return 0
-        return roundDown((tokensPerSecond * rereadSeconds).coerceAtMost(Int.MAX_VALUE.toDouble()).toInt())
+    /**
+     * The largest whole multiple of [GRANULARITY] tokens that [times] read from nothing within
+     * [rereadSeconds]; 0 for times nobody knows. Since the curve rises strictly, that is the
+     * most tokens read in the time, rounded down.
+     */
+    fun timeLimit(times: ReadingTimes): Int {
+        if (!times.isKnown) return 0
+        return roundDown(times.tokensWithin(rereadSeconds.toDouble()))
     }
 
     /**
@@ -134,14 +145,14 @@ class ContextPolicy(
      *   or the user's choice is.
      * @param chosen the user's fixed choice, or null for automatic. A choice is held to the
      *   model and the device's memory, not to the time: it is the user's to spend.
-     * @param tokensPerSecond the speed the model reads at, for the automatic setting; a speed
-     *   nobody knows keeps the automatic limit at [start].
+     * @param readingTimes how long the model takes to read a conversation on this device, for
+     *   the automatic setting; times nobody knows keep the automatic limit at [start].
      */
-    fun limit(start: Int, maxContext: Int, bytesPerToken: Long, totalBytes: Long, chosen: Int?, tokensPerSecond: Double): Int {
+    fun limit(start: Int, maxContext: Int, bytesPerToken: Long, totalBytes: Long, chosen: Int?, readingTimes: ReadingTimes): Int {
         val byModel = maxContext.coerceAtLeast(1)
         val byMemory = memoryLimit(byModel, bytesPerToken, totalBytes).coerceAtLeast(minOf(start, byModel))
         if (chosen != null) return chosen.coerceIn(1, byMemory)
-        val byTime = maxOf(timeLimit(tokensPerSecond), start)
+        val byTime = maxOf(timeLimit(readingTimes), start)
         return minOf(byModel, byMemory, byTime)
     }
 
@@ -164,16 +175,16 @@ class ContextPolicy(
     /**
      * The limit of [model]'s context on a device with [totalBytes] of memory, by what the
      * catalogue says of the model: for showing and for the settings, before the model is loaded.
-     * The engine decides with what the loaded model says of itself, and with the speed it has
-     * measured.
+     * The engine decides with what the loaded model says of itself, and with the catalogue's
+     * reading times scaled to what it has measured.
      */
-    fun limit(model: ModelSpec, totalBytes: Long, chosen: Int?, tokensPerSecond: Double = model.readTokensPerSecond.toDouble()): Int = limit(
+    fun limit(model: ModelSpec, totalBytes: Long, chosen: Int?, readingTimes: ReadingTimes = model.readingTimes): Int = limit(
         start = minOf(model.contextLength, model.maxContextLength),
         maxContext = model.maxContextLength,
         bytesPerToken = model.contextBytesPerToken,
         totalBytes = totalBytes,
         chosen = chosen,
-        tokensPerSecond = tokensPerSecond,
+        readingTimes = readingTimes,
     )
 
     /**
@@ -186,8 +197,9 @@ class ContextPolicy(
         return steps(start, limit(model, totalBytes, chosen = Int.MAX_VALUE))
     }
 
-    /** How long reading [tokens] again takes at [tokensPerSecond], in whole seconds; null for a speed nobody knows. */
-    fun rereadSeconds(tokens: Int, tokensPerSecond: Double): Int? = if (tokensPerSecond > 0) Math.ceil(tokens / tokensPerSecond).toInt() else null
+    /** How long reading [tokens] from nothing takes by [times], rounded up to whole seconds; null for times nobody knows. */
+    fun rereadSeconds(tokens: Int, times: ReadingTimes): Int? =
+        if (times.isKnown) Math.ceil(times.seconds(tokens)).coerceAtMost(Int.MAX_VALUE.toDouble()).toInt() else null
 
     private fun roundDown(tokens: Int): Int = tokens / GRANULARITY * GRANULARITY
 

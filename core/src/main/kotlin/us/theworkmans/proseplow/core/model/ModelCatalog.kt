@@ -7,9 +7,10 @@ import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
  * The models the app knows. Adding or removing a model is a change to this object and to the
  * build that packages the model file; nothing is ever discovered or downloaded at run time.
  *
- * Every number below is taken from the model's own published files and says which one. The two
- * exceptions are [ModelSpec.contextLength], which is this app's choice for a phone, and
- * [ModelSpec.defaultMaxNewTokens] where the model's files give no usable value; both say so.
+ * Every number below is taken from the model's own published files and says which one. The
+ * exceptions are [ModelSpec.contextLength], which is this app's choice for a phone,
+ * [ModelSpec.defaultMaxNewTokens] where the model's files give no usable value, and
+ * [ModelSpec.readingTimes], which are measurements on the tested phone; each says so.
  */
 object ModelCatalog {
 
@@ -22,6 +23,68 @@ object ModelCatalog {
 
     /** Reply length where the model's own files give no number suited to [PHONE_CONTEXT]. */
     private const val PHONE_MAX_NEW_TOKENS: Int = 1024
+
+    /**
+     * The chunk of a deep read for a model with recurrent state (Qwen3.5, Boris-2), which can be
+     * stopped only between chunks: large enough that a long conversation is not read slowly,
+     * small enough that a stop waits about 1.4 to 2.5 s on the tested phone (see
+     * [ModelSpec.deepReadChunk]).
+     */
+    private const val RECURRENT_DEEP_READ_CHUNK: Int = 128
+
+    /**
+     * Qwen3.5-0.8B's reading times on the tested phone: the seconds it took to read a
+     * conversation of so many tokens from nothing. Measured by the device run
+     * `ReadingDepthDeviceTest` in `llama/src/androidTest`, with its activity in front, the app's
+     * own settings and this model's [ModelSpec.deepReadChunk] (128). The phone had then been
+     * measuring for an hour and was warm (battery at 34 degrees Celsius); a cool phone began
+     * about a quarter faster. Beyond the last point the times are extrapolated (see
+     * [ReadingTimes]).
+     */
+    private val QWEN35_READING: ReadingTimes = ReadingTimes(
+        listOf(
+            ReadingTimes.Point(2048, 30.4),
+            ReadingTimes.Point(4096, 63.5),
+            ReadingTimes.Point(6144, 99.6),
+            ReadingTimes.Point(8192, 138.8),
+            ReadingTimes.Point(10240, 181.9),
+            ReadingTimes.Point(12288, 227.2),
+            ReadingTimes.Point(14336, 275.4),
+            ReadingTimes.Point(15872, 313.5),
+        ),
+    )
+
+    /**
+     * peacebell-v1-291M's reading times on the tested phone, measured in the same run and the
+     * same state as those of Qwen3.5 ([QWEN35_READING]), in this model's
+     * [ModelSpec.deepReadChunk] (256).
+     */
+    private val PEACEBELL_READING: ReadingTimes = ReadingTimes(
+        listOf(
+            ReadingTimes.Point(2048, 15.5),
+            ReadingTimes.Point(4096, 35.5),
+            ReadingTimes.Point(6144, 60.1),
+            ReadingTimes.Point(8192, 89.2),
+            ReadingTimes.Point(10240, 125.1),
+            ReadingTimes.Point(12288, 163.5),
+            ReadingTimes.Point(14336, 206.4),
+            ReadingTimes.Point(15872, 241.6),
+        ),
+    )
+
+    /**
+     * Boris-2-Instruct's reading times on the tested phone, measured in the same run and the
+     * same state as those of Qwen3.5 ([QWEN35_READING]), in this model's
+     * [ModelSpec.deepReadChunk] (128). The run leaves room for a short reply, so its last point
+     * is below the model's 2,048 tokens and the rest is extrapolated.
+     */
+    private val BORIS_2_READING: ReadingTimes = ReadingTimes(
+        listOf(
+            ReadingTimes.Point(512, 1.3),
+            ReadingTimes.Point(1024, 2.9),
+            ReadingTimes.Point(1536, 5.1),
+        ),
+    )
 
     /**
      * Qwen3.5-0.8B.
@@ -50,7 +113,8 @@ object ModelCatalog {
         sourceRepository = "Qwen/Qwen3.5-0.8B",
         maxContextLength = 262_144,
         contextBytesPerToken = 12_288,
-        readTokensPerSecond = 90,
+        readingTimes = QWEN35_READING,
+        deepReadChunk = RECURRENT_DEEP_READ_CHUNK,
         licence = "Apache-2.0",
     )
 
@@ -86,7 +150,8 @@ object ModelCatalog {
         sourceRepository = "wayneworkman2012/peacebell-v1-291M",
         maxContextLength = 32_768,
         contextBytesPerToken = 66_560,
-        readTokensPerSecond = 184,
+        readingTimes = PEACEBELL_READING,
+        deepReadChunk = ModelSpec.MAX_EVALUATION_CHUNK,
         licence = "Apache-2.0",
     )
 
@@ -120,7 +185,8 @@ object ModelCatalog {
         sourceRepository = "opencerebral/Boris-2-Instruct",
         maxContextLength = 2048,
         contextBytesPerToken = 63_488,
-        readTokensPerSecond = 380,
+        readingTimes = BORIS_2_READING,
+        deepReadChunk = RECURRENT_DEEP_READ_CHUNK,
         licence = "Apache-2.0",
     )
 
@@ -166,6 +232,7 @@ object ModelCatalog {
         // Its card calls 4,096 the trained context; the file itself would allow 8,192. The smaller counts.
         maxContextLength = 4096,
         contextBytesPerToken = 40_960,
+        deepReadChunk = ModelSpec.MAX_EVALUATION_CHUNK,
         licence = "MIT",
     )
 

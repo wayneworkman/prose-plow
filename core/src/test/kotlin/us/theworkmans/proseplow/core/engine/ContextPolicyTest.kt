@@ -5,6 +5,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReadingTimes
 
 /**
  * How large a context may be on a device, in numbers: the phone the app was measured on (5.5 GB
@@ -73,34 +74,35 @@ class ContextPolicyTest {
 
     @Test
     fun `left to itself a context grows as far as two minutes of reading`() {
-        assertEquals("90 tokens a second: 10,800, in whole 1,024s", 10_240, policy.timeLimit(90.0))
-        assertEquals(21_504, policy.timeLimit(184.0))
-        assertEquals(45_056, policy.timeLimit(380.0))
-        assertEquals(0, policy.timeLimit(0.0))
-        assertEquals(0, policy.timeLimit(-5.0))
-        assertEquals(0, policy.timeLimit(Double.NaN))
-        assertEquals(0, policy.timeLimit(8.0)) // 960 tokens: less than one 1,024.
+        // Qwen3.5 reads 6,144 tokens in 99.6 s and 8,192 in 138.8 s: two minutes reach 7,209, which is 7,168 in whole 1,024s.
+        assertEquals(7168, policy.timeLimit(ModelCatalog.QWEN35_0_8B.readingTimes))
+        assertEquals("a constant 90 tokens a second: 10,800, in whole 1,024s", 10_240, policy.timeLimit(ReadingTimes.flat(90.0)))
+        assertEquals("Peacebell: 9,949 tokens in two minutes", 9216, policy.timeLimit(ModelCatalog.PEACEBELL_V1_291M.readingTimes))
+        assertEquals("Boris-2, by its curve beyond its own 2,048 tokens: 9,647", 9216, policy.timeLimit(ModelCatalog.BORIS_2_INSTRUCT.readingTimes))
+        assertEquals("times nobody knows", 0, policy.timeLimit(ReadingTimes.UNKNOWN))
+        assertEquals("960 tokens: less than one 1,024", 0, policy.timeLimit(ReadingTimes.flat(8.0)))
+        assertEquals("a phone that takes half as long again reads 4,096 (96 s) but not 5,120 (123 s)", 4096, policy.timeLimit(ModelCatalog.QWEN35_0_8B.readingTimes.scaled(1.5)))
     }
 
     @Test
     fun `the limit of each model on the test phone, automatic and chosen`() {
-        fun limit(model: ModelSpec, chosen: Int? = null, speed: Double = model.readTokensPerSecond.toDouble()) = policy.limit(
+        fun limit(model: ModelSpec, chosen: Int? = null, times: ReadingTimes = model.readingTimes) = policy.limit(
             start = model.contextLength, maxContext = model.maxContextLength, bytesPerToken = model.contextBytesPerToken,
-            totalBytes = phoneTotal, chosen = chosen, tokensPerSecond = speed,
+            totalBytes = phoneTotal, chosen = chosen, readingTimes = times,
         )
         val qwen = ModelCatalog.QWEN35_0_8B
         val peacebell = ModelCatalog.PEACEBELL_V1_291M
         val boris = ModelCatalog.BORIS_2_INSTRUCT
 
-        assertEquals("the time decides for Qwen", 10_240, limit(qwen))
-        assertEquals("the memory decides for Peacebell: 20,480 is less than two minutes' 21,504", 20_480, limit(peacebell))
+        assertEquals("the time decides for Qwen", 7168, limit(qwen))
+        assertEquals("and for Peacebell: 9,216 is less than the memory's 20,480", 9216, limit(peacebell))
         assertEquals("the model decides for Boris-2", 2048, limit(boris))
         assertEquals(4096, limit(ModelCatalog.SHARD_2))
 
-        // The speed measured in the session takes the catalogue's place: out of sight Qwen reads 67 a second.
-        assertEquals(7168, limit(qwen, speed = 67.0))
-        assertEquals("never below the size it starts with", 4096, limit(qwen, speed = 10.0))
-        assertEquals(4096, limit(qwen, speed = 0.0))
+        // The curve scaled to what the session measured takes the catalogue's place.
+        assertEquals("a faster phone: 10,240 in 110 s, 11,264 in 123 s", 10_240, limit(qwen, times = qwen.readingTimes.scaled(0.6)))
+        assertEquals("never below the size it starts with", 4096, limit(qwen, times = qwen.readingTimes.scaled(4.0)))
+        assertEquals(4096, limit(qwen, times = ReadingTimes.UNKNOWN))
 
         // A size the user chose is held to the model and the memory, not to the time.
         assertEquals(32_768, limit(qwen, chosen = 32_768))
@@ -131,12 +133,15 @@ class ContextPolicyTest {
         assertEquals(listOf(4096, 8192, 16_384, 32_768, 65_536, 111_616), policy.choices(ModelCatalog.QWEN35_0_8B, phoneTotal))
         assertEquals("a model that cannot grow has one size", listOf(2048), policy.choices(ModelCatalog.BORIS_2_INSTRUCT, phoneTotal))
         assertEquals(listOf(4096), policy.choices(ModelCatalog.SHARD_2, phoneTotal))
-        assertEquals(10_240, policy.limit(ModelCatalog.QWEN35_0_8B, phoneTotal, chosen = null))
+        assertEquals(7168, policy.limit(ModelCatalog.QWEN35_0_8B, phoneTotal, chosen = null))
         assertEquals(32_768, policy.limit(ModelCatalog.QWEN35_0_8B, phoneTotal, chosen = 32_768))
 
-        assertEquals(46, policy.rereadSeconds(4096, 90.0))
-        assertEquals("six minutes and a bit for 32,768 tokens at 90 a second", 365, policy.rereadSeconds(32_768, 90.0))
-        assertEquals(null, policy.rereadSeconds(4096, 0.0))
+        val qwenTimes = ModelCatalog.QWEN35_0_8B.readingTimes
+        assertEquals(64, policy.rereadSeconds(4096, qwenTimes))
+        assertEquals("rounded up to the whole second", 82, policy.rereadSeconds(5120, qwenTimes))
+        assertEquals("fourteen minutes for 32,768 tokens, far more than eight times the 4,096", 843, policy.rereadSeconds(32_768, qwenTimes))
+        assertEquals("an hour and forty minutes for the most this phone's memory allows", 5988, policy.rereadSeconds(111_616, qwenTimes))
+        assertEquals(null, policy.rereadSeconds(4096, ReadingTimes.UNKNOWN))
     }
 
     @Test
@@ -145,10 +150,10 @@ class ContextPolicyTest {
         val qwen = ModelCatalog.QWEN35_0_8B
         val peacebell = ModelCatalog.PEACEBELL_V1_291M
         assertEquals(policy.choices(qwen, phoneTotal), limits.choices(qwen))
-        assertEquals(10_240, limits.limit(qwen, chosen = null))
+        assertEquals(7168, limits.limit(qwen, chosen = null))
         assertEquals(32_768, limits.limit(qwen, chosen = 32_768))
         assertEquals(12_288L * 8192, limits.bytes(qwen, 8192))
-        assertEquals(92, limits.rereadSeconds(qwen, 8192))
+        assertEquals(139, limits.rereadSeconds(qwen, 8192))
         assertEquals("a model of which the catalogue says neither", 0L to null, testModel().let { limits.bytes(it, 4096) to limits.rereadSeconds(it, 4096) })
 
         assertEquals(null, limits.chosen(qwen, stored = null))
@@ -162,8 +167,8 @@ class ContextPolicyTest {
         // Nobody asked the device: plenty, and only the model and the time are limits.
         val plenty = DeviceContextLimits()
         assertEquals(262_144, plenty.choices(qwen).last())
-        assertEquals(10_240, plenty.limit(qwen, chosen = null))
-        assertEquals(21_504, plenty.limit(peacebell, chosen = null))
+        assertEquals(7168, plenty.limit(qwen, chosen = null))
+        assertEquals(9216, plenty.limit(peacebell, chosen = null))
     }
 
     @Test
@@ -172,6 +177,6 @@ class ContextPolicyTest {
         assertEquals(550_000_000L, cautious.capBytes(phoneTotal))
         assertEquals(2_200_000_000L, cautious.floorBytes(phone))
         assertEquals(400_000_000L, cautious.budgetBytes(phone, 0))
-        assertEquals(5120, cautious.timeLimit(90.0))
+        assertEquals("60 s reach 3,879 tokens of Qwen3.5: 3,072 in whole 1,024s", 3072, cautious.timeLimit(ModelCatalog.QWEN35_0_8B.readingTimes))
     }
 }

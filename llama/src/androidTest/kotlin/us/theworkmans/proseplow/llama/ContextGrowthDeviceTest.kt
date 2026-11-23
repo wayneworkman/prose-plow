@@ -97,6 +97,13 @@ class ContextGrowthDeviceTest {
             val millis = (System.nanoTime() - start) / 1_000_000
             report("${model.id}: forgetting at $size tokens took $millis ms and left a context of ${native.contextSize()}; before: $grown; after: ${memory()}")
             assertEquals("forgetting returns to the opening size", opened, native.contextSize())
+            // Whether the allocator has given the grown context's pages back, at once or only after a while.
+            var waited = 0
+            for (seconds in LINGER_SECONDS) {
+                Thread.sleep((seconds - waited) * 1000L)
+                waited = seconds
+                report("${model.id}: $seconds s after forgetting: ${memory()}")
+            }
 
             // A size that is refused changes nothing, and says so with its own code.
             try {
@@ -150,6 +157,9 @@ class ContextGrowthDeviceTest {
         const val PROBE_TOKENS: Int = 256
 
         const val GENERATED: Int = 16
+
+        /** When, in seconds after forgetting, the process's memory is read again. */
+        val LINGER_SECONDS: List<Int> = listOf(1, 3, 10)
 
         const val FILLER: String = "The quick brown fox jumps over the lazy dog, and then it does so again and again until evening. "
     }

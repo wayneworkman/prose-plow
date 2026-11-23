@@ -840,7 +840,7 @@ class SourceRulesTest {
             navigation.count { it.contains("SettingsViewModel(session.settings, session.models, contextLimits = session.contextLimits)") },
         )
         assertEquals(2, navigation.count { it.contains("SettingsViewModel(") })
-        for (word in listOf("contextBytesPerToken", "readTokensPerSecond", "maxShareOfTotal", "floorShareOfTotal", "rereadSeconds =")) {
+        for (word in listOf("contextBytesPerToken", "readingTimes", "maxShareOfTotal", "floorShareOfTotal", "rereadSeconds =")) {
             assertEquals("$word is the policy's to use", emptyList<String>(), users(all, word))
         }
 

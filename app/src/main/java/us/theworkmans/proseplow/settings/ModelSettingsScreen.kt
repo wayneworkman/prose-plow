@@ -292,11 +292,12 @@ private fun contextCost(option: SettingsViewModel.ContextOption): String? {
     if (option.memoryBytes <= 0) return null
     val memory = Formatter.formatShortFileSize(LocalContext.current, option.memoryBytes)
     val seconds = option.rereadSeconds ?: return stringResource(R.string.context_cost_memory_only, memory)
+    val hours = option.rereadHours
     val minutes = option.rereadMinutes
-    val time = if (minutes != null) {
-        pluralStringResource(R.plurals.duration_minutes, minutes, minutes)
-    } else {
-        pluralStringResource(R.plurals.duration_seconds, seconds, seconds)
+    val time = when {
+        hours != null -> pluralStringResource(R.plurals.duration_hours, hours, hours)
+        minutes != null -> pluralStringResource(R.plurals.duration_minutes, minutes, minutes)
+        else -> pluralStringResource(R.plurals.duration_seconds, seconds, seconds)
     }
     return stringResource(R.string.context_cost, memory, time)
 }
