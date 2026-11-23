@@ -111,11 +111,12 @@ Privacy:
   for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
   when Android reports that the app has left the screen, which is a fraction of a second after
   you leave it; coming straight back within that moment finds the app still open, also with
-  "immediately". Settings has "Lock now", which does not wait for anything.
+  "immediately". "Lock now", in the chat's menu and in Settings, does not wait for anything.
 - **Finishes the answer after locking**, unless you turn that off. If the app locks by itself
   while an answer is being written, the screen is locked as always, and behind it that one
-  answer is finished and saved before the encryption key is erased. The price: until then, and
-  for at most ten minutes, the key is still in memory. Unlocking in that time takes the full
+  answer is finished and saved before the encryption key is erased. The price: until then the
+  key is still in memory, for at most ten minutes and then the closing of the session, which
+  takes at most three waits of ten seconds each (see [The lock](#the-lock)). Unlocking in that time takes the full
   passphrase or fingerprint check as always and brings you back to the answer under way. "Lock
   now" never waits: it stops the answer and erases the key at once.
 - **Ends its own process when it is locked.** Once the app is locked, has nothing left to
@@ -336,7 +337,7 @@ Everything is in the app's private storage.
 | --- | --- | --- |
 | `files/sessions/<id>.enc` | One chat: its messages, its draft, its model and title | Encrypted |
 | `files/session-index.enc` | The list of chats | Encrypted |
-| `files/settings.enc` | The settings: the system prompt and the temperature of each model | Encrypted |
+| `files/settings.enc` | The settings: the system prompt, the temperature, the longest reply and the context size of each model, and whether the app has asked for permission to show notifications | Encrypted |
 | `files/kept/*.enc` | Exact copies of files that could not be read completely, kept before they are replaced | Encrypted, as the original was |
 | `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
 
@@ -375,8 +376,9 @@ optionally a second time by a fingerprint key.
   where the phone has one.
 - **PBKDF2** is implemented in the app over `javax.crypto.Mac`, so that the passphrase is turned
   into bytes in an array that is zeroed afterwards; it is checked against the RFC test vectors
-  and the JDK's implementation. The iteration count is read from `lock.json`, and a count below
-  600,000 is refused as a damaged configuration.
+  and the JDK's implementation. The iteration count and the salt are read from `lock.json`; an
+  iteration count below 600,000 or above 10,000,000, or a salt shorter than 16 or longer than 64
+  bytes, is refused as a damaged configuration.
 - **The fingerprint key** is an AES-256-GCM key in the Android Keystore that can only be used
   after a strong (Class 3) biometric authentication, once per use, through the system's
   biometric prompt with a crypto object. The phone's PIN, pattern or password cannot authorise
@@ -402,18 +404,25 @@ optionally a second time by a fingerprint key.
   seconds after the Home gesture), so someone who leaves and comes straight back within that
   moment finds the app as it was, also with "immediately".
 - When it locks, the screens are torn down at once, a reply that is being written is stopped and
-  kept as a stopped message, the inference engine is told to forget the conversation, the
-  writes that are waiting get up to ten seconds to finish, and the data key is overwritten with
-  zeros whether or not they did. A write that the storage does not complete in that time is
+  kept as a stopped message (the lock waits up to ten seconds for the engine to let go), the
+  inference engine is told to forget the conversation (again up to ten seconds), the writes
+  that are waiting get up to ten seconds to finish, and the data key is overwritten with zeros
+  whether or not any of that did. Closing a session therefore takes at most three waits of ten
+  seconds each, plus the moment a passphrase check that is running at the same time needs to
+  return. A write that the storage does not complete in that time is
   not waited for, so that it cannot keep the key in memory; only a reset waits for it, because
   a reset deletes the files.
 - **An answer can be finished behind the lock.** When the app locks by itself (the timeout, or
   the check on coming back) while an answer is being written, and "Finish the answer after
   locking" is on (the default), everything above happens for the screen: it is torn down, the
   lock screen is all there is to see or capture. But the unlocked session is left alive, data
-  key included, and told to start nothing new. When that one answer is finished, or ten
-  minutes after the moment of locking if it is not (it is then stopped and kept as a stopped
-  message), the session is closed in the order described above and the key is overwritten.
+  key included, and told to start nothing new, provided the service that keeps the app running
+  in the background has really started; if Android refused it, the answer is stopped and the
+  key overwritten as with the setting off, since nothing would then keep the app awake to end
+  the session on time. When that one answer is finished, or ten minutes after the moment of
+  locking if it is not (it is then stopped and kept as a stopped message), the session is
+  closed in the order described above, which takes at most three waits of ten seconds, and the
+  key is overwritten.
   The ten minutes count whatever the model is doing: reading a long conversation again is
   part of the answer, so one that takes longer than that to read is not finished behind the
   lock (see [The context grows with the conversation](#the-context-grows-with-the-conversation)).
@@ -500,7 +509,8 @@ it or losing the phone loses the chats.
   mentioned, and the strings in which the text fields, the Markdown renderer and the JSON codec
   held chat text.
 - While an answer is being finished behind the lock, everything of the first point is still in
-  memory, the data key included, for at most ten minutes.
+  memory, the data key included: for at most ten minutes, and then for as long as the session
+  takes to close (at most three waits of ten seconds each, see [The lock](#the-lock)).
 - The loaded model stays in memory for as long as the process lives, across "Lock now" for
   one. Its weights are no secret. After the process has ended, the next unlock loads it again.
 - Nothing decrypted is put into the saved instance state, and the main code contains no logging
@@ -564,8 +574,9 @@ it or losing the phone loses the chats.
 - **The unlocked app.** Whoever holds the phone while the app is unlocked reads everything, and
   the app stays unlocked in the background for the time you chose.
 - **The minutes in which an answer is finished behind the lock.** With "Finish the answer after
-  locking" on, the lock screen shows, but for up to ten minutes the data key and the
-  conversation are in memory as if the app were unlocked. Nothing on the screen or in the
+  locking" on, the lock screen shows, but for up to ten minutes, and the half minute at most
+  that closing the session then takes, the data key and the conversation are in memory as if
+  the app were unlocked. Nothing on the screen or in the
   app's interface gives access to them without the passphrase or the fingerprint; an attacker
   who can read the memory of the process in that time (a compromised phone, see below) finds
   them. Turn the setting off, or use "Lock now", if that matters more than the answer.
@@ -980,17 +991,19 @@ cat app/build/reports/manifest-permissions/debug.txt     # every permission of t
 cat app/build/reports/native-packaging/packageDebug.txt  # models stored on 16 KiB boundaries, libraries aligned
 ```
 
-The first must list exactly `android.permission.USE_BIOMETRIC`,
-`android.permission.USE_FINGERPRINT` and
-`us.theworkmans.proseplow.debug.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`: the two that the
-biometric library needs and one that protects the app's own internal broadcasts. There is no
-`android.permission.INTERNET`. To look at the APK itself with the SDK's tools:
+The first must list exactly seven: the four the app asks for,
+`android.permission.FOREGROUND_SERVICE`, `android.permission.FOREGROUND_SERVICE_SPECIAL_USE`,
+`android.permission.POST_NOTIFICATIONS` and `android.permission.WAKE_LOCK`; the two that the
+biometric library needs, `android.permission.USE_BIOMETRIC` and
+`android.permission.USE_FINGERPRINT`; and
+`us.theworkmans.proseplow.debug.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`, which protects the
+app's own internal broadcasts. There is no `android.permission.INTERNET`. To look at the APK itself with the SDK's tools:
 
 ```sh
 BT="$ANDROID_HOME/build-tools/37.0.0"
 APK=app/build/outputs/apk/debug/app-debug.apk
 
-"$BT/aapt2" dump permissions "$APK"                # the same three permissions, read from the APK
+"$BT/aapt2" dump permissions "$APK"                # the same seven permissions, read from the APK
 "$BT/apksigner" verify --verbose --print-certs "$APK"
 "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -n 5    # ends with "Verification successful"
 unzip -l "$APK" | grep -E 'assets/models/|lib/arm64-v8a/'
@@ -1286,8 +1299,11 @@ sections, from someone who has actually followed them.
   behaviour changes its item there, and a string that is added or reworded is quoted there in
   the same commit: a test fails otherwise and says what to do.
 - Logic that needs no Android belongs in `core`. `app` depends on `core`, never the reverse.
-- The app requests no permission. A change that adds one, or a dependency that brings one, fails
-  the build and needs a very good reason.
+- The app requests four permissions, all for finishing an answer out of sight (see
+  [What the app does](#what-the-app-does)), and none for the network. The build checks the merged
+  manifest against an allow-list of seven entries (those four, the two the fingerprint library
+  adds and the one the support library declares for the app's own receivers): a change that adds
+  a permission, or a dependency that brings one, fails the build and needs a very good reason.
 - Model files, signing keys and `local.properties` are never committed.
 - When a change makes the build depend on a new tool or another version, record it in the
   versions table of this file.

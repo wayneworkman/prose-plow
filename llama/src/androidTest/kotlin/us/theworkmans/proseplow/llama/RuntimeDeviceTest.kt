@@ -45,9 +45,10 @@ class RuntimeDeviceTest {
     fun theBuildSaysWhichModelsItCarries() {
         val present = NativeEngine.availableModels(appContext)
         report("models present: ${present.joinToString { it.id }.ifEmpty { "none" }} (the catalogue knows ${ModelCatalog.all.joinToString { it.id }})")
-        // Whatever the answer, it must be consistent with what can be located.
+        // Whatever the answer, it must be consistent with what can be located: a bundled model
+        // whose file is there, and never a model that is not bundled, whatever file is there.
         for (model in ModelCatalog.all) {
-            assertEquals(model in present, ModelFiles.locate(appContext, model) != null)
+            assertEquals(model.id, model.bundled && ModelFiles.locate(appContext, model) != null, model in present)
         }
     }
 }

@@ -345,7 +345,7 @@ class ChatController(
      */
     fun send(sessionId: String, text: String): Boolean {
         val session = sendable(sessionId) ?: return false
-        if (PromptWhitespace.isBlank(text)) return false
+        if (isBlankMessage(text)) return false
         return begin(session.withUserTurn(typed(session, text), clock, ids))
     }
 
@@ -376,7 +376,7 @@ class ChatController(
      */
     fun edit(sessionId: String, userMessageId: String, newText: String): Boolean {
         val session = sendable(sessionId) ?: return false
-        if (PromptWhitespace.isBlank(newText)) return false
+        if (isBlankMessage(newText)) return false
         return begin(session.editAndTruncate(userMessageId, typed(session, newText), clock)?.withAssistantPlaceholder(clock, ids))
     }
 
@@ -709,6 +709,15 @@ class ChatController(
     }
 
     companion object {
+        /**
+         * The one definition of a message too blank to send, for Send, for an edit and for the
+         * button that offers either: nothing would be left of it once the prompt strips it, by
+         * the models' own rule ([PromptWhitespace]). A definition of its own anywhere else (such
+         * as Kotlin's `isBlank`, for which U+0085 is not whitespace) would offer a button
+         * that then does nothing.
+         */
+        fun isBlankMessage(text: String): Boolean = PromptWhitespace.isBlank(text)
+
         /** The key of the index in the [CoalescingWriter]. */
         const val INDEX_KEY: String = "session-index"
 

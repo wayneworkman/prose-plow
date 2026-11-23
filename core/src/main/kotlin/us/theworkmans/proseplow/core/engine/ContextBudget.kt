@@ -37,10 +37,39 @@ internal object ContextBudget {
         listOf(0) + (1 until messages.size).filter { messages[it].role == PromptRole.USER }
 
     /**
+     * The tail of [starts] from the earliest start whose rendering the tokenizer can take
+     * ([acceptable]). A plain-text ChatML model renders its whole conversation as one text,
+     * which the native tokenizer refuses beyond a fixed length; the other formats render every
+     * message as a text of its own. Either way, leaving more out never makes a text longer, so
+     * the earliest acceptable start is searched for by halving, and nothing is tokenised for it.
+     * The turns before it are left out as turns are for the context. When not even the last
+     * start is acceptable (its latest message alone is too long), that start alone is returned:
+     * the tokenizer then refuses it, which is what such a message gets.
+     */
+    fun tokenisable(starts: List<Int>, acceptable: (start: Int) -> Boolean): List<Int> {
+        require(starts.isNotEmpty()) { "Not a list of start candidates" }
+        if (acceptable(starts.first())) return starts
+        var low = 1
+        var high = starts.lastIndex
+        var first = starts.lastIndex
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            if (acceptable(starts[middle])) {
+                first = middle
+                high = middle - 1
+            } else {
+                low = middle + 1
+            }
+        }
+        return starts.subList(first, starts.size)
+    }
+
+    /**
      * Finds the longest conversation that fits.
      *
      * @param messageCount the number of messages in the conversation.
-     * @param starts the result of [startCandidates].
+     * @param starts the result of [startCandidates], or a tail of it ([tokenisable]): the
+     *   messages before its first entry are left out in any case.
      * @param contextSize the model's context in tokens.
      * @param reserve tokens to keep free for the reply while older turns can still be dropped.
      * @param minimum tokens that must stay free in any case. Once only the last turn is left, the
@@ -57,9 +86,9 @@ internal object ContextBudget {
         minimum: Int,
         render: (start: Int) -> TokenisedPrompt,
     ): Result {
-        require(starts.isNotEmpty() && starts.first() == 0 && starts.last() < messageCount) { "Not a list of start candidates" }
-        val whole = render(0)
-        if (whole.tokens.size + reserve <= contextSize) return Result.Fits(whole, droppedMessages = 0)
+        require(starts.isNotEmpty() && starts.zipWithNext().all { (a, b) -> a < b } && starts.last() < messageCount) { "Not a list of start candidates" }
+        val whole = render(starts.first())
+        if (whole.tokens.size + reserve <= contextSize) return Result.Fits(whole, droppedMessages = starts.first())
 
         // Dropping more never makes the prompt longer, so the first start that fits can be
         // searched for by halving.

@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.engine.FakeNativeLlama.Call
@@ -140,5 +141,37 @@ class PromptTokeniserTest {
         list.wipe()
         assertEquals(0, list.size)
         assertEquals(0, list.commonPrefixWith(intArrayOf(1)))
+    }
+
+    /** The security review's C3: an array the list has outgrown is wiped before it is let go of. */
+    @Test
+    fun `every array the token list outgrows is wiped`() {
+        val dropped = ArrayList<IntArray>()
+        val list = TokenList(onDropped = { dropped += it })
+        list.addAll(IntArray(256) { it + 1 })
+        assertEquals("nothing outgrown yet", 0, dropped.size)
+        list.addAll(IntArray(2_000) { it + 1_000 })
+        assertEquals("256 to 512 to 1024 to 2048 to 4096", 4, dropped.size)
+        assertEquals(listOf(256, 512, 1024, 2048), dropped.map { it.size })
+        for (array in dropped) assertTrue("a dropped array still holds token ids", array.all { it == 0 })
+        assertEquals(2_256, list.size)
+        assertEquals(1, list[0])
+        assertEquals(2_999, list[2_255])
+    }
+
+    @Test
+    fun `a prompt is within the tokenizer's limit when every text is, counted in UTF-8`() {
+        assertEquals(0, PromptTokeniser.utf8Length(""))
+        assertEquals(1 + 2 + 3 + 4, PromptTokeniser.utf8Length("a\u00e9\u20ac\uD83D\uDE00"))
+        assertEquals("an unpaired surrogate is encoded as a question mark", 1, PromptTokeniser.utf8Length("\uD83D"))
+        for (text in listOf("plain", "\u00e9t\u00e9", "\uD83D\uDE00 x", "a\uDE00b", "\uD83D", "x\uD83Dy\uD83D")) {
+            assertEquals(text, text.toByteArray(Charsets.UTF_8).size, PromptTokeniser.utf8Length(text))
+        }
+
+        val most = NativeLlama.MAX_TOKENIZE_BYTES
+        val atTheLimit = "\u00e9".repeat(most / 2)
+        assertTrue(PromptTokeniser.withinLimit(Prompt(listOf(PromptSegment.Text(atTheLimit), PromptSegment.Special(atTheLimit), PromptSegment.TokenId(1)))))
+        assertFalse(PromptTokeniser.withinLimit(Prompt(listOf(PromptSegment.Text("a"), PromptSegment.Text(atTheLimit + "a")))))
+        assertFalse(PromptTokeniser.withinLimit(Prompt(listOf(PromptSegment.Special("x".repeat(most + 1))))))
     }
 }

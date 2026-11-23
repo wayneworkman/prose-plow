@@ -45,6 +45,8 @@ internal fun PassphraseDialog(
     busy: Boolean,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
+    /** False while the confirmation must wait (a wait after wrong attempts). */
+    confirmEnabled: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     AlertDialog(
@@ -55,7 +57,7 @@ internal fun PassphraseDialog(
             ProtectWindow()
             Column(modifier = Modifier.plainSelectionMenu(), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
         },
-        confirmButton = { TextButton(onClick = onConfirm, enabled = !busy) { Text(confirmLabel) } },
+        confirmButton = { TextButton(onClick = onConfirm, enabled = !busy && confirmEnabled) { Text(confirmLabel) } },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text(stringResource(R.string.cancel)) } },
     )
 }
@@ -98,17 +100,30 @@ internal fun NewPassphraseDialog(state: SecurityUiState, onSubmit: (CharArray, C
     }
 }
 
-/** The current passphrase, asked for before a protected change (see [SecurityDialog.Confirm]). */
+/**
+ * The current passphrase, asked for before a protected change (see [SecurityDialog.Confirm]).
+ * A wait after wrong attempts ([retryAtElapsed], on [elapsedNow]'s clock) is counted down under
+ * the field and holds "Continue" back, exactly as on the lock screen and from the same value.
+ */
 @Composable
-internal fun ConfirmPassphraseDialog(message: String, state: SecurityUiState, onSubmit: (CharArray) -> Unit, onDismiss: () -> Unit) {
+internal fun ConfirmPassphraseDialog(
+    message: String,
+    state: SecurityUiState,
+    retryAtElapsed: Long,
+    elapsedNow: () -> Long,
+    onSubmit: (CharArray) -> Unit,
+    onDismiss: () -> Unit,
+) {
     val field = remember { TextFieldState() }
+    val waitMillis = rememberWaitMillis(retryAtElapsed, elapsedNow)
     val submit = {
-        if (field.text.isNotEmpty()) onSubmit(field.takeChars())
+        if (waitMillis == 0L && field.text.isNotEmpty()) onSubmit(field.takeChars())
     }
     PassphraseDialog(
         title = stringResource(R.string.confirm_passphrase_title),
         confirmLabel = stringResource(R.string.passphrase_continue),
         busy = state.busy,
+        confirmEnabled = waitMillis == 0L,
         onConfirm = submit,
         onDismiss = onDismiss,
     ) {
@@ -122,6 +137,7 @@ internal fun ConfirmPassphraseDialog(message: String, state: SecurityUiState, on
             onAction = submit,
             modifier = Modifier.fillMaxWidth(),
         )
+        RetryCountdown(waitMillis)
         if (state.busy) Working(stringResource(R.string.lock_checking))
     }
 }

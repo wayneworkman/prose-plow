@@ -55,6 +55,7 @@ import us.theworkmans.proseplow.security.ProofExpiredException
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SecurityStatus
+import us.theworkmans.proseplow.security.UnlockUi
 import us.theworkmans.proseplow.security.WindowSecurity
 import us.theworkmans.proseplow.security.wipe
 import us.theworkmans.proseplow.ui.ProtectWindow
@@ -74,10 +75,12 @@ sealed interface SecurityDialog {
     data object Reset : SecurityDialog
 }
 
-enum class SecurityError { MISMATCH, EMPTY, TOO_SHORT, TOO_LONG, DIGITS_ONLY, WRONG, THROTTLED, EXPIRED, FAILED, SCREENSHOTS_NOT_ALLOWED }
+/** What went wrong, said once in words. A wait after wrong attempts is not one of these: it is counted down ([SecurityViewModel.unlockUi]). */
+enum class SecurityError { MISMATCH, TOO_SHORT, TOO_LONG, DIGITS_ONLY, WRONG, EXPIRED, FAILED, SCREENSHOTS_NOT_ALLOWED }
 
-private fun PassphraseProblem.toSecurityError() = when (this) {
-    PassphraseProblem.EMPTY -> SecurityError.EMPTY
+/** What is said about [this]; nothing about an empty entry, which no dialog submits (see [SecurityViewModel.submitCurrentPassphrase]). */
+private fun PassphraseProblem.toSecurityError(): SecurityError? = when (this) {
+    PassphraseProblem.EMPTY -> null
     PassphraseProblem.TOO_SHORT -> SecurityError.TOO_SHORT
     PassphraseProblem.TOO_LONG -> SecurityError.TOO_LONG
     PassphraseProblem.DIGITS_ONLY -> SecurityError.DIGITS_ONLY
@@ -108,6 +111,15 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
 
     private val _state = MutableStateFlow(SecurityUiState())
     val state: StateFlow<SecurityUiState> = _state.asStateFlow()
+
+    /**
+     * The lock's own state of attempts: [UnlockUi.retryAtElapsed] is when the next passphrase
+     * may be tried, on [elapsedNow]'s clock. The dialogs count it down as the lock screen does,
+     * from the same value, whichever screen the wrong attempts were made on.
+     */
+    val unlockUi: StateFlow<UnlockUi> = appLock.unlockUi
+
+    fun elapsedNow(): Long = appLock.elapsedNow()
 
     fun biometricAvailable() = appLock.biometricAvailable()
 
@@ -170,7 +182,8 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
     /** The current passphrase for a [SecurityDialog.Confirm]. */
     fun submitCurrentPassphrase(passphrase: CharArray) {
         val dialog = _state.value.dialog as? SecurityDialog.Confirm
-        if (dialog == null || _state.value.busy) {
+        // An empty entry is not looked at: nothing to check, count or say. The dialog never submits one.
+        if (dialog == null || _state.value.busy || passphrase.isEmpty()) {
             passphrase.wipe()
             return
         }
@@ -180,7 +193,8 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
                 when (val check = appLock.checkPassphrase(passphrase)) {
                     is PassphraseCheck.Ok -> perform(dialog.action, check.proof)
                     is PassphraseCheck.Wrong -> _state.update { it.copy(busy = false, error = SecurityError.WRONG) }
-                    is PassphraseCheck.Throttled -> _state.update { it.copy(busy = false, error = SecurityError.THROTTLED) }
+                    // The wait is counted down under the field (unlockUi); there is nothing else to say.
+                    is PassphraseCheck.Throttled -> _state.update { it.copy(busy = false, error = null) }
                     is PassphraseCheck.Rejected -> _state.update { it.copy(busy = false, error = check.problem.toSecurityError()) }
                     PassphraseCheck.Failed -> _state.update { it.copy(busy = false, error = SecurityError.FAILED) }
                 }
@@ -338,6 +352,8 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
                 },
             ),
             state = state,
+            retryAtElapsed = viewModel.unlockUi.collectAsStateWithLifecycle().value.retryAtElapsed,
+            elapsedNow = viewModel::elapsedNow,
             onSubmit = viewModel::submitCurrentPassphrase,
             onDismiss = viewModel::dismissDialog,
         )
@@ -349,12 +365,10 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
 @Composable
 internal fun errorText(error: SecurityError?): String = when (error) {
     SecurityError.MISMATCH -> stringResource(R.string.passphrase_mismatch)
-    SecurityError.EMPTY -> stringResource(R.string.passphrase_empty)
     SecurityError.TOO_SHORT -> stringResource(R.string.passphrase_too_short)
     SecurityError.TOO_LONG -> stringResource(R.string.passphrase_too_long)
     SecurityError.DIGITS_ONLY -> stringResource(R.string.passphrase_digits_only)
     SecurityError.WRONG -> stringResource(R.string.lock_wrong)
-    SecurityError.THROTTLED -> stringResource(R.string.lock_throttled)
     SecurityError.EXPIRED -> stringResource(R.string.passphrase_expired)
     SecurityError.FAILED -> stringResource(R.string.security_failed)
     SecurityError.SCREENSHOTS_NOT_ALLOWED -> stringResource(R.string.security_screenshots_failed)

@@ -176,4 +176,33 @@ class LlamaEngineBudgetTest {
         val qwenDropped = qwen.engine.generate(request(*conversation.toTypedArray())).toList().done().stats.droppedMessages
         assertTrue("plain dropped $plainDropped, Qwen $qwenDropped", qwenDropped < plainDropped)
     }
+
+    /**
+     * A plain-text ChatML model has its whole conversation rendered as one text, and the native
+     * tokenizer refuses a text of more than [NativeLlama.MAX_TOKENIZE_BYTES] bytes. A chat that
+     * grew beyond that, with a context large enough for all of it, must still be answered: the
+     * oldest turns are left out until the text is within the limit, and that is reported, as
+     * when the context is what is short.
+     */
+    @Test
+    fun `a conversation whose text is longer than the tokenizer takes is trimmed, not refused`() = runTest {
+        val long = (1..12).flatMap { turn -> listOf(user("Question $turn: " + "word ".repeat(5_000)), assistant("Answer $turn.")) } +
+            user("The latest question, which must always be sent.")
+        fun bytes(start: Int) = prompt(long.drop(start)).toByteArray(Charsets.UTF_8).size
+        assertTrue("the whole conversation is beyond the limit", bytes(0) > NativeLlama.MAX_TOKENIZE_BYTES)
+        val expectedStart = long.indices.first { start -> long[start].role == PromptRole.USER && bytes(start) <= NativeLlama.MAX_TOKENIZE_BYTES }
+        assertTrue("and some of it is within it", expectedStart < long.lastIndex)
+
+        val test = loadedEngine(testModel(contextLength = 400_000, maxNewTokens = 50))
+        test.fake.enqueueReply("Yes.")
+        val events = test.engine.generate(request(*long.toTypedArray(), systemPrompt = system)).toList()
+
+        assertEquals("Yes.", events.done().text)
+        assertEquals(GenerationEvent.HistoryTrimmed(droppedMessages = expectedStart, keptMessages = long.size - expectedStart), events.first())
+        assertEquals(prompt(long.drop(expectedStart)) + "Yes.", test.fake.memoryText)
+        assertTrue(
+            "no text beyond the limit was handed to the tokenizer",
+            test.fake.callsOf<Call.Tokenize>().all { it.text.toByteArray(Charsets.UTF_8).size <= NativeLlama.MAX_TOKENIZE_BYTES },
+        )
+    }
 }

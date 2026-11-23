@@ -152,7 +152,7 @@ object ModelCatalog {
     val SHARD_2: ModelSpec = ModelSpec(
         id = "shard-2",
         displayName = "Shard-2",
-        description = "Continues the text you write; not a chat model. It can take back words it has just written.",
+        description = "Continues the text you write. It is not a chat model and does not answer questions. It can take back words it has just written. Its facts are often invented.",
         family = ModelFamily.COMPLETION,
         ggufFileName = "shard-2.gguf",
         contextLength = 4096,
@@ -178,6 +178,14 @@ object ModelCatalog {
 
     /** The models whose files ship with the app: the only ones a user can choose. */
     val bundled: List<ModelSpec> = all.filter { it.bundled }
+
+    /**
+     * The models an installation offers: the bundled ones whose files it has ([present]), in
+     * catalogue order. The one definition of what the app offers. A model that is not bundled
+     * is never offered, even where its file can be found (a file a developer placed in a debug
+     * build), because the app must not offer a model it may not ship.
+     */
+    fun offered(present: (ModelSpec) -> Boolean): List<ModelSpec> = bundled.filter(present)
 
     /** The model a new chat starts with. */
     val default: ModelSpec = QWEN35_0_8B

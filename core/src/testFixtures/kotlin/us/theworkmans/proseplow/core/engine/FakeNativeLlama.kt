@@ -194,6 +194,10 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
     override fun tokenize(utf8: ByteArray, parseSpecial: Boolean): IntArray {
         enter(Call.Tokenize(String(utf8, Charsets.UTF_8), parseSpecial))
+        // As the native session: a text beyond the limit is refused before it is looked at.
+        if (utf8.size > NativeLlama.MAX_TOKENIZE_BYTES) {
+            throw NativeLlamaException(NativeLlamaException.TOKENIZE_FAILED, "Text of ${utf8.size} bytes is longer than ${NativeLlama.MAX_TOKENIZE_BYTES}")
+        }
         val out = ArrayList<Int>(utf8.size)
         var index = 0
         while (index < utf8.size) {

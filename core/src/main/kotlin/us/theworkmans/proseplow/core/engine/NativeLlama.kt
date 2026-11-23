@@ -49,6 +49,7 @@ interface NativeLlama {
      *   returns for this string encoded on its own. For a SentencePiece model that includes the
      *   word-start piece the reference puts at the beginning of every call.
      * - An empty array in gives an empty array out.
+     * - A text of more than [MAX_TOKENIZE_BYTES] bytes is refused, before it is looked at.
      *
      * @throws NativeLlamaException with [NativeLlamaException.TOKENIZE_FAILED].
      */
@@ -287,6 +288,13 @@ interface NativeLlama {
     companion object {
         /** What [saveCheckpoint] returns when no checkpoint could be saved. */
         const val NO_CHECKPOINT: Int = -1
+
+        /**
+         * The longest text [tokenize] accepts, in bytes: `PP_TOKENIZE_BYTES_MAX` of the native
+         * session (256 KiB), repeated here so that the engine can keep every text it hands over
+         * within it. Tokenising cannot be interrupted, and a lock has to wait for it.
+         */
+        const val MAX_TOKENIZE_BYTES: Int = 262_144
     }
 }
 

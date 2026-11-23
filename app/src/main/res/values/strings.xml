@@ -21,7 +21,6 @@
     <string name="passphrase_mismatch">The passphrases do not match.</string>
     <string name="passphrase_too_short">Use at least 10 characters.</string>
     <string name="passphrase_digits_only">Use more than digits: a PIN is not allowed.</string>
-    <string name="passphrase_empty">Enter your passphrase.</string>
     <string name="passphrase_too_long">That is longer than any passphrase can be (the limit is 1,024 characters).</string>
     <string name="passphrase_working">Securing the key…</string>
 
@@ -39,7 +38,6 @@
     <string name="lock_checking">Checking the passphrase…</string>
     <string name="lock_wrong">Wrong passphrase.</string>
     <string name="lock_retry_in">Too many wrong attempts. Try again in %1$s.</string>
-    <string name="lock_throttled">Too many wrong attempts. Wait a while, then try again.</string>
 
     <!-- Reset app data: the lock screen, the error screens and Settings -->
     <string name="reset_action">Reset app data</string>

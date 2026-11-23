@@ -178,6 +178,9 @@ class ChatViewModel(
     var inputText: String by mutableStateOf(draftOf(controller.state.value))
         private set
 
+    /** Whether [inputText] is something to send, by the controller's own rule ([ChatController.isBlankMessage]). */
+    val inputSendable: Boolean get() = !ChatController.isBlankMessage(inputText)
+
     private val openId: String get() = controller.state.value.open.id
 
     /** The chat [inputText] belongs to. */

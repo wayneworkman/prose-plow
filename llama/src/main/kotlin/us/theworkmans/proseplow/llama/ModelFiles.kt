@@ -53,8 +53,13 @@ internal object ModelFiles {
         return if (bundled != null && "${model.ggufFileName}.so" in bundled) ModelLocation.Asset(assetPath(model)) else null
     }
 
-    /** The models of the catalogue whose files this build has, in catalogue order. */
-    fun present(context: Context): List<ModelSpec> = ModelCatalog.all.filter { locate(context, it) != null }
+    /**
+     * The models this installation offers: those of [ModelCatalog.offered], the bundled models
+     * whose files this build has, in catalogue order. A model that is not bundled is left out
+     * even when [locate] finds its file; the factory still opens such a file when asked for it
+     * directly, as the device tests do.
+     */
+    fun present(context: Context): List<ModelSpec> = ModelCatalog.offered { locate(context, it) != null }
 
     /**
      * Opens [location] and passes the descriptor with the offset and length of the model's bytes

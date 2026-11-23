@@ -28,10 +28,11 @@ object NativeEngine {
     fun factory(context: Context): NativeLlamaFactory = LlamaFactory(context.applicationContext, NativeSettings())
 
     /**
-     * The models of the catalogue whose files are present, in catalogue order. Which models an
-     * APK carries is chosen when it is built, down to none at all, so the app offers what this
-     * returns and nothing it merely knows about. Cheap enough to call when a screen opens; it
-     * lists a directory of assets and loads no native code.
+     * The bundled models of the catalogue whose files are present, in catalogue order
+     * ([ModelFiles.present]). Which models an APK carries is chosen when it is built, down to
+     * none at all, so the app offers what this returns and nothing it merely knows about, nor a
+     * model that is not bundled whose file a developer placed in a debug build. Cheap enough to
+     * call when a screen opens; it lists a directory of assets and loads no native code.
      */
     fun availableModels(context: Context): List<ModelSpec> = ModelFiles.present(context.applicationContext)
 

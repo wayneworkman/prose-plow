@@ -141,7 +141,7 @@ private fun SetupScreen(appLock: AppLock<*>) {
         modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        ui.problem?.let { Text(passphraseProblemText(it), color = MaterialTheme.colorScheme.error) }
+        ui.problem?.let { passphraseProblemText(it) }?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         ui.error?.let { Text(stringResource(R.string.error_detail, it), color = MaterialTheme.colorScheme.error) }
     }
     if (ui.busy) Working(stringResource(R.string.passphrase_working))
@@ -163,14 +163,7 @@ private fun LockScreen(appLock: AppLock<*>, state: LockState.Locked) {
             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { appLock.autoPromptBiometric(state.generation) }
         }
     }
-    val now by produceState(appLock.elapsedNow(), ui.retryAtElapsed) {
-        value = appLock.elapsedNow()
-        while (value < ui.retryAtElapsed) {
-            delay(500)
-            value = appLock.elapsedNow()
-        }
-    }
-    val waitMillis = (ui.retryAtElapsed - now).coerceAtLeast(0)
+    val waitMillis = rememberWaitMillis(ui.retryAtElapsed, appLock::elapsedNow)
     val canSubmit = !ui.busy && waitMillis == 0L
     val submit = {
         if (canSubmit && field.text.isNotEmpty()) appLock.unlockWithPassphrase(field.takeChars())
@@ -191,13 +184,8 @@ private fun LockScreen(appLock: AppLock<*>, state: LockState.Locked) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         if (ui.wrongPassphrase) Text(stringResource(R.string.lock_wrong), color = MaterialTheme.colorScheme.error)
-        ui.rejected?.let { Text(passphraseProblemText(it), color = MaterialTheme.colorScheme.error) }
-        if (waitMillis > 0) {
-            Text(
-                stringResource(R.string.lock_retry_in, DateUtils.formatElapsedTime((waitMillis + 999) / 1000)),
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
+        ui.rejected?.let { passphraseProblemText(it) }?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        RetryCountdown(waitMillis)
         ui.error?.let { Text(stringResource(R.string.error_detail, it), color = MaterialTheme.colorScheme.error) }
     }
     if (ui.busy) Working(stringResource(R.string.lock_checking))
@@ -303,17 +291,46 @@ fun FingerprintOfferDialog(offer: FingerprintOffer, onAccept: () -> Unit, onDecl
     )
 }
 
-/** Why a passphrase was not accepted, in words. */
+/**
+ * Why a passphrase was not accepted, in words; nothing for an empty entry, which no screen
+ * submits and the lock ignores ([us.theworkmans.proseplow.security.AppLock.unlockWithPassphrase]).
+ */
 @Composable
-internal fun passphraseProblemText(problem: PassphraseProblem): String = stringResource(
-    when (problem) {
-        PassphraseProblem.EMPTY -> R.string.passphrase_empty
-        PassphraseProblem.TOO_SHORT -> R.string.passphrase_too_short
-        PassphraseProblem.TOO_LONG -> R.string.passphrase_too_long
-        PassphraseProblem.DIGITS_ONLY -> R.string.passphrase_digits_only
-        PassphraseProblem.MISMATCH -> R.string.passphrase_mismatch
-    },
-)
+internal fun passphraseProblemText(problem: PassphraseProblem): String? = when (problem) {
+    PassphraseProblem.EMPTY -> null
+    PassphraseProblem.TOO_SHORT -> stringResource(R.string.passphrase_too_short)
+    PassphraseProblem.TOO_LONG -> stringResource(R.string.passphrase_too_long)
+    PassphraseProblem.DIGITS_ONLY -> stringResource(R.string.passphrase_digits_only)
+    PassphraseProblem.MISMATCH -> stringResource(R.string.passphrase_mismatch)
+}
+
+/**
+ * The milliseconds left until [retryAtElapsed] on [elapsedNow]'s clock, 0 when there is no
+ * wait; refreshed twice a second while there is one. The one countdown of the wait after wrong
+ * attempts, for the lock screen and the passphrase dialogs alike.
+ */
+@Composable
+internal fun rememberWaitMillis(retryAtElapsed: Long, elapsedNow: () -> Long): Long {
+    val now by produceState(elapsedNow(), retryAtElapsed) {
+        value = elapsedNow()
+        while (value < retryAtElapsed) {
+            delay(500)
+            value = elapsedNow()
+        }
+    }
+    return (retryAtElapsed - now).coerceAtLeast(0)
+}
+
+/** "Try again in {time}." while [waitMillis] is more than 0, the time rounded up to the whole second. */
+@Composable
+internal fun RetryCountdown(waitMillis: Long) {
+    if (waitMillis > 0) {
+        Text(
+            stringResource(R.string.lock_retry_in, DateUtils.formatElapsedTime((waitMillis + 999) / 1000)),
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
+}
 
 /** A small spinner with what is being waited for. */
 @Composable

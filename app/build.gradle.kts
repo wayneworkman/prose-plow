@@ -137,9 +137,12 @@ kotlin {
  * Fails when a variant's merged manifest requests or declares a permission that is not in
  * [allowed]; the permissions it found are written to [report].
  *
- * The app's promise is that it never uses the network. Its own manifest asks for no permission at
- * all, but every dependency's manifest is merged into it and can add one unnoticed, so it is the
- * merged result, the manifest that is packaged, that is checked.
+ * The app's promise is that it never uses the network. Its own manifest asks for four
+ * permissions, all for finishing an answer out of sight (a foreground service of the special-use
+ * type, notifications and a wake lock); the allow-list is those four, the two the fingerprint
+ * library adds and the one the support library declares for the app's own receivers: seven
+ * entries. Every dependency's manifest is merged into the app's and can add one unnoticed, so it
+ * is the merged result, the manifest that is packaged, that is checked.
  *
  * The task is not a check beside the build but a step of it: it takes the merged manifest in and
  * hands the same manifest on as [checkedManifest], and everything that packages or installs the

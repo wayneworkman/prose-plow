@@ -54,7 +54,11 @@ class AppLockTest {
     private var openFails: Exception? = null
     private val screenWatch = FakeScreenOffWatch()
 
+    /** Whether the keep-alive (the answer service in the foreground) is running, as the lock is told. */
+    private var keepAliveRunning = true
+
     private lateinit var lock: AppLock<FakeSession>
+    private lateinit var manager: LockManager
 
     /** How often the lock ended the process since the last [startApp], and what had happened by the first time. */
     private var processEnds = 0
@@ -70,8 +74,11 @@ class AppLockTest {
     /** Uses of the lock manager's collaborators while nothing held the lock's mutex. */
     private val unserialised = mutableListOf<String>()
 
+    /** True while the test itself drives the lock manager, as nothing in the app does. */
+    private var testDrivesTheManager = false
+
     private fun insideTheManager() {
-        if (!lock.managerInUse) unserialised += Throwable().stackTrace.drop(1).take(8).joinToString("\n")
+        if (!lock.managerInUse && !testDrivesTheManager) unserialised += Throwable().stackTrace.drop(1).take(8).joinToString("\n")
     }
 
     @After
@@ -168,7 +175,7 @@ class AppLockTest {
                 return clock.elapsed
             }
         }
-        val manager = LockManager(
+        manager = LockManager(
             store = LockConfigStore(files.lockConfig, onWriteStep = { insideTheManager() }),
             vault = vault,
             clock = managerClock,
@@ -205,6 +212,7 @@ class AppLockTest {
                     madeWay += "carry on"
                 }
             },
+            canFinishOutOfSight = { keepAliveRunning },
         )
         assertEquals("nothing is known before the configuration was read", LockState.Starting, lock.state.value)
         if (visible) {
@@ -337,9 +345,13 @@ class AppLockTest {
         assertTrue(lock.unlockUi.value.wrongPassphrase)
         assertFalse(lock.unlockUi.value.busy)
 
+        // An empty entry is not looked at: nothing checked, counted or said.
+        val attempts = storedConfig().failedAttempts
         lock.unlockWithPassphrase(CharArray(0))
+        assertFalse(lock.unlockUi.value.busy)
         runCurrent()
-        assertEquals(PassphraseProblem.EMPTY, lock.unlockUi.value.rejected)
+        assertNull(lock.unlockUi.value.rejected)
+        assertEquals(attempts, storedConfig().failedAttempts)
 
         val typed = passphrase.toCharArray()
         lock.unlockWithPassphrase(typed)
@@ -1184,6 +1196,85 @@ class AppLockTest {
         assertTrue(lock.state.value is LockState.Locked)
     }
 
+    /**
+     * The security review's A3: without the keep-alive the process may be frozen and the phone
+     * asleep, and then no timer runs that would end a lease. So a lease starts only while the
+     * keep-alive really runs; otherwise the app's own lock is as with the setting off.
+     */
+    @Test
+    fun noLeaseStartsUnlessTheKeepAliveIsReallyRunning() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        assertTrue(lock.status.value.finishAnswerAfterLocking)
+        keepAliveRunning = false // The answer service never reached the foreground.
+        session.answer = CompletableDeferred()
+
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("nothing is left to finish behind the lock", 0, session.finishOnly)
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped"), log)
+
+        // With the keep-alive running again, the next answer is finished behind the lock as before.
+        keepAliveRunning = true
+        enter(passphrase)
+        val next = session()
+        lockItselfDuringAnAnswer(next)
+        assertEquals(1, next.finishOnly)
+        assertFalse(next.closeStarted)
+        lock.lock()
+        runCurrent()
+    }
+
+    /**
+     * The security review's D1 (LEASE-05): an unlock during a lease gives the leased session back
+     * only when the key it yields is that session's key. Here the configuration is replaced
+     * behind the app's back by one whose passphrase opens another data key: the unlock opens a
+     * new session with that key, and the leased session is closed and its key destroyed.
+     */
+    @Test
+    fun anUnlockDuringALeaseThatYieldsAnotherKeyEndsTheLeaseAndOpensANewSession() = runTest(dispatcher) {
+        startApp()
+        val leased = createPassphrase()
+        val blob = leased.cipher.seal("p", plaintext)
+        lockItselfDuringAnAnswer(leased)
+        assertFalse(leased.closeStarted)
+
+        // A configuration made elsewhere, with its own data key and its own binding key.
+        val foreignVault = SoftwareKeyVault()
+        val foreignFiles = AppFiles(temp.newFolder("foreign-files"), temp.newFolder("foreign-cache"))
+        val foreign = LockManager(
+            store = LockConfigStore(foreignFiles.lockConfig),
+            vault = foreignVault,
+            clock = clock,
+            iterations = 1_000,
+            minIterations = 1,
+            encryptedDataExists = { false },
+        )
+        assertEquals(StartResult.SetupRequired, foreign.start())
+        foreign.setUp(otherPassphrase.toCharArray()).key.destroy()
+        // Swapped in for the app's own: the file, and its binding key in the key store.
+        foreignFiles.lockConfig.copyTo(files.lockConfig, overwrite = true)
+        for ((id, key) in foreignVault.entries) vault.putKey(id, key)
+        // The lock manager reads its configuration only when it starts; this is that read.
+        testDrivesTheManager = true
+        assertEquals(StartResult.Locked, manager.start())
+        testDrivesTheManager = false
+
+        enter(otherPassphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertEquals("a new session, not the leased one", 2, sessions.size)
+        assertFalse(session() === leased)
+        assertEquals(0, leased.resumed)
+        assertTrue(leased.closed)
+        assertDestroyed(leased.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertThrows("the new session's key is not the old one", UndecryptableException::class.java) { session().cipher.open("p", blob) }
+    }
+
     @Test
     fun aCeilingItsTimerMissedIsEnforcedBeforeTheSessionIsHandedBack() = runTest(dispatcher) {
         startApp()
@@ -1722,6 +1813,91 @@ class AppLockTest {
         pass(60_000)
         assertTrue(lock.state.value is LockState.Locked)
         assertEquals(1, processEnds)
+    }
+
+    /**
+     * The security review's A2: a fingerprint prompt whose callback never arrives must not keep
+     * the locked, idle process alive once nothing of the app is on screen. A callback that comes
+     * after all is ignored.
+     */
+    @Test
+    fun aFingerprintPromptThatNeverAnswersDoesNotKeepTheProcessAliveOutOfSight() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onActivityCreated()
+        lock.onForeground()
+        lock.lock()
+        runCurrent()
+        assertEquals("the lock screen is on screen", 0, processEnds)
+        lock.requestBiometricUnlock()
+        runCurrent()
+        assertEquals(BiometricPurpose.UNLOCK, launcher.purpose)
+        assertTrue(lock.unlockUi.value.biometricPromptShowing)
+
+        // Home is pressed; the prompt goes, and its callback never comes.
+        lock.onBackground()
+        runCurrent()
+        assertEquals(1, processEnds)
+        assertFalse(lock.unlockUi.value.biometricPromptShowing)
+
+        // A callback that arrives late after all opens nothing.
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(1, sessions.size)
+    }
+
+    @Test
+    fun aFingerprintPromptIsLeftAloneWhileTheAppIsStillOnScreen() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onActivityCreated()
+        lock.onForeground()
+        lock.lock()
+        runCurrent()
+        lock.requestBiometricUnlock()
+        runCurrent()
+        // Another instance of the activity is on screen too; this one leaves.
+        lock.onActivityCreated("other")
+        lock.onForeground("other")
+        lock.onBackground()
+        assertTrue("something is still on screen: the prompt is still pending", lock.unlockUi.value.biometricPromptShowing)
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    /**
+     * The security review's B2: an activity that is created and destroyed by the system without
+     * ever reaching the screen must not leave the process believing that one is on its way.
+     */
+    @Test
+    fun anActivityDestroyedWithoutBeingShownDoesNotKeepTheProcessAlive() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        assertEquals(0, processEnds)
+
+        // A second instance is made and thrown away before it is ever shown.
+        lock.onActivityCreated("second")
+        lock.onActivityDestroyed(finished = false, who = "second")
+        lock.onBackground()
+        assertEquals(1, processEnds)
+    }
+
+    @Test
+    fun anActivityOnItsWayToTheScreenKeepsTheProcessUntilItArrivesOrGoes() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        lock.onActivityCreated("second")
+        lock.onBackground()
+        assertEquals("one is still on its way", 0, processEnds)
+        lock.onForeground("second")
+        lock.onBackground("second")
+        assertEquals("it arrived and left", 1, processEnds)
     }
 
     @Test

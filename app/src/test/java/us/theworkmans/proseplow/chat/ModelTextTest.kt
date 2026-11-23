@@ -46,6 +46,34 @@ class ModelTextTest {
     }
 
     @Test
+    fun theDescriptionsShownAreTheCataloguesDescriptions() {
+        // The catalogue's English description and the one the screens show must not drift apart.
+        for (model in ModelCatalog.all) {
+            val resource = "model_description_" + model.id.replace(Regex("[^a-z0-9]+"), "_")
+            assertEquals(resource, model.description, strings[resource])
+            assertEquals("the resource the screens use", resource, resourceName(ModelText.descriptionRes(model.id)!!))
+        }
+    }
+
+    /** The name of the string resource [id], read from the generated R class. */
+    private fun resourceName(id: Int): String = R.string::class.java.fields.single { it.getInt(null) == id }.name
+
+    /**
+     * Copy takes a chat model's reply without the blanks around it, and a text-continuing
+     * model's exactly as written: its leading whitespace belongs to the text it continues.
+     */
+    @Test
+    fun copyTakesAContinuationExactlyAsWrittenAndAChatReplyTrimmed() {
+        val written = " and so it went on.\n\n    indented, as the model wrote it\n"
+        assertEquals(written, ModelText.copiedReply(ModelCatalog.SHARD_2.id, written))
+        for (model in ModelCatalog.all.filter { it != ModelCatalog.SHARD_2 }) {
+            assertEquals(model.id, written.trim(), ModelText.copiedReply(model.id, written))
+        }
+        assertEquals("a model this version does not know", written.trim(), ModelText.copiedReply("a-model-from-another-build", written))
+        assertEquals(written.trim(), ModelText.copiedReply(null, written))
+    }
+
+    @Test
     fun aModelThisVersionDoesNotKnowHasNoTextOfItsOwn() {
         assertNull(ModelText.nameRes("a-model-from-another-build"))
         assertNull(ModelText.descriptionRes("a-model-from-another-build"))

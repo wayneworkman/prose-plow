@@ -138,10 +138,44 @@ class ContextBudgetTest {
     @Test
     fun `start candidates that are not a start list are rejected`() {
         assertThrows(IllegalArgumentException::class.java) {
-            ContextBudget.fit(3, listOf(1, 2), 100, 10, 1) { prompt(1) }
+            ContextBudget.fit(3, listOf(2, 1), 100, 10, 1) { prompt(1) }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            ContextBudget.fit(3, listOf(0, 3), 100, 10, 1) { prompt(1) }
         }
         assertThrows(IllegalArgumentException::class.java) {
             ContextBudget.fit(3, emptyList(), 100, 10, 1) { prompt(1) }
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            ContextBudget.tokenisable(emptyList()) { true }
+        }
+    }
+
+    @Test
+    fun `a tail of the start candidates leaves out what is before it, and says so`() {
+        val conversation = (1..5).flatMap { listOf(user(), assistant()) } + user()
+        val starts = ContextBudget.startCandidates(conversation).drop(2)
+        val rendered = ArrayList<Int>()
+        val result = ContextBudget.fit(conversation.size, starts, contextSize = 1_000, reserve = 10, minimum = 1) { start ->
+            rendered += start
+            prompt(5 + (conversation.size - start) * 10)
+        }
+        assertEquals(starts.first(), (result as ContextBudget.Result.Fits).droppedMessages)
+        assertEquals("only what may be sent is rendered", listOf(starts.first()), rendered)
+    }
+
+    @Test
+    fun `the earliest start the tokenizer can take is found by halving`() {
+        val starts = (0..40).toList()
+        for (first in starts) {
+            val asked = ArrayList<Int>()
+            val tail = ContextBudget.tokenisable(starts) { start ->
+                asked += start
+                start >= first
+            }
+            assertEquals("first acceptable $first", starts.subList(first, starts.size), tail)
+            assertTrue("asked ${asked.size} times", asked.size <= 7)
+        }
+        assertEquals("nothing acceptable: the last start alone, to be refused", listOf(40), ContextBudget.tokenisable(starts) { false })
     }
 }

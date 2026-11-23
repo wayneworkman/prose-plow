@@ -83,8 +83,8 @@ is about things that are **not** built and is kept apart from everything else.
   own processor. It opens no network connection at any time and has no permission to open one
   (NOT-01).
 - **APP-03** The models are part of the installed app. Which of them an installation offers is
-  decided when it is built and is asked again at every unlock: the app offers exactly the models
-  of its catalogue whose files it carries, down to none at all (MODEL-02, MODEL-21).
+  decided when it is built and is asked again at every unlock: the app offers exactly the bundled
+  models of its catalogue whose files it carries, down to none at all (MODEL-02, MODEL-21).
 - **APP-04** The app is text only (no images, sound or files go into or come out of a model)
   and uses the processor only (no graphics processor, no neural accelerator).
 - **APP-05** The app has two groups of screens and only ever builds one of them.
@@ -284,7 +284,9 @@ is about things that are **not** built and is kept apart from everything else.
   6. The data key is overwritten with zeros, whatever became of the steps before. From then on
      every use of the session's cipher fails.
 
-  LEASE-01 is the one case in which steps 3 to 6 are put off.
+  Steps 3 to 6 therefore take at most three waits of 10 seconds each, and they begin once a
+  passphrase check that is running at that moment has returned (the two never overlap). LEASE-01
+  is the one case in which steps 3 to 6 are put off.
 - **LOCK-18** A write that the storage does not complete within its time is not waited for, so
   that it cannot keep the key in memory. Its bytes were encrypted before the key went, so it may
   still reach the disk later. Until it has, an unlock that follows may already be writing the
@@ -314,9 +316,9 @@ is about things that are **not** built and is kept apart from everything else.
   accented letter typed as one code point or as a letter and a combining accent). The key is
   derived from the UTF-8 bytes of that form. This encoding is permanent (FMT-04).
 - **PASS-04** Input entered to unlock or to confirm is refused before any check, and without
-  counting an attempt, when it is empty ("Enter your passphrase.") or longer than 1,024
-  characters. The screens do not submit an empty field, so the first message is a safeguard
-  rather than something a user normally meets.
+  counting an attempt, when it is empty or longer than 1,024 characters. The screens do not
+  submit an empty field, and an empty entry that reached the lock anyway is ignored without a
+  message; a longer one is answered as LOCK-07 says.
 - **PASS-05** Every check that is made counts as an attempt before it is checked: the count and
   its time are written to the disk first, and only then is the key derived. Ending the app in
   the middle of a check therefore does not avoid the count. The right passphrase sets the count
@@ -383,10 +385,12 @@ is about things that are **not** built and is kept apart from everything else.
   The new passphrase is checked as in SETUP-03, with the message under the second field. On
   success the dialog closes and the security section says, once: "The passphrase was changed."
 - **PASS-16** Messages of the confirmation dialog (also used by BIO-03 and BIO-06), shown under
-  its field: "Wrong passphrase."; "Too many wrong attempts. Wait a while, then try again." (no
-  countdown is shown here; the wait is the one of PASS-06); the too-long message of PASS-04;
-  and, when the key store or the storage failed, "That did not work: the phone's key store or
-  storage reported an error."
+  its field: "Wrong passphrase."; the too-long message of PASS-04; and, when the key store or the
+  storage failed, "That did not work: the phone's key store or storage reported an error." A
+  wait after wrong attempts (PASS-06) is shown below the field exactly as on the lock screen
+  (LOCK-07): "Too many wrong attempts. Try again in {time}.", counting down from the same value
+  the lock screen counts down, whichever of the two screens the attempts were made on, with
+  "Continue" disabled until it reaches zero.
 - **PASS-17** If more than 2 minutes pass between confirming the current passphrase and saving
   the new one, nothing is changed, the dialog closes and the section says: "Too much time has
   passed. Enter your passphrase again."
@@ -485,7 +489,9 @@ is about things that are **not** built and is kept apart from everything else.
   delete the key that was made for it.
 - **BIO-17** A prompt that is showing during a rotation still reports its result. A prompt that
   disappeared without a result is noticed when the app comes back to the front, and "Use
-  fingerprint" is enabled again.
+  fingerprint" is enabled again. An unlock prompt still waiting for its result when nothing of
+  the app is on screen any more, or on its way there, is given up, so that it cannot keep the
+  locked process alive (END-01); a result that arrives after that is ignored.
 
 ## 6. Finishing an answer behind the lock (LEASE)
 
@@ -498,14 +504,18 @@ is about things that are **not** built and is kept apart from everything else.
   locks exactly as always: every unlocked screen is torn down and the lock screen is all there
   is to see or capture. Behind it the unlocked session is left alive, data key included, until
   that one answer is finished. "Being written" includes an answer that is still waiting for its
-  model to load.
+  model to load. This happens only while the keep-alive of BG-01 is really running: if the
+  platform refused it (BG-03), or it has not started yet, nothing would keep the process awake to
+  end the session on time, and the lock is as LEASE-09 describes.
 - **LEASE-02** A session left alive in this way starts nothing new: no further reply, and no
   model load that is not for the answer under way, whoever asks. That answer goes on, the
   loading of its model included, and is saved as it goes.
 - **LEASE-03** The session ends when the answer has ended, in whichever way, or 10 minutes after
   the moment of locking, whichever comes first. At the limit an answer that is still being
   written is stopped and kept as a stopped message. Then the session is closed in the order of
-  LOCK-17 (steps 3 to 6) and the key is overwritten.
+  LOCK-17 (steps 3 to 6) and the key is overwritten. The key is therefore in memory for at most
+  10 minutes and then the closing, which is bounded by three waits of up to 10 seconds each
+  (LOCK-17).
 - **LEASE-04** The limit is counted on the device clock. Because a timer can be late, the
   deadline itself is checked when the app comes to the front and before a session is handed back
   (LEASE-05); a session whose time is up is ended, not resumed.
@@ -523,8 +533,9 @@ is about things that are **not** built and is kept apart from everything else.
 - **LEASE-08** "Lock now" never leaves a session alive, and it ends one that is being finished:
   the answer is stopped and the key overwritten at once, whatever the setting. A reset ends it
   too (RESET-07).
-- **LEASE-09** With the setting off, or with no answer being written, the app's own lock stops
-  whatever is running and overwrites the key at once, as LOCK-17 describes.
+- **LEASE-09** With the setting off, with no answer being written, or without a running
+  keep-alive (LEASE-01), the app's own lock stops whatever is running and overwrites the key at
+  once, as LOCK-17 describes.
 - **LEASE-10** While a session is alive behind the lock its key cannot be wrapped anew: changing
   the passphrase and setting up fingerprint unlock need a session that is on screen.
 - **LEASE-11** When the answer is finished behind the lock, it is saved, the engine forgets the
@@ -532,14 +543,15 @@ is about things that are **not** built and is kept apart from everything else.
   and the process ends (END-01). What keeps the process running in the background (BG-01) is
   held until the key has been overwritten, never released before.
 - **LEASE-12** The price is stated to the user (SECSET-05) and is part of the security model
-  (THREAT-09): until the session ends, for at most 10 minutes, the data key and the conversation
-  are in memory as if the app were unlocked, although nothing on the screen gives access to
-  them.
+  (THREAT-09): until the session ends, for at most 10 minutes and then the closing of LEASE-03
+  (at most three waits of 10 seconds each), the data key and the conversation are in memory as
+  if the app were unlocked, although nothing on the screen gives access to them.
   - **Parity note:** the feature needs the process to keep computing for up to 10 minutes while
     the app is out of sight or the screen is off. A platform that suspends background apps
     sooner cannot provide it as it is. What must hold in any case: the screen locks at once; the
-    key is not kept longer than the stated limit; unlocking is never shortened; and "Lock now"
-    always wins.
+    key is not kept longer than the stated limit; a session is left alive only while something
+    really keeps the process running to end it on time; unlocking is never shortened; and "Lock
+    now" always wins.
 - **LEASE-13** The 10 minutes count whatever the model is doing. Reading a conversation again is
   part of the answer (ENG-34), so an answer in a conversation that takes longer than that to read is
   stopped at the limit, possibly before it has written a word, and has to be asked for with the app
@@ -920,7 +932,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   while an answer arrives.
 - **MSG-02** The send button (described as "Send") is enabled when the chat can take a message
   (it is readable and its model is in this build) and the field holds more than blanks. A blank
-  message is not sent, and a message that could not be sent stays in the field.
+  message is not sent, and a message that could not be sent stays in the field. "Blanks" has one
+  meaning for the button, for sending and for an edit (MSG-13): the characters the prompt trims
+  (FMT-09), so the button is never offered for a text that would then not be sent.
 - **MSG-03** Sending stores the text without the blanks around it, adds it to the conversation,
   adds the empty reply that is about to be written (stamped with the chat's model at that
   moment), clears the draft and any failure left from the turn before, and scrolls to the end.
@@ -1081,7 +1095,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **MD-08** The text of every message, of the About screen and of the notices can be selected.
   The menu of a selection offers Cut, Copy, Paste and Select all and nothing else (PRIV-12).
 - **MD-09** A copy button copies the message's text: a user's message as stored, a reply without
-  the blanks around it. The copy is confirmed with "Copied" by the app only where the platform
+  the blanks around it, and the reply of a model that continues text exactly as written
+  (MODEL-22). The copy is confirmed with "Copied" by the app only where the platform
   does not show a confirmation of its own. A copy that the system refuses (a text too large to
   hand over, for one) is answered with "That could not be copied." instead of a crash.
   - **On Android:** Android 13 and later show their own clipboard confirmation, so the app's
@@ -1108,8 +1123,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | `peacebell-v1-291m` | "Peacebell v1 291M" | "Answers questions about the Second World War from memory. Not a general assistant." | `wayneworkman2012/peacebell-v1-291M` | Apache-2.0 |
   | `boris-2-instruct` | "Boris-2-Instruct" | "A very small chat model for everyday questions. Fluent, but often wrong on facts." | `opencerebral/Boris-2-Instruct` | Apache-2.0 |
 
-- **MODEL-02** The app offers exactly the models of its catalogue whose files the installation
-  carries, in the order of the catalogue. This is asked at every unlock. Nothing is ever
+- **MODEL-02** The app offers exactly the models of its catalogue that are marked as bundled and
+  whose files the installation carries, in the order of the catalogue; both conditions are
+  decided in one place. This is asked at every unlock. A model that is not bundled is never
+  offered, whatever file of it is present (MODEL-23). Nothing is ever
   discovered, downloaded or imported at run time: adding or removing a model is a change of the
   build.
 - **MODEL-03** A new chat starts with Qwen3.5 0.8B when the build offers it (CHAT-04).
@@ -1205,8 +1222,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   supported by the code and deliberately not bundled: its repository names a licence only in the
   metadata of its model card, and the app ships a model only when its licence is established.
   No build can package it (the build accepts only models the manifest marks as bundled, and
-  fails on any other model file it finds in the package). The support that exists, and that a
-  port must carry if it is to be switched on:
+  fails on any other model file it finds in the package), and no build offers it, not even a
+  development build with its file in place (MODEL-02, MODEL-23). The support that exists, and
+  that a port must carry if it is to be switched on, is therefore reached today only by the
+  tests:
   - It is not a chat model. It is given only the latest message, exactly as typed, and writes on
     from it: earlier turns are not sent, nothing is trimmed, and there is no system prompt.
   - The interface words three lines for it differently: the empty chat says "Start a text" and
@@ -1230,12 +1249,15 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   - A long conversation is never reported as shortened for it, because no history is sent.
 - **MODEL-22** For a text-continuing model the chat screen still shows the user's text and the
   model's continuation as two separate messages. It shows the continuation without the
-  whitespace in front of it and copies it without the whitespace around it, although it is
-  stored with both.
+  whitespace in front of it (Markdown would otherwise take indented text for a block of code),
+  although it is stored with it, and copies it exactly as written, first character to last,
+  since that whitespace is part of the text.
 - **MODEL-23** A development build also uses a model file that a developer placed in the app's
   private storage, in preference to a packaged one, so that the weights need not be packaged
   again for every change of the code. Nothing verifies such a file, and the code that looks for
-  it is not part of a release build. This is the only way Shard-2 can appear in an app today.
+  it is not part of a release build. Such a file is used only for a model the build offers
+  anyway (MODEL-02): a file of a model that is not bundled, such as Shard-2, does not make the
+  app offer it. The device tests open such a file directly, without the app's list of models.
 
 ## 15. Settings of each model (MSET)
 
@@ -1554,13 +1576,19 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   - **On Android:** a foreground service of the type "special use" (required from Android 14;
     no named type describes running a model on the device, and the manifest states the use),
     with a partial wake lock that is taken with a limit of 2 minutes and renewed every minute,
-    so that it can never be left held.
+    so that it can never be left held. The service is started as an ordinary service while the
+    app is in front and puts itself in the foreground the moment it is created; it is not
+    started with `startForegroundService`, because a service started that way that fails to
+    reach the foreground can only stop by crashing the app. It counts as running only from the
+    moment it is in the foreground until it ends.
 - **BG-02** The keep-alive begins when an answer begins to be written while the app is in front
   (the platform lets it be started from nowhere else). It ends by itself at the moment no answer
   is being written any more and no session is still ending behind the lock: it is held until the
   data key has been overwritten, so that the process cannot be put to sleep on its way there.
 - **BG-03** If the platform refuses the keep-alive, the answer is written all the same, as far
-  as the system lets the process run.
+  as the system lets the process run. The refusal is recorded at once: nothing goes on counting
+  on a keep-alive, so the app's own lock does not leave the session alive for that answer
+  (LEASE-01).
 - **BG-04** While the keep-alive runs, a notification says "Writing an answer…" and nothing
   else. It is silent, is marked as ongoing and carries no badge. In the system's settings for
   the app's notifications its kind is named "Answer in progress". It is gone with the
@@ -1737,10 +1765,15 @@ is what a port has to reproduce, whatever it is written in.
 - **ENG-24** A system prompt that is blank is not sent. A model that was trained without a
   system message is given no system text of any kind, whatever the request holds.
 - **ENG-25** A piece of text handed to the tokeniser in one call may be at most 262,144 bytes of
-  UTF-8 (NAT-06); a longer piece fails the request with the native failure of MSG-14. For the
-  formats that tokenise each message on its own that bounds one message. For the plain-text
-  ChatML format (Boris-2), where the whole conversation is one piece, it bounds the whole
-  conversation as rendered, before any shortening by ENG-04.
+  UTF-8 (NAT-06). Before anything is tokenised, the oldest whole turns (as ENG-04 counts them) are
+  left out until every piece of the rendered prompt is within that limit, and this is reported as
+  any shortening by ENG-04 is; ENG-04 then shortens further if the context needs it. For the
+  formats that tokenise each message on its own a piece is one message, so an older message beyond
+  the limit is left out with its turn. For the plain-text ChatML format (Boris-2), where the whole
+  conversation is one piece, the conversation sent is the longest run of the latest turns whose
+  rendered text is within the limit. Only a last turn whose own text is beyond the limit (a single
+  message of more than 262,144 bytes, in any format, the text-continuing one included) still fails
+  the request with the native failure of MSG-14.
 - **ENG-26** The size of the context is read back from the native side once the model is loaded and
   after every change of that size, not assumed from the catalogue or from what was asked for.
 - **ENG-27** Every native call is made from one dedicated thread, one at a time.
@@ -2019,7 +2052,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   copies is released. Until then (the lock screen is still being looked at, or an answer is
   being finished behind the lock) they remain.
 - **MEM-08** While an answer is being finished behind the lock, everything of MEM-01 is still in
-  memory, the data key included, for at most 10 minutes (LEASE-12).
+  memory, the data key included, for at most 10 minutes and then the closing, which is bounded
+  by three waits of up to 10 seconds each (LEASE-03, LEASE-12).
 - **MEM-09** Nothing is done about what the system may have moved to compressed swap.
 - **MEM-10** Clearing the model's memory at a lock also returns a grown context to the size it
   started with (ENG-35), so the memory a long conversation took is given back to the device then.
@@ -2627,8 +2661,9 @@ without these properties has not reached parity.
   whose fingerprint is enrolled on the device.
 - **THREAT-09** The unlocked app. Whoever holds the device while the app is unlocked reads
   everything, and the app stays unlocked in the background for the time the user chose. With
-  "Finish the answer after locking" on, the lock screen shows, but for up to 10 minutes the data
-  key and the conversation are in memory as if the app were unlocked; nothing on the screen
+  "Finish the answer after locking" on, the lock screen shows, but for up to 10 minutes, and then
+  the closing of LEASE-03, the data key and the conversation are in memory as if the app were
+  unlocked; nothing on the screen
   gives access to them, but whoever can read the process's memory in that time finds them.
 - **THREAT-10** A compromised device. Root access, malware with system privileges or an
   exploited system can read the app's memory while it is unlocked, record what is typed and
@@ -3035,7 +3070,8 @@ the fixtures under `core/src/test/resources/golden/`.
     with its key for a bounded time; unlocking is never shortened; "Lock now" and a reset always
     end it; the keep-alive is held until the key is gone; and then the process ends.
   - Its limits, as built: it only applies when the app locks by itself, and only if the user
-    left the setting on; it lasts at most 10 minutes; a session behind the lock starts nothing
+    left the setting on, and while the keep-alive runs; it lasts at most 10 minutes and the
+    closing after them (LEASE-03); a session behind the lock starts nothing
     new, neither a reply nor a model load, so a run that needs a further generation after a tool
     has answered (TOOL-06 is such a run) stops at that step; the keep-alive can only be started
     while the app is in front, so work that begins in the background has nothing to keep its

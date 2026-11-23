@@ -22,6 +22,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.ReplyLength
+import us.theworkmans.proseplow.core.prompt.Prompt
 import us.theworkmans.proseplow.core.prompt.PromptFormatException
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptRole
@@ -715,22 +716,27 @@ class LlamaEngine(
             this.tokeniser = tokeniser
             // A model that continues text is only ever given the latest message: there are no
             // older turns to leave out, and none must be reported as left out.
-            val starts = if (model.family.continuesText) listOf(0) else ContextBudget.startCandidates(messages)
+            val candidates = if (model.family.continuesText) listOf(0) else ContextBudget.startCandidates(messages)
+            val rendered = HashMap<Int, Prompt>()
+            fun rendering(start: Int): Prompt = rendered.getOrPut(start) {
+                model.promptFormat.render(
+                    PromptInput(
+                        messages = messages.subList(start, messages.size),
+                        systemPrompt = systemPrompt,
+                        extraSystemText = extraSystemText,
+                        continueFinalMessage = request.continueFinalMessage,
+                    ),
+                )
+            }
+            // Turns whose text the tokenizer could not take at all are left out first.
+            val starts = ContextBudget.tokenisable(candidates) { start -> PromptTokeniser.withinLimit(rendering(start)) }
             return ContextBudget.fit(
                 messageCount = messages.size,
                 starts = starts,
                 contextSize = contextSize,
                 reserve = minOf(requestedNewTokens, ReplyLength.maxTokens(contextSize)),
                 minimum = minOf(requestedNewTokens, settings.minReplyTokens),
-            ) { start ->
-                val input = PromptInput(
-                    messages = messages.subList(start, messages.size),
-                    systemPrompt = systemPrompt,
-                    extraSystemText = extraSystemText,
-                    continueFinalMessage = request.continueFinalMessage,
-                )
-                tokeniser.tokenise(model.promptFormat.render(input))
-            }
+            ) { start -> tokeniser.tokenise(rendering(start)) }
         }
 
         private var tokeniser: PromptTokeniser? = null

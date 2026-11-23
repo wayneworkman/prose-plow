@@ -181,4 +181,19 @@ class ModelCatalogTest {
         assertTrue(SamplingParams(temperature = -1f).isGreedy)
         assertFalse(SamplingParams(temperature = 0.01f).isGreedy)
     }
+
+    /** Only a bundled model whose file is present is offered: a model that is not bundled never is, whatever file is there. */
+    @Test
+    fun theAppOffersOnlyBundledModelsWhoseFilesArePresent() {
+        assertFalse(ModelCatalog.SHARD_2.bundled)
+        assertEquals("every file there", ModelCatalog.bundled, ModelCatalog.offered { true })
+        assertFalse("a sideloaded Shard-2 is not offered", ModelCatalog.SHARD_2 in ModelCatalog.offered { true })
+        assertEquals(emptyList<ModelSpec>(), ModelCatalog.offered { false })
+        assertEquals(emptyList<ModelSpec>(), ModelCatalog.offered { it == ModelCatalog.SHARD_2 })
+        assertEquals(
+            "in catalogue order",
+            listOf(ModelCatalog.QWEN35_0_8B, ModelCatalog.BORIS_2_INSTRUCT),
+            ModelCatalog.offered { it == ModelCatalog.BORIS_2_INSTRUCT || it == ModelCatalog.QWEN35_0_8B },
+        )
+    }
 }

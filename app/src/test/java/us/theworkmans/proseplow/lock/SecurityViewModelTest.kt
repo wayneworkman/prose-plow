@@ -164,17 +164,34 @@ class SecurityViewModelTest {
     fun tooManyWrongPassphrasesAreThrottledHereToo() = runTest(dispatcher) {
         unlockedApp()
         viewModel.onChangePassphrase()
-        repeat(5) {
+        assertEquals("no wait to begin with", 0L, viewModel.unlockUi.value.retryAtElapsed)
+        repeat(4) {
             confirmWith("not the passphrase")
             assertEquals(SecurityError.WRONG, viewModel.state.value.error)
+            assertEquals("the first four cost nothing", 0L, viewModel.unlockUi.value.retryAtElapsed)
         }
+        confirmWith("not the passphrase")
+        assertEquals(SecurityError.WRONG, viewModel.state.value.error)
+        // The fifth starts a wait, which the dialog counts down from the lock's own value, the
+        // one the lock screen counts down.
+        assertEquals(clock.elapsed + 30_000, viewModel.unlockUi.value.retryAtElapsed)
+        assertEquals(viewModel.elapsedNow() + 30_000, lock.unlockUi.value.retryAtElapsed)
+
         confirmWith(passphrase)
-        assertEquals(SecurityError.THROTTLED, viewModel.state.value.error)
+        assertEquals("the countdown says it; nothing else is said", null, viewModel.state.value.error)
+        assertEquals(clock.elapsed + 30_000, viewModel.unlockUi.value.retryAtElapsed)
         assertTrue(viewModel.state.value.dialog is SecurityDialog.Confirm)
 
+        // An empty entry is not looked at: nothing is checked, counted or said.
         viewModel.submitCurrentPassphrase(CharArray(0))
+        assertFalse(viewModel.state.value.busy)
         runCurrent()
-        assertEquals(SecurityError.EMPTY, viewModel.state.value.error)
+        assertEquals(null, viewModel.state.value.error)
+
+        // And the lock screen, once the app locks, shows the same wait.
+        lock.lock()
+        runCurrent()
+        assertEquals(clock.elapsed + 30_000, lock.unlockUi.value.retryAtElapsed)
     }
 
     @Test

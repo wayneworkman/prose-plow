@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.ServiceCompat
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,10 +24,15 @@ import kotlinx.coroutines.launch
  * holds a partial wake lock for the same time.
  *
  * It is started when an answer begins while the app is in front, and it stops itself the moment
- * [KeepAliveSource.keepAliveWanted] turns false. Nothing stops it from outside: a service that
- * is asked to start in the foreground must call [startForeground] before it may be stopped, so
- * it does that first, at once, and only then looks whether it is still wanted. That also covers
- * an answer that was over before the service existed.
+ * [KeepAliveSource.keepAliveWanted] turns false. It is started as an ordinary service
+ * (`startService`), which Android allows while the app is in front, and puts itself in the
+ * foreground at once when it is created. Not with `startForegroundService`: a service started
+ * that way must reach the foreground before it may stop, and one whose `startForeground` was
+ * refused could then only stop by crashing the app. Started ordinarily, a refusal is only a
+ * refusal: the service tells [KeepAliveSource.onKeepAliveRefused] and stops. Only once it is in
+ * the foreground does it say that the keep-alive runs ([KeepAliveSource.onKeepAlive]), and then
+ * it looks whether it is still wanted, which also covers an answer that was over before the
+ * service existed. Nothing stops it from outside except the end of the process.
  *
  * The type is `specialUse` (Android 14 and later demand a type). None of the named types
  * describes running a language model on the device at the user's request: it is not a transfer
@@ -43,6 +47,9 @@ class AnswerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /** Set once this service has said that it runs in the foreground, so that its end is said too. */
+    private var told: KeepAliveSource? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
@@ -50,18 +57,16 @@ class AnswerService : Service() {
     override fun onCreate() {
         super.onCreate()
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-        val inForeground = try {
+        val source = application as? KeepAliveSource
+        // A refusal (the app had already left the screen) is told to the source: the answer goes on without this service.
+        val wanted = KeepAliveEntry.enter(source) {
             ServiceCompat.startForeground(this, AnswerNotifications.WRITING_ID, AnswerNotifications.writing(this), type)
-            true
-        } catch (_: RuntimeException) {
-            // Android refused (the app had already left the screen). The answer goes on without this service.
-            false
         }
-        val wanted = (application as? KeepAliveSource)?.keepAliveWanted
-        if (!inForeground || wanted == null) {
+        if (wanted == null) {
             stopSelf()
             return
         }
+        told = source
         stayAwake()
         scope.launch {
             wanted.first { !it }
@@ -89,6 +94,8 @@ class AnswerService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        told?.onKeepAlive(false)
+        told = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         super.onDestroy()
@@ -99,9 +106,13 @@ class AnswerService : Service() {
         private const val WAKE_LOCK_MILLIS = 120_000L
         private const val WAKE_LOCK_RENEW_MILLIS = 60_000L
 
-        /** Asks Android to start the service; false when it will not (the app is not in front). */
+        /**
+         * Asks Android to start the service, as an ordinary service (see the class comment);
+         * false when it will not (the app is not in front). That it is in the foreground is
+         * known only when it says so.
+         */
         fun start(context: Context): Boolean = try {
-            ContextCompat.startForegroundService(context, Intent(context, AnswerService::class.java))
+            context.startService(Intent(context, AnswerService::class.java))
             true
         } catch (_: RuntimeException) {
             false

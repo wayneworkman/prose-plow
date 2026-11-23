@@ -4,8 +4,14 @@ import us.theworkmans.proseplow.core.prompt.Prompt
 import us.theworkmans.proseplow.core.prompt.PromptBoundary
 import us.theworkmans.proseplow.core.prompt.PromptSegment
 
-/** A growable list of token ids: the engine's own copy of what the model's memory holds. */
-internal class TokenList {
+/**
+ * A growable list of token ids: the engine's own copy of what the model's memory holds. The ids
+ * spell out the conversation, so no array of them is ever let go of unwiped: not on [truncate]
+ * or [wipe], and not when the list grows into a larger array.
+ *
+ * @param onDropped told of every array the list has outgrown, after it was wiped. For the tests.
+ */
+internal class TokenList(private val onDropped: (IntArray) -> Unit = {}) {
     private var items = IntArray(256)
 
     var size: Int = 0
@@ -14,8 +20,16 @@ internal class TokenList {
     operator fun get(index: Int): Int = items[index]
 
     fun add(token: Int) {
-        if (size == items.size) items = items.copyOf(size * 2)
+        if (size == items.size) grow()
         items[size++] = token
+    }
+
+    /** Doubles the array; the old one is overwritten before it is dropped, since nothing else would. */
+    private fun grow() {
+        val old = items
+        items = old.copyOf(old.size * 2)
+        old.fill(0)
+        onDropped(old)
     }
 
     fun addAll(tokens: IntArray, count: Int = tokens.size) {
@@ -136,7 +150,44 @@ internal class PromptTokeniser(private val native: NativeLlama) {
         return cache.getOrPut(segment) { native.tokenize(text.toByteArray(Charsets.UTF_8), parseSpecial) }
     }
 
-    private companion object {
-        val EMPTY = IntArray(0)
+    companion object {
+        private val EMPTY = IntArray(0)
+
+        /**
+         * Whether every text of [prompt] is within what the native tokenizer takes
+         * ([NativeLlama.MAX_TOKENIZE_BYTES] bytes of UTF-8 each). A prompt that is not would be
+         * refused, whatever the size of the context; this is asked before anything is tokenised.
+         */
+        fun withinLimit(prompt: Prompt): Boolean = prompt.segments.all { segment ->
+            when (segment) {
+                is PromptSegment.TokenId -> true
+                is PromptSegment.Text -> utf8Length(segment.text) <= NativeLlama.MAX_TOKENIZE_BYTES
+                is PromptSegment.Special -> utf8Length(segment.text) <= NativeLlama.MAX_TOKENIZE_BYTES
+            }
+        }
+
+        /**
+         * The length of [text] as [tokenise] hands it over (`toByteArray(UTF_8)`), counted
+         * without encoding it. That encoder writes an unpaired surrogate as one `?`.
+         */
+        internal fun utf8Length(text: String): Int {
+            var bytes = 0
+            var index = 0
+            while (index < text.length) {
+                val char = text[index]
+                when {
+                    char.code < 0x80 -> bytes += 1
+                    char.code < 0x800 -> bytes += 2
+                    Character.isHighSurrogate(char) && index + 1 < text.length && Character.isLowSurrogate(text[index + 1]) -> {
+                        bytes += 4
+                        index++
+                    }
+                    Character.isSurrogate(char) -> bytes += 1
+                    else -> bytes += 3
+                }
+                index++
+            }
+            return bytes
+        }
     }
 }

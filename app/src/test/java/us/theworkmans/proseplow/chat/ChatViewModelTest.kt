@@ -98,6 +98,33 @@ class ChatViewModelTest {
         assertEquals(listOf("What is a furrow?", "A trench."), state.session!!.messages.map { it.text })
     }
 
+    /**
+     * Send, an edit, and whether the button is offered all go by one definition of a blank
+     * message: the prompt's own stripping rule. U+0085 is whitespace to the models but not to
+     * Kotlin's `isBlank`, which offered a button that then did nothing.
+     */
+    @Test
+    fun theButtonIsOfferedExactlyForWhatCanBeSentOrSavedAsAnEdit() = runTest(StandardTestDispatcher(scheduler)) {
+        unlocked()
+        for (blank in listOf("", "   ", "\u0085", "\u001F\n", "\u3000\u00A0")) {
+            viewModel.onInputChange(blank)
+            assertFalse("offered for ${blank.map { it.code }}", viewModel.inputSendable)
+            viewModel.send()
+            assertEquals(emptyList<Any>(), state.session!!.messages)
+        }
+        viewModel.onInputChange("\u200B") // Not whitespace to Python's strip: the model would read it.
+        assertTrue(viewModel.inputSendable)
+
+        exchange("A question", "An answer")
+        viewModel.startEdit(state.session!!.messages[0].id)
+        viewModel.onInputChange("\u0085 ")
+        assertFalse(viewModel.inputSendable)
+        viewModel.send()
+        runCurrent()
+        assertEquals(listOf("A question", "An answer"), state.session!!.messages.map { it.text })
+        assertEquals("the edit is still open", state.session!!.messages[0].id, state.editingMessageId)
+    }
+
     @Test
     fun aMessageThatCannotBeSentStaysInTheField() = runTest(StandardTestDispatcher(scheduler)) {
         unlocked()

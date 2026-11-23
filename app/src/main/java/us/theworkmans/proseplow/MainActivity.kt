@@ -109,7 +109,7 @@ class MainActivity : FragmentActivity() {
         // prompts). Compose dialogs are separate windows; see ProtectWindow.
         window.decorView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         val appLock = container.appLock
-        appLock.onActivityCreated()
+        appLock.onActivityCreated(this)
 
         // Created in onCreate, as the androidx.biometric documentation asks, so a prompt that is
         // showing during a rotation reports to this instance.

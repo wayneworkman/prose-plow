@@ -632,8 +632,10 @@ class SourceRulesTest {
     /**
      * The answer service keeps the process alive and awake and does nothing else. No other app
      * can start it; Android is told what it is for; it is never restarted without its process;
-     * it stops only itself (stopping it from outside before it has shown its notification is an
-     * error on Android); and the wake lock it holds always has a time limit.
+     * it is started as an ordinary service and puts itself in the foreground first thing (a
+     * service started with `startForegroundService` that fails to reach the foreground crashes
+     * the app when it stops), and says whether that worked through the one plain-Kotlin entry;
+     * it stops only itself; and the wake lock it holds always has a time limit.
      */
     @Test
     fun theAnswerServiceIsNotExportedSaysWhatItIsForAndHoldsNoWakeLockForEver() {
@@ -653,12 +655,18 @@ class SourceRulesTest {
         val service_ = code(file)
         assertTrue(service_.contains("override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY"))
         assertTrue(service_.contains("override fun onBind(intent: Intent?): IBinder? = null"))
-        assertEquals(listOf("AnswerService.kt"), users(all, "startForegroundService("))
+        assertEquals("never with the obligation to reach the foreground", emptyList<String>(), users(all, "startForegroundService("))
+        assertEquals(listOf("AnswerService.kt"), users(all, "startService("))
+        assertTrue(service_.contains("context.startService(Intent(context, AnswerService::class.java))"))
+        assertEquals(listOf("AnswerService.kt"), users(all, "KeepAliveEntry.enter("))
         assertEquals(listOf("AnswerService.kt"), users(all, "stopService("))
         assertEquals("only the end of the process stops the service from outside", listOf("ProcessEnd.kt"), users(all, "AnswerService.stop("))
-        // In the foreground first, before anything can stop it.
+        // In the foreground first, through the entry that tells whether it worked, before anything can stop it.
         val created = file.readText().substringAfter("override fun onCreate() {").substringBefore("\n    }\n")
+        assertTrue(created.indexOf("KeepAliveEntry.enter(source) {") in 0 until created.indexOf("ServiceCompat.startForeground("))
         assertTrue(created.indexOf("ServiceCompat.startForeground(") in 0 until created.indexOf("stopSelf()"))
+        // And its end is told, so that nothing believes the keep-alive still runs.
+        assertTrue(service_.contains("told?.onKeepAlive(false)"))
 
         assertEquals(listOf("AnswerService.kt"), users(all, "newWakeLock("))
         assertEquals(listOf("lock.acquire(WAKE_LOCK_MILLIS)"), service_.filter { it.contains(".acquire(") })

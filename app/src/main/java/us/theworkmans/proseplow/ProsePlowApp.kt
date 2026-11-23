@@ -49,6 +49,14 @@ class ProsePlowApp : Application(), KeepAliveSource {
     override val keepAliveWanted: StateFlow<Boolean>?
         get() = if (lazyContainer.isInitialized()) container.answerWork.keepAliveWanted else null
 
+    override fun onKeepAlive(running: Boolean) {
+        if (lazyContainer.isInitialized()) container.answerWork.onKeepAlive(running)
+    }
+
+    override fun onKeepAliveRefused() {
+        if (lazyContainer.isInitialized()) container.answerWork.onKeepAliveRefused()
+    }
+
     override fun onCreate() {
         super.onCreate()
         turnSmartSelectionOff()
@@ -168,6 +176,8 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         mainDispatcher = Dispatchers.Main.immediate,
         ioDispatcher = Dispatchers.IO,
         processEnder = AndroidProcessEnder(app),
+        // A session is left alive behind the lock only while the answer service really keeps the process awake.
+        canFinishOutOfSight = { answerWork.keepAliveRunning },
         heavyWork = object : MakesWay {
             override fun standAside() = generationGate.close()
 

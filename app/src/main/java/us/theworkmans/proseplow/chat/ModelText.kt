@@ -66,6 +66,19 @@ object ModelText {
         ModelFamily.QWEN35_CHATML, ModelFamily.PEACEBELL_CHATML, ModelFamily.PLAIN_CHATML, null -> R.string.message_hint
     }
 
+    /**
+     * What Copy puts on the clipboard for a reply of the model [modelId] whose stored text is
+     * [text]. A chat model's reply without the blanks around it. A model that continues text
+     * wrote every character of it as part of the text, leading whitespace included (the user's
+     * text and the continuation are one text), so its reply is copied exactly as written; only
+     * the display drops the leading whitespace, which Markdown would otherwise take for a block
+     * of code.
+     */
+    fun copiedReply(modelId: String?, text: String): String = when (family(modelId)) {
+        ModelFamily.COMPLETION -> text
+        ModelFamily.QWEN35_CHATML, ModelFamily.PEACEBELL_CHATML, ModelFamily.PLAIN_CHATML, null -> text.trim()
+    }
+
     /** Why the model [modelId] has no system prompt to set, as a line that takes the model's name. */
     @StringRes
     fun noSystemPromptRes(modelId: String?): Int = when (family(modelId)) {

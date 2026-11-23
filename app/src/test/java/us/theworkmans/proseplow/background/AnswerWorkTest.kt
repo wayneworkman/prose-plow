@@ -1,8 +1,12 @@
 package us.theworkmans.proseplow.background
 
+import kotlinx.coroutines.flow.StateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -115,6 +119,62 @@ class AnswerWorkTest {
         work.onWriting(true)
         assertEquals(2, starts)
         assertTrue(wanted)
+    }
+
+    /** The answer service's own entry, wired to [work] as the application wires it. */
+    private val source = object : KeepAliveSource {
+        override val keepAliveWanted: StateFlow<Boolean> get() = work.keepAliveWanted
+
+        override fun onKeepAlive(running: Boolean) = work.onKeepAlive(running)
+
+        override fun onKeepAliveRefused() = work.onKeepAliveRefused()
+    }
+
+    /**
+     * The security review's D5: `startForeground` throwing when the service is created. Nothing
+     * may go on believing that a keep-alive exists: it is neither running nor wanted, and the
+     * service stops at once.
+     */
+    @Test
+    fun aForegroundThatAndroidRefusesIsToldAndNothingBelievesAKeepAliveExists() {
+        work.onInFront(true)
+        work.onWriting(true)
+        assertTrue(wanted)
+        assertFalse("not running before the service says so", work.keepAliveRunning)
+
+        var asked = 0
+        val watched = KeepAliveEntry.enter(source) {
+            asked++
+            throw IllegalStateException("Android refused")
+        }
+        assertEquals(1, asked)
+        assertNull("the service stops at once", watched)
+        assertFalse(work.keepAliveRunning)
+        assertFalse(wanted)
+
+        // The next answer asks again, and this time the service reaches the foreground.
+        work.onWriting(false)
+        work.onWriting(true)
+        assertEquals(2, starts)
+        assertSame(work.keepAliveWanted, KeepAliveEntry.enter(source) { })
+        assertTrue(work.keepAliveRunning)
+        work.onKeepAlive(false)
+        assertFalse("ended with the service", work.keepAliveRunning)
+    }
+
+    @Test
+    fun aServiceInAProcessThatNeverWroteAnAnswerStopsAtOnce() {
+        var asked = 0
+        assertNull(KeepAliveEntry.enter(null) { asked++ })
+        assertEquals("in the foreground first, whatever follows", 1, asked)
+        val empty = object : KeepAliveSource {
+            override val keepAliveWanted: StateFlow<Boolean>? = null
+
+            override fun onKeepAlive(running: Boolean) = fail("nothing to tell")
+
+            override fun onKeepAliveRefused() = fail("nothing to tell")
+        }
+        assertNull(KeepAliveEntry.enter(empty) { })
     }
 
     @Test

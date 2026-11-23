@@ -266,7 +266,7 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                         onTextChange = viewModel::onInputChange,
                         editing = state.editingMessageId != null,
                         generating = state.generating,
-                        sendEnabled = state.canWrite && viewModel.inputText.isNotBlank(),
+                        sendEnabled = state.canWrite && viewModel.inputSendable,
                         onSend = {
                             viewModel.send()
                             followBottom.value = true

@@ -148,7 +148,7 @@ fun AssistantMessage(
                 )
                 if (canContinue) TextButton(onClick = onContinue) { Text(stringResource(R.string.continue_reply)) }
                 if (answer.isNotEmpty()) {
-                    MessageAction(R.drawable.ic_copy, stringResource(R.string.copy_message), onClick = { onCopy(message.text.trim()) })
+                    MessageAction(R.drawable.ic_copy, stringResource(R.string.copy_message), onClick = { onCopy(ModelText.copiedReply(message.modelId, message.text)) })
                     MessageAction(R.drawable.ic_refresh, stringResource(R.string.regenerate), enabled = canRegenerate, onClick = onRegenerate)
                 }
             }

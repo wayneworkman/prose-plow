@@ -23,7 +23,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.background.AnswerWork
+import us.theworkmans.proseplow.background.KeepAliveEntry
+import us.theworkmans.proseplow.background.KeepAliveSource
 import us.theworkmans.proseplow.background.ReadyNotice
 import us.theworkmans.proseplow.core.chat.FakeClock
 import us.theworkmans.proseplow.core.chat.MessageStatus
@@ -299,9 +302,28 @@ class AppSessionTest {
         var keepAliveStarts = 0
         var readyShown = 0
         var readyCleared = 0
-        val answers = AnswerWork(
+
+        /** Whether Android puts the answer service in the foreground when it is created. */
+        var foregroundAllowed = true
+
+        /** The answer service: created a moment after it was started, as Android does, through the service's own entry. */
+        private val service = object : KeepAliveSource {
+            override val keepAliveWanted: StateFlow<Boolean> get() = answers.keepAliveWanted
+
+            override fun onKeepAlive(running: Boolean) = answers.onKeepAlive(running)
+
+            override fun onKeepAliveRefused() {
+                answers.onKeepAliveRefused()
+                noteKeepAlive()
+            }
+        }
+
+        val answers: AnswerWork = AnswerWork(
             keepAlive = {
                 keepAliveStarts++
+                CoroutineScope(dispatcher).launch {
+                    KeepAliveEntry.enter(service) { if (!foregroundAllowed) throw IllegalStateException("not allowed from the background") }
+                }
                 true
             },
             readyNotice = object : ReadyNotice {
@@ -318,6 +340,38 @@ class AppSessionTest {
 
         /** The last thing in [log] when the lock ended the process for the first time. */
         var lastBeforeProcessEnd: String? = null
+
+        /** True while the keep-alive is wanted, as last seen by [noteKeepAlive]. */
+        private var keepAliveWasWanted = false
+
+        /**
+         * Called right after everything that can let the keep-alive go: notes in [log] the
+         * moment it was let go, and whether the data key of the latest unlock was still alive
+         * then. Synchronous, so the note is made at that very moment and not later.
+         */
+        fun noteKeepAlive() {
+            val wanted = answers.keepAliveWanted.value
+            if (keepAliveWasWanted && !wanted) {
+                val keyAlive = try {
+                    cipher.seal("probe", byteArrayOf(1))
+                    true
+                } catch (_: KeyDestroyedException) {
+                    false
+                }
+                log += if (keyAlive) "keep-alive let go, the key still alive" else "keep-alive let go, the key destroyed"
+            }
+            keepAliveWasWanted = wanted
+        }
+
+        /** What the session tells, passed on to [answers] as the app passes it, with [noteKeepAlive] after each. */
+        private val events = object : AnswerEvents {
+            override fun onWriting(writing: Boolean) {
+                answers.onWriting(writing)
+                noteKeepAlive()
+            }
+
+            override fun onReplyFinished() = answers.onReplyFinished()
+        }
 
         val lock: AppLock<WatchedSession> = AppLock(
             manager = LockManager(
@@ -343,7 +397,7 @@ class AppSessionTest {
                 }
                 val session = AppSession(
                     recording, layout, engine, ModelCatalog.bundled, dispatcher, dispatcher, FakeClock(), SequentialIds("u${++unlocks}-"),
-                    answerEvents = answers,
+                    answerEvents = events,
                 )
                 WatchedSession(session, unlocked, log)
             },
@@ -354,11 +408,17 @@ class AppSessionTest {
             processEnder = {
                 if (processEnds++ == 0) lastBeforeProcessEnd = log.lastOrNull()
             },
+            canFinishOutOfSight = { answers.keepAliveRunning },
         )
 
         init {
             // As the application does: the keep-alive stays while a session is ending behind the lock.
-            CoroutineScope(dispatcher).launch { lock.sessionEnding.collect(answers::onSessionEnding) }
+            CoroutineScope(dispatcher).launch {
+                lock.sessionEnding.collect {
+                    answers.onSessionEnding(it)
+                    noteKeepAlive()
+                }
+            }
         }
 
         /** The app's one activity reaches the screen. */
@@ -572,7 +632,9 @@ class AppSessionTest {
         assertEquals(1, app.readyShown)
         assertEquals(1, app.processEnds)
         assertEquals("the end of the process came after the close, and nothing after it", "closed, the key still works", app.lastBeforeProcessEnd)
-        assertEquals("closed, the key still works", app.log.last())
+        // The security review's D2: the keep-alive was let go once, and only after the key was destroyed.
+        assertEquals(listOf("closed, the key still works", "keep-alive let go, the key destroyed"), app.log.takeLast(2))
+        assertEquals(listOf("keep-alive let go, the key destroyed"), app.log.filter { it.startsWith("keep-alive") })
 
         // A cold unlock finds the whole answer, finished; coming to the front took the notification away.
         val cleared = app.readyCleared
@@ -583,6 +645,60 @@ class AppSessionTest {
         val reply = again.openSession.messages.last()
         assertEquals("Half way there", reply.text)
         assertEquals(MessageStatus.COMPLETE, reply.status)
+    }
+
+    /**
+     * The security review's A3 and D5: Android refuses to put the answer service in the
+     * foreground (its `startForeground` throws when it is created). The keep-alive is then known
+     * not to exist: nothing is wanted any more, and when the app locks by itself the answer is
+     * stopped and the key destroyed as with the setting off, instead of a lease that no timer
+     * might ever end.
+     */
+    @Test
+    fun aKeepAliveThatAndroidRefusesLeavesNoLeaseBehindTheLock() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.foregroundAllowed = false
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        assertEquals("the start was asked for", 1, app.keepAliveStarts)
+        assertFalse("and is known to have failed", app.answers.keepAliveRunning)
+        assertFalse(app.answers.keepAliveWanted.value)
+
+        app.leave() // "Immediately": the app locks by itself now.
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Locked)
+        assertFalse("no lease", app.log.contains("finish only"))
+        assertEquals(0, app.fake.activeGenerations)
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.lock.sessionEnding.value)
+        assertEquals(1, app.processEnds)
+
+        app.comeToFront()
+        val reply = unlock(app).openSession.messages.last()
+        assertEquals(id, app.session.openSession.id)
+        assertEquals("Half ", reply.text)
+        assertEquals(MessageStatus.STOPPED, reply.status)
+    }
+
+    @Test
+    fun theKeepAliveIsKnownToRunOnlyFromWhenTheServiceIsInTheForegroundUntilItEnds() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        assertFalse(app.answers.keepAliveRunning)
+        app.fake.enqueueReply(listOf("One ", "two"), millisBetween = 500)
+        session.chat.send(session.openSession.id, "Count")
+        runCurrent()
+        assertTrue(app.answers.keepAliveWanted.value)
+        assertTrue("the service was created and reached the foreground", app.answers.keepAliveRunning)
+        // The service ends (it stops itself once it is no longer wanted).
+        app.answers.onKeepAlive(false)
+        assertFalse(app.answers.keepAliveRunning)
+        advanceTimeBy(5_000)
+        runCurrent()
+        session.close()
     }
 
     @Test
