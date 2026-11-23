@@ -414,7 +414,7 @@ Everything is in the app's private storage.
 
 The models are assets of the APK and are not encrypted: they are public files.
 
-Each encrypted file is one blob:
+Each encrypted file is one blob, except the model's saved memory (below):
 
     "PPE" | version 0x01 | nonce (12 random bytes) | AES-256-GCM ciphertext | tag (16 bytes)
 
@@ -425,6 +425,16 @@ header followed by `proseplow:<purpose>`, where the purpose names what the blob 
 decrypt. The purpose says what a blob is, not which version of it: an older copy of the same
 file decrypts as well (see "What this does not protect against"). Files are replaced atomically
 (temporary file, `fsync`, rename, `fsync` of the directory).
+
+The model's saved memory of one conversation, `files/model-memory/<chat id>.enc`, is too large to
+be one blob, and is a sealed stream instead: a 28-byte header (`"PPS"`, version 0x01, a random
+stream id and the date of the oldest message it was made from) followed by chunks of 4 MiB, each
+sealed with AES-256-GCM under its own random nonce and bound to the header, the purpose
+`model-memory:<chat id>`, its place in the stream and whether it is the last. At most one exists,
+and it is deleted whenever a message it was made from is pruned, edited or deleted. It is written
+to a temporary file and renamed without the two `fsync`s, because it can always be made again and
+a damaged one fails authentication; its deletion is flushed. The app does not write one yet: the
+store is there, but nothing calls it.
 
 ### The key hierarchy
 
@@ -829,7 +839,9 @@ it or losing the phone loses the chats.
   covered taps does not help against what is drawn around a button.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
-  sizes and the dates of their newest messages, and the content of `lock.json` (whether fingerprint
+  sizes and the dates of their newest messages, whether the model's memory of a conversation is
+  kept, for which chat, its size (and so roughly how long that conversation is) and the date of
+  its oldest message, and the content of `lock.json` (whether fingerprint
   unlock is on and for how long, whether an answer is finished after locking, how many wrong
   attempts were made and when, how long messages are kept, the latest trusted time, and when,
   on the clock since the phone's start, the app last locked or was unlocked).
@@ -1461,7 +1473,7 @@ None of it has been tried.
 | Suite | What it covers | Command |
 | --- | --- | --- |
 | `core` (JVM, 468 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, saving the memory and reading it back (not yet used by the app), stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 755 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `app` (JVM, 792 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

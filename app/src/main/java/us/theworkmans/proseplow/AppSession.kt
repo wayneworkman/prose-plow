@@ -30,6 +30,8 @@ import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.CoalescingWriter
+import us.theworkmans.proseplow.data.MemoryStore
+import us.theworkmans.proseplow.data.ModelMemoryFiles
 import us.theworkmans.proseplow.data.SealedDirectory
 import us.theworkmans.proseplow.data.SealedFile
 import us.theworkmans.proseplow.data.SessionStore
@@ -62,6 +64,13 @@ class DataLayout(files: AppFiles) {
      * over them. Each is still sealed for the purpose of the file it is a copy of.
      */
     val kept = File(files.filesDir, "kept")
+
+    /**
+     * The model's saved memory: at most one `<chat id>.enc`, a sealed stream for the purpose
+     * [MemoryStore.purposeOf] (see [ModelMemoryFiles]). Under the files directory and outside
+     * `security/`, with the encrypted suffix, so the lock counts it as data and a reset deletes it.
+     */
+    val modelMemory = File(files.filesDir, "model-memory")
 
     companion object {
         val SETTINGS_PURPOSE = Purposes.of("settings")
@@ -107,6 +116,10 @@ class DataLayout(files: AppFiles) {
  *   makes the default delete what the user chose to keep.
  * @param answerEvents told, on the main dispatcher, when an answer begins and ends being
  *   written and when one is finished: what keeps the process alive out of sight goes by it.
+ * @param memoryFiles the files of the model's saved memory: one object for the whole process
+ *   (see [ModelMemoryFiles]). At the opening, before anything else, what has expired of it goes
+ *   by the rules that need no key; and every pruning, edit and deletion of a chat's stored
+ *   messages deletes the chat's memory before the chat is written.
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
  *   then shows that the data could not be opened, with Try again, instead of an empty app.
  */
@@ -124,6 +137,7 @@ class AppSession(
     val contextLimits: DeviceContextLimits = DeviceContextLimits(),
     expiryIntervalMillis: Long? = null,
     lockedMessageLifetimeDays: Int? = null,
+    val memoryFiles: ModelMemoryFiles = ModelMemoryFiles(layout.modelMemory, layout.sessions),
 ) : UnlockedSession, MessageLifetimeSetting {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
@@ -159,10 +173,14 @@ class AppSession(
             val sessionStore = SessionStore(
                 sessions = SealedDirectory(layout.sessions, DataLayout::sessionPurpose, cipher, layout.kept, "session"),
                 indexFile = SealedFile(layout.sessionIndex, DataLayout.SESSION_INDEX_PURPOSE, cipher, layout.kept, "session-index"),
+                memory = memoryFiles,
             )
             settings = settingsStore
-            // Nothing else uses the files yet: what has expired goes before anything is shown.
-            val opened = sessionStore.expireAll(sessionStore.open(), settingsStore.settings.value.messageLifetime, clock.nowMillis())
+            // Nothing else uses the files yet: what has expired goes before anything is shown or
+            // restored, the model's memory first.
+            val now = clock.nowMillis()
+            memoryFiles.sweep(settingsStore.settings.value.messageLifetime, now)
+            val opened = sessionStore.expireAll(sessionStore.open(), settingsStore.settings.value.messageLifetime, now)
             chat = ChatController(
                 store = sessionStore,
                 writer = writer,

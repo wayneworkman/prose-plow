@@ -784,9 +784,10 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 `security/DurabilityTest.kt`, `security/MandatoryLockTest.kt`. The exact forms are in section 25.
 
 - **KEY-01** Everything the app stores about the user is encrypted with one 256-bit data key,
-  with AES-256-GCM and a new random nonce for every write. Each stored blob is bound to a
-  purpose that names what it is (the settings, the list of chats, one chat by its id), so a file
-  that is renamed, or put in the place of another, does not decrypt (FMT-01, FMT-02).
+  with AES-256-GCM and a new random nonce for every write (for a sealed stream, every chunk;
+  FMT-21). Each stored blob and each stream is bound to a purpose that names what it is (the
+  settings, the list of chats, one chat by its id, the model's saved memory of one chat), so a
+  file that is renamed, or put in the place of another, does not decrypt (FMT-01, FMT-02).
 - **KEY-02** The data key exists on disk only wrapped: always by a key derived from the
   passphrase and, when fingerprint unlock is on, a second time by a hardware key that needs a
   biometric match. There is no key that opens the data without the user.
@@ -835,7 +836,8 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
 **Source:** `AppSession.kt` (`DataLayout`), `security/AppFiles.kt`, `security/AtomicFiles.kt`,
 `data/SealedFile.kt`, `data/SealedStreamFile.kt`, `data/CoalescingWriter.kt`,
-`data/SessionStore.kt`, `data/SettingsStore.kt`, `data/ExpiredFiles.kt`,
+`data/SessionStore.kt`, `data/SettingsStore.kt`, `data/ExpiredFiles.kt`, `data/MemoryStore.kt`,
+`data/ModelMemoryFiles.kt`, `chat/ChatController.kt` (`keepsSavedMemory`),
 `app/src/main/res/xml/data_extraction_rules.xml`; tests in
 `app/src/test/java/us/theworkmans/proseplow/data/`, `security/AppFilesTest.kt`,
 `security/DurabilityTest.kt`.
@@ -848,6 +850,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   | `session-index.enc` | The list of chats (a summary of each) and which chat was on screen last | Encrypted, purpose `session-index` |
   | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); whether the question about notifications has been asked; and how long messages are kept (SECSET-13) | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
+  | `model-memory/<chat id>.enc` | The model's saved memory of one conversation, at most one such file (STORE-24); nothing writes it yet. The file's last-modified time is the date of the oldest message it was made from | A sealed stream (FMT-21) for the purpose `model-memory:<chat id>`, with the store's header (FMT-22) |
   | `security/lock.json` | The lock configuration (FMT-06), with a readable copy of how long messages are kept and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
 
   The model files are part of the installed app and are not encrypted: they are public files.
@@ -864,7 +867,13 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   for the screens, or a backup.
 - **STORE-05** A file is replaced atomically: the new content is written to `<name>.tmp`, that
   file is flushed to the disk, renamed over the old one, and the directory is flushed too. A
-  stop at any point leaves either the old or the new content, never a mixture.
+  stop at any point leaves either the old or the new content, never a mixture. The one
+  exception is a sealed stream (FMT-21), the model's saved memory (STORE-24): it is written to
+  `<name>.tmp` and renamed in the same way, but neither the file nor the directory is flushed,
+  because flushing hundreds of megabytes takes seconds the app does not have when it leaves the
+  screen. A power loss can then leave the old memory, none, or one with holes in it, which does
+  not authenticate and is deleted (STORE-25); a memory is never the only copy of anything. Its
+  deletion is flushed like every other.
 - **STORE-06** A write counts as durable only once the directory has been flushed as well,
   because a rename that was never flushed can be undone by a power loss. Whatever must not
   happen before the new content is certain (deleting a hardware key that only the old content
@@ -929,7 +938,8 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 - **STORE-20** Nothing in the storage layer is specific to chats: an encrypted file is a blob
   sealed with a namespaced purpose, written atomically and protected by the rule of STORE-09
   (TOOL-07). The storage layer can also write and read the second form of an encrypted file,
-  the stream of FMT-21, which is as little specific to chats; no store uses it yet.
+  the stream of FMT-21, which is as little specific to chats; the store of the model's saved
+  memory (STORE-24) uses it.
 - **STORE-21** Every time a chat is written, its file's last-modified time is set to the date of
   its newest message (CHAT-24). When that cannot be done, or no message has a date, the file
   keeps the time it was written, which is later: a deletion by the date (STORE-22) then comes
@@ -944,12 +954,21 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
     past is deleted; kept copies of the settings hold no message and stay;
   - what interrupted writes of chats, of kept copies or of the list of chats left behind
     (`*.enc.tmp`) is deleted once its own date plus the limit lies in the past.
+  - the model's saved memory (STORE-24) goes first, before anything of the chats: a memory
+    whose date plus the limit lies in the past, or whose date cannot be read, is deleted; so is
+    a memory whose chat file (`sessions/<same id>.enc`) is not there, one whose name is not that
+    of a chat, and every temporary file of a save (`*.tmp` in its directory), whatever its date;
+    and a chat deleted here has its memory deleted before the chat itself, whatever the
+    memory's own date.
 
   It runs at every start of the lock, which includes every run of the background maintenance
-  job (BG-12) while that is on. With "Never" nothing is deleted. A file whose date cannot be read
-  is left alone, and so is a file among the chats whose name is not that of a chat. The
-  directories are flushed after a deletion (STORE-13). The list of chats cannot be changed
-  without the key: it names the deleted chats until the next unlock (STORE-23).
+  job (BG-12) while that is on. With "Never" nothing is deleted by its date. The rules of the
+  saved memory that go by names (a temporary file, a memory without its chat, a name that is not
+  a chat's) need no limit and no `lock.json`: they run with "Never" too, and when the readable
+  copy names no choice; only the rule by date is then off. A file whose date cannot be read is
+  left alone, except a saved memory, and so is a file among the chats whose name is not that of
+  a chat. The directories are flushed after a deletion (STORE-13). The list of chats cannot be
+  changed without the key: it names the deleted chats until the next unlock (STORE-23).
 - **STORE-23** At every unlock, before any chat is shown and once the list has been corrected by
   the files (STORE-11), the expiry of CHAT-22 is applied to every stored chat whose entry in the
   list does not rule it out: an entry records the date of the chat's oldest message, and a chat
@@ -965,6 +984,59 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   expired, and stays listed, so that opening it says so (CHAT-12). A message stored without a
   date takes its file's date, and one dated in the future takes the present; both are stored
   so.
+
+- **STORE-24** The model's saved memory: the working memory of the model for one conversation,
+  kept so that the conversation need not be read again after a lock (ENG-38, ENG-39). It is a
+  sealed stream (FMT-21) in `model-memory/<chat id>.enc`, sealed for the purpose
+  `model-memory:<chat id>`, with the store's own header (FMT-22) at the start of its first
+  chunk, so that the header is authenticated with it. At most one exists, the memory of the
+  conversation the model last worked on: a new one replaces that of any other chat. It is never
+  copied into `kept/` (STORE-09): a memory that does not pass its checks is deleted. Its
+  directory follows STORE-02, so the lock counts a memory as encrypted data and never makes a
+  new key over one, and a reset deletes it (RESET-07). **Nothing saves a memory yet:** the store
+  exists, with its clean-up, but the session does not call it, so no such file is written.
+- **STORE-25** What makes a saved memory usable. Before the engine is told what is kept, and
+  again when it is read back: its first chunk authenticates and begins with a header of the
+  store's version; the build (the app's version code and the time its package was last installed
+  or updated, so that every update of the app costs one reading of the conversation and no state
+  of another llama.cpp is ever read), the model and the length of the model's packaged file are
+  those of now; the chat's file exists; the chat as it is now begins with the very messages the
+  memory was made from (the same first message, the same digest of their ids, dates and text;
+  messages added since are allowed, and are read on top); the date of the oldest of them, as the
+  stream's header carries it and the chunk proves it, is within the limit of SECSET-13 at the
+  trusted time (CHAT-24), and the file's own date is never what decides this; and the file's
+  date is not later than that date, which would keep it from the clean-up of STORE-22. A memory
+  that fails any of these, more than one memory file, or one whose name is not a chat's, is
+  deleted. A failure to read the disk or the chats, or the key going, deletes nothing at that
+  check. When a memory is read back, only chunks that have authenticated are handed on, its end
+  is reported only once its last chunk has opened with nothing behind it and its length is the
+  header's, and any failure on the way deletes it.
+- **STORE-26** Saving a memory. It is refused, and what was kept stays, for a conversation the
+  session does not know or that has no messages, with a message without a usable date (none, or
+  one later than the trusted time), whose oldest message has already passed the limit, for a
+  model the build does not carry, and once the key has gone. It needs its stream's size free and
+  a reserve beside it, the larger of 1 GiB and 5% of the volume: when there is room for that
+  beside the memory kept now, the old memory stays until the new one has taken its name; when
+  there is room only without it, the old one is deleted first; when there is not room even then,
+  the old one is deleted and nothing is saved. The engine's thread seals each piece as a chunk
+  where the native export left it, and a thread of the save writes the chunks out through a
+  queue of 3, so the engine's thread never waits in a write to the disk; cancelling the save lets
+  it go within one chunk, and a disk that does not answer holds only ciphertext. The file is
+  dated by the oldest message it was made from (the earlier of the date the chat's entry records
+  and the messages' own); a memory whose date cannot be set, or does not hold, is not kept.
+  Deleting wins over saving: every deletion counts up a number shared by the whole process, and
+  the last step of a save checks that number and renames the file under the same lock, so a save
+  that ends after a deletion keeps nothing. A save that is given up leaves no temporary file.
+- **STORE-27** A saved memory never outlives a message it was made from. Without the key, by
+  STORE-22. At every unlock, before any chat is shown or any memory read back, the same rules by
+  name and date run under the user's own limit. And wherever the stored messages of a chat are
+  pruned (CHAT-22, STORE-23), edited, asked for again, retried or deleted, the chat's memory is
+  deleted first and the chat is written afterwards, in the same write, so that a stop between
+  the two leaves no memory rather than a memory of text that is gone; a newer write of the same
+  chat that takes the place of that write before it runs carries the deletion over. A change
+  that only adds (a new message or reply, an answer that is carried on, a draft, another model)
+  keeps the memory. A memory that cannot be deleted then does not stop the change: STORE-25 and
+  STORE-22 catch it before it could be used.
 
 ## 11. Chats (CHAT)
 
@@ -2274,8 +2346,8 @@ is what a port has to reproduce, whatever it is written in.
   cover the whole memory whatever size the context has.
 
 - **ENG-38** Saving the memory. Not yet used: nothing in the app calls it. On request the engine
-  writes what the model's memory holds into a vault (an interface the app is to implement over its
-  second encrypted form, the sealed stream), naming the conversation by an opaque key its caller
+  writes what the model's memory holds into a vault (an interface; the app's is the store of
+  STORE-24, over its second encrypted form, the sealed stream), naming the conversation by an opaque key its caller
   gives and passing it through without looking into it. The image is handed from the native session
   to the vault's own buffer piece by piece, behind the vault's own header; the engine
   adds to that header the model, the size of the context, the number of tokens, how long reading
@@ -2828,9 +2900,9 @@ This section is exact where the others describe. Each item carries one of three 
 - **FMT-02** *(Adopt)* Purposes. A purpose names what a blob or a stream is and is authenticated
   with it. It is a name space, or a name space, a colon and an id; a name space is a lower-case
   letter followed by lower-case letters, digits and hyphens, and contains no colon. In use:
-  `settings`; `session-index`; `session:` followed by the chat's id. Set aside for the memory of
-  a model kept as a stream (FMT-21), with nothing sealed for it yet: `model-memory:` followed by
-  a chat's id. The name space `dek` is reserved for the lock (`dek:passphrase`, FMT-04) and
+  `settings`; `session-index`; `session:` followed by the chat's id; and for the model's saved
+  memory, a stream (FMT-21, STORE-24): `model-memory:` followed by the chat's id (nothing saves a
+  memory yet). The name space `dek` is reserved for the lock (`dek:passphrase`, FMT-04) and
   refused to every store. A purpose is permanent once data has been sealed with it.
 - **FMT-03** *(Adopt)* Names of files. A chat is `sessions/<id>.enc`, where the id is the text
   form of a random (version 4) UUID; an id is valid as a file name if it matches
@@ -2961,8 +3033,8 @@ This section is exact where the others describe. Each item carries one of three 
 - **FMT-21** *(Adopt)* The sealed stream, the second form of an encrypted file (FMT-01), for
   content too large to be held in memory at once. A blob is one message, which can only be
   encrypted and decrypted whole; a stream is a header followed by chunks, each a message of its
-  own under the same data key, so that it is written and read one chunk at a time. Nothing the
-  app stores has this form yet: it is the form in which the memory of a model is to be kept.
+  own under the same data key, so that it is written and read one chunk at a time. It is the
+  form of the model's saved memory (STORE-24), which nothing saves yet.
 
   | Bytes | Content |
   | --- | --- |
@@ -3015,6 +3087,40 @@ This section is exact where the others describe. Each item carries one of three 
   authenticated data and the chunk size of version 1 are permanent. `security/SealedStreamTest.kt`
   and `data/SealedStreamFileTest.kt` hold the test vectors: a stream of one chunk byte for byte,
   and a stream of three chunks by its digest.
+- **FMT-22** *(Adopt; the build's two numbers are Android's, see below)* The header of the model's
+  saved memory (STORE-24). It is the first bytes of the plaintext of the stream's first chunk,
+  so it is authenticated with that chunk, and the memory image the native session wrote follows
+  it at once, in the same chunk and on. All numbers have their most significant byte first and
+  are signed; a text is its length in UTF-8 bytes (2 bytes, at most 256) followed by those bytes.
+
+  | Bytes | Content |
+  | --- | --- |
+  | 2 | The format version, `00 01` |
+  | 2 | The length of the header in bytes, these four included |
+  | 8 | The app's version code |
+  | 8 | When the app's package was last installed or updated, in milliseconds since 1970 |
+  | 2 + n | The model's id |
+  | 8 | The length of the model's packaged file in bytes |
+  | 2 + n | The chat's id |
+  | 2 + n | The id of the chat's first message when the memory was made |
+  | 4 | How many of the chat's messages, from its first, the memory was made from |
+  | 32 | The digest of those messages, below |
+  | 2 + n | The conversation's key, as the engine was given it |
+  | 4 | The size of the context when the memory was saved, in tokens |
+  | 4 | The number of tokens in the memory |
+  | 8 | How long reading those tokens again takes, in seconds, as the bits of an IEEE 754 double |
+  | 8 | The length of the memory image in bytes, the header not counted |
+
+  The digest is SHA-256 over the ASCII bytes of `proseplow model memory messages v1` followed,
+  for every message in order, by the length of its id in UTF-8 bytes (4 bytes), those bytes, its
+  date in milliseconds since 1970 (8 bytes), the length of its text in UTF-8 bytes (4 bytes) and
+  those bytes. A header is at most 1,378 bytes long. One of another version, longer than that,
+  longer than the chunk, with a text that is not UTF-8, or that does not end exactly where its
+  length says is refused, and the memory deleted. The date of the oldest message is not in this
+  header: it is the stream's own (FMT-21). The version and the digest's label are permanent. The
+  build is named by Android's version code and the package's last update time; a port names its
+  build by what its platform has, and the memory is only ever read back by the build that wrote
+  it (NAT-19), so no two platforms need to agree on those 16 bytes.
 
 ### Prompts
 
@@ -3350,9 +3456,11 @@ without these properties has not reached parity.
   device can delete everything, though not read it.
 - **THREAT-18** What the files reveal without being decrypted, to someone who can read the
   app's private storage: that the app is installed and which models it carries; how many chats
-  there are, their sizes and when they were changed; and the content of the lock configuration
-  (whether fingerprint unlock is on, whether an answer is finished after locking, how many wrong
-  attempts were made and when).
+  there are, their sizes and when they were changed; whether the model's memory of a
+  conversation is kept (STORE-24), of which chat, how large it is (which says roughly how long
+  that conversation is) and the date of the oldest message it was made from; and the content of
+  the lock configuration (whether fingerprint unlock is on, whether an answer is finished after
+  locking, how many wrong attempts were made and when).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
   one, or is unlocked and waiting to lock itself (BG-04), and when. Nothing else.
 - **THREAT-25** What the expiry of messages (CHAT-22) does not do. Deleting is not erasing:

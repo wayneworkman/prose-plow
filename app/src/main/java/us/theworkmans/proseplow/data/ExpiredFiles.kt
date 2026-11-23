@@ -7,6 +7,7 @@ import us.theworkmans.proseplow.security.ExpiredDataSweep
 import us.theworkmans.proseplow.security.syncDirectory
 import us.theworkmans.proseplow.security.tempFileFor
 import java.io.File
+import java.io.IOException
 
 /**
  * The expiry of messages as far as it can go without the data key, by the dates of the files
@@ -26,15 +27,29 @@ import java.io.File
  * unlocked expiry, which can read it. A file whose date cannot be read (0) is left alone. Every
  * deletion is tried even when one before it failed; what is left is tried again at the next run.
  *
+ * The model's saved memory goes first, by the rules of [ModelMemoryFiles.sweep]: a temporary
+ * file always, a memory whose chat file is not there always, and one whose date is past the
+ * limit; and a memory goes before its chat when the chat is deleted here. The first two need no
+ * limit, so they run whatever the readable copy of the limit says, with "Never" and with a copy
+ * that names no choice.
+ *
  * @param sessionsDir the chats, one `<id>.enc` file each.
  * @param keptDir the kept copies ([SealedFile.keepCopy]).
  * @param indexFile the list of chats.
+ * @param memory the model's saved memory.
  */
-class ExpiredFiles(private val sessionsDir: File, private val keptDir: File, private val indexFile: File) : ExpiredDataSweep {
+class ExpiredFiles(
+    private val sessionsDir: File,
+    private val keptDir: File,
+    private val indexFile: File,
+    private val memory: ModelMemoryFiles,
+) : ExpiredDataSweep {
 
     override fun sweep(lifetimeDays: Int, nowMillis: Long) {
-        val lifetime = MessageLifetime.fromStoredDays(lifetimeDays) ?: return
-        if (lifetime.limitMillis == null) return
+        val lifetime = MessageLifetime.fromStoredDays(lifetimeDays)
+        // The memory first, and also without a limit: its name rules need none.
+        memory.sweep(lifetime, nowMillis)
+        if (lifetime?.limitMillis == null) return
         val expired = { file: File -> file.lastModified().let { it > 0 && MessageExpiry.fileExpired(it, lifetime, nowMillis) } }
         var sessionsChanged = false
         var keptChanged = false
@@ -44,6 +59,12 @@ class ExpiredFiles(private val sessionsDir: File, private val keptDir: File, pri
                 name.endsWith(AppFiles.ENCRYPTED_SUFFIX) -> {
                     val id = name.removeSuffix(AppFiles.ENCRYPTED_SUFFIX)
                     if (!SealedDirectory.isValidId(id) || !expired(file)) continue
+                    // The memory of the chat before anything of the chat itself.
+                    try {
+                        memory.deleteFor(id)
+                    } catch (_: IOException) {
+                        // Its chat file goes below: the name rule takes the memory at the next run.
+                    }
                     // The copies first: should this stop half-way, no copy outlives its chat unnoticed.
                     for (copy in keptCopiesOf(id)) keptChanged = copy.delete() || keptChanged
                     tempFileFor(file).delete()

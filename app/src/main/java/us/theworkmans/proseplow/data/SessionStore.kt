@@ -44,15 +44,24 @@ data class SessionIndex(val activeId: String? = null, val sessions: List<Session
  * to that message's date. That is what lets expired chats be deleted while the app is locked,
  * without the key (see [ExpiredFiles]).
  *
+ * The model's saved memory of a chat ([MemoryStore]) never outlives a message it was made from.
+ * Wherever this store removes or changes stored messages (an expiry that prunes them, a [save]
+ * that says it does, a deletion) the memory of that chat is deleted first ([memory]) and the
+ * chat is written afterwards, so that a stop between the two leaves no memory rather than a
+ * memory of text that is gone. A memory that cannot be deleted does not stop the chat's change:
+ * the checks of the memory catch it before it could be used.
+ *
  * All methods block; call them off the main thread.
  *
  * @param setFileDate sets a file's last-modified time and says whether that worked; replaced in
  *   the unit tests to make it fail.
+ * @param memory deletes the saved memory of a chat, without the key.
  */
 class SessionStore(
     private val sessions: SealedDirectory,
     private val indexFile: SealedFile,
     private val setFileDate: (File, Long) -> Boolean = { file, millis -> file.setLastModified(millis) },
+    private val memory: SavedMemoryDeletion = SavedMemoryDeletion.None,
 ) {
 
     /**
@@ -160,10 +169,14 @@ class SessionStore(
      * cannot be set (or no message has one) the file keeps the time it was written, which is
      * later than its newest message: a deletion by the date then comes later, never earlier.
      *
+     * @param dropMemoryFirst true when this write removes or changes messages that were stored
+     *   (see `ChatController.keepsSavedMemory`): the saved memory of the chat is deleted before
+     *   anything is written.
      * @throws IOException when it was not stored.
      */
     @Throws(IOException::class)
-    fun save(session: ChatSession) {
+    fun save(session: ChatSession, dropMemoryFirst: Boolean = false) {
+        if (dropMemoryFirst) dropMemory(session.id)
         val file = sessions.file(session.id)
         file.write(SessionCodec.encode(session).toByteArray(Charsets.UTF_8))
         MessageExpiry.newestMessageMillis(session)?.let { setFileDate(file.file, it) }
@@ -229,7 +242,8 @@ class SessionStore(
             is MessageExpiry.Outcome.Pruned -> outcome.session
             MessageExpiry.Outcome.Emptied -> return if (loaded.incomplete == null || fileExpired) deleted(id) else checked(normalised)
         }
-        save(kept)
+        // Messages went, or their dates changed: the memory made from them goes first.
+        save(kept, dropMemoryFirst = true)
         return Expiry.Pruned(kept)
     }
 
@@ -286,12 +300,24 @@ class SessionStore(
     }
 
     /**
-     * Deletes the session [id] for good, readable or not, with every kept copy of it.
+     * Deletes the session [id] for good, readable or not, with every kept copy of it, and its
+     * saved memory before anything else.
      * @throws IOException when something of it is still there.
      */
     @Throws(IOException::class)
     fun delete(id: String) {
-        if (SealedDirectory.isValidId(id)) sessions.file(id).delete()
+        if (!SealedDirectory.isValidId(id)) return
+        dropMemory(id)
+        sessions.file(id).delete()
+    }
+
+    /** Deletes the saved memory of the chat [id]; a failure is let go (see the class comment). */
+    private fun dropMemory(id: String) {
+        try {
+            memory.deleteFor(id)
+        } catch (_: IOException) {
+            // The memory's own checks and the clean-up by its name and date catch it.
+        }
     }
 
     /** Stores the index. @throws IOException when it was not stored. */

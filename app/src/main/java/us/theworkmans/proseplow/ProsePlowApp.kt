@@ -31,6 +31,7 @@ import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
 import us.theworkmans.proseplow.data.ExpiredFiles
+import us.theworkmans.proseplow.data.ModelMemoryFiles
 import us.theworkmans.proseplow.llama.NativeEngine
 import us.theworkmans.proseplow.security.AndroidKeyVault
 import us.theworkmans.proseplow.security.AppFiles
@@ -136,6 +137,12 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
     private val layout = DataLayout(files)
 
     /**
+     * The files of the model's saved memory, one object for the process: its deletions, by
+     * whichever session or by the lock's clean-up, stop every save that began before them.
+     */
+    private val modelMemory = ModelMemoryFiles(layout.modelMemory, layout.sessions)
+
+    /**
      * The inference engine, for the life of the process: loading a model takes seconds, and its
      * weights are no secret, so the loaded model survives a lock, and an unlock in the same
      * process finds it ready. (The process itself ends once the app is locked and out of sight;
@@ -209,6 +216,7 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
                 contextLimits = contextLimits,
                 expiryIntervalMillis = ChatController.EXPIRY_INTERVAL_MILLIS,
                 lockedMessageLifetimeDays = lockedMessageLifetimeDays,
+                memoryFiles = modelMemory,
             )
         },
         biometricStatus = {
@@ -232,7 +240,7 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
             override fun carryOn() = generationGate.open()
         },
         // What has expired is deleted at every start of the lock, before anything can be unlocked.
-        expiredData = ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex),
+        expiredData = ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex, modelMemory),
         maintenanceScheduling = MaintenanceScheduling(MaintenanceSchedule(AndroidMaintenanceSlot(app))::apply),
     )
 

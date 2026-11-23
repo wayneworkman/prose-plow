@@ -64,6 +64,13 @@ class SealedStreamFile internal constructor(
         require(chunkSize > 0) { "A chunk holds at least one byte" }
     }
 
+    /**
+     * The plaintext of every chunk of this file's streams but the last, in bytes: the size of the
+     * format's version ([SealedStream.CHUNK_SIZE]). A store that fills one chunk at a time sizes
+     * its buffer by this, so that it never names a size of its own.
+     */
+    val chunkBytes: Int get() = chunkSize
+
     /** The write begun last. While it is open, the temporary name is its own. */
     private var writer: SealedStreamWriter? = null
 

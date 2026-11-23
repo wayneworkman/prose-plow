@@ -1007,13 +1007,16 @@ class SourceRulesTest {
      *    has the chunks of its version.
      * 3. A chunk never passes through an array of the collected heap in the app's own code, and
      *    a stream is never flushed to the disk when it is written (which would take the seconds
-     *    the app does not have when it leaves the screen), while its deletion is.
+     *    the app does not have when it leaves the screen), while its deletion is. That holds for
+     *    the store of the model's memory too, which hands the chunks between the native export
+     *    and the file; it takes its chunk size from the file and names none of its own (2.).
      */
     @Test
     fun aStreamIsSealedUnderTheKeysExclusionInChunksOfItsVersionAndBetweenDirectBuffers() {
         val all = sources(main)
         val format = code(File(module, "$main/security/SealedStream.kt"))
         val file = code(File(module, "$main/data/SealedStreamFile.kt"))
+        val store = code(File(module, "$main/data/MemoryStore.kt"))
 
         // 1.
         assertEquals(listOf("Envelope.kt"), users(all, "SealedStream.sealChunk("))
@@ -1065,7 +1068,7 @@ class SourceRulesTest {
         )
 
         // 3.
-        for ((name, lines) in listOf("SealedStream.kt" to format, "SealedStreamFile.kt" to file)) {
+        for ((name, lines) in listOf("SealedStream.kt" to format, "SealedStreamFile.kt" to file, "MemoryStore.kt" to store)) {
             for (word in listOf("ByteBuffer.wrap(", "ByteBuffer.allocate(", ".array()", "hasArray()")) {
                 assertTrue("$name: $word puts a chunk into an array of the heap, or takes it from one", lines.none { it.contains(word) })
             }
@@ -1080,6 +1083,9 @@ class SourceRulesTest {
             ),
             (format + file).filter { it.contains("allocate") },
         )
+        for (word in listOf(".force(", ".sync()", "syncExisting(", "writeAtomically(", "syncDirectory(")) {
+            assertTrue("$word would flush a stream that is being written", store.none { it.contains(word) })
+        }
         for (word in listOf(".force(", ".sync()", "syncExisting(", "writeAtomically(")) {
             assertTrue("$word would flush a stream that is being written", file.none { it.contains(word) })
         }

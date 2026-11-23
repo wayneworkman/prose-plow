@@ -43,6 +43,7 @@ import us.theworkmans.proseplow.data.CoalescingWriter
 import us.theworkmans.proseplow.data.SessionIndex
 import us.theworkmans.proseplow.data.SessionStore
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 /** The chat that is on screen. */
 sealed interface OpenChat {
@@ -242,6 +243,15 @@ class ChatController(
     /** Set while the session goes on behind the lock: the reply in flight may finish, nothing new begins. */
     private var finishingOnly = false
 
+    /**
+     * The chats whose next write removes or changes messages that were stored, so that their
+     * saved memory is to be deleted before that write ([keepsSavedMemory]). Added to on the main
+     * thread when the change is made, and taken by the write that carries it out, whichever write
+     * of the chat that turns out to be: a newer write takes the place of one that has not run
+     * yet ([CoalescingWriter]), and must not take the deletion away with it.
+     */
+    private val memoryToDrop: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     /** The index as it was last handed to the writer; null when what is on disk is known to be out of date. */
     private var writtenIndex: SessionIndex? = opened.index.takeUnless { opened.stale }
 
@@ -343,6 +353,7 @@ class ChatController(
         }
         val removed = sessions.remove(id)
         incomplete.remove(id)
+        // The store deletes the chat's saved memory first.
         writer.submit(sessionKey(id), urgent = true) { store.delete(id) }
         val replacement = if (_state.value.open.id == id) OpenChat.Ready(newSession(removed?.modelId)) else null
         _state.update { state ->
@@ -584,6 +595,10 @@ class ChatController(
      * Makes [updated] the state of its session: publishes it, lists it once it has content, and
      * hands it to the writer. Does nothing for a session that is no longer here (deleted while a
      * reply was still arriving for it).
+     *
+     * A change that removes or alters a message that was stored (an edit, an answer asked for
+     * again, a retry, an expiry; see [keepsSavedMemory]) has the chat's saved memory deleted
+     * before the chat is written, in the same write.
      */
     private fun commit(updated: ChatSession, urgent: Boolean) {
         val id = updated.id
@@ -600,7 +615,8 @@ class ChatController(
             )
         }
         if (stored) {
-            writer.submit(sessionKey(id), urgent) { store.save(updated) }
+            if (!keepsSavedMemory(current, updated)) memoryToDrop += id
+            writer.submit(sessionKey(id), urgent) { store.save(updated, dropMemoryFirst = memoryToDrop.remove(id)) }
             saveIndex(urgent = false)
         }
     }
@@ -905,6 +921,30 @@ class ChatController(
 
         /** The key of the session [id] in the [CoalescingWriter]. */
         fun sessionKey(id: String): String = "session:$id"
+
+        /**
+         * True when going from [before] to [after] leaves every message a saved memory of the
+         * chat can have been made from as it was: each message of [before] that is not being
+         * written stands at the same place in [after] with the same id, role and date, and with
+         * its text unchanged or only added to at its end (an answer that is continued). Messages
+         * may be added after them. Anything else (a message removed, its text changed, its date
+         * made usable) means that the saved memory may hold text that is gone, and it is deleted
+         * before the chat is written ([SessionStore.save]).
+         *
+         * The message being written is left out: its text changes with every piece of the reply,
+         * text is only ever taken back from what the same reply wrote, and no memory is saved
+         * while a reply is being written.
+         */
+        fun keepsSavedMemory(before: ChatSession, after: ChatSession): Boolean {
+            if (before.messages === after.messages) return true
+            for ((index, old) in before.messages.withIndex()) {
+                if (old.status == MessageStatus.STREAMING) continue
+                val new = after.messages.getOrNull(index) ?: return false
+                if (new.id != old.id || new.role != old.role || new.createdAtMillis != old.createdAtMillis) return false
+                if (!new.text.startsWith(old.text)) return false
+            }
+            return true
+        }
 
         /**
          * True when the chat's last message can be continued by its model: an answer with some

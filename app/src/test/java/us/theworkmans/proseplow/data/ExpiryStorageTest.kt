@@ -61,7 +61,7 @@ class ExpiryStorageTest {
     )
 
     private fun sweep(lifetime: MessageLifetime = MessageLifetime.SEVEN_DAYS, at: Long = now) =
-        ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex).sweep(lifetime.storedDays, at)
+        ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex, ModelMemoryFiles(layout.modelMemory, layout.sessions)).sweep(lifetime.storedDays, at)
 
     private fun file(id: String) = File(layout.sessions, "$id.enc")
 
