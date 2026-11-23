@@ -11,10 +11,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.SessionFixture
 import us.theworkmans.proseplow.core.model.ModelCatalog
+import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.data.ModelOverrides
 import us.theworkmans.proseplow.data.SettingsStore
 import us.theworkmans.proseplow.openSession
+import java.util.Locale
 
 /** The Settings screen's ViewModel over the real session: edits are saved as they are made. */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -111,6 +115,167 @@ class SettingsViewModelTest {
     }
 
     // --- Temperature: the text as typed, and what is stored of it ---
+
+    // --- The longest reply ---
+
+    private fun viewModelOver(session: AppSession) =
+        SettingsViewModel(session.settings, session.models, decimalSeparator = { '.' }, wholeNumber = { "%,d".format(Locale.ROOT, it) })
+
+    @Test
+    fun aLongestReplyIsStoredAsItIsTypedAndAnEntryThatIsNoneIsNotSaved() = runTest {
+        val app = SessionFixture(temp.root, testScheduler)
+        val session = app.open()
+        val viewModel = viewModelOver(session)
+        val model = ModelCatalog.QWEN35_0_8B
+        fun stored() = session.settings.settings.value.overrides(qwen).maxNewTokens
+        assertEquals("", viewModel.replyLength(qwen))
+        assertNull(stored())
+        assertEquals("the default is named", "1,024", viewModel.defaultReplyLength(model))
+        assertEquals("16" to "2,048", viewModel.replyLengthLimits(model))
+        assertEquals("16" to "1,024", viewModel.replyLengthLimits(ModelCatalog.BORIS_2_INSTRUCT))
+
+        // "300", one key at a time: "3" is below the least and is not saved, "30" and "300" are.
+        viewModel.onReplyLengthChange(qwen, "3")
+        assertEquals("the field keeps what was typed", "3", viewModel.replyLength(qwen))
+        assertTrue(viewModel.replyLengthInvalid(model))
+        assertNull("but nothing is stored for it", stored())
+        viewModel.onReplyLengthChange(qwen, "30")
+        assertFalse(viewModel.replyLengthInvalid(model))
+        assertEquals(30, stored())
+        viewModel.onReplyLengthChange(qwen, "300")
+        assertEquals(300, stored())
+
+        // One digit too many: the entry is marked and the last valid value stays in use.
+        viewModel.onReplyLengthChange(qwen, "3000")
+        assertTrue(viewModel.replyLengthInvalid(model))
+        assertEquals("3000", viewModel.replyLength(qwen))
+        assertEquals(300, stored())
+        assertEquals(300, session.settings.settings.value.maxNewTokens(model))
+        viewModel.onReplyLengthChange(qwen, "1,5")
+        assertTrue(viewModel.replyLengthInvalid(model))
+        assertEquals(300, stored())
+
+        // Emptied, by hand or by the button in the field: the model's own again.
+        viewModel.useDefaultReplyLength(qwen)
+        assertEquals("", viewModel.replyLength(qwen))
+        assertFalse(viewModel.replyLengthInvalid(model))
+        assertNull(stored())
+        assertEquals(1024, session.settings.settings.value.maxNewTokens(model))
+
+        // It is there after a lock, encrypted like the rest, and a new page shows it.
+        viewModel.onReplyLengthChange(qwen, "640")
+        session.close()
+        assertFalse(app.diskContains("maxNewTokens"))
+        val again = app.open()
+        assertEquals("640", viewModelOver(again).replyLength(qwen))
+        again.close()
+    }
+
+    @Test
+    fun theLongestReplyAppliesFromTheNextAnswer() = runTest {
+        val app = SessionFixture(temp.root, testScheduler)
+        val session = app.open()
+        runCurrent()
+        val viewModel = viewModelOver(session)
+        val id = session.openSession.id
+
+        app.engine.enqueueReply(listOf("Hi."))
+        session.chat.send(id, "Hello")
+        runCurrent()
+        assertEquals("the model's own until something is set", 1024, app.engine.requests.last().maxNewTokens)
+
+        viewModel.onReplyLengthChange(qwen, "200")
+        app.engine.enqueueReply(listOf("Hi again."))
+        session.chat.send(id, "Hello again")
+        runCurrent()
+        assertEquals(200, app.engine.requests.last().maxNewTokens)
+
+        // An entry that is not valid changes nothing about the answers.
+        viewModel.onReplyLengthChange(qwen, "20000")
+        app.engine.enqueueReply(listOf("Still here."))
+        session.chat.send(id, "And now?")
+        runCurrent()
+        assertEquals(200, app.engine.requests.last().maxNewTokens)
+        session.close()
+    }
+
+    @Test
+    fun restoringAModelsDefaultsEmptiesItsNumbersAndLeavesItsSystemPrompt() = runTest {
+        val app = SessionFixture(temp.root, testScheduler)
+        val session = app.open()
+        val viewModel = viewModelOver(session)
+        assertFalse("nothing to restore yet", viewModel.hasOwnValues(qwen))
+
+        viewModel.onSystemPromptChange(qwen, "Be brief.")
+        assertFalse("a system prompt is not a value with a default", viewModel.hasOwnValues(qwen))
+        viewModel.onTemperatureChange(qwen, "1.2")
+        viewModel.onReplyLengthChange(qwen, "99999") // Not valid: only the text is there.
+        viewModel.onTemperatureChange(peacebell, "0.3")
+        assertTrue(viewModel.hasOwnValues(qwen))
+
+        viewModel.restoreDefaults(qwen)
+
+        assertEquals("", viewModel.temperature(qwen))
+        assertEquals("", viewModel.replyLength(qwen))
+        assertFalse(viewModel.hasOwnValues(qwen))
+        val stored = session.settings.settings.value
+        assertEquals(ModelOverrides(), stored.overrides(qwen))
+        assertEquals("the system prompt stays", "Be brief.", stored.systemPrompt(qwen))
+        assertEquals("and so does every other model", 0.3f, stored.overrides(peacebell).temperature)
+        session.close()
+    }
+
+    @Test
+    fun theRowOfAModelSaysTheValuesItsNextAnswerWouldHave() = runTest {
+        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled + ModelCatalog.SHARD_2 }
+        val session = app.open()
+        val list = viewModelOver(session) // The Settings page.
+        val page = viewModelOver(session) // A model's page, with a ViewModel of its own over the same store.
+        val model = ModelCatalog.QWEN35_0_8B
+        fun row(of: ModelSpec = model) = list.summary(of, list.stored.value)
+
+        val own = row()
+        assertEquals("1,024", own.replyTokens)
+        assertEquals(TemperatureInput.format(model.sampling.temperature.coerceAtLeast(0f), '.'), own.temperature)
+        assertEquals(SettingsViewModel.SystemPromptState.NONE, own.systemPrompt)
+
+        page.onTemperatureChange(qwen, "0.7")
+        page.onReplyLengthChange(qwen, "512")
+        page.onSystemPromptChange(qwen, "Be brief.")
+        assertEquals("what the model's page changed is what the row says", SettingsViewModel.ModelSummary("0.7", "512", SettingsViewModel.SystemPromptState.SET), row())
+
+        // An entry that was not saved is not what the row says.
+        page.onReplyLengthChange(qwen, "5")
+        assertEquals("512", row().replyTokens)
+        page.onSystemPromptChange(qwen, "")
+        assertEquals(SettingsViewModel.SystemPromptState.NONE, row().systemPrompt)
+
+        // Models that take no system prompt say nothing about one.
+        assertEquals(SettingsViewModel.SystemPromptState.NOT_POSSIBLE, row(ModelCatalog.PEACEBELL_V1_291M).systemPrompt)
+        assertEquals(SettingsViewModel.SystemPromptState.NOT_POSSIBLE, row(ModelCatalog.SHARD_2).systemPrompt)
+        assertEquals("200", row(ModelCatalog.SHARD_2).replyTokens)
+        assertEquals("512", row(ModelCatalog.BORIS_2_INSTRUCT).replyTokens)
+        session.close()
+    }
+
+    @Test
+    fun aStoredLongestReplyTheModelDoesNotAcceptIsNeitherUsedNorShown() = runTest {
+        val app = SessionFixture(temp.root, testScheduler)
+        var session = app.open()
+        // As a build with a larger context for Boris-2 could have stored it.
+        session.settings.update(urgent = true) { it.withMaxNewTokens(ModelCatalog.BORIS_2_INSTRUCT.id, 2000).withMaxNewTokens(qwen, 2000) }
+        session.close()
+
+        session = app.open()
+        val viewModel = viewModelOver(session)
+        assertEquals("", viewModel.replyLength(ModelCatalog.BORIS_2_INSTRUCT.id))
+        assertFalse(viewModel.replyLengthInvalid(ModelCatalog.BORIS_2_INSTRUCT))
+        assertEquals("512", viewModel.summary(ModelCatalog.BORIS_2_INSTRUCT, viewModel.stored.value).replyTokens)
+        assertEquals("the model that accepts it shows it", "2000", viewModel.replyLength(qwen))
+        session.close()
+    }
+
+    // --- The temperature ---
 
     @Test
     fun aTemperatureIsStoredAsItIsTypedAndTheFieldKeepsTheText() = runTest {

@@ -258,7 +258,15 @@
 
     <!-- Settings: each model's own settings -->
     <string name="section_models">Models</string>
-    <string name="models_support">Each model has its own settings. Changes are saved as you type and apply from the next answer.</string>
+    <string name="models_support">Each model has its own settings. Tap a model to see and change them.</string>
+    <string name="model_settings_open">open its settings</string>
+    <string name="model_summary_prompt_set">Temperature %1$s · replies up to %2$s tokens · system prompt set</string>
+    <string name="model_summary_prompt_none">Temperature %1$s · replies up to %2$s tokens · no system prompt</string>
+    <string name="model_summary_no_prompt_possible">Temperature %1$s · replies up to %2$s tokens</string>
+    <string name="model_settings_support">Changes are saved as you type and apply from the next answer.</string>
+    <string name="model_card">Model card</string>
+    <string name="model_card_address">%1$s · opens in your browser</string>
+    <string name="model_card_open">open it in your browser</string>
     <string name="invalid_not_saved">Not saved until valid.</string>
     <string name="system_prompt_label">System prompt</string>
     <string name="system_prompt_support">Given to the model at the start of every conversation, before your first message.</string>
@@ -270,6 +278,13 @@
     <string name="temperature_support_greedy">0 always picks the most likely word; higher values make answers more varied. Default for this model: %1$s, so any value above 0 turns on sampling.</string>
     <string name="temperature_invalid">Enter a number from 0 to 2.</string>
     <string name="temperature_use_default">Use the model\'s default temperature</string>
+    <string name="reply_length_label">Longest reply</string>
+    <string name="reply_length_support">The most tokens one answer may have before it stops with \"%1$s\"; %2$s carries on from there. A token is about three quarters of a word. A longer limit leaves less room for the earlier conversation. Default for this model: %3$s; at most %4$s.</string>
+    <string name="reply_length_invalid">Enter a whole number from %1$s to %2$s.</string>
+    <string name="reply_length_use_default">Use the model\'s default longest reply</string>
+    <string name="model_restore_defaults">Restore this model\'s defaults</string>
+    <string name="model_restore_defaults_support">Sets the temperature and the longest reply back to this model\'s own values. The system prompt stays as it is.</string>
+    <string name="model_restore_defaults_support_no_prompt">Sets the temperature and the longest reply back to this model\'s own values.</string>
 
     <!-- Settings: about -->
     <string name="section_about">About</string>
@@ -278,7 +293,6 @@
     <string name="about_summary">Runs language models on this phone. Chats are stored encrypted on the device and are never sent anywhere.</string>
     <string name="about_models">Models in this build</string>
     <string name="about_no_models">This build contains no model.</string>
-    <string name="about_model_source">Source: huggingface.co/%1$s</string>
     <string name="about_model_licence">Licence: %1$s</string>
     <string name="about_licence_not_stated">not stated yet</string>
     <string name="about_third_party">Open-source software and models</string>

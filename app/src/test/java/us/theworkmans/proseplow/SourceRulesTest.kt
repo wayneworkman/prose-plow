@@ -753,6 +753,101 @@ class SourceRulesTest {
     }
 
     /**
+     * The longest reply of a model has one definition of its limits, in the core, which the
+     * engine itself goes by; the app has no number of its own for them. And it reaches the
+     * engine through one place, the place every kind of request goes through, read from the
+     * settings at that moment.
+     */
+    @Test
+    fun theLongestReplyHasOneDefinitionAndOneWayToTheEngine() {
+        val core = File(module.parentFile, "core/src/main/kotlin/us/theworkmans/proseplow/core")
+        val engine = code(File(core, "engine/LlamaEngine.kt"))
+        assertTrue(engine.contains("reserve = minOf(requestedNewTokens, ReplyLength.maxTokens(contextSize)),"))
+        assertTrue(engine.contains("val minReplyTokens: Int = ReplyLength.MIN_TOKENS,"))
+        val limits = code(File(core, "model/ReplyLength.kt"))
+        assertTrue(limits.contains("const val MIN_TOKENS: Int = 16"))
+        assertTrue(limits.contains("fun maxTokens(contextTokens: Int): Int = contextTokens / 2"))
+
+        val all = sources(main)
+        for (word in listOf("contextLength / 2", "contextSize / 2", "contextLength/2", "defaultMaxNewTokens * 2")) {
+            assertEquals("$word is a limit of the app's own", emptyList<String>(), users(all, word))
+        }
+        assertEquals("the least is only ever named, not written out", listOf("SettingsStore.kt"), users(all, "ReplyLength.MIN_TOKENS"))
+
+        val controller = code(File(module, "$main/chat/ChatController.kt"))
+        assertEquals(
+            "every reply is asked for in one place, with the model's settings as they are then",
+            listOf("val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens)"),
+            controller.filter { it.contains("generationRequest(") },
+        )
+        assertEquals(listOf("ChatController.kt"), users(all, ".generationRequest("))
+        assertEquals(
+            listOf("ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model), current.maxNewTokens(model))"),
+            code(File(module, "$main/AppSession.kt")).filter { it.contains("ModelRequestSettings(") },
+        )
+    }
+
+    /**
+     * Settings is a short page of rows, and each model has a page of its own. The headings are
+     * headings to a screen reader, a model's row is one button that says what it opens, and the
+     * note about the length limit in the settings is the very string the chat shows.
+     */
+    @Test
+    fun theSettingsPagesSayWhatTheyAreToAScreenReader() {
+        val heading = code(File(module, "$main/ui/Notices.kt")).joinToString("\n").substringAfter("fun SectionTitle(").substringBefore("\n}")
+        assertTrue("a section title must be a heading", heading.contains("semantics { heading() }"))
+        val settings = code(File(module, "$main/settings/SettingsScreen.kt"))
+        val page = code(File(module, "$main/settings/ModelSettingsScreen.kt"))
+        assertTrue(settings.contains("title = { Text(stringResource(R.string.settings), modifier = Modifier.semantics { heading() }) },"))
+        assertTrue(page.contains("title = { Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.semantics { heading() }) },"))
+        assertTrue(settings.contains(".clickable(onClickLabel = stringResource(R.string.model_settings_open), role = Role.Button, onClick = onOpen)"))
+        assertTrue("the fields of a model are on its page, not in Settings", settings.none { it.contains("TextField(") })
+        assertEquals(3, page.count { it.contains("OutlinedTextField(") })
+
+        val support = page.joinToString("\n").substringAfter("R.string.reply_length_support,").substringBefore(")\n)")
+        assertEquals(
+            listOf("stringResource(R.string.note_length),", "stringResource(R.string.continue_reply),", "default,", "most,"),
+            support.lines().map { it.trim() }.filter { it.isNotEmpty() }.take(4),
+        )
+        val strings = File(module, "src/main/res/values/strings.xml").readText()
+        val text = Regex("""<string name="reply_length_support">([^<]*)</string>""").find(strings)!!.groupValues[1]
+        for (placeholder in listOf("%1\$s", "%2\$s", "%3\$s", "%4\$s")) assertTrue(placeholder, text.contains(placeholder))
+        assertTrue("the limit note is not written out a second time", !text.contains("Reached the length limit"))
+    }
+
+    /**
+     * The app hands an address to another app in two places only: a link in an answer, after its
+     * confirmation, and a model's card, whose address comes from the one place in the core that
+     * builds it and is shown on the row that opens it. Both go through the same opener, which is
+     * the only code that starts another app. There is no browser inside the app: no web view,
+     * no browser library, and nothing in the manifest that asks which apps are installed.
+     */
+    @Test
+    fun aModelsCardOpensInThePhonesBrowserAndNothingIsLoadedInTheApp() {
+        val all = sources(main)
+        assertEquals(listOf("ChatScreen.kt", "ModelCardLink.kt"), users(all, "Links.open("))
+        assertEquals("only the opener starts another app", listOf("Links.kt"), users(all, "ACTION_VIEW"))
+        val row = code(File(module, "$main/settings/ModelCardLink.kt"))
+        assertTrue(row.contains("val address = ModelCard.address(model) ?: return"))
+        assertTrue(row.contains("val url = ModelCard.url(model) ?: return"))
+        assertTrue("what is opened is what the core built, and a failure is said", row.contains("if (!Links.open(context, url)) AppToasts.show(context, noApp)"))
+        assertTrue("the address is shown on the row", row.contains("stringResource(R.string.model_card_address, address),"))
+        assertEquals("the address is built in the core and nowhere in the app", emptyList<String>(), users(all, "huggingface.co"))
+        assertEquals(listOf("AboutScreen.kt", "ModelCardLink.kt", "ModelSettingsScreen.kt"), users(all, "ModelCardLink("))
+
+        for (word in listOf("WebView", "CustomTabs", "androidx.browser", "android.webkit")) {
+            assertEquals("$word would be a browser inside the app", emptyList<String>(), users(all, word))
+        }
+        val build = File(module, "build.gradle.kts").readText()
+        assertTrue(!build.contains("browser") && !build.contains("webkit"))
+        val manifest = File(module, "src/main/AndroidManifest.xml").readText().replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
+        assertTrue("opening an address needs no list of other apps", !manifest.contains("<queries"))
+
+        val strings = File(module, "src/main/res/values/strings.xml").readText()
+        assertTrue(strings.contains("<string name=\"model_card_address\">%1\$s \u00B7 opens in your browser</string>"))
+    }
+
+    /**
      * A destroyed data key must never be picked up for a new wrap (a passphrase change, a
      * fingerprint enrolment). The lock therefore drops its reference to the session before it
      * hands the session on to be closed, where the key is destroyed; the data key itself refuses

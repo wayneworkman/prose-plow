@@ -121,6 +121,75 @@ class SettingsStoreTest {
         assertTrue(text.contains("qwen3.5-0.8b"))
     }
 
+    // --- The stored form: the longest reply per model ---
+
+    @Test
+    fun aLongestReplyIsStoredBesideTheTemperatureAndOnlyWhenItIsSet() {
+        val qwen = ModelCatalog.QWEN35_0_8B
+        val fresh = AppSettings()
+        assertEquals("the model's own", 1024, fresh.maxNewTokens(qwen))
+        assertFalse(SettingsCodec.encode(fresh).contains("maxNewTokens"))
+
+        val set = fresh.withMaxNewTokens(qwen.id, 300).withTemperature(qwen.id, 0.5f)
+        assertEquals(300, set.maxNewTokens(qwen))
+        assertEquals(ModelOverrides(temperature = 0.5f, maxNewTokens = 300), set.overrides(qwen.id))
+        val encoded = SettingsCodec.encode(set)
+        assertTrue(encoded, encoded.contains("\"maxNewTokens\":300"))
+        val decoded = SettingsCodec.decode(encoded) as SettingsCodec.Decoded.Readable
+        assertTrue(decoded.complete)
+        assertEquals(set, decoded.settings)
+        assertEquals("the schema version did not change for it", 1, decoded.schemaVersion)
+
+        // Back to the model's own: nothing is left to store for it, and a model with nothing set has no entry.
+        val reset = set.withMaxNewTokens(qwen.id, null)
+        assertEquals(ModelOverrides(temperature = 0.5f), reset.overrides(qwen.id))
+        assertEquals(1024, reset.maxNewTokens(qwen))
+        assertEquals(emptyMap<String, ModelOverrides>(), reset.withTemperature(qwen.id, null).modelOverrides)
+        assertEquals("another model is not touched", 512, set.maxNewTokens(ModelCatalog.BORIS_2_INSTRUCT))
+    }
+
+    /**
+     * Read tolerantly, and never moved to the nearest limit: a value that is missing, not a whole
+     * number, or outside what the model accepts means the model's own longest reply.
+     */
+    @Test
+    fun aStoredLongestReplyThatCannotBeUsedMeansTheModelsOwn() {
+        val qwen = ModelCatalog.QWEN35_0_8B
+        val boris = ModelCatalog.BORIS_2_INSTRUCT
+        fun stored(value: String) = SettingsCodec.decode(
+            """{"schemaVersion":1,"settings":{"models":{"${qwen.id}":{"temperature":0.5,"maxNewTokens":$value},"${boris.id}":{"maxNewTokens":$value}}}}""",
+        ) as SettingsCodec.Decoded.Readable
+
+        // A whole number both models accept.
+        val good = stored("700")
+        assertTrue(good.complete)
+        assertEquals(700, good.settings.maxNewTokens(qwen))
+        assertEquals(700, good.settings.maxNewTokens(boris))
+
+        // Not a whole number, or shorter than any model's shortest reply: left out and counted, for both models.
+        for (bad in listOf("512.5", "\"512\"", "true", "null", "[512]", "5e2", "15", "0", "-512", "99999999999")) {
+            val read = stored(bad)
+            assertEquals(bad, 2, read.skippedEntries)
+            assertEquals(bad, 1024, read.settings.maxNewTokens(qwen))
+            assertEquals(bad, 512, read.settings.maxNewTokens(boris))
+            assertEquals("$bad: what else was set for the model is kept", 0.5f, read.settings.overrides(qwen.id).temperature)
+        }
+
+        // A whole number that only the model with the larger context accepts: the other uses its
+        // own, not its largest. The file itself is as the app could have written it.
+        val large = stored("2000")
+        assertTrue(large.complete)
+        assertEquals(2000, large.settings.maxNewTokens(qwen))
+        assertEquals("not clamped to 1,024", 512, large.settings.maxNewTokens(boris))
+        val huge = stored("100000")
+        assertEquals(1024, huge.settings.maxNewTokens(qwen))
+        assertEquals(512, huge.settings.maxNewTokens(boris))
+
+        // And the value itself cannot be made with a length no model could have.
+        assertThrows(IllegalArgumentException::class.java) { ModelOverrides(maxNewTokens = 15) }
+        assertThrows(IllegalArgumentException::class.java) { AppSettings().withMaxNewTokens(qwen.id, 0) }
+    }
+
     // --- The stored form: whether the notification permission was asked for ---
 
     @Test

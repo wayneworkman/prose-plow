@@ -303,4 +303,34 @@ class ThirdPartyNoticesTextTest {
             centred,
         )
     }
+
+    /**
+     * Every heading stands apart in the same way: under a line. Where the text itself has none
+     * above a heading (a licence's heading straight under the entry before it), the screen is
+     * told to draw one. Only headings are ever given one, and the blocks stay as they were.
+     */
+    @Test
+    fun everyHeadingHasALineAboveItTheTextsOwnOrTheScreens() {
+        val blocks = ThirdPartyNoticesText.blocks(shipped)
+        val before = blocks.toList()
+        val headings = blocks.indices.filter { blocks[it] is NoticesBlock.Heading }
+        assertTrue(headings.size > 3)
+
+        val drawn = blocks.indices.filter { ThirdPartyNoticesText.headingLacksRuleAbove(blocks, it) }
+        assertTrue("only headings", drawn.all { it in headings })
+        for (index in headings) {
+            val ruledInTheText = index == 0 || blocks[index - 1] == NoticesBlock.Rule
+            assertEquals((blocks[index] as NoticesBlock.Heading).text, !ruledInTheText, index in drawn)
+        }
+        assertTrue("the shipped text has both kinds", drawn.isNotEmpty() && drawn.size < headings.size)
+        assertTrue(
+            "the one that was seen on the phone is among them",
+            drawn.any { (blocks[it] as NoticesBlock.Heading).text.contains("MIT LICENSE") },
+        )
+        assertEquals("nothing of the text is touched by asking", before, blocks)
+
+        // A heading at the very top needs nothing above it.
+        val top = listOf(NoticesBlock.Heading("At the top"), NoticesBlock.Paragraph("Text", indent = 0, centred = false, separated = false), NoticesBlock.Heading("Under text"))
+        assertEquals(listOf(false, false, true), top.indices.map { ThirdPartyNoticesText.headingLacksRuleAbove(top, it) })
+    }
 }

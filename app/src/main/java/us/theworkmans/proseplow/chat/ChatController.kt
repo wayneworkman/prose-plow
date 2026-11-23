@@ -111,8 +111,10 @@ data class ChatState(
  *   with what the user set for this model in their place. It is always passed to the engine in
  *   full, so that what a reply was generated with never depends on a second place that knows
  *   the defaults.
+ * @property maxNewTokens the longest the reply may get, in tokens: what the user set for this
+ *   model, or the model's own. Passed in full for the same reason.
  */
-data class ModelRequestSettings(val systemPrompt: String?, val sampling: SamplingParams)
+data class ModelRequestSettings(val systemPrompt: String?, val sampling: SamplingParams, val maxNewTokens: Int)
 
 /** Things that happened and are said once. */
 enum class ChatNotice {
@@ -636,7 +638,7 @@ class ChatController(
             }
             // Read again: the draft may have changed while the model was loading.
             val settings = requestSettings(spec)
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling)
+            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens)
             engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
         } catch (e: CancellationException) {
             throw e

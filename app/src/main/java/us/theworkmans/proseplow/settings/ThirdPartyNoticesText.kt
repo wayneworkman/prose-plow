@@ -63,6 +63,16 @@ object ThirdPartyNoticesText {
     /** The beginning of a list entry: a bullet, a dash, `(a)`, `1.` or `1)`, then a blank. */
     private val listEntry = Regex("""^(\*|-|\(\w{1,3}\)|\d{1,2}[.)])\s""")
 
+    /**
+     * True when the block at [index] of [blocks] is a heading that the text did not rule off
+     * from what stands above it: a heading in the middle of the list, straight under the last
+     * line of the entry before it. The headings at the top of the text have a line above them;
+     * the screen gives these the same line and space, so that every heading looks alike. That
+     * is a matter of how the blocks are drawn: the blocks, and so the text, stay as they are.
+     */
+    fun headingLacksRuleAbove(blocks: List<NoticesBlock>, index: Int): Boolean =
+        blocks[index] is NoticesBlock.Heading && index > 0 && blocks[index - 1] != NoticesBlock.Rule
+
     /** The blocks of [text], in its order. */
     fun blocks(text: String): List<NoticesBlock> {
         val lines = text.replace("\r\n", "\n").split('\n').map { it.trimEnd() }

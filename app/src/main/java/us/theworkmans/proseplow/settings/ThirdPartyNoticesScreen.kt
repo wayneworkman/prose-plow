@@ -1,13 +1,14 @@
 package us.theworkmans.proseplow.settings
 
 import android.content.res.Resources
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -89,25 +90,36 @@ fun ThirdPartyNoticesScreen(viewModel: ThirdPartyNoticesViewModel, onBack: () ->
                 LazyColumn(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) {
                     // The three kinds of block are laid out differently; saying which is which lets the
                     // list reuse a paragraph's layout for the next paragraph while it scrolls.
-                    items(current.blocks, contentType = { block -> block::class }) { block -> NoticesBlockRow(block) }
+                    itemsIndexed(current.blocks, contentType = { _, block -> block::class }) { index, block ->
+                        NoticesBlockRow(block, ruleAbove = ThirdPartyNoticesText.headingLacksRuleAbove(current.blocks, index))
+                    }
                 }
             }
         }
     }
 }
 
-/** One block of the notices: a dividing line, a heading, or a paragraph set in as the text had it. */
+/**
+ * One block of the notices: a dividing line, a heading, or a paragraph set in as the text had it.
+ *
+ * @param ruleAbove for a heading that the text did not rule off from the entry above it: the
+ *   same line, with the same space, that the text's own rules are drawn with, so that every
+ *   heading stands apart alike. It adds no word and moves none.
+ */
 @Composable
-private fun NoticesBlockRow(block: NoticesBlock) {
+private fun NoticesBlockRow(block: NoticesBlock, ruleAbove: Boolean) {
     when (block) {
-        NoticesBlock.Rule -> HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-        is NoticesBlock.Heading -> Text(
-            block.text,
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.primary,
-            // A screen reader can then go from one licence or one part to the next.
-            modifier = Modifier.fillMaxWidth().semantics { heading() },
-        )
+        NoticesBlock.Rule -> NoticesRule()
+        is NoticesBlock.Heading -> Column(modifier = Modifier.fillMaxWidth()) {
+            if (ruleAbove) NoticesRule()
+            Text(
+                block.text,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary,
+                // A screen reader can then go from one licence or one part to the next.
+                modifier = Modifier.fillMaxWidth().semantics { heading() },
+            )
+        }
         is NoticesBlock.Paragraph -> Text(
             block.text,
             style = MaterialTheme.typography.bodySmall,
@@ -120,4 +132,10 @@ private fun NoticesBlockRow(block: NoticesBlock) {
                 ),
         )
     }
+}
+
+/** The dividing line of the notices, with the space it keeps above and below. */
+@Composable
+private fun NoticesRule() {
+    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 }

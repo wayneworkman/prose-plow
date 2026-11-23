@@ -5,7 +5,7 @@ Prose Plow runs small language models entirely on the phone. The models are pack
 * A model for each chat, which can be switched in the middle of the chat. Every answer is labelled with the model that wrote it.
 * A reply can be stopped while it is being written, asked for again, or continued after it was stopped or reached its length limit.
 * One of your own earlier messages can be edited, which removes everything after it and has the model answer the new text.
-* In Settings, a temperature from 0 to 2 for each model, and a system prompt for each model that was trained with one.
+* In Settings, a page for each model: a temperature from 0 to 2, the longest reply, and a system prompt for each model that was trained with one.
 * Answers are shown as Markdown, with a copy button on every message. Images are never loaded, and a link is handed to another app only after you have confirmed it.
 
 <b>Privacy</b>

@@ -52,11 +52,22 @@ Chats:
   stopped or reached its length limit can be continued by the model that wrote it. One of your
   own earlier messages can be edited, which removes everything after it and has the model answer
   the new text. A request that failed can be tried again.
-- **A system prompt for each model**, in Settings, for the models that were trained with one
+- **A page of settings for each model.** Settings lists the models, each with its current
+  values on one line; tapping a model opens its own page, which can also put the model's own
+  values back.
+- **A link to each model's card.** A model's page, and the About screen, show the address of
+  the model's page on Hugging Face (`huggingface.co/<owner>/<name>`) and open it in the phone's
+  own browser at a tap. The app has no browser of its own and loads nothing itself.
+- **A system prompt for each model**, on its page, for the models that were trained with one
   (Qwen3.5 and Boris-2; Peacebell was trained without one and has none).
-- **A temperature for each model**, in Settings, from 0 to 2. Left empty, a model uses its own
-  reference value; 0 always picks the most likely word. It applies from the next answer and
-  switches with the model.
+- **A temperature for each model**, from 0 to 2. Left empty, a model uses its own reference
+  value; 0 always picks the most likely word. It applies from the next answer and switches
+  with the model.
+- **A longest reply for each model**, in tokens (a token is about three quarters of a word).
+  An answer that reaches it stops with "Reached the length limit" and can be continued. Left
+  empty, a model uses its own value from the table below; it can be set from 16 tokens to
+  half of the model's context, because the room for a reply is taken from the room for the
+  earlier conversation.
 - **Answers as Markdown**, with selectable text, a copy button on every message and on every
   block of code. Images are never loaded: the app shows their alternative text. A link is shown
   in full and is handed to another app only after you have confirmed it.
@@ -142,12 +153,15 @@ with the SHA-256 the converted file must have.
 | What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts |
 | Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project |
 | Context on the phone, tokens | 4,096 | 4,096 | 2,048 |
-| Longest reply, tokens | 1,024 | 1,024 | 512 |
+| Longest reply, tokens: the default, and the most it can be set to | 1,024; 2,048 | 1,024; 2,048 | 512; 1,024 |
 | Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 |
 | System prompt | yes | no | yes |
 
 The sampling values are each model's own reference settings, taken from its published files.
-The temperature can be changed for each model in Settings; the other values are fixed.
+The temperature and the longest reply can be changed for each model in Settings; the other
+values are fixed. The most a reply can be set to is half of the context: that is as much room
+as the engine keeps free for a reply while it leaves older messages out, so a longer limit
+could not be kept.
 The Qwen3.5 file leaves out the vision tower and the multi-token-prediction head of the
 checkpoint: the app is text only.
 
@@ -507,7 +521,11 @@ it or losing the phone loses the chats.
 - **An old data key.** Changing the passphrase wraps the same data key again; it does not
   encrypt the chats anew. Only a reset replaces the data key.
 - **What another app does with a link.** A link you choose to open is handed to another app,
-  which uses the network.
+  which uses the network: a link in an answer, after you have seen its address in full and
+  confirmed it; and a model's card on Hugging Face, whose address is the app's own, fixed in
+  the build and shown on the row that opens it, which therefore opens at a tap. In both cases
+  the app only passes the address to Android; it opens no connection itself, has no in-app
+  browser, and still has no network permission.
 - **The sources of the build.** The llama.cpp commit, the Gradle distribution and the model
   files are pinned by hash. Maven and Python packages are pinned by version only, and the
   Android SDK packages by name.
@@ -1100,8 +1118,8 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 336 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 523 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 344 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 541 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (29 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

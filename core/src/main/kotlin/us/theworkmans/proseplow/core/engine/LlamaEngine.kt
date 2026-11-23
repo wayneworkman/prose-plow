@@ -21,6 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReplyLength
 import us.theworkmans.proseplow.core.prompt.PromptFormatException
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptRole
@@ -165,7 +166,7 @@ class LlamaEngine(
     data class Settings(
         val maxCheckpoints: Int = 4,
         val evaluationChunk: Int = 32,
-        val minReplyTokens: Int = 16,
+        val minReplyTokens: Int = ReplyLength.MIN_TOKENS,
     ) {
         init {
             require(maxCheckpoints >= 0) { "maxCheckpoints must not be negative" }
@@ -449,7 +450,7 @@ class LlamaEngine(
                 messageCount = messages.size,
                 starts = starts,
                 contextSize = contextSize,
-                reserve = minOf(requestedNewTokens, contextSize / 2),
+                reserve = minOf(requestedNewTokens, ReplyLength.maxTokens(contextSize)),
                 minimum = minOf(requestedNewTokens, settings.minReplyTokens),
             ) { start ->
                 val input = PromptInput(

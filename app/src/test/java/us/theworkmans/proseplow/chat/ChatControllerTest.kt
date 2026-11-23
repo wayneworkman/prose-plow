@@ -71,6 +71,72 @@ class ChatControllerTest {
 
     private suspend fun AppSession.nextNotice(): ChatNotice? = withTimeoutOrNull(1) { chat.notices.first() }
 
+    /**
+     * The longest reply set for a model goes with every request to that model, whichever way the
+     * reply was asked for: a new message, the same question again, an edited message, and a
+     * reply that is continued. It is read when the reply is about to be written, so a change
+     * applies from the next answer; and a chat that switches models gets the other model's.
+     */
+    @Test
+    fun everyKindOfRequestIsMadeWithTheLongestReplySetForItsModel() = runTest {
+        val session = unlocked()
+        val id = session.id
+        fun asked() = app.engine.requests.last().maxNewTokens
+        fun limit(tokens: Int?) = session.settings.update(urgent = true) { it.withMaxNewTokens(qwen, tokens) }
+
+        // Nothing set: the model's own, said in full and not left to the engine.
+        exchange(session, "First question", "First answer")
+        assertEquals(ModelCatalog.QWEN35_0_8B.defaultMaxNewTokens, asked())
+
+        // A new message.
+        limit(300)
+        exchange(session, "Second question", "Second answer")
+        assertEquals(300, asked())
+
+        // The same question again.
+        limit(310)
+        val answer = session.openSession.messages.last()
+        app.engine.enqueueReply(listOf("Another answer"))
+        assertTrue(session.chat.regenerate(id, answer.id))
+        runCurrent()
+        assertEquals(310, asked())
+
+        // An edited message.
+        limit(320)
+        val question = session.openSession.messages.last { it.role == Role.USER }
+        app.engine.enqueueReply(listOf("An answer to the edited question"))
+        assertTrue(session.chat.edit(id, question.id, "Second question, edited"))
+        runCurrent()
+        assertEquals(320, asked())
+
+        // A reply that reached its limit and is continued.
+        limit(330)
+        app.engine.enqueueReply(listOf("Cut off at the"), finishReason = FinishReason.LENGTH)
+        assertTrue(session.chat.send(id, "Third question"))
+        runCurrent()
+        assertEquals(330, asked())
+        limit(340)
+        app.engine.enqueueReply(listOf(" limit, and carried on."))
+        assertTrue(session.chat.continueReply(id, session.openSession.messages.last().id))
+        runCurrent()
+        assertEquals(340, asked())
+        assertEquals(6, app.engine.requests.size)
+
+        // Back to the model's own.
+        limit(null)
+        exchange(session, "Fourth question", "Fourth answer")
+        assertEquals(1024, asked())
+
+        // Another model has its own limit: what is set for one is not used for the other.
+        limit(340)
+        session.chat.selectModel(id, boris)
+        runCurrent()
+        exchange(session, "A question for another model", "Its answer")
+        assertEquals(boris, app.engine.requests.last().modelId)
+        assertEquals(ModelCatalog.BORIS_2_INSTRUCT.defaultMaxNewTokens, asked())
+        session.close()
+    }
+
     // --- Starting ------------------------------------------------------------------------------
 
     @Test

@@ -8,6 +8,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.engine.FakeNativeLlama.Call
 import us.theworkmans.proseplow.core.model.ModelFamily
+import us.theworkmans.proseplow.core.model.ReplyLength
+import us.theworkmans.proseplow.core.model.replyLengthRange
 import us.theworkmans.proseplow.core.prompt.PlainChatMlFormat
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptMessage
@@ -86,6 +88,31 @@ class LlamaEngineBudgetTest {
         val kept = conversation.size - events.done().stats.droppedMessages
         assertTrue("some history survives", kept > 1)
         assertTrue(events.done().stats.promptTokens <= 300)
+    }
+
+    /**
+     * The longest reply a user can ask for is half of the context ([ReplyLength]). The engine
+     * keeps exactly that much free, so the conversation still has the other half: the latest
+     * question is sent, with as much before it as fits, and the reply can really become as long
+     * as its limit instead of running into the end of the context.
+     */
+    @Test
+    fun `a reply limit at the model's maximum leaves a workable prompt and can be reached`() = runTest {
+        val model = testModel(contextLength = 600)
+        val limit = model.replyLengthRange.last
+        assertEquals(300, limit)
+        val test = loadedEngine(model)
+        test.fake.enqueueReply("y".repeat(1_000))
+
+        val events = test.engine.generate(request(*conversation.toTypedArray(), systemPrompt = system, maxNewTokens = limit)).toList()
+
+        val done = events.done()
+        assertTrue("the latest question is sent", test.fake.memoryText.contains("The latest question, which must always be sent."))
+        assertTrue("with the system prompt", test.fake.memoryText.contains(system))
+        assertTrue("in the half that is the conversation's: ${done.stats.promptTokens}", done.stats.promptTokens in 1..(600 - limit))
+        assertEquals("the reply ends at its limit, not at the end of the context", FinishReason.LENGTH, done.finishReason)
+        assertEquals(limit, done.stats.generatedTokens)
+        assertTrue(test.fake.memory.size <= 600)
     }
 
     @Test

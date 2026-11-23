@@ -79,11 +79,8 @@ fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit, onOpenNotices: () -
                     Column {
                         Text(modelName(model.id), style = MaterialTheme.typography.bodyLarge)
                         modelDescription(model.id)?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
-                        Text(
-                            stringResource(R.string.about_model_source, model.sourceRepository),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        // Where the model comes from, as on the model's own page: its card, which a tap opens in the browser.
+                        ModelCardLink(model)
                         Text(
                             stringResource(R.string.about_model_licence, model.licence ?: stringResource(R.string.about_licence_not_stated)),
                             style = MaterialTheme.typography.bodySmall,

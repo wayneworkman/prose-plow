@@ -6,6 +6,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import us.theworkmans.proseplow.core.model.ModelCard
+import us.theworkmans.proseplow.core.model.ModelCatalog
 
 /**
  * Which links from a model's answer may be handed to another app: web addresses and mail, and
@@ -37,6 +39,15 @@ class LinksTest {
         )
         for (link in refused) assertFalse(link, Links.open(context, link))
         assertEquals("nothing was handed to another app", 0, context.started)
+    }
+
+    @Test
+    fun everyModelsCardIsAnAddressTheOpenerHandsOn() {
+        for (model in ModelCatalog.all) {
+            val url = checkNotNull(ModelCard.url(model))
+            assertTrue(url, url.startsWith("https://huggingface.co/"))
+            assertTrue(url, Links.canOpen(url))
+        }
     }
 
     @Test

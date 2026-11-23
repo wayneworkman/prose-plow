@@ -13,6 +13,8 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.core.model.ReplyLength
+import us.theworkmans.proseplow.core.model.acceptsReplyLength
 import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import java.io.IOException
@@ -28,14 +30,18 @@ import java.io.IOException
  *
  * @property temperature the sampling temperature, from [MIN_TEMPERATURE] to [MAX_TEMPERATURE].
  *   0 always takes the most likely token; higher values make the choice more varied.
+ * @property maxNewTokens the longest reply, in tokens. What a model accepts depends on the
+ *   model (see [ReplyLength]), which this class does not know: it only holds a value that could
+ *   be some model's, and [AppSettings.maxNewTokens] is where a model's own limits are applied.
  */
-data class ModelOverrides(val temperature: Float? = null) {
+data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int? = null) {
     init {
         require(temperature == null || isValidTemperature(temperature)) { "A temperature is a number from $MIN_TEMPERATURE to $MAX_TEMPERATURE" }
+        require(maxNewTokens == null || isPossibleReplyLength(maxNewTokens)) { "A reply is at least ${ReplyLength.MIN_TOKENS} tokens long" }
     }
 
     /** True when nothing is set, so that there is nothing to store for the model. */
-    val isDefault: Boolean get() = temperature == null
+    val isDefault: Boolean get() = temperature == null && maxNewTokens == null
 
     /**
      * The sampling a reply is generated with: [defaults], the model's own from the catalogue,
@@ -48,6 +54,9 @@ data class ModelOverrides(val temperature: Float? = null) {
         const val MAX_TEMPERATURE: Float = 2f
 
         fun isValidTemperature(value: Float): Boolean = value.isFinite() && value >= MIN_TEMPERATURE && value <= MAX_TEMPERATURE
+
+        /** True when [tokens] could be the longest reply of some model: not below the least any model accepts. */
+        fun isPossibleReplyLength(tokens: Int): Boolean = tokens >= ReplyLength.MIN_TOKENS
     }
 }
 
@@ -101,6 +110,23 @@ data class AppSettings(
      */
     fun sampling(model: ModelSpec): SamplingParams = overrides(model.id).applyTo(model.sampling)
 
+    /**
+     * These settings with [tokens] as the longest reply of [modelId]; null goes back to the
+     * model's own. A model for which nothing is set any more loses its entry.
+     */
+    fun withMaxNewTokens(modelId: String, tokens: Int?): AppSettings {
+        val updated = overrides(modelId).copy(maxNewTokens = tokens)
+        return copy(modelOverrides = if (updated.isDefault) modelOverrides - modelId else modelOverrides + (modelId to updated))
+    }
+
+    /**
+     * The longest reply [model] writes now, in tokens: what the user set for it if the model
+     * accepts that, and the catalogue's value otherwise. A stored value outside the model's
+     * limits is not moved to the nearest limit: it is a value nobody chose for this model as it
+     * is now (its context is a decision of the build and can change), so the model's own applies.
+     */
+    fun maxNewTokens(model: ModelSpec): Int = overrides(model.id).maxNewTokens?.takeIf(model::acceptsReplyLength) ?: model.defaultMaxNewTokens
+
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
     override fun toString(): String =
         "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides, notificationsAsked=$notificationsAsked)"
@@ -112,7 +138,7 @@ data class AppSettings(
  * ```
  * {"schemaVersion": 1, "settings": {
  *     "systemPrompts": {"<model id>": "<text>", ...},
- *     "models": {"<model id>": {"temperature": 0.7}, ...},
+ *     "models": {"<model id>": {"temperature": 0.7, "maxNewTokens": 512}, ...},
  *     "notificationsAsked": true}}
  * ```
  *
@@ -126,8 +152,9 @@ data class AppSettings(
  * Reading is forgiving in the same way as for sessions: fields this version does not know are
  * ignored, in the settings and in every model's object; a field of the wrong type takes its
  * default; and a value that cannot be used (a system prompt that is not text, a temperature that
- * is not a number or lies outside its range) is left out, which for a temperature means the
- * model's own, and counted. [decode] reports whether everything was read, so that the store can
+ * is not a number or lies outside its range, a longest reply that is not a whole number or is
+ * shorter than any model's shortest) is left out, which for these means the model's own, and
+ * counted. [decode] reports whether everything was read, so that the store can
  * keep a copy of the file before it writes over it.
  */
 object SettingsCodec {
@@ -162,6 +189,7 @@ object SettingsCodec {
                 for ((modelId, overrides) in settings.modelOverrides) {
                     putJsonObject(modelId) {
                         overrides.temperature?.let { put("temperature", it) }
+                        overrides.maxNewTokens?.let { put("maxNewTokens", it) }
                     }
                 }
             }
@@ -207,7 +235,15 @@ object SettingsCodec {
                         ?.takeIf(ModelOverrides::isValidTemperature)
                     if (temperature == null) skipped++
                 }
-                val read = ModelOverrides(temperature = temperature)
+                var maxNewTokens: Int? = null
+                val storedMaxNewTokens = model["maxNewTokens"]
+                if (storedMaxNewTokens != null) {
+                    // A whole number written as one: 512.0, "512" and 5e2 are not what this app writes.
+                    maxNewTokens = (storedMaxNewTokens as? JsonPrimitive)?.takeUnless { it.isString }?.content?.toIntOrNull()
+                        ?.takeIf(ModelOverrides::isPossibleReplyLength)
+                    if (maxNewTokens == null) skipped++
+                }
+                val read = ModelOverrides(temperature = temperature, maxNewTokens = maxNewTokens)
                 if (!read.isDefault) overrides[modelId] = read
             }
             else -> skipped++

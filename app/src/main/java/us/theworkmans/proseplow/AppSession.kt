@@ -148,7 +148,7 @@ class AppSession(
                 opened = sessionStore.open(),
                 requestSettings = { model ->
                     val current = settingsStore.settings.value
-                    ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model))
+                    ModelRequestSettings(current.systemPrompt(model.id).ifEmpty { null }, current.sampling(model), current.maxNewTokens(model))
                 },
                 clock = clock,
                 ids = ids,

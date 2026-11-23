@@ -2,11 +2,14 @@ package us.theworkmans.proseplow
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalView
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.dropUnlessResumed
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -15,6 +18,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.toRoute
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
@@ -24,6 +28,7 @@ import us.theworkmans.proseplow.chat.ChatViewModel
 import us.theworkmans.proseplow.lock.SecurityViewModel
 import us.theworkmans.proseplow.security.AppLock
 import us.theworkmans.proseplow.settings.AboutScreen
+import us.theworkmans.proseplow.settings.ModelSettingsScreen
 import us.theworkmans.proseplow.settings.SettingsScreen
 import us.theworkmans.proseplow.settings.SettingsViewModel
 import us.theworkmans.proseplow.settings.ThirdPartyNoticesScreen
@@ -35,6 +40,10 @@ private data object ChatRoute
 
 @Serializable
 private data object SettingsRoute
+
+/** The page of one model's settings. The id is a catalogue id, which is no secret; nothing else of a model is in the route. */
+@Serializable
+private data class ModelSettingsRoute(val modelId: String)
 
 @Serializable
 private data object AboutRoute
@@ -89,12 +98,28 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
             val securityViewModel: SecurityViewModel = viewModel(
                 factory = viewModelFactory { initializer { SecurityViewModel(appLock) } },
             )
+            val lifecycle = LocalLifecycleOwner.current.lifecycle
             SettingsScreen(
                 viewModel = settingsViewModel,
                 security = securityViewModel,
                 onBack = dropUnlessResumed { navController.popBackStack() },
+                // As dropUnlessResumed does for the others: a second tap during the transition opens nothing.
+                onOpenModel = { modelId -> if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) navController.navigate(ModelSettingsRoute(modelId)) },
                 onOpenAbout = dropUnlessResumed { navController.navigate(AboutRoute) },
             )
+        }
+        composable<ModelSettingsRoute> { entry ->
+            val modelId = entry.toRoute<ModelSettingsRoute>().modelId
+            val model = session.models.firstOrNull { it.id == modelId }
+            if (model == null) {
+                // A page that came back from saved state for a model this build no longer has.
+                LaunchedEffect(modelId) { navController.popBackStack() }
+            } else {
+                val modelViewModel: SettingsViewModel = viewModel(
+                    factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models) } },
+                )
+                ModelSettingsScreen(viewModel = modelViewModel, model = model, onBack = dropUnlessResumed { navController.popBackStack() })
+            }
         }
         composable<AboutRoute> {
             AboutScreen(
