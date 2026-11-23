@@ -137,11 +137,13 @@ kotlin {
  * Fails when a variant's merged manifest requests or declares a permission that is not in
  * [allowed]; the permissions it found are written to [report].
  *
- * The app's promise is that it never uses the network. Its own manifest asks for four
- * permissions, all for finishing an answer out of sight (a foreground service of the special-use
- * type, notifications and a wake lock); the allow-list is those four, the two the fingerprint
- * library adds and the one the support library declares for the app's own receivers: seven
- * entries. Every dependency's manifest is merged into the app's and can add one unnoticed, so it
+ * The app's promise is that it never uses the network. Its own manifest asks for five
+ * permissions: four for finishing an answer out of sight (a foreground service of the special-use
+ * type, notifications and a wake lock) and one that keeps the background maintenance job across
+ * restarts of the phone; the allow-list is those five, the two the fingerprint library adds and
+ * the one the support library declares for the app's own receivers: eight entries. The attribute
+ * `android:permission` of a component is not checked here: it is what the app requires of others
+ * (the job service requires the system's `BIND_JOB_SERVICE`), not what it asks for. Every dependency's manifest is merged into the app's and can add one unnoticed, so it
  * is the merged result, the manifest that is packaged, that is checked.
  *
  * The task is not a check beside the build but a step of it: it takes the merged manifest in and
@@ -301,8 +303,9 @@ abstract class GenerateThirdPartyNotices : DefaultTask() {
 androidComponents {
     // Every permission a merged manifest may contain. The app itself declares the four that let an
     // answer be finished while it is not on screen: the foreground service and its type, the
-    // notifications, and the wake lock. USE_BIOMETRIC and USE_FINGERPRINT are merged in by
-    // androidx.biometric. androidx.core declares and requests the app's own signature-level
+    // notifications, and the wake lock; and RECEIVE_BOOT_COMPLETED, which keeps the background
+    // maintenance job scheduled across restarts. USE_BIOMETRIC and USE_FINGERPRINT are merged in
+    // by androidx.biometric. androidx.core declares and requests the app's own signature-level
     // DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION, added per variant below because it carries the
     // application id. Anything else, android.permission.INTERNET above all, fails the build.
     val allowedPermissions = setOf(
@@ -310,6 +313,7 @@ androidComponents {
         "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.WAKE_LOCK",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.USE_BIOMETRIC",
         "android.permission.USE_FINGERPRINT",
     )

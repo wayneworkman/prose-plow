@@ -135,6 +135,7 @@ class MandatoryLockTest {
                 "fingerprintPeriodStart",
                 "messageLifetimeDays",
                 "trustedTime",
+                "backgroundMaintenance",
             ),
             stored.keys,
         )

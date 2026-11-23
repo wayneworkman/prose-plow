@@ -59,6 +59,9 @@ class AppLockTest {
     /** Every run of the locked clean-up: the readable limit and the trusted time it was given. */
     private val sweeps = mutableListOf<Pair<Int, Long>>()
 
+    /** What the lock told the job scheduler, in order: true to schedule, false to cancel. */
+    private val scheduled = mutableListOf<Boolean>()
+
     /** The readable copy of how long messages are kept that the lock handed to each session it opened. */
     private val copiesHandedIn = mutableListOf<Int>()
 
@@ -178,7 +181,7 @@ class AppLockTest {
      * with it and reaches the screen, as the app really starts; without one, nothing is ever on
      * screen for this lock.
      */
-    private fun TestScope.startApp(visible: Boolean = false): AppLock<FakeSession> {
+    private fun TestScope.startApp(visible: Boolean = false, beforeAnythingRuns: () -> Unit = {}): AppLock<FakeSession> {
         processEnds = 0
         logAtProcessEnd = null
         vault.onUse = ::insideTheManager
@@ -243,6 +246,7 @@ class AppLockTest {
                 }
             },
             canFinishOutOfSight = { keepAliveRunning },
+            maintenanceScheduling = { enabled -> scheduled += enabled },
             expiredData = { lifetime, now ->
                 insideTheManager()
                 log += "expired data swept"
@@ -254,6 +258,7 @@ class AppLockTest {
             lock.onActivityCreated()
             lock.onForeground()
         }
+        beforeAnythingRuns()
         runCurrent()
         return lock
     }
@@ -2747,5 +2752,149 @@ class AppLockTest {
         enter(passphrase)
         assertEquals("the session was handed the copy as it stood, to fall back on", 90, copiesHandedIn.last())
         assertEquals(0, LockConfigStore(files.lockConfig).read()!!.messageLifetimeDays)
+    }
+
+    // --- Background maintenance ---------------------------------------------------------------
+
+    /**
+     * The job follows the switch: scheduled at every start with it on (the scheduler keeps a job
+     * that exists, MaintenanceScheduleTest), cancelled with nothing set up, scheduled at set-up,
+     * and cancelled and kept off when it is turned off, at every later start too.
+     */
+    @Test
+    fun theJobIsScheduledWhileTheSwitchIsOnAndCancelledWhenItIsOff() = runTest(dispatcher) {
+        startApp()
+        assertEquals("nothing is set up", listOf(false), scheduled)
+        createPassphrase()
+        assertEquals(listOf(false, true), scheduled)
+        assertTrue(lock.status.value.backgroundMaintenance)
+
+        lock.setBackgroundMaintenance(false)
+        runCurrent()
+        assertEquals(listOf(false, true, false), scheduled)
+        assertFalse(lock.status.value.backgroundMaintenance)
+        assertFalse(LockConfigStore(files.lockConfig).read()!!.backgroundMaintenance)
+
+        lock.lock()
+        runCurrent()
+        scheduled.clear()
+        startApp()
+        assertEquals("off stays off at the next start", listOf(false), scheduled)
+        lock.setBackgroundMaintenance(true)
+        runCurrent()
+        assertEquals(listOf(false, true), scheduled)
+    }
+
+    /**
+     * A process the platform started for the job: the lock's start is the work (one clean-up,
+     * not two), the process is held until it is done, the job is told it is finished, and the
+     * process ends only when the run is released, which the job service does from a later
+     * message of the main thread than the platform's own "finished" message; then it ends once,
+     * as it would have. Catches a second sweep, a process ended in the step in which the job is
+     * told it is finished (on Android that kills it before the system hears it), and a release
+     * that ends it twice.
+     */
+    @Test
+    fun aRunThatStartedTheProcessWaitsForTheStartThenFinishesThenTheProcessEnds() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        sweeps.clear()
+        log.clear()
+
+        var finished = 0
+        var release: (() -> Unit)? = null
+        startApp {
+            lock.startMaintenance(startedForIt = true) { releaseIt ->
+                finished++
+                log += "job finished"
+                release = releaseIt
+            }
+        }
+
+        assertEquals(1, sweeps.size)
+        assertEquals(1, finished)
+        // The platform's own "finished" message is still in the queue: nothing may end the
+        // process in the step in which the job was told it is finished.
+        assertEquals("held until released", 0, processEnds)
+        pass(60_000)
+        assertEquals("held for as long as the release has not come", 0, processEnds)
+        log += "released"
+        release!!()
+        assertEquals(1, processEnds)
+        assertEquals("the process ended after the release", "released", logAtProcessEnd!!.last())
+        release!!()
+        runCurrent()
+        assertEquals("a second release changes nothing", 1, processEnds)
+    }
+
+    /**
+     * A process that was alive already: the run asks the lock for the clean-up itself, under the
+     * mutex; with a session alive that only records the trusted time.
+     */
+    @Test
+    fun aRunInAProcessThatWasAliveRunsTheCleanUpThroughTheLock() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        sweeps.clear()
+
+        var finished = 0
+        lock.startMaintenance(startedForIt = false) { release -> finished++; release() }
+        runCurrent()
+        assertEquals("the app is open and locked: the clean-up runs again", 1, sweeps.size)
+        assertEquals(1, finished)
+        assertEquals("on screen, so the process stays", 0, processEnds)
+
+        // Unlocked: a session is alive, so only the trusted time is recorded.
+        enter(passphrase)
+        clock.wall += 9_000
+        lock.startMaintenance(startedForIt = false) { release -> finished++; release() }
+        runCurrent()
+        assertEquals(1, sweeps.size)
+        assertEquals(2, finished)
+        assertEquals(clock.wall, LockConfigStore(files.lockConfig).read()!!.trustedTime!!.wallMillis)
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    /**
+     * The user opens the app while a run that started the process is under way: the run ends
+     * as usual, the process is not ended while the app is on screen, and the passphrase opens
+     * it once the lock's start (and its clean-up) is done.
+     */
+    @Test
+    fun openingTheAppDuringARunEndsNothing() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        var finished = 0
+        startApp {
+            lock.startMaintenance(startedForIt = true) { release -> finished++; release() }
+            lock.onActivityCreated()
+            lock.onForeground()
+        }
+        assertEquals(1, finished)
+        assertEquals(0, processEnds)
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    /** A run the platform stops early is not reported finished, and the process still ends when nothing needs it. */
+    @Test
+    fun aRunThatIsStoppedEarlyLetsGo() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        var finished = 0
+        startApp {
+            val run = lock.startMaintenance(startedForIt = true) { release -> finished++; release() }
+            run.cancel()
+        }
+        assertEquals(0, finished)
+        assertEquals("a run stopped early holds nothing: the process ends as it would have", 1, processEnds)
     }
 }

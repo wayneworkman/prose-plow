@@ -613,7 +613,7 @@ class SourceRulesTest {
             assertEquals("$word could carry something of an answer into a notification", emptyList<String>(), users(all, word))
         }
         assertTrue("a text with arguments is not a fixed text", notifications.none { Regex("""getString\([^)]*,""").containsMatchIn(it) })
-        for (name in listOf("AnswerNotifications.kt", "AnswerService.kt", "AnswerWork.kt")) {
+        for (name in listOf("AnswerNotifications.kt", "AnswerService.kt", "AnswerWork.kt", "MaintenanceJob.kt", "MaintenanceSchedule.kt")) {
             val reach = imports(File(module, "$main/background/$name")).filter { import -> listOf("$app.chat.", "$app.core.", "$app.data.", "$app.settings.").any(import::startsWith) }
             assertEquals("$name can reach what an answer is made of", emptyList<String>(), reach)
         }
@@ -641,9 +641,8 @@ class SourceRulesTest {
     fun theAnswerServiceIsNotExportedSaysWhatItIsForAndHoldsNoWakeLockForEver() {
         val manifest = File(module, "src/main/AndroidManifest.xml").readText().replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
         val services = Regex("""<service\b[^>]*>""").findAll(manifest).map { it.value }.toList()
-        assertEquals(1, services.size)
-        val service = services.single()
-        assertTrue(service.contains("android:name=\".background.AnswerService\""))
+        assertEquals("the answer service and the maintenance job", 2, services.size)
+        val service = services.single { it.contains("android:name=\".background.AnswerService\"") }
         assertTrue("the service must stay closed to other apps", service.contains("android:exported=\"false\""))
         assertTrue(service.contains("android:foregroundServiceType=\"specialUse\""))
         val property = Regex("""<property\s+android:name="android\.app\.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\s+android:value="([^"]+)"""").find(manifest)
@@ -690,33 +689,42 @@ class SourceRulesTest {
         assertTrue(service_.contains("PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG) ?: return") || service_.any { it.contains("newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)") })
         // The rules of when it runs are plain Kotlin, tested without a phone.
         assertEquals(emptyList<String>(), imports(File(module, "$main/background/AnswerWork.kt")).filter { it.startsWith("android.") || it.startsWith("androidx.") })
+        assertEquals(emptyList<String>(), imports(File(module, "$main/background/MaintenanceSchedule.kt")).filter { it.startsWith("android.") || it.startsWith("androidx.") })
     }
 
     /**
-     * The app asks for exactly four permissions, all for finishing an answer out of sight, and
-     * the build's allow-list for the merged manifest is those four and what the fingerprint
-     * library adds. The network is in neither, and the allow-list is what the build is checked
-     * against (see [theBuildCannotPackageAManifestThatWasNotChecked]).
+     * The app asks for exactly five permissions: four for finishing an answer out of sight, and
+     * RECEIVE_BOOT_COMPLETED, the owner's decision, which keeps the background maintenance job
+     * across restarts. The build's allow-list for the merged manifest is those five and what the
+     * fingerprint library adds. The network is in neither, and the allow-list is what the build is
+     * checked against (see [theBuildCannotPackageAManifestThatWasNotChecked]). The one
+     * `android:permission` attribute is the job service's requirement that only the system binds
+     * it, which is not a permission the app holds.
      */
     @Test
-    fun theAppAsksForFourPermissionsAndNoneOfThemIsTheNetwork() {
-        val four = setOf(
+    fun theAppAsksForFivePermissionsAndNoneOfThemIsTheNetwork() {
+        val own = setOf(
             "android.permission.FOREGROUND_SERVICE",
             "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
             "android.permission.POST_NOTIFICATIONS",
             "android.permission.WAKE_LOCK",
+            "android.permission.RECEIVE_BOOT_COMPLETED",
         )
         val manifest = File(module, "src/main/AndroidManifest.xml").readText().replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
         val requested = Regex("""<uses-permission[^>]*android:name="([^"]+)"""").findAll(manifest).map { it.groupValues[1] }.toList()
-        assertEquals(four, requested.toSet())
-        assertEquals("each once", 4, requested.size)
+        assertEquals(own, requested.toSet())
+        assertEquals("each once", 5, requested.size)
+        val required = Regex("""android:permission="([^"]+)"""").findAll(manifest).map { it.groupValues[1] }.toList()
+        assertEquals("only the job scheduler may bind the job", listOf("android.permission.BIND_JOB_SERVICE"), required)
+        val job = Regex("""<service\b[^>]*MaintenanceJobService[^>]*>""").find(manifest)!!.value
+        assertTrue(job.contains("android:exported=\"false\"") && job.contains("android:permission=\"android.permission.BIND_JOB_SERVICE\""))
         assertTrue(!manifest.contains("INTERNET") && !manifest.contains("ACCESS_NETWORK_STATE") && !manifest.contains("<permission"))
         for (other in listOf("uses-permission-sdk-23", "maxSdkVersion")) assertTrue(other, !manifest.contains(other))
 
         val build = File(module, "build.gradle.kts").readLines().map { it.trim() }.filterNot { it.startsWith("//") || it.startsWith("*") || it.startsWith("/**") }.joinToString("\n")
         val listed = build.substringAfter("val allowedPermissions = setOf(").substringBefore(")")
         val allowed = Regex(""""([^"]+)"""").findAll(listed).map { it.groupValues[1] }.toSet()
-        assertEquals(four + setOf("android.permission.USE_BIOMETRIC", "android.permission.USE_FINGERPRINT"), allowed)
+        assertEquals(own + setOf("android.permission.USE_BIOMETRIC", "android.permission.USE_FINGERPRINT"), allowed)
         assertTrue(build.contains("allowed.set(variant.applicationId.map { id -> allowedPermissions + \"\$id.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\" })"))
         assertTrue("the network is not allowed anywhere in the build", !build.contains("INTERNET") && !build.contains("NETWORK"))
     }

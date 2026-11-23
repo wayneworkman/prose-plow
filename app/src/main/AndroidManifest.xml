@@ -3,11 +3,12 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- No network permission, and none may be added: the model runs on the device and the app
-         never uses the network. The four permissions below are everything the app asks for, and
-         all of them serve one thing: letting an answer be finished while the app is not on
-         screen. Together with the few that libraries merge in they are held to an allow-list by
-         the verify*Manifest tasks in app/build.gradle.kts, which fail the build on anything else
-         (android.permission.INTERNET above all). -->
+         never uses the network. The five permissions below are everything the app asks for: four
+         let an answer be finished while the app is not on screen, and one keeps the background
+         maintenance job scheduled across restarts of the phone. Together with the few that
+         libraries merge in they are held to an allow-list by the verify*Manifest tasks in
+         app/build.gradle.kts, which fail the build on anything else (android.permission.INTERNET
+         above all). -->
 
     <!-- The answer service: a foreground service, of the "special use" type on Android 14 and
          later (see the service below). -->
@@ -18,6 +19,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- The processor stays awake while an answer is written with the screen off. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The background maintenance job is kept across restarts of the phone (JobInfo's
+         setPersisted), which Android allows only with this. No receiver of the app listens for the
+         boot: the platform's job scheduler does. Used only while "Background maintenance" is on;
+         with it off the job is cancelled. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".ProsePlowApp"
@@ -58,6 +64,15 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Finishes an answer that a language model on this device is writing for the user, after the user has left the app or the screen has turned off." />
         </service>
+
+        <!-- The background maintenance job (background/MaintenanceJob.kt): every few hours it lets
+             the lock delete what has expired, and does nothing else. Not exported; the permission
+             attribute says that only the system's job scheduler may bind it (it is a requirement
+             on whoever binds, not a permission this app asks for). -->
+        <service
+            android:name=".background.MaintenanceJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <!-- Privacy: androidx.emoji2 (pulled in by Compose) registers EmojiCompatInitializer, which
              asks the Google Play Services downloadable-fonts provider for an emoji font and can

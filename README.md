@@ -119,6 +119,10 @@ Privacy:
   Deletion happens whenever the app runs, also when it is opened and not unlocked, and is timed
   by a clock that setting the phone's date back cannot hold up (see
   [Messages expire](#messages-expire)).
+- **Background maintenance**, unless you turn it off in Settings. The app wakes for a moment
+  every few hours, also after the phone restarts, to delete what has expired. It never unlocks
+  anything, never loads a model and shows nothing. Turned off, nothing of the app runs in the
+  background, and messages are only deleted when you open the app.
 - **Locks by itself.** The app is locked at every start and after it has been in the background
   for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
   when Android reports that the app has left the screen, which is a fraction of a second after
@@ -151,11 +155,12 @@ Privacy:
   blocked again. The preview in the app switcher stays hidden in any case. On Android 12 and
   older that preview can only be hidden by blocking screenshots altogether, so there the
   allowance is not available and the setting says so.
-- **No network permission.** The app asks for four permissions, all of them for finishing an
-  answer out of sight: the foreground service and its type, notifications, and keeping the
-  processor awake. The build fails if the merged manifest contains any permission that is not
-  on its allow-list (those four, and the three that the fingerprint and support libraries
-  add); the network is not on it.
+- **No network permission.** The app asks for five permissions: four for finishing an answer
+  out of sight (the foreground service and its type, notifications, and keeping the processor
+  awake), and `RECEIVE_BOOT_COMPLETED`, which keeps the background maintenance job scheduled
+  after the phone restarts. The build fails if the merged manifest contains any permission that
+  is not on its allow-list (those five, and the three that the fingerprint and support
+  libraries add); the network is not on it.
 - **No backups.** The app's data is excluded from Android's cloud backup and from
   device-to-device transfer.
 
@@ -389,7 +394,7 @@ Everything is in the app's private storage.
 | `files/session-index.enc` | The list of chats: the title, dates, model and number of messages of each, and the date of its oldest message | Encrypted |
 | `files/settings.enc` | The settings: the system prompt, the temperature, the longest reply and the context size of each model, whether the app has asked for permission to show notifications, and how long messages are kept | Encrypted |
 | `files/kept/*.enc` | Exact copies of files that could not be read completely, kept before they are replaced | Encrypted, as the original was |
-| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts, a copy of how long messages are kept, and the trusted time (see [Messages expire](#messages-expire)) | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
+| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts, a copy of how long messages are kept, the trusted time (see [Messages expire](#messages-expire)), and whether background maintenance is on | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
 
 The models are assets of the APK and are not encrypted: they are public files.
 
@@ -568,6 +573,13 @@ by the dates of the messages.
   again from the encrypted setting. It runs as part of the lock's own work, so it never runs
   beside an unlock, and it deletes nothing while a session is still alive behind the lock. The
   list of chats names the deleted chats until the next unlock, which drops them without a word.
+- **When the app is not used.** With "Background maintenance" on (the default), Android's job
+  scheduler starts the app about every six hours, also after a restart of the phone, and the
+  start of the lock does the deletion above; the job holds the app until that is done and then
+  lets it end as it always does. If the app was already running, the job asks the lock for the
+  same deletion. It never unlocks anything, never loads a model and shows no notification. The
+  job is kept across restarts with `RECEIVE_BOOT_COMPLETED`, which is used only while the switch
+  is on: turning it off cancels the job.
 - **Which time.** Anyone holding the phone can set its date. Messages are therefore dated, and
   aged, by a trusted time that never goes back: the date and time, or the last trusted time
   plus the time the phone has been running since it was recorded (within the same start of the
@@ -679,6 +691,9 @@ it or losing the phone loses the chats.
 - The check of the merged manifest against the permission allow-list is a step of the build and
   not a task beside it: what is packaged is the manifest the check handed on, so no APK or
   bundle can be built or installed from a manifest that did not pass.
+- The background maintenance job's service is not exported and can only be bound by the system's
+  job scheduler (`BIND_JOB_SERVICE`). It does nothing but hand the run to the lock, has no
+  receiver of its own, and shows no notification.
 - The initialiser through which a library would ask Google Play Services for a downloadable
   emoji font is removed from the manifest, because that request would be made by another
   process on the app's behalf.
@@ -755,7 +770,12 @@ it or losing the phone loses the chats.
 - **What the expiry of messages does not do.** Deleting is not forensic erasure: the flash
   storage may keep the encrypted bytes (see below), and text that was decrypted stays in the
   app's memory until its process ends. Nothing expires while the app does not run: deletion
-  happens when it starts, when it is unlocked, and while it is open. A date set forward on the
+  happens when it starts (by itself through the background maintenance job, or when you open
+  it), when it is unlocked, and while it is open. Android decides when the job runs: it may put
+  runs off, or stop them, for an app you have not used for a while; force-stopping the app
+  cancels the job until the app is next opened; and nothing runs after a restart of the phone
+  until it has been unlocked once, because the app's files cannot be read before that. With the
+  switch off, messages are only deleted when you open the app. A date set forward on the
   phone makes messages expire early, and the trusted time then stays ahead until the real date
   catches up. A kept copy of a chat that could not be read completely cannot be rewritten: its
   older messages stay until the copy's own date (that of its newest message) is past the limit,
@@ -1122,19 +1142,23 @@ cat app/build/reports/manifest-permissions/debug.txt     # every permission of t
 cat app/build/reports/native-packaging/packageDebug.txt  # models stored on 16 KiB boundaries, libraries aligned
 ```
 
-The first must list exactly seven: the four the app asks for,
+The first must list exactly eight: the five the app asks for,
 `android.permission.FOREGROUND_SERVICE`, `android.permission.FOREGROUND_SERVICE_SPECIAL_USE`,
-`android.permission.POST_NOTIFICATIONS` and `android.permission.WAKE_LOCK`; the two that the
+`android.permission.POST_NOTIFICATIONS`, `android.permission.WAKE_LOCK` and
+`android.permission.RECEIVE_BOOT_COMPLETED`; the two that the
 biometric library needs, `android.permission.USE_BIOMETRIC` and
 `android.permission.USE_FINGERPRINT`; and
 `us.theworkmans.proseplow.debug.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`, which protects the
-app's own internal broadcasts. There is no `android.permission.INTERNET`. To look at the APK itself with the SDK's tools:
+app's own internal broadcasts. There is no `android.permission.INTERNET`.
+`android.permission.BIND_JOB_SERVICE` appears in the manifest only as what the job service
+requires of whoever binds it (the system's job scheduler); it is not a permission of the app,
+and the check does not list it. To look at the APK itself with the SDK's tools:
 
 ```sh
 BT="$ANDROID_HOME/build-tools/37.0.0"
 APK=app/build/outputs/apk/debug/app-debug.apk
 
-"$BT/aapt2" dump permissions "$APK"                # the same seven permissions, read from the APK
+"$BT/aapt2" dump permissions "$APK"                # the same eight permissions, read from the APK
 "$BT/apksigner" verify --verbose --print-certs "$APK"
 "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -n 5    # ends with "Verification successful"
 unzip -l "$APK" | grep -E 'assets/models/|lib/arm64-v8a/'
@@ -1360,7 +1384,7 @@ None of it has been tried.
 | Suite | What it covers | Command |
 | --- | --- | --- |
 | `core` (JVM, 430 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 669 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `app` (JVM, 680 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
@@ -1432,9 +1456,10 @@ sections, from someone who has actually followed them.
   behaviour changes its item there, and a string that is added or reworded is quoted there in
   the same commit: a test fails otherwise and says what to do.
 - Logic that needs no Android belongs in `core`. `app` depends on `core`, never the reverse.
-- The app requests four permissions, all for finishing an answer out of sight (see
+- The app requests five permissions, four for finishing an answer out of sight and one that keeps
+  the background maintenance job across restarts (see
   [What the app does](#what-the-app-does)), and none for the network. The build checks the merged
-  manifest against an allow-list of seven entries (those four, the two the fingerprint library
+  manifest against an allow-list of eight entries (those five, the two the fingerprint library
   adds and the one the support library declares for the app's own receivers): a change that adds
   a permission, or a dependency that brings one, fails the build and needs a very good reason.
 - Model files, signing keys and `local.properties` are never committed.

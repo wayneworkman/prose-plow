@@ -334,6 +334,23 @@ class SecurityViewModel(private val appLock: AppLock<*>, private val lifetimeSet
         }
     }
 
+    /**
+     * "Background maintenance". Like the other settings the lock needs it asks for no passphrase:
+     * it opens no key. The switch shows what is stored, so a failure leaves it as it was.
+     */
+    fun setBackgroundMaintenance(enabled: Boolean) {
+        viewModelScope.launch {
+            try {
+                appLock.setBackgroundMaintenance(enabled)
+                _state.update { it.copy(error = null) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _state.update { it.copy(error = SecurityError.FAILED) }
+            }
+        }
+    }
+
     /** "Finish the answer after locking". The switch shows what is stored, so a failure leaves it as it was. */
     fun setFinishAnswerAfterLocking(enabled: Boolean) {
         viewModelScope.launch {
@@ -351,7 +368,8 @@ class SecurityViewModel(private val appLock: AppLock<*>, private val lifetimeSet
 
 /**
  * The rows of the Security section: change passphrase, fingerprint unlock and how long the
- * fingerprint works, the background timeout, how long messages are kept, "Lock now", the
+ * fingerprint works, the background timeout, how long messages are kept and the background
+ * maintenance that deletes them while the app is not used, "Lock now", the
  * temporary screenshot allowance and "Reset app data", with their dialogs. It emits its rows into the column of the Settings screen it is placed in (which
  * supplies the section title and the spacing), and needs nothing but its ViewModel.
  *
@@ -388,6 +406,12 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
     TimeoutPicker(status.lockTimeoutSeconds, viewModel::setLockTimeout)
     val messageLifetimeDays by viewModel.messageLifetimeDays.collectAsStateWithLifecycle()
     MessageLifetimePicker(messageLifetimeDays, viewModel::selectMessageLifetime)
+    SwitchRow(
+        title = stringResource(R.string.security_background_maintenance),
+        support = stringResource(R.string.security_background_maintenance_support),
+        checked = status.backgroundMaintenance,
+        onCheckedChange = viewModel::setBackgroundMaintenance,
+    )
     SwitchRow(
         title = stringResource(R.string.security_finish_answer),
         support = pluralStringResource(

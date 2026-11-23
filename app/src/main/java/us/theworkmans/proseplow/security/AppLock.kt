@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -55,6 +56,8 @@ data class SecurityStatus(
      * manager decides again, at the moment of use, whatever this says.
      */
     val fingerprintPeriodOver: Boolean = false,
+    /** The background maintenance job is to be scheduled ([LockConfig.backgroundMaintenance]). */
+    val backgroundMaintenance: Boolean = true,
 )
 
 enum class BiometricStatus {
@@ -129,6 +132,21 @@ fun interface ExpiredDataSweep {
     companion object {
         /** For a lock beside which nothing is stored. */
         val None = ExpiredDataSweep { _, _ -> }
+    }
+}
+
+/**
+ * Schedules or cancels the background maintenance job, as the setting says; implemented over the
+ * platform's job scheduler outside this package. [apply] keeps a job that is scheduled already
+ * as it is, so that applying the setting again at every start does not put its next run off.
+ * Blocking; called off the main thread, under the lock's mutex; never throws.
+ */
+fun interface MaintenanceScheduling {
+    fun apply(enabled: Boolean)
+
+    companion object {
+        /** For a lock without a job. */
+        val None = MaintenanceScheduling { }
     }
 }
 
@@ -273,6 +291,8 @@ class AppLock<S : UnlockedSession>(
      * be unlocked, and only while no session is alive; see [cleanUpWhileLocked].
      */
     private val expiredData: ExpiredDataSweep = ExpiredDataSweep.None,
+    /** Schedules the background maintenance job while its setting is on; see [startMaintenance]. */
+    private val maintenanceScheduling: MaintenanceScheduling = MaintenanceScheduling.None,
 ) {
     private val mutex = Mutex()
     private val main = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -365,6 +385,15 @@ class AppLock<S : UnlockedSession>(
      */
     private val stopping = ArrayList<Job>()
 
+    /**
+     * Runs of the background maintenance job that have not finished yet ([startMaintenance]).
+     * The process is not ended while there is one. Main thread only.
+     */
+    private var maintenanceRuns = 0
+
+    /** The lock's latest start ([start]); a maintenance run that started the process waits for it. */
+    private var starting: Job? = null
+
     /** Main thread only. */
     private var lockGeneration = 0
     private var autoPromptedGeneration = -1
@@ -424,15 +453,21 @@ class AppLock<S : UnlockedSession>(
 
     private fun start() {
         _state.value = LockState.Starting
-        launchWork {
+        starting = launchWork {
             withManager { m ->
                 closeRetired()
                 var waitMillis = 0L
                 val next: LockState<Nothing> = try {
                     when (val result = m.start()) {
-                        StartResult.SetupRequired -> LockState.SetupRequired
+                        StartResult.SetupRequired -> {
+                            // Nothing is stored, and nothing will be until a passphrase is: no job.
+                            maintenanceScheduling.apply(false)
+                            LockState.SetupRequired
+                        }
                         StartResult.Locked -> {
                             dropBiometricIfGone(m)
+                            // At every start, so that an update or a schedule that was lost is put right.
+                            maintenanceScheduling.apply(m.config?.backgroundMaintenance != false)
                             cleanUpWhileLocked(m)
                             waitMillis = m.backoffRemainingMillis()
                             LockState.Locked(0)
@@ -512,6 +547,7 @@ class AppLock<S : UnlockedSession>(
             finishAnswerAfterLocking = config?.finishAnswerAfterLocking != false,
             fingerprintPeriodSeconds = config?.fingerprintPeriodSeconds ?: LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS,
             fingerprintPeriodOver = config?.biometric != null && !m.fingerprintPeriodRunning(),
+            backgroundMaintenance = config?.backgroundMaintenance != false,
         )
     }
 
@@ -658,7 +694,8 @@ class AppLock<S : UnlockedSession>(
      * Main thread: ends the process if nothing needs it any more. That is when no activity is on
      * screen or on its way there; no session is open, leased or still stopping (a session only
      * counts as stopped once its last write has returned, so nothing is lost); nothing is using
-     * the lock manager; and the app is locked. The screens that are neither unlocked nor
+     * the lock manager; no run of background maintenance is under way ([startMaintenance]);
+     * and the app is locked. The screens that are neither unlocked nor
      * locked (set-up, the error screens) count as locked once a session has been open in this
      * process, which is the case after a reset: there is something in memory to release.
      */
@@ -666,6 +703,7 @@ class AppLock<S : UnlockedSession>(
         if (onScreen.isNotEmpty() || arriving.isNotEmpty() || successors > 0) return
         if (live != null || lease != null || unfinished != 0) return
         if (mutex.isLocked || _unlockUi.value.busy || _setupUi.value.busy || pendingPurpose != null) return
+        if (maintenanceRuns > 0) return
         val settled = when (_state.value) {
             is LockState.Locked -> true
             LockState.SetupRequired, is LockState.Unrecoverable, is LockState.Failed -> everOpened
@@ -1019,6 +1057,7 @@ class AppLock<S : UnlockedSession>(
                 withManager { m ->
                     closeRetired()
                     val result = whileOthersStandAside { m.setUp(first) }
+                    maintenanceScheduling.apply(m.config?.backgroundMaintenance != false)
                     publishStatus(m)
                     open(m, result.key, from, if (biometricAvailable()) FingerprintOffer.FIRST_SETUP to result.proof else null)
                 }
@@ -1337,6 +1376,82 @@ class AppLock<S : UnlockedSession>(
      * (the setting itself is the session's). @throws IOException when it could not be written.
      */
     suspend fun setMessageLifetimeDays(days: Int) = op { m -> m.setMessageLifetimeDays(days) }
+
+    /**
+     * "Background maintenance": stores the setting, then schedules the job or cancels it.
+     * @throws IOException when the setting could not be stored; nothing is scheduled or cancelled then.
+     */
+    suspend fun setBackgroundMaintenance(enabled: Boolean) = op { m ->
+        m.setBackgroundMaintenance(enabled)
+        maintenanceScheduling.apply(enabled)
+    }
+
+    // --- Background maintenance -----------------------------------------------------------------
+
+    /**
+     * A run of the background maintenance job (main thread). The work is the lock's own
+     * clean-up of what has expired ([cleanUpWhileLocked]), under the mutex as always, and the
+     * run holds the process until that work is done: while it lasts, [considerEndingProcess]
+     * does not end the process. Then [onFinished] is called with a `release`, and the hold ends
+     * only when `release` is called, never in the same step as [onFinished]: telling the
+     * platform that a job is finished may itself only queue a message on the main thread, and
+     * the process must not end before that message has been handled. The caller therefore
+     * calls `release` from a later message of the main thread, queued after the platform's own.
+     * `release` then looks at the process again, so it ends exactly as it would have without the
+     * job. Calling `release` more than once does nothing more; if [onFinished] throws, the hold
+     * is released at once.
+     *
+     * [startedForIt]: the process was started for this run, and this lock with it. Its [start]
+     * runs the clean-up already, so the run waits for that start to end and does nothing more;
+     * the clean-up is not run twice. In a process that was alive before (the app is open, or a
+     * session is alive behind the lock) the run asks for the clean-up itself, through the mutex;
+     * with a session alive that only stores the trusted time.
+     *
+     * It never touches a key or the stores, and opens nothing. Cancelling the returned job (the
+     * platform stopped the run, or its service is destroyed) before the work is done stops
+     * waiting; whatever the lock is doing goes on as its own work, [onFinished] is not called,
+     * and the hold is released at once. Every way the run can end therefore either releases the
+     * hold or hands `release` to [onFinished].
+     */
+    fun startMaintenance(startedForIt: Boolean, onFinished: (release: () -> Unit) -> Unit): Job {
+        maintenanceRuns++
+        val start = starting
+        var released = false
+        // Main thread, like the count it lowers; once only.
+        val release = {
+            if (!released) {
+                released = true
+                maintenanceRuns--
+                considerEndingProcess()
+            }
+        }
+        // Atomic: a run that is cancelled before it began still passes its finally block, so it
+        // can never go on holding the process.
+        return main.launch(start = CoroutineStart.ATOMIC) {
+            var done = false
+            try {
+                if (startedForIt && start != null) {
+                    start.join()
+                } else {
+                    launchWork { withManager { m -> if (m.config != null) cleanUpWhileLocked(m) } }.join()
+                }
+                done = true
+            } finally {
+                withContext(NonCancellable) {
+                    if (!done) {
+                        release()
+                    } else {
+                        try {
+                            onFinished(release)
+                        } catch (e: RuntimeException) {
+                            release()
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /** Whether an answer under way is finished behind the app's own lock; see the class comment. */
     suspend fun setFinishAnswerAfterLocking(enabled: Boolean) = op { m -> m.setFinishAnswerAfterLocking(enabled) }

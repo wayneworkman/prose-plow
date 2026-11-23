@@ -319,7 +319,9 @@ is about things that are **not** built and is kept apart from everything else.
   (LOCK-18), nothing is deleted and only the trusted time is stored: the files are that
   session's, and its own expiry covers them. Every unlock and every lock (step 7 of LOCK-17,
   and the end of a lease) store the trusted time as well, and every unlock writes the readable
-  copy of the limit of SECSET-13 in the lock configuration again from the setting itself.
+  copy of the limit of SECSET-13 in the lock configuration again from the setting itself. The
+  background maintenance job (BG-12) runs this same clean-up through the lock; it never runs
+  it beside the lock's own work.
 
 ## 4. The passphrase (PASS)
 
@@ -644,6 +646,8 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   - no session is open, being finished behind the lock, or still closing. A session only counts
     as closed once its last write has returned, so nothing is lost;
   - no passphrase or fingerprint check, set-up or other work of the lock is running;
+  - no run of the background maintenance job holds the process (BG-14). A run that has finished
+    holds it until the platform has been told so, and is looked at again only after that;
   - the app is locked. The set-up screen and the two failure screens count as locked only if a
     session was open earlier in the same process, which is the case after a reset.
 - **END-02** The conditions are looked at when the app leaves the screen, when a screen of the
@@ -917,7 +921,9 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   - what interrupted writes of chats, of kept copies or of the list of chats left behind
     (`*.enc.tmp`) is deleted once its own date plus the limit lies in the past.
 
-  With "Never" nothing is deleted. A file whose date cannot be read is left alone. The
+  It runs at every start of the lock, which includes every run of the background maintenance
+  job (BG-12) while that is on. With "Never" nothing is deleted. A file whose date cannot be read
+  is left alone. The
   directories are flushed after a deletion (STORE-13). The list of chats cannot be changed
   without the key: it names the deleted chats until the next unlock (STORE-23).
 - **STORE-23** At every unlock, before any chat is shown and once the list has been corrected by
@@ -1620,6 +1626,14 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   configuration is the limit for everything the unlocked app does and shows; that copy is not
   changed by it, and the settings get the limit back with their next change. So a settings
   file that cannot be read never deletes what the user chose to keep.
+- **SECSET-14** Right after it, the switch "Background maintenance", on by default, with the
+  line "Lets the app wake for a moment every few hours, also after the phone restarts, to delete
+  what has expired. It never unlocks anything and never loads a model. Off: messages are only
+  deleted when you open the app." (BG-12). No passphrase is asked for. It is stored in the lock
+  configuration (FMT-06), because it is needed while the app is locked; a file without the
+  field means on. Turning it on schedules the job and turning it off cancels it; if the setting
+  cannot be stored, the switch shows the stored value again and the group says "That did not
+  work: the phone's key store or storage reported an error."
 - **SECSET-05** The switch "Finish the answer after locking" (section 6), on by default and
   stored in the lock configuration. The line under it says, when on: "On: if the app locks by
   itself while an answer is being written, the screen locks as always and the answer is
@@ -1756,9 +1770,12 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 ## 18. Background work and notifications (BG)
 
 **Source:** `background/AnswerWork.kt`, `background/AnswerService.kt`,
-`background/AnswerNotifications.kt`, `MainActivity.kt` (`askForNotificationsOnce`),
-`ProsePlowApp.kt`, `app/src/main/AndroidManifest.xml`; tests `background/AnswerWorkTest.kt`,
-`AppSessionTest.kt`, `SourceRulesTest.kt`.
+`background/AnswerNotifications.kt`, `background/MaintenanceJob.kt`,
+`background/MaintenanceSchedule.kt`, `security/AppLock.kt` (`startMaintenance`),
+`MainActivity.kt` (`askForNotificationsOnce`), `ProsePlowApp.kt`,
+`app/src/main/AndroidManifest.xml`; tests `background/AnswerWorkTest.kt`,
+`background/MaintenanceScheduleTest.kt`, `security/AppLockTest.kt`, `AppSessionTest.kt`,
+`SourceRulesTest.kt`.
 
 - **BG-01** An answer goes on being written when the app is put in the background or the
   device's screen turns off. For that, the app keeps its process alive and the processor awake
@@ -1817,14 +1834,50 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   engine adapts its threads by itself (NAT-03). On the phone that was tested, reading the
   conversation into the model was about a quarter slower in the background, and writing the
   answer was as fast as in front.
-- **BG-11** The app asks for four permissions, all for finishing an answer out of sight: the
-  foreground service, its type, notifications, and keeping the processor awake. Libraries add
-  three more: two for the use of biometrics, and one private permission of the app's own that
-  guards its internal receivers. The network is not among them (BUILD-01).
+- **BG-11** The app asks for five permissions: four for finishing an answer out of sight (the
+  foreground service, its type, notifications, and keeping the processor awake), and one that
+  keeps the background maintenance job scheduled across restarts of the device (BG-12, DEC-43).
+  Libraries add three more: two for the use of biometrics, and one private permission of the
+  app's own that guards its internal receivers. The network is not among them (BUILD-01).
   - **Parity note:** computing for minutes while the app is not on screen, or while the screen
     is off, is restricted on some platforms. The properties to preserve: an answer the user
     asked for is not lost by leaving the app if the platform allows it to go on; the user can
     see that the app is working; and a notification never says anything about the content.
+
+- **BG-12** While "Background maintenance" is on (SECSET-14), a job runs about every 6 hours,
+  also after the device restarts, in which the app deletes what has expired without the key
+  (STORE-22). It is scheduled at every start of the lock while the switch is on, so that an
+  update or a schedule that was lost puts itself right; a job that is already scheduled as it
+  should be is left as it is, so the next run is not put off. Turning the switch off cancels it,
+  and with no passphrase set up (after a reset) it is cancelled too: then nothing of the app runs
+  at start-up or in the background. The job never unlocks anything, never touches a key, never
+  loads a model and shows no notification.
+  - **On Android:** the platform's job scheduler (no library): one periodic job of 6 hours,
+    persisted across restarts (which needs `RECEIVE_BOOT_COMPLETED`), run by a job service that
+    is not exported and that only the system may bind (`BIND_JOB_SERVICE`). The platform
+    decides when within each period a run comes, may put runs off or stop them for an app that
+    is not used, cancels the job when the app is force-stopped, and runs nothing before the
+    device's first unlock after a restart, because the app's files are not readable until then.
+- **BG-13** A run that starts the app's process: the process starts and the lock starts as it
+  always does (LOCK-22), which runs the clean-up under the lock's own serialisation. The run
+  waits for that start to end and does nothing more, so the clean-up is not done twice. A run
+  in a process that was alive already (the app is open, or a session is alive behind the lock)
+  asks the lock for the same clean-up, which waits its turn behind the lock's other work; with a
+  session alive it only stores the trusted time (CHAT-24).
+- **BG-14** A run holds the process until its work is done: until then the process is not ended
+  (END-01). Then the platform is told the job is finished, and the hold is let go only after
+  that has reached the platform, never in the same step; then the process is looked at again,
+  so it ends exactly as it would have without the job (locked and out of sight, it ends at
+  once). Ending the process first would make the platform see a job die unfinished, count it
+  as failed and run it again sooner. A run the platform stops early, or one still going when its
+  service is taken down, is not reported as finished and lets go of the process at once; a run
+  holds it at most once and lets go of it at most once.
+  - **On Android:** `jobFinished` only queues the platform's own message on the main thread;
+    the hold is let go from a message posted to the same thread after it, so the platform's
+    message is handled first. No delay is involved, only the order of the queue.
+- **BG-15** Opening the app during a run changes nothing for either: the lock screen comes up
+  as at any start, a passphrase is checked once the lock's start (and its clean-up) is done, and
+  the process is not ended while the app is on screen.
 
 ## 19. The inference engine (ENG)
 
@@ -2393,12 +2446,13 @@ These are properties a build of the app is held to by the build itself or by tes
 its own means for each of them.
 
 - **BUILD-01** The build fails when the merged list of permissions contains anything outside a
-  fixed list: the four the app asks for (BG-11), the two the biometric library adds, and one
+  fixed list: the five the app asks for (BG-11), the two the biometric library adds, and one
   private permission a support library declares for the app's own internal receivers. The
   network permission is not on the list. The check is a step of the build and not a task beside
   it: what is packaged is the very list the check handed on, so nothing can be built or
   installed from a list that did not pass. The reason: a dependency can add a permission
-  unnoticed.
+  unnoticed. What a component requires of others (the job service's `BIND_JOB_SERVICE`) is not a
+  permission of the app and is not on the list.
 - **BUILD-02** No native library that carries a network client is linked. Of llama.cpp only the
   core library is built; its helper library contains an HTTP client and a downloader, and the
   build fails if that target so much as exists.
@@ -2553,6 +2607,7 @@ This section is exact where the others describe. Each item carries one of three 
   | `trustedTime.wallMillis` | number | The trusted time, in milliseconds since 1970 | 0 to 253,402,300,799,999 (the end of the year 9999) |
   | `trustedTime.elapsedMillis` | number | That moment on the device clock | not negative |
   | `trustedTime.bootCount` | number or null | The device's count of starts at that moment; null when it could not be read | when not null, not negative |
+  | `backgroundMaintenance` | boolean, default true | SECSET-14; a file without the field means on | |
 
   The hardware keys are named `proseplow.passphrase.binding.` and `proseplow.dek.biometric.`
   followed by the generation in decimal without leading zeros. Every key of the app begins with
@@ -3188,6 +3243,14 @@ only state a rule, the item says so and states its effect instead of inventing a
   Preserve: a restart always ends the period; whatever cannot be decided counts as run out; a
   lock that ran late starts the period when it was due; the check is made again at the moment
   of use; and running out never removes fingerprint unlock.
+- **DEC-43** *A scheduled background job, and the permission it needs to survive a restart*
+  (BG-12, SECSET-14). The owner's decision of 2026-11-23, which added `RECEIVE_BOOT_COMPLETED` as
+  the eighth entry of the build's allow-list (BUILD-01). Reasons: messages are to expire whether
+  or not the app is opened, and a job that ends with a restart would stop deleting after the
+  first one. Preserve: the job is used only while its switch is on and cancelled when it is
+  off; it has no receiver of its own (the platform's scheduler handles the restart); it runs the
+  lock's own clean-up through the lock and never beside it; it never touches a key, loads a
+  model or shows anything; and it never keeps the process alive longer than its work.
 
 ## 27. Planned tools: design considerations (TOOL)
 

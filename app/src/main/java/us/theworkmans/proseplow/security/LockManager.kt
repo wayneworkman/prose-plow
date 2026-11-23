@@ -606,6 +606,13 @@ class LockManager(
         if (current.messageLifetimeDays != days) save(current.copy(messageLifetimeDays = days))
     }
 
+    /** Stores [LockConfig.backgroundMaintenance]. Nothing is written when it already is [enabled]. */
+    @Throws(IOException::class)
+    fun setBackgroundMaintenance(enabled: Boolean) {
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (current.backgroundMaintenance != enabled) save(current.copy(backgroundMaintenance = enabled))
+    }
+
     /** Stores [LockConfig.finishAnswerAfterLocking]. Nothing is written when it already is [enabled]. */
     @Throws(IOException::class)
     fun setFinishAnswerAfterLocking(enabled: Boolean) {

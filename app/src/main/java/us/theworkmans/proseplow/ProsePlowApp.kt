@@ -9,6 +9,7 @@ import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.foundation.ExperimentalFoundationApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -16,7 +17,10 @@ import us.theworkmans.proseplow.background.AndroidKeepAliveProbe
 import us.theworkmans.proseplow.background.AndroidReadyNotice
 import us.theworkmans.proseplow.background.AnswerService
 import us.theworkmans.proseplow.background.AnswerWork
+import us.theworkmans.proseplow.background.AndroidMaintenanceSlot
 import us.theworkmans.proseplow.background.KeepAliveSource
+import us.theworkmans.proseplow.background.MaintenanceHost
+import us.theworkmans.proseplow.background.MaintenanceSchedule
 import us.theworkmans.proseplow.background.MemoryPressure
 import us.theworkmans.proseplow.chat.ChatController
 import us.theworkmans.proseplow.core.chat.Clock as MessageClock
@@ -34,6 +38,7 @@ import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.Clock
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
+import us.theworkmans.proseplow.security.MaintenanceScheduling
 import us.theworkmans.proseplow.security.MakesWay
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.TrustedClock
@@ -43,9 +48,11 @@ import java.util.concurrent.Executors
  * The application object. It only holds the [container]; nothing is created until the activity
  * first asks for it. The answer service asks through [keepAliveWanted], which does not create
  * it: a process in which no activity has run (one that only runs tests, for one) never has a
- * container, and so never has a lock that could end it.
+ * container, and so never has a lock that could end it. The background maintenance job is the
+ * one other thing that creates it ([startMaintenance]): a process the platform started for that
+ * job has the lock start as any start does, and ends when the job is done.
  */
-class ProsePlowApp : Application(), KeepAliveSource {
+class ProsePlowApp : Application(), KeepAliveSource, MaintenanceHost {
     /** What Android has said about memory being short; see [MemoryPressure]. It exists without the container. */
     val memoryPressure = MemoryPressure { SystemClock.elapsedRealtime() }
 
@@ -61,6 +68,16 @@ class ProsePlowApp : Application(), KeepAliveSource {
 
     override fun onKeepAliveRefused() {
         if (lazyContainer.isInitialized()) container.answerWork.onKeepAliveRefused()
+    }
+
+    /**
+     * A run of the background maintenance job (main thread). Whether the container exists yet
+     * says whether this process was started for the run: then the lock's start, made here,
+     * already is the work ([AppLock.startMaintenance]).
+     */
+    override fun startMaintenance(onFinished: (release: () -> Unit) -> Unit): Job {
+        val startedForIt = !lazyContainer.isInitialized()
+        return container.appLock.startMaintenance(startedForIt, onFinished)
     }
 
     override fun onCreate() {
@@ -212,6 +229,7 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         },
         // What has expired is deleted at every start of the lock, before anything can be unlocked.
         expiredData = ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex),
+        maintenanceScheduling = MaintenanceScheduling(MaintenanceSchedule(AndroidMaintenanceSlot(app))::apply),
     )
 
     init {

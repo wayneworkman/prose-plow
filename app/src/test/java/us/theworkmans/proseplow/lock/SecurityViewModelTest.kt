@@ -432,4 +432,26 @@ class SecurityViewModelTest {
         assertEquals("the setting is not changed either", changes, lifetimeSetting.changes.size)
         assertEquals(0, copy())
     }
+
+    /** "Background maintenance" needs no passphrase, is stored in the lock configuration, and a failure leaves it as it was. */
+    @Test
+    fun theBackgroundMaintenanceSwitchIsStoredWithoutAPassphrase() = runTest(dispatcher) {
+        unlockedApp()
+        assertTrue(viewModel.status.value.backgroundMaintenance)
+        viewModel.setBackgroundMaintenance(false)
+        runCurrent()
+        assertNull(viewModel.state.value.dialog)
+        assertFalse(viewModel.status.value.backgroundMaintenance)
+        assertFalse(LockConfigStore(files.lockConfig).read()!!.backgroundMaintenance)
+
+        files.securityDir.setWritable(false)
+        try {
+            viewModel.setBackgroundMaintenance(true)
+            runCurrent()
+        } finally {
+            files.securityDir.setWritable(true)
+        }
+        assertEquals(SecurityError.FAILED, viewModel.state.value.error)
+        assertFalse(viewModel.status.value.backgroundMaintenance)
+    }
 }

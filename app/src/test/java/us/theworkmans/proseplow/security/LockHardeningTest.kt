@@ -533,6 +533,26 @@ class LockHardeningTest {
     }
 
     /**
+     * "Background maintenance" was added without a new version: a file without the field means
+     * on, and a value that is not a truth value is a damaged configuration like any other.
+     */
+    @Test
+    fun backgroundMaintenanceIsOnUnlessTheConfigurationSaysOff() {
+        setUp()
+        editStored { it.remove("backgroundMaintenance") }
+        val m = manager()
+        assertEquals(StartResult.Locked, m.start())
+        assertTrue(m.config!!.backgroundMaintenance)
+        m.setBackgroundMaintenance(false)
+        assertTrue(configFile.readText().contains("\"backgroundMaintenance\":false"))
+        assertFalse(manager().apply { start() }.config!!.backgroundMaintenance)
+        for (bad in listOf<Any?>("yes", 1, null)) {
+            editStored { it["backgroundMaintenance"] = bad }
+            assertEquals("$bad", StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
+        }
+    }
+
+    /**
      * The readable copy of how long messages are kept, and the trusted time, were added without
      * a new version. A file without them reads and validates: the copy means 7 days and no time
      * is trusted yet. A value outside the choices, or a mark no clock can give, is a damaged

@@ -75,6 +75,13 @@ data class LockConfig(
      * means; the wall clock is then trusted as it is.
      */
     val trustedTime: TimeMark? = null,
+    /**
+     * Whether the background maintenance job is scheduled: a run every few hours, also after a
+     * restart of the phone, that deletes what has expired while the app is not used. It is here,
+     * and not with the encrypted settings, because it is needed while the app is locked. A file
+     * written before this field existed does not have it, which means on.
+     */
+    val backgroundMaintenance: Boolean = true,
 ) {
     /**
      * Every field is in range and every wrap well formed, so nothing read from the file can make
