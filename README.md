@@ -120,7 +120,11 @@ Privacy:
   key is still in memory, for at most ten minutes and then the closing of the session, which
   takes at most three waits of ten seconds each (see [The lock](#the-lock)). Unlocking in that time takes the full
   passphrase or fingerprint check as always and brings you back to the answer under way. "Lock
-  now" never waits: it stops the answer and erases the key at once.
+  now" never waits: it stops the answer and erases the key at once. The answer is not finished
+  behind the lock, but stopped at the lock as with the setting off, when Android has the app's
+  background use restricted (App info, Battery) or does not grant it the foreground service;
+  and if Android stops that service while the answer is being finished, the answer is stopped
+  and the key erased at that moment.
 - **Ends its own process when it is locked.** Once the app is locked, has nothing left to
   finish and is not on screen, it ends its process, because that is the only thing that
   removes every copy of a conversation from memory. Opening it again starts it afresh, at the
@@ -450,12 +454,16 @@ optionally a second time by a fingerprint key.
   locking" is on (the default), everything above happens for the screen: it is torn down, the
   lock screen is all there is to see or capture. But the unlocked session is left alive, data
   key included, and told to start nothing new, provided the service that keeps the app running
-  in the background has really started; if Android refused it, the answer is stopped and the
-  key overwritten as with the setting off, since nothing would then keep the app awake to end
-  the session on time. When that one answer is finished, or ten minutes after the moment of
-  locking if it is not (it is then stopped and kept as a stopped message), the session is
-  closed in the order described above, which takes at most three waits of ten seconds, and the
-  key is overwritten.
+  in the background is really in the foreground at the moment of locking, as Android says then,
+  and the app's background use is not restricted. Otherwise (Android refused the service, or
+  returned from `startForeground` without granting it, has since taken it out of the
+  foreground, or will do so as the app leaves the screen because its background use is
+  restricted) the answer is stopped and the key overwritten as with the setting off, since
+  nothing would then keep the app awake to end the session on time. When that one answer is
+  finished, ten minutes after the moment of locking if it is not, or the moment Android stops
+  that service on the way (the answer is then stopped and kept as a stopped message), the
+  session is closed in the order described above, which takes at most three waits of ten
+  seconds, and the key is overwritten.
   The ten minutes count whatever the model is doing: reading a long conversation again is
   part of the answer, so one that takes longer than that to read is not finished behind the
   lock (see [The context grows with the conversation](#the-context-grows-with-the-conversation)).
@@ -1263,9 +1271,9 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 372 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 562 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
-| `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
+| `core` (JVM, 408 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 590 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark | `./gradlew :app:connectedDebugAndroidTest` |

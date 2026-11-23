@@ -4,10 +4,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
@@ -26,6 +28,7 @@ import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.KeepAliveEntry
+import us.theworkmans.proseplow.background.KeepAliveProbe
 import us.theworkmans.proseplow.background.KeepAliveSource
 import us.theworkmans.proseplow.background.ReadyNotice
 import us.theworkmans.proseplow.core.chat.FakeClock
@@ -303,14 +306,35 @@ class AppSessionTest {
         var readyShown = 0
         var readyCleared = 0
 
-        /** Whether Android puts the answer service in the foreground when it is created. */
+        /** Whether Android puts the answer service in the foreground when it is created (false: `startForeground` throws). */
         var foregroundAllowed = true
 
-        /** The answer service: created a moment after it was started, as Android does, through the service's own entry. */
+        /** Whether a `startForeground` that returns has any effect (false: it returns, and the service is not in the foreground). */
+        var foregroundTakesEffect = true
+
+        /** Whether the user has restricted the app's background use. */
+        var backgroundRestricted = false
+
+        /** Whether Android has the answer service in the foreground now, as its own record says. */
+        var serviceInForeground = false
+
+        /** How many instances of the answer service were created. */
+        var serviceCreations = 0
+
+        /** The instance that lives, while one does. */
+        private var serviceInstance: Job? = null
+
+        /** The instance has said that it runs and has not yet said that it ended: the service's `told`. */
+        private var serviceTold = false
+
+        /** The answer service's link to the app, as the application object is. */
         private val service = object : KeepAliveSource {
             override val keepAliveWanted: StateFlow<Boolean> get() = answers.keepAliveWanted
 
-            override fun onKeepAlive(running: Boolean) = answers.onKeepAlive(running)
+            override fun onKeepAlive(running: Boolean) {
+                answers.onKeepAlive(running)
+                noteKeepAlive()
+            }
 
             override fun onKeepAliveRefused() {
                 answers.onKeepAliveRefused()
@@ -318,14 +342,49 @@ class AppSessionTest {
             }
         }
 
-        val answers: AnswerWork = AnswerWork(
-            keepAlive = {
-                keepAliveStarts++
-                CoroutineScope(dispatcher).launch {
-                    KeepAliveEntry.enter(service) { if (!foregroundAllowed) throw IllegalStateException("not allowed from the background") }
+        /**
+         * `startService`: an instance is created a moment later, as Android does, unless one
+         * lives (which then only gets the start command). The instance does what AnswerService
+         * does, through the same entry: into the foreground, confirmed or refused; then it waits
+         * until it is no longer wanted, says that it ends, and leaves the foreground.
+         */
+        private fun startService(): Boolean {
+            keepAliveStarts++
+            if (serviceInstance?.isActive == true) return true
+            serviceInstance = CoroutineScope(dispatcher).launch {
+                serviceCreations++
+                val wanted = KeepAliveEntry.enter(service, { serviceInForeground }) {
+                    if (!foregroundAllowed) throw IllegalStateException("not allowed from the background")
+                    serviceInForeground = foregroundTakesEffect
                 }
-                true
-            },
+                if (wanted == null) {
+                    serviceInForeground = false
+                    serviceInstance = null
+                    return@launch
+                }
+                serviceTold = true
+                wanted.first { !it }
+                serviceTold = false
+                service.onKeepAlive(false)
+                serviceInForeground = false
+                serviceInstance = null
+            }
+            return true
+        }
+
+        /** Android stops the service from outside ("app idle", the user in the task manager): its onDestroy says that it ended. */
+        fun destroyServiceFromOutside() {
+            serviceInstance?.cancel()
+            serviceInstance = null
+            serviceInForeground = false
+            if (serviceTold) {
+                serviceTold = false
+                service.onKeepAlive(false)
+            }
+        }
+
+        val answers: AnswerWork = AnswerWork(
+            keepAlive = { startService() },
             readyNotice = object : ReadyNotice {
                 override fun show() {
                     readyShown++
@@ -334,6 +393,11 @@ class AppSessionTest {
                 override fun clear() {
                     readyCleared++
                 }
+            },
+            probe = object : KeepAliveProbe {
+                override fun backgroundRestricted() = this@LockedApp.backgroundRestricted
+
+                override fun serviceInForeground() = this@LockedApp.serviceInForeground
             },
         )
         var processEnds = 0
@@ -408,7 +472,7 @@ class AppSessionTest {
             processEnder = {
                 if (processEnds++ == 0) lastBeforeProcessEnd = log.lastOrNull()
             },
-            canFinishOutOfSight = { answers.keepAliveRunning },
+            canFinishOutOfSight = answers::canFinishOutOfSight,
         )
 
         init {
@@ -419,6 +483,8 @@ class AppSessionTest {
                     noteKeepAlive()
                 }
             }
+            // And the end of the keep-alive ends a lease.
+            answers.whenKeepAliveEnds(lock::onKeepAliveEnded)
         }
 
         /** The app's one activity reaches the screen. */
@@ -693,12 +759,153 @@ class AppSessionTest {
         runCurrent()
         assertTrue(app.answers.keepAliveWanted.value)
         assertTrue("the service was created and reached the foreground", app.answers.keepAliveRunning)
-        // The service ends (it stops itself once it is no longer wanted).
-        app.answers.onKeepAlive(false)
-        assertFalse(app.answers.keepAliveRunning)
+        assertTrue(app.serviceInForeground)
+        // The answer ends; the service, no longer wanted, says so and leaves the foreground by itself.
         advanceTimeBy(5_000)
         runCurrent()
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertFalse("told by the service itself", app.answers.keepAliveRunning)
+        assertFalse(app.serviceInForeground)
         session.close()
+    }
+
+    /**
+     * The third review's gap: two answers in a row, with the service really ending between them.
+     * The second answer gets a new instance that reaches the foreground again, and the app's own
+     * lock during it still leaves the answer to be finished.
+     */
+    @Test
+    fun twoAnswersInARowEachGetAKeepAliveOfTheirOwn() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        val id = session.openSession.id
+        app.fake.enqueueReply(listOf("One ", "two"), millisBetween = 500)
+        session.chat.send(id, "Count")
+        runCurrent()
+        assertEquals(1, app.serviceCreations)
+        assertTrue(app.answers.keepAliveRunning)
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertFalse("the first instance has ended", app.answers.keepAliveRunning)
+        assertFalse(app.serviceInForeground)
+
+        app.fake.enqueueReply(listOf("Three ", "four ", "five"), millisBetween = 500)
+        session.chat.send(id, "Go on")
+        runCurrent()
+        advanceTimeBy(500)
+        runCurrent()
+        assertEquals("a new instance", 2, app.serviceCreations)
+        assertTrue(app.answers.keepAliveRunning)
+        assertTrue(app.serviceInForeground)
+        app.log.clear()
+
+        app.leave()
+        assertEquals(listOf("screens cleared", "finish only"), app.log)
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertEquals(2, app.fake.completedGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.answers.keepAliveRunning)
+        assertFalse(app.serviceInForeground)
+        assertEquals(1, app.processEnds)
+    }
+
+    /**
+     * The third review's finding 1: a `startForeground` that returns without effect (an app-op
+     * set to ignore, or background use restricted and the app not on top) is a refusal. Without
+     * the check after it, the keep-alive would be believed to run and a lease would start.
+     */
+    @Test
+    fun aStartForegroundThatReturnsWithoutEffectLeavesNoLeaseBehindTheLock() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.foregroundTakesEffect = false
+        val session = inTheMiddleOfAnAnswer(app)
+        assertEquals(1, app.serviceCreations)
+        assertFalse(app.answers.keepAliveRunning)
+        assertFalse(app.answers.keepAliveWanted.value)
+
+        app.leave()
+        runCurrent()
+        assertFalse("no lease", app.log.contains("finish only"))
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertEquals(1, app.processEnds)
+        assertEquals(MessageStatus.STOPPED, session.openSession.messages.last().status)
+    }
+
+    /**
+     * Finding 1: the user has restricted the app's background use. Android takes the service out
+     * of the foreground as the app leaves the top, without a word, so the lock asks and starts
+     * no lease, although the service did reach the foreground while the app was on top.
+     */
+    @Test
+    fun backgroundUseRestrictedAtTheLockLeavesNoLease() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        inTheMiddleOfAnAnswer(app)
+        assertTrue(app.answers.keepAliveRunning)
+        assertTrue(app.serviceInForeground)
+        app.backgroundRestricted = true
+
+        app.leave()
+        runCurrent()
+        assertFalse("no lease", app.log.contains("finish only"))
+        assertEquals(0, app.fake.activeGenerations)
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.lock.sessionEnding.value)
+        assertEquals(1, app.processEnds)
+    }
+
+    /** Finding 1: Android has already taken the service out of the foreground when the app locks, and nothing told it. */
+    @Test
+    fun aServiceNoLongerInTheForegroundAtTheLockLeavesNoLease() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        inTheMiddleOfAnAnswer(app)
+        app.serviceInForeground = false
+        assertTrue("the flag alone still says it runs", app.answers.keepAliveRunning)
+
+        app.leave()
+        runCurrent()
+        assertFalse("no lease", app.log.contains("finish only"))
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertEquals(1, app.processEnds)
+    }
+
+    /**
+     * Finding 1's net: while a lease runs, Android stops the answer service from outside (as
+     * "Stopping service due to app idle" does). The lease ends at once, by the ceiling's path:
+     * the answer is stopped and saved as stopped, the session closed, the key destroyed and the
+     * process ended, long before the ten minutes.
+     */
+    @Test
+    fun aKeepAliveStoppedFromOutsideDuringALeaseEndsTheLeaseAtOnce() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        app.leave()
+        runCurrent()
+        assertEquals(listOf("screens cleared", "finish only"), app.log.filterNot { it.startsWith("sealed") })
+        assertTrue(app.lock.sessionEnding.value)
+        assertEquals(1, app.fake.activeGenerations)
+
+        app.destroyServiceFromOutside()
+        runCurrent()
+        assertEquals("stopped, not finished", 0, app.fake.completedGenerations)
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.lock.sessionEnding.value)
+        assertEquals(1, app.processEnds)
+        assertEquals("an answer that was cut off is not announced", 0, app.readyShown)
+
+        app.comeToFront()
+        val reply = unlock(app).openSession.messages.last()
+        assertEquals(id, app.session.openSession.id)
+        assertEquals("Half ", reply.text)
+        assertEquals(MessageStatus.STOPPED, reply.status)
     }
 
     @Test

@@ -185,9 +185,10 @@ sealed interface PassphraseCheck {
  * or the check on coming back) while the session has unfinished work, the setting allows it, and
  * something really keeps the process running out of sight ([canFinishOutOfSight]), the screens
  * lock exactly as always, but the session is left alive, key included: a lease. It ends when
- * the work is finished or after [LEASE_MILLIS], whichever comes first, and then the session is
- * closed and its key destroyed as at any lock (a close that is itself bounded, see
- * [UnlockedSession.close]). "Lock now" never leaves anything
+ * the work is finished, after [LEASE_MILLIS], or when what keeps the process running goes away
+ * ([onKeepAliveEnded]), whichever comes first, and then the session is closed and its key
+ * destroyed as at any lock (a close that is itself bounded, see [UnlockedSession.close]).
+ * "Lock now" never leaves anything
  * alive. Nothing about unlocking changes: the passphrase or the fingerprint is checked in full,
  * with the same back-off and counters, and only a success whose key is the leased session's
  * key puts that same session back on screen.
@@ -225,10 +226,11 @@ class AppLock<S : UnlockedSession>(
     private val heavyWork: MakesWay = MakesWay.None,
     /**
      * True while something keeps the process alive and awake out of sight (the answer service,
-     * in the foreground). Asked at the moment the app locks by itself: without it no lease
-     * starts, because a process that is frozen or asleep runs none of the timers that end a
-     * lease, and its key would stay in memory for as long as nobody comes back. The default,
-     * for a lock with nothing beside it, is that nothing does.
+     * in the foreground, as Android says at the moment of asking). Asked at the moment the app
+     * locks by itself: without it no lease starts, because a process that is frozen or asleep
+     * runs none of the timers that end a lease, and its key would stay in memory for as long as
+     * nobody comes back. Its end is told through [onKeepAliveEnded]. The default, for a lock with
+     * nothing beside it, is that nothing does.
      */
     private val canFinishOutOfSight: () -> Boolean = { false },
 ) {
@@ -507,6 +509,17 @@ class AppLock<S : UnlockedSession>(
         }
     }
 
+    /**
+     * What kept the process alive and awake out of sight has ended (main thread): the answer
+     * service was refused, left the foreground or was stopped. A lease that is running depends
+     * on it (without it the process may be frozen and none of its timers run), so it ends now,
+     * by the same path as the ceiling: the work is stopped, the session closed and its key
+     * destroyed. Without a lease this changes nothing.
+     */
+    fun onKeepAliveEnded() {
+        lease?.let(::endLease)
+    }
+
     /** Main thread: ends [parked] if it is still the lease. Its session is closed, and its key destroyed, from here. */
     private fun endLease(parked: Lease<S>) {
         if (!release(parked)) return
@@ -730,6 +743,13 @@ class AppLock<S : UnlockedSession>(
         enrollmentProof = null
         offerProof = null
         _fingerprintOffer.value = null
+        // An enrolment prompt belongs to the unlocked state; the lock cancels its new key. It is
+        // pending no longer, so that it cannot keep the locked, idle process alive, and a
+        // callback that arrives late is ignored without a message.
+        if (pendingPurpose == BiometricPurpose.ENROLL) {
+            pendingPurpose = null
+            _unlockUi.update { it.copy(biometricPromptShowing = false) }
+        }
         // The reference goes before the session is retired: from this line on nothing can pick
         // its key up for a new wrap (a passphrase change, a fingerprint enrolment), whatever
         // order the work that follows runs in.
@@ -758,7 +778,7 @@ class AppLock<S : UnlockedSession>(
      * the report never comes, a pending unlock would keep the locked, idle process alive for
      * ever. So it is dropped here, and a callback that arrives late is ignored as any callback
      * without a pending purpose is. An enrolment is not touched: it happens while unlocked, and
-     * the lock cancels it in any case.
+     * the lock drops it ([leaveUnlocked]).
      */
     private fun dropUnlockPromptOutOfSight() {
         if (onScreen.isNotEmpty() || arriving.isNotEmpty() || successors > 0) return
@@ -814,6 +834,10 @@ class AppLock<S : UnlockedSession>(
      * A MainActivity was destroyed; [finished]: for good (back pressed), not for a configuration
      * change. The screens' state is shared by every instance (it lives in the session), so it is
      * cleared only when the last instance finishes; the session stays until the lock engages.
+     *
+     * Then it looks again, as when the app leaves the screen: an activity that was on its way
+     * there may have been all that held an unlock prompt or the process. During a rotation this
+     * changes nothing, since the instance destroyed on screen leaves a successor counted.
      */
     fun onActivityDestroyed(finished: Boolean, who: Any = Unit) {
         activities = (activities - 1).coerceAtLeast(0)
@@ -833,6 +857,8 @@ class AppLock<S : UnlockedSession>(
             }
             live?.session?.clearScreens()
         }
+        dropUnlockPromptOutOfSight()
+        considerEndingProcess()
     }
 
     // --- First run ----------------------------------------------------------------------------

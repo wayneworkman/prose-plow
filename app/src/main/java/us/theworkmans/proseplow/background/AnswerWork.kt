@@ -39,9 +39,11 @@ interface KeepAliveSource {
     val keepAliveWanted: StateFlow<Boolean>?
 
     /**
-     * The answer service has reached the foreground ([running] true), or has ended (false). Only
-     * a service in the foreground keeps the process alive and awake, so only this says that the
-     * keep-alive exists. Ignored when nothing in this process has written an answer.
+     * The answer service has reached the foreground ([running] true), or is leaving it or has
+     * ended (false). Only a service in the foreground keeps the process alive and awake, so only
+     * this says that the keep-alive exists. The service says false before it leaves the
+     * foreground, not afterwards, so that nothing believes in a keep-alive that is already gone.
+     * Ignored when nothing in this process has written an answer.
      */
     fun onKeepAlive(running: Boolean)
 
@@ -53,22 +55,42 @@ interface KeepAliveSource {
     fun onKeepAliveRefused()
 }
 
+/**
+ * What Android says about the keep-alive at this moment, asked rather than remembered: a service
+ * can be taken out of the foreground without being told, so a flag set when it got there is not
+ * enough. Main thread.
+ */
+interface KeepAliveProbe {
+    /**
+     * The user has restricted the app's background use (`ActivityManager.isBackgroundRestricted`).
+     * Android then takes the answer service out of the foreground as soon as the app leaves the
+     * top, without a callback, and stops it a minute later.
+     */
+    fun backgroundRestricted(): Boolean
+
+    /** Android has the answer service in the foreground now. */
+    fun serviceInForeground(): Boolean
+}
+
 /** What the answer service does when it is created, apart from Android: plain Kotlin, so that it is tested. */
 object KeepAliveEntry {
     /**
      * Puts the service in the foreground through [startForeground], first and at once, and tells
      * [source] how that went. Returns what the service is to watch, or null when it is to stop
-     * at once: when Android refused (a [RuntimeException] from [startForeground]), and when
-     * nothing in the process has ever written an answer (no [source], or one with no flow).
+     * at once: when Android refused, and when nothing in the process has ever written an answer
+     * (no [source], or one with no flow). A refusal is a [RuntimeException] from
+     * [startForeground], and equally a call that returned without effect, which Android does
+     * when its app-op is set to ignore or the app's background use is restricted and the app is
+     * not on top: so success is only what [inForeground] confirms afterwards.
      */
-    fun enter(source: KeepAliveSource?, startForeground: () -> Unit): StateFlow<Boolean>? {
-        val inForeground = try {
+    fun enter(source: KeepAliveSource?, inForeground: () -> Boolean, startForeground: () -> Unit): StateFlow<Boolean>? {
+        val inTheForeground = try {
             startForeground()
-            true
+            inForeground()
         } catch (_: RuntimeException) {
             false
         }
-        if (!inForeground) {
+        if (!inTheForeground) {
             source?.onKeepAliveRefused()
             return null
         }
@@ -89,50 +111,93 @@ object KeepAliveEntry {
  *   more and no session is still ending behind the lock: between the last word of an answer
  *   and the destruction of the data key the session is saved and closed, and a process that
  *   was put to sleep in that moment would keep the key in memory.
- * - **A keep-alive exists only once the service says so.** [keepAliveRunning] is true from the
- *   moment the answer service has reached the foreground until it ends. A refusal turns
- *   [keepAliveWanted] false at once. The lock leaves a session alive behind it only while this
- *   is true: without the service the process may be frozen, and with it every timer that would
- *   end the session.
+ * - **A keep-alive exists only once the service says so, and only while Android agrees.**
+ *   [keepAliveRunning] is true from the moment the answer service has confirmed that it is in
+ *   the foreground until it says that it is leaving it. A refusal, or the end of the service
+ *   while it was still wanted, turns [keepAliveWanted] false at once, and the app asks again
+ *   when it next comes to the front with the answer still being written. The lock leaves a
+ *   session alive behind it only when [canFinishOutOfSight] holds at that moment: without the
+ *   service in the foreground the process may be frozen, and with it every timer that would end
+ *   the session. And whoever was told through [whenKeepAliveEnds] hears of every end, so that a
+ *   session left alive on the strength of the keep-alive does not outlive it.
  * - **"Your answer is ready" only for someone who is not looking.** It is shown when the model
  *   finished an answer by itself while the app was not in front, and taken away when the app
  *   comes to the front. It never says anything about the answer.
  */
-class AnswerWork(private val keepAlive: KeepAliveStarter, private val readyNotice: ReadyNotice) : AnswerEvents {
+class AnswerWork(
+    private val keepAlive: KeepAliveStarter,
+    private val readyNotice: ReadyNotice,
+    private val probe: KeepAliveProbe,
+) : AnswerEvents {
     private var writing = false
     private var sessionEnding = false
     private var inFront = false
+    private var keepAliveEnded: () -> Unit = {}
 
     private val _keepAliveWanted = MutableStateFlow(false)
 
     /** The answer service runs while this is true, and stops itself when it turns false. */
     val keepAliveWanted: StateFlow<Boolean> = _keepAliveWanted.asStateFlow()
 
-    /** True while the answer service is in the foreground: what keeps the process alive and awake really runs. */
+    /** True while the answer service says it is in the foreground: what keeps the process alive and awake runs, as far as the service knows. */
     var keepAliveRunning: Boolean = false
         private set
 
-    /** The answer service reached the foreground ([running] true) or ended. See [KeepAliveSource.onKeepAlive]. */
-    fun onKeepAlive(running: Boolean) {
-        keepAliveRunning = running
+    /**
+     * Whether something keeps the process alive and awake out of sight at this moment: the
+     * service has said that it runs, the user has not restricted the app's background use, and
+     * Android has the service in the foreground now. The one place where the lock's question is
+     * answered (it is asked at the moment the app locks by itself); the flag alone is not
+     * enough, because Android takes a restricted app's service out of the foreground when the
+     * app leaves the top without telling it.
+     */
+    fun canFinishOutOfSight(): Boolean = keepAliveRunning && !probe.backgroundRestricted() && probe.serviceInForeground()
+
+    /**
+     * [action] is called on every end of the keep-alive (a refusal, or the service leaving the
+     * foreground or ending), on the main thread, at once. One listener: the lock, which ends a
+     * session it left alive on the strength of the keep-alive.
+     */
+    fun whenKeepAliveEnds(action: () -> Unit) {
+        keepAliveEnded = action
     }
 
-    /** Android refused the foreground: nothing is kept alive, and nothing is wanted until the next answer asks again. */
+    /**
+     * The answer service confirmed the foreground ([running] true), or is leaving it or has ended
+     * (false). See [KeepAliveSource.onKeepAlive]. An end while the keep-alive was still wanted
+     * means that it was stopped from outside: nothing is wanted any more either, so that the
+     * next answer, or coming back to the front, asks again.
+     */
+    fun onKeepAlive(running: Boolean) {
+        keepAliveRunning = running
+        if (!running) {
+            _keepAliveWanted.value = false
+            keepAliveEnded()
+        }
+    }
+
+    /** Android refused the foreground: nothing is kept alive, and nothing is wanted until it is asked for again. */
     fun onKeepAliveRefused() {
         keepAliveRunning = false
         _keepAliveWanted.value = false
+        keepAliveEnded()
     }
 
     override fun onWriting(writing: Boolean) {
         if (this.writing == writing) return
         this.writing = writing
-        if (!writing) {
-            settle()
-        } else if (!_keepAliveWanted.value && inFront) {
-            // Wanted before it is started: the service looks at this the moment it exists.
-            _keepAliveWanted.value = true
-            if (!keepAlive.start()) _keepAliveWanted.value = false
-        }
+        if (!writing) settle() else askForKeepAlive()
+    }
+
+    /**
+     * Starts the keep-alive if an answer is being written, none is wanted yet, and the app is in
+     * front (Android lets a foreground service be started from nowhere else).
+     */
+    private fun askForKeepAlive() {
+        if (!writing || _keepAliveWanted.value || !inFront) return
+        // Wanted before it is started: the service looks at this the moment it exists.
+        _keepAliveWanted.value = true
+        if (!keepAlive.start()) _keepAliveWanted.value = false
     }
 
     /** A session that has left the screen is still alive ([ending] true), or none is. */
@@ -149,10 +214,17 @@ class AnswerWork(private val keepAlive: KeepAliveStarter, private val readyNotic
         if (!inFront) readyNotice.show()
     }
 
-    /** The app's screen came to the front, or left it. */
+    /**
+     * The app's screen came to the front, or left it. Coming to the front with an answer still
+     * being written and no keep-alive wanted (it was refused, could not be started, or was
+     * stopped from outside) asks for it again: only now may it be started.
+     */
     fun onInFront(inFront: Boolean) {
         this.inFront = inFront
-        if (inFront) readyNotice.clear()
+        if (inFront) {
+            readyNotice.clear()
+            askForKeepAlive()
+        }
     }
 }
 

@@ -20,6 +20,13 @@ class AnswerWorkTest {
     private var shown = 0
     private var cleared = 0
 
+    /** What Android says at the moment of asking. */
+    private var restricted = false
+    private var inForeground = true
+
+    /** How often the keep-alive's end was told onward (to the lock, in the app). */
+    private var endsTold = 0
+
     private val work = AnswerWork(
         keepAlive = {
             starts++
@@ -34,7 +41,12 @@ class AnswerWorkTest {
                 cleared++
             }
         },
-    )
+        probe = object : KeepAliveProbe {
+            override fun backgroundRestricted() = restricted
+
+            override fun serviceInForeground() = inForeground
+        },
+    ).apply { whenKeepAliveEnds { endsTold++ } }
 
     private val wanted get() = work.keepAliveWanted.value
 
@@ -143,7 +155,7 @@ class AnswerWorkTest {
         assertFalse("not running before the service says so", work.keepAliveRunning)
 
         var asked = 0
-        val watched = KeepAliveEntry.enter(source) {
+        val watched = KeepAliveEntry.enter(source, { true }) {
             asked++
             throw IllegalStateException("Android refused")
         }
@@ -156,16 +168,117 @@ class AnswerWorkTest {
         work.onWriting(false)
         work.onWriting(true)
         assertEquals(2, starts)
-        assertSame(work.keepAliveWanted, KeepAliveEntry.enter(source) { })
+        assertSame(work.keepAliveWanted, KeepAliveEntry.enter(source, { true }) { })
         assertTrue(work.keepAliveRunning)
         work.onKeepAlive(false)
         assertFalse("ended with the service", work.keepAliveRunning)
     }
 
+    /**
+     * The third security review's finding 1: Android may return from `startForeground` without
+     * putting the service in the foreground (its app-op set to ignore, or the app's background
+     * use restricted and the app not on top). That is a refusal like a thrown one.
+     */
+    @Test
+    fun aStartForegroundThatReturnsWithoutEffectIsARefusal() {
+        work.onInFront(true)
+        work.onWriting(true)
+        assertTrue(wanted)
+        var asked = 0
+        val watched = KeepAliveEntry.enter(source, { false }) { asked++ }
+        assertEquals("startForeground was called and returned", 1, asked)
+        assertNull("the service stops at once", watched)
+        assertFalse(work.keepAliveRunning)
+        assertFalse(wanted)
+        assertEquals("the end is told onward", 1, endsTold)
+        assertFalse(work.canFinishOutOfSight())
+    }
+
+    /** Finding 1: the lock's question is answered by asking Android at that moment, not by the flag alone. */
+    @Test
+    fun whetherAnAnswerCanBeFinishedOutOfSightIsAskedOfAndroidAtThatMoment() {
+        work.onInFront(true)
+        work.onWriting(true)
+        assertFalse("not before the service says that it runs", work.canFinishOutOfSight())
+        KeepAliveEntry.enter(source, { true }) { }
+        assertTrue(work.keepAliveRunning)
+        assertTrue(work.canFinishOutOfSight())
+
+        restricted = true
+        assertFalse("the user has restricted the app's background use", work.canFinishOutOfSight())
+        restricted = false
+        inForeground = false
+        assertFalse("Android took the service out of the foreground without a word", work.canFinishOutOfSight())
+        assertTrue("the flag alone still says it runs", work.keepAliveRunning)
+        inForeground = true
+        assertTrue(work.canFinishOutOfSight())
+    }
+
+    /**
+     * Finding 1's net: the service ended while it was still wanted (stopped from outside). The
+     * end is told onward, nothing is kept wanted, and coming back to the front asks again.
+     */
+    @Test
+    fun aKeepAliveStoppedFromOutsideIsToldOnwardAndAskedForAgainInFront() {
+        work.onInFront(true)
+        work.onWriting(true)
+        KeepAliveEntry.enter(source, { true }) { }
+        work.onInFront(false)
+        assertEquals(1, starts)
+
+        work.onKeepAlive(false) // As the service says when it is destroyed.
+        assertFalse(work.keepAliveRunning)
+        assertFalse(wanted)
+        assertEquals(1, endsTold)
+        assertFalse(work.canFinishOutOfSight())
+
+        work.onInFront(true)
+        assertEquals("asked for again, the answer still being written", 2, starts)
+        assertTrue(wanted)
+    }
+
+    /** The note under "Suspicions": a refused keep-alive is asked for again when the app comes back to the front. */
+    @Test
+    fun aRefusedKeepAliveIsAskedForAgainWhenTheAppComesBackToTheFront() {
+        startWorks = false
+        work.onInFront(true)
+        work.onWriting(true)
+        assertFalse(wanted)
+        work.onInFront(false)
+        startWorks = true
+        work.onInFront(false)
+        assertEquals("never from the background", 1, starts)
+        work.onInFront(true)
+        assertEquals(2, starts)
+        assertTrue(wanted)
+        work.onInFront(true) // Wanted already: nothing is started twice.
+        assertEquals(2, starts)
+
+        // Without an answer being written, coming to the front starts nothing.
+        work.onWriting(false)
+        work.onInFront(false)
+        work.onInFront(true)
+        assertEquals(2, starts)
+    }
+
+    /** Finding 4: the service says that the keep-alive ends before it leaves the foreground, and its end is told onward once. */
+    @Test
+    fun theNormalEndOfTheServiceIsToldOnwardAndLeavesNothingWanted() {
+        work.onInFront(true)
+        work.onWriting(true)
+        KeepAliveEntry.enter(source, { true }) { }
+        work.onWriting(false)
+        assertFalse(wanted)
+        assertTrue("until the service says so", work.keepAliveRunning)
+        work.onKeepAlive(false)
+        assertFalse(work.keepAliveRunning)
+        assertEquals(1, endsTold)
+    }
+
     @Test
     fun aServiceInAProcessThatNeverWroteAnAnswerStopsAtOnce() {
         var asked = 0
-        assertNull(KeepAliveEntry.enter(null) { asked++ })
+        assertNull(KeepAliveEntry.enter(null, { true }) { asked++ })
         assertEquals("in the foreground first, whatever follows", 1, asked)
         val empty = object : KeepAliveSource {
             override val keepAliveWanted: StateFlow<Boolean>? = null
@@ -174,7 +287,7 @@ class AnswerWorkTest {
 
             override fun onKeepAliveRefused() = fail("nothing to tell")
         }
-        assertNull(KeepAliveEntry.enter(empty) { })
+        assertNull(KeepAliveEntry.enter(empty, { true }) { })
     }
 
     @Test

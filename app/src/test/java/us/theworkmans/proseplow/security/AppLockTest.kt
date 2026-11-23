@@ -1230,6 +1230,38 @@ class AppLockTest {
     }
 
     /**
+     * The third review's finding 1, the net: what kept the process alive out of sight ends while
+     * a lease runs (the answer service stopped from outside). The lease ends at once, by the
+     * ceiling's path, long before the ten minutes. Without a lease the same news changes nothing.
+     */
+    @Test
+    fun theEndOfTheKeepAliveEndsALeaseAtOnceAndNothingElse() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        lock.onKeepAliveEnded()
+        runCurrent()
+        assertTrue("an unlocked session is not touched", lock.state.value is LockState.Unlocked)
+        assertFalse(session.closeStarted)
+
+        lockItselfDuringAnAnswer(session)
+        pass(60_000)
+        assertFalse(session.closeStarted)
+        assertEquals(0, processEnds)
+
+        lock.onKeepAliveEnded()
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertEquals(listOf("screens cleared", "finish only", "session closed", "session stopped"), log)
+        assertEquals(1, processEnds)
+        lock.onKeepAliveEnded() // Told again: nothing is left to end.
+        runCurrent()
+        assertEquals(4, log.size)
+        assertEquals(1, processEnds)
+    }
+
+    /**
      * The security review's D1 (LEASE-05): an unlock during a lease gives the leased session back
      * only when the key it yields is that session's key. Here the configuration is replaced
      * behind the app's back by one whose passphrase opens another data key: the unlock opens a
@@ -1898,6 +1930,110 @@ class AppLockTest {
         lock.onForeground("second")
         lock.onBackground("second")
         assertEquals("it arrived and left", 1, processEnds)
+    }
+
+    /**
+     * The third review's finding 3, the "or goes" order: the first activity leaves while a second
+     * is on its way, and the second is then destroyed without ever being shown. Its destruction
+     * looks again and ends the process.
+     */
+    @Test
+    fun anActivityOnItsWayThatGoesUnseenAfterTheOtherLeftLetsTheProcessEnd() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        lock.onActivityCreated("second")
+        lock.onBackground()
+        assertEquals("one is still on its way", 0, processEnds)
+        lock.onActivityDestroyed(finished = false, who = "second")
+        assertEquals("it went without arriving", 1, processEnds)
+    }
+
+    /** Finding 3, with an unlock prompt pending: it is dropped once the activity on its way has gone unseen, and a late callback opens nothing. */
+    @Test
+    fun anUnlockPromptIsDroppedWhenTheActivityOnItsWayGoesUnseen() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onActivityCreated()
+        lock.onForeground()
+        lock.lock()
+        runCurrent()
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onActivityCreated("second")
+        lock.onBackground()
+        assertTrue("one is on its way: the prompt is left alone", lock.unlockUi.value.biometricPromptShowing)
+        assertEquals(0, processEnds)
+
+        lock.onActivityDestroyed(finished = false, who = "second")
+        assertFalse(lock.unlockUi.value.biometricPromptShowing)
+        assertEquals(1, processEnds)
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+    }
+
+    /**
+     * What `successors` is for: between the destruction of an activity on screen (a rotation)
+     * and the creation of its successor, something else looks whether the process is still
+     * needed (here a lease ends as its answer is finished). Nothing is on screen or on its way
+     * in that moment, and yet the process must not end.
+     */
+    @Test
+    fun aRotationDuringWhichALeaseEndsDoesNotEndTheProcess() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        val answer = lockItselfDuringAnAnswer(session)
+        lock.onForeground() // Back at the lock screen while the answer is finished behind it.
+        assertFalse(session.closeStarted)
+
+        lock.onActivityDestroyed(finished = false)
+        answer.complete(Unit)
+        runCurrent()
+        assertTrue("the lease ended and its session closed", session.closed)
+        assertEquals("the successor is on its way", 0, processEnds)
+
+        lock.onActivityCreated()
+        lock.onForeground()
+        runCurrent()
+        assertEquals(0, processEnds)
+        lock.onBackground()
+        assertEquals(1, processEnds)
+    }
+
+    /**
+     * The third review's finding 2: an enrolment prompt is open when the app locks by itself (the
+     * user pressed Home on it). The lock drops it, so the locked, idle process still ends, and a
+     * callback that arrives late is ignored without a message.
+     */
+    @Test
+    fun anEnrolmentPromptOpenWhenTheAppLocksDoesNotKeepTheProcessAlive() = runTest(dispatcher) {
+        biometric = BiometricStatus.AVAILABLE
+        val launcher = FakeLauncher()
+        startApp(visible = true)
+        lock.attach(launcher)
+        val session = createPassphrase()
+        lock.declineFingerprintOffer()
+        val proof = (lock.checkPassphrase(passphrase.toCharArray()) as PassphraseCheck.Ok).proof
+        assertTrue(lock.startBiometricEnrollment(proof))
+        assertEquals(BiometricPurpose.ENROLL, launcher.purpose)
+        assertTrue(lock.unlockUi.value.biometricPromptShowing)
+
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.unlockUi.value.biometricPromptShowing)
+        assertEquals(1, processEnds)
+        assertTrue("the new key is gone", vault.biometricKeys.isEmpty())
+
+        lock.onBiometricError(AppLock.ERROR_HW_UNAVAILABLE)
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertNull("no stray message on the lock screen", lock.unlockUi.value.notice)
+        assertFalse(lock.status.value.biometricEnabled)
+        assertTrue(vault.biometricKeys.isEmpty())
     }
 
     @Test

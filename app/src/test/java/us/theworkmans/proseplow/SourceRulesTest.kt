@@ -663,10 +663,27 @@ class SourceRulesTest {
         assertEquals("only the end of the process stops the service from outside", listOf("ProcessEnd.kt"), users(all, "AnswerService.stop("))
         // In the foreground first, through the entry that tells whether it worked, before anything can stop it.
         val created = file.readText().substringAfter("override fun onCreate() {").substringBefore("\n    }\n")
-        assertTrue(created.indexOf("KeepAliveEntry.enter(source) {") in 0 until created.indexOf("ServiceCompat.startForeground("))
+        // Success is what Android confirms after the call, not only a call that did not throw (the third review's finding 1).
+        assertTrue(created.indexOf("KeepAliveEntry.enter(source, probe::serviceInForeground) {") in 0 until created.indexOf("ServiceCompat.startForeground("))
         assertTrue(created.indexOf("ServiceCompat.startForeground(") in 0 until created.indexOf("stopSelf()"))
-        // And its end is told, so that nothing believes the keep-alive still runs.
-        assertTrue(service_.contains("told?.onKeepAlive(false)"))
+        // And its end is told, so that nothing believes the keep-alive still runs: before it leaves
+        // the foreground (finding 4), and in onDestroy when Android stopped it from outside.
+        val leave = file.readText().substringAfter("private fun leave() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(
+            listOf("told?.onKeepAlive(false)", "told = null", "ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)", "stopSelf()"),
+            leave,
+        )
+        assertEquals("the service leaves the foreground in one place", listOf("ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)"), service_.filter { it.contains("stopForeground(") })
+        val destroyed = file.readText().substringAfter("override fun onDestroy() {").substringBefore("\n    }\n")
+        assertTrue(destroyed.contains("told?.onKeepAlive(false)"))
+        // Android is asked, at the moment of asking, through the system's own record of the service and the user's restriction.
+        assertTrue(service_.contains("override fun backgroundRestricted(): Boolean = app.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted ?: true"))
+        assertTrue(service_.any { it.contains("manager.getRunningServices(Int.MAX_VALUE).any { it.service.className == name && it.pid == pid && it.foreground }") })
+        // The lock's question is answered by that, and the end of the keep-alive reaches the lock (finding 1's net).
+        val application = code(File(module, "$main/ProsePlowApp.kt"))
+        assertTrue(application.contains("canFinishOutOfSight = answerWork::canFinishOutOfSight,"))
+        assertTrue(application.contains("answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)"))
+        assertTrue(application.contains("val answerWork = AnswerWork(keepAlive = { AnswerService.start(app) }, readyNotice = AndroidReadyNotice(app), probe = AndroidKeepAliveProbe(app))"))
 
         assertEquals(listOf("AnswerService.kt"), users(all, "newWakeLock("))
         assertEquals(listOf("lock.acquire(WAKE_LOCK_MILLIS)"), service_.filter { it.contains(".acquire(") })

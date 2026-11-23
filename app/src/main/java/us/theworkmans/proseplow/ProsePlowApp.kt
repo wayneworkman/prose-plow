@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import us.theworkmans.proseplow.background.AndroidKeepAliveProbe
 import us.theworkmans.proseplow.background.AndroidReadyNotice
 import us.theworkmans.proseplow.background.AnswerService
 import us.theworkmans.proseplow.background.AnswerWork
@@ -142,7 +143,7 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
      * What keeps the process alive while an answer is written out of sight, and says when one is
      * ready; see [AnswerWork]. It holds nothing of any answer.
      */
-    val answerWork = AnswerWork(keepAlive = { AnswerService.start(app) }, readyNotice = AndroidReadyNotice(app))
+    val answerWork = AnswerWork(keepAlive = { AnswerService.start(app) }, readyNotice = AndroidReadyNotice(app), probe = AndroidKeepAliveProbe(app))
 
     val appLock: AppLock<AppSession> = AppLock(
         manager = LockManager(
@@ -176,8 +177,8 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         mainDispatcher = Dispatchers.Main.immediate,
         ioDispatcher = Dispatchers.IO,
         processEnder = AndroidProcessEnder(app),
-        // A session is left alive behind the lock only while the answer service really keeps the process awake.
-        canFinishOutOfSight = { answerWork.keepAliveRunning },
+        // A session is left alive behind the lock only while the answer service really keeps the process awake, as Android says at that moment.
+        canFinishOutOfSight = answerWork::canFinishOutOfSight,
         heavyWork = object : MakesWay {
             override fun standAside() = generationGate.close()
 
@@ -189,5 +190,8 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         // For the life of the process: the answer service stays until a session that is being
         // finished or closed behind the lock has lost its key.
         CoroutineScope(Dispatchers.Main.immediate).launch { appLock.sessionEnding.collect(answerWork::onSessionEnding) }
+        // And a session left alive behind the lock does not outlive the keep-alive: its end, told
+        // by the service on the main thread, ends the lease at once.
+        answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)
     }
 }

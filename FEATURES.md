@@ -486,7 +486,9 @@ is about things that are **not** built and is kept apart from everything else.
   settings and returning enables the switch.
 - **BIO-16** An enrolment whose prompt is answered after the app has locked wraps nothing. A
   lock, and closing the app's last screen while the prompt shows, cancel a pending enrolment and
-  delete the key that was made for it.
+  delete the key that was made for it. The lock also gives up waiting for that prompt's result,
+  so that it cannot keep the locked process alive (END-01); a result that arrives after that is
+  ignored and shows no message.
 - **BIO-17** A prompt that is showing during a rotation still reports its result. A prompt that
   disappeared without a result is noticed when the app comes back to the front, and "Use
   fingerprint" is enabled again. An unlock prompt still waiting for its result when nothing of
@@ -504,15 +506,23 @@ is about things that are **not** built and is kept apart from everything else.
   locks exactly as always: every unlocked screen is torn down and the lock screen is all there
   is to see or capture. Behind it the unlocked session is left alive, data key included, until
   that one answer is finished. "Being written" includes an answer that is still waiting for its
-  model to load. This happens only while the keep-alive of BG-01 is really running: if the
-  platform refused it (BG-03), or it has not started yet, nothing would keep the process awake to
-  end the session on time, and the lock is as LEASE-09 describes.
+  model to load. This happens only while the keep-alive of BG-01 is really running at the moment
+  of locking, as the platform says at that moment: if the platform refused it or did not grant
+  it (BG-03), if it has not started yet, if the platform no longer has it running, or if the user
+  has restricted the app's background use, nothing would keep the process awake to end the
+  session on time, and the lock is as LEASE-09 describes.
+  - **On Android:** the foreground service must be in the foreground according to the system's
+    own record of it (`ActivityManager.getRunningServices`, which returns the app's own
+    services), and `ActivityManager.isBackgroundRestricted` must be false. A restricted app's
+    service is taken out of the foreground as the app leaves the screen, without being told.
 - **LEASE-02** A session left alive in this way starts nothing new: no further reply, and no
   model load that is not for the answer under way, whoever asks. That answer goes on, the
   loading of its model included, and is saved as it goes.
-- **LEASE-03** The session ends when the answer has ended, in whichever way, or 10 minutes after
-  the moment of locking, whichever comes first. At the limit an answer that is still being
-  written is stopped and kept as a stopped message. Then the session is closed in the order of
+- **LEASE-03** The session ends when the answer has ended, in whichever way, 10 minutes after
+  the moment of locking, or the moment the keep-alive of BG-01 ends on the way (the platform
+  stopped it, or took it out of the foreground), whichever comes first. At the limit, and when
+  the keep-alive is lost, an answer that is still being written is stopped and kept as a
+  stopped message. Then the session is closed in the order of
   LOCK-17 (steps 3 to 6) and the key is overwritten. The key is therefore in memory for at most
   10 minutes and then the closing, which is bounded by three waits of up to 10 seconds each
   (LOCK-17).
@@ -533,9 +543,9 @@ is about things that are **not** built and is kept apart from everything else.
 - **LEASE-08** "Lock now" never leaves a session alive, and it ends one that is being finished:
   the answer is stopped and the key overwritten at once, whatever the setting. A reset ends it
   too (RESET-07).
-- **LEASE-09** With the setting off, with no answer being written, or without a running
-  keep-alive (LEASE-01), the app's own lock stops whatever is running and overwrites the key at
-  once, as LOCK-17 describes.
+- **LEASE-09** With the setting off, with no answer being written, without a running keep-alive,
+  or with the app's background use restricted (LEASE-01), the app's own lock stops whatever is
+  running and overwrites the key at once, as LOCK-17 describes.
 - **LEASE-10** While a session is alive behind the lock its key cannot be wrapped anew: changing
   the passphrase and setting up fingerprint unlock need a session that is on screen.
 - **LEASE-11** When the answer is finished behind the lock, it is saved, the engine forgets the
@@ -569,8 +579,10 @@ is about things that are **not** built and is kept apart from everything else.
   - no passphrase or fingerprint check, set-up or other work of the lock is running;
   - the app is locked. The set-up screen and the two failure screens count as locked only if a
     session was open earlier in the same process, which is the case after a reset.
-- **END-02** The conditions are looked at when the app leaves the screen and after every piece
-  of the lock's own work.
+- **END-02** The conditions are looked at when the app leaves the screen, when a screen of the
+  app is destroyed (one that was on its way to being shown may have been all that held the
+  process; a rotation is not leaving the screen), and after every piece of the lock's own work,
+  the end of a session behind the lock included (LEASE-03).
 - **END-03** What follows from END-01:
   - after the app has locked in the background and its session is closed, the process ends;
   - leaving the lock screen without unlocking ends the process;
@@ -1596,15 +1608,22 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     app is in front and puts itself in the foreground the moment it is created; it is not
     started with `startForegroundService`, because a service started that way that fails to
     reach the foreground can only stop by crashing the app. It counts as running only from the
-    moment it is in the foreground until it ends.
+    moment the system confirms that it is in the foreground (a `startForeground` that returns
+    without effect is a refusal) until it says, before leaving the foreground, that it ends.
+    Each time it renews its wake lock it asks the system whether it is still in the
+    foreground, and ends if it is not.
 - **BG-02** The keep-alive begins when an answer begins to be written while the app is in front
   (the platform lets it be started from nowhere else). It ends by itself at the moment no answer
   is being written any more and no session is still ending behind the lock: it is held until the
   data key has been overwritten, so that the process cannot be put to sleep on its way there.
-- **BG-03** If the platform refuses the keep-alive, the answer is written all the same, as far
-  as the system lets the process run. The refusal is recorded at once: nothing goes on counting
-  on a keep-alive, so the app's own lock does not leave the session alive for that answer
-  (LEASE-01).
+  If it was refused or lost while an answer is still being written, it is asked for again when
+  the app comes back to the front.
+- **BG-03** If the platform refuses the keep-alive, does not grant it although it raised no
+  error, or the user has restricted the app's background use, the answer is written all the
+  same, as far as the system lets the process run, but it is not finished behind the lock: the
+  app's own lock stops it (LEASE-01, LEASE-09). A refusal is recorded at once, so nothing goes on
+  counting on a keep-alive. A keep-alive that the platform stops while an answer is being
+  finished behind the lock ends that session at once (LEASE-03).
 - **BG-04** While the keep-alive runs, a notification says "Writing an answer…" and nothing
   else. It is silent, is marked as ongoing and carries no badge. In the system's settings for
   the app's notifications its kind is named "Answer in progress". It is gone with the
