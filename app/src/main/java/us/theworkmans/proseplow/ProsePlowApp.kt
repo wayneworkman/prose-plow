@@ -6,8 +6,16 @@ import android.os.SystemClock
 import androidx.biometric.BiometricManager
 import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.foundation.ExperimentalFoundationApi
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import us.theworkmans.proseplow.background.AndroidReadyNotice
+import us.theworkmans.proseplow.background.AnswerService
+import us.theworkmans.proseplow.background.AnswerWork
+import us.theworkmans.proseplow.background.KeepAliveSource
+import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
 import us.theworkmans.proseplow.llama.NativeEngine
@@ -18,15 +26,22 @@ import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.Clock
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
+import us.theworkmans.proseplow.security.MakesWay
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import java.util.concurrent.Executors
 
 /**
  * The application object. It only holds the [container]; nothing is created until the activity
- * first asks for it.
+ * first asks for it. The answer service asks through [keepAliveWanted], which does not create
+ * it: a process in which no activity has run (one that only runs tests, for one) never has a
+ * container, and so never has a lock that could end it.
  */
-class ProsePlowApp : Application() {
-    val container: AppContainer by lazy { AppContainer(this) }
+class ProsePlowApp : Application(), KeepAliveSource {
+    private val lazyContainer = lazy { AppContainer(this) }
+    val container: AppContainer by lazyContainer
+
+    override val keepAliveWanted: StateFlow<Boolean>?
+        get() = if (lazyContainer.isInitialized()) container.answerWork.keepAliveWanted else null
 
     override fun onCreate() {
         super.onCreate()
@@ -61,14 +76,23 @@ class AppContainer(context: Context) {
 
     /**
      * The inference engine, for the life of the process: loading a model takes seconds, and its
-     * weights are no secret, so the loaded model survives a lock and the next unlock finds it
-     * ready. Every call into native code is made on one thread of its own, as the engine requires.
-     * Nothing is created, and no thread started, before the first unlock.
+     * weights are no secret, so the loaded model survives a lock, and an unlock in the same
+     * process finds it ready. (The process itself ends once the app is locked and out of sight;
+     * the unlock after that loads the model again.) Every call into native code is made on one
+     * thread of its own, as the engine requires. Nothing is created, and no thread started,
+     * before the first unlock.
      */
     private val engine: InferenceEngine by lazy {
         val nativeThread = Executors.newSingleThreadExecutor { task -> Thread(task, "inference") }
-        LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher())
+        LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate)
     }
+
+    /**
+     * Closed by the lock for as long as it derives a key from a passphrase, so that the model
+     * does not hold the fast processor cores while someone waits at the lock screen. The
+     * engine's generations wait at it; nothing else knows it.
+     */
+    private val generationGate = GenerationGate()
 
     private val clock = object : Clock {
         override fun wallMillis() = System.currentTimeMillis()
@@ -79,6 +103,12 @@ class AppContainer(context: Context) {
 
     /** Everything Android has to do for the window policy; see [ScreenSecurity]. */
     val screenSecurity = ScreenSecurity(app)
+
+    /**
+     * What keeps the process alive while an answer is written out of sight, and says when one is
+     * ready; see [AnswerWork]. It holds nothing of any answer.
+     */
+    val answerWork = AnswerWork(keepAlive = { AnswerService.start(app) }, readyNotice = AndroidReadyNotice(app))
 
     val appLock: AppLock<AppSession> = AppLock(
         manager = LockManager(
@@ -92,7 +122,7 @@ class AppContainer(context: Context) {
         files = files,
         clock = clock,
         // The models offered are the ones whose files this build really carries, asked at every unlock.
-        openSession = { cipher -> AppSession(cipher, layout, engine, NativeEngine.availableModels(app)) },
+        openSession = { cipher -> AppSession(cipher, layout, engine, NativeEngine.availableModels(app), answerEvents = answerWork) },
         biometricStatus = {
             // Only "none enrolled" removes fingerprint unlock; NO_HARDWARE, HW_UNAVAILABLE,
             // UNSUPPORTED, SECURITY_UPDATE_REQUIRED and STATUS_UNKNOWN keep it for later.
@@ -105,5 +135,17 @@ class AppContainer(context: Context) {
         screenshots = ScreenshotAllowance(clock, screenSecurity, Dispatchers.Main.immediate),
         mainDispatcher = Dispatchers.Main.immediate,
         ioDispatcher = Dispatchers.IO,
+        processEnder = AndroidProcessEnder(app),
+        heavyWork = object : MakesWay {
+            override fun standAside() = generationGate.close()
+
+            override fun carryOn() = generationGate.open()
+        },
     )
+
+    init {
+        // For the life of the process: the answer service stays until a session that is being
+        // finished or closed behind the lock has lost its key.
+        CoroutineScope(Dispatchers.Main.immediate).launch { appLock.sessionEnding.collect(answerWork::onSessionEnding) }
+    }
 }

@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
@@ -63,11 +64,17 @@ data class ModelOverrides(val temperature: Float? = null) {
  *   without an entry has none.
  * @property modelOverrides what the user set in place of a model's own values, by model id. Only
  *   models with something set have an entry.
+ * @property notificationsAsked the user has been asked once whether the app may post
+ *   notifications, and is not asked again.
  */
 data class AppSettings(
     val systemPrompts: Map<String, String> = emptyMap(),
     val modelOverrides: Map<String, ModelOverrides> = emptyMap(),
+    val notificationsAsked: Boolean = false,
 ) {
+
+    /** These settings once the user has been asked whether the app may post notifications. */
+    fun withNotificationsAsked(): AppSettings = if (notificationsAsked) this else copy(notificationsAsked = true)
 
     /** The system prompt set for [modelId], or an empty string. */
     fun systemPrompt(modelId: String): String = systemPrompts[modelId].orEmpty()
@@ -95,7 +102,8 @@ data class AppSettings(
     fun sampling(model: ModelSpec): SamplingParams = overrides(model.id).applyTo(model.sampling)
 
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
-    override fun toString(): String = "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides)"
+    override fun toString(): String =
+        "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides, notificationsAsked=$notificationsAsked)"
 }
 
 /**
@@ -104,8 +112,12 @@ data class AppSettings(
  * ```
  * {"schemaVersion": 1, "settings": {
  *     "systemPrompts": {"<model id>": "<text>", ...},
- *     "models": {"<model id>": {"temperature": 0.7}, ...}}}
+ *     "models": {"<model id>": {"temperature": 0.7}, ...},
+ *     "notificationsAsked": true}}
  * ```
+ *
+ * `notificationsAsked` is only written once it is true, and was added, like `models`, without a
+ * new schema version: a file without it means what it always meant.
  *
  * `models` holds what the user set per model ([ModelOverrides]); a value that is not set is not
  * written. It was added without a new schema version, because a file without it means exactly
@@ -153,6 +165,7 @@ object SettingsCodec {
                     }
                 }
             }
+            if (settings.notificationsAsked) put("notificationsAsked", true)
         }
     }.toString()
 
@@ -199,7 +212,13 @@ object SettingsCodec {
             }
             else -> skipped++
         }
-        return Decoded.Readable(AppSettings(systemPrompts = prompts, modelOverrides = overrides), version, skipped)
+        var asked = false
+        val storedAsked = stored["notificationsAsked"]
+        if (storedAsked != null) {
+            val value = (storedAsked as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+            if (value == null) skipped++ else asked = value
+        }
+        return Decoded.Readable(AppSettings(systemPrompts = prompts, modelOverrides = overrides, notificationsAsked = asked), version, skipped)
     }
 }
 

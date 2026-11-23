@@ -439,6 +439,13 @@ class LockManager(
         save(current.copy(lockTimeoutSeconds = seconds))
     }
 
+    /** Stores [LockConfig.finishAnswerAfterLocking]. Nothing is written when it already is [enabled]. */
+    @Throws(IOException::class)
+    fun setFinishAnswerAfterLocking(enabled: Boolean) {
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (current.finishAnswerAfterLocking != enabled) save(current.copy(finishAnswerAfterLocking = enabled))
+    }
+
     /**
      * Deletes everything, in the order that leaves the least behind if it is interrupted: every
      * key first (from that moment nothing stored can be decrypted, whatever else still gets

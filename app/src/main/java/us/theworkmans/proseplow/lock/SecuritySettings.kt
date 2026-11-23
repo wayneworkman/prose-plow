@@ -236,6 +236,20 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
             }
         }
     }
+
+    /** "Finish the answer after locking". The switch shows what is stored, so a failure leaves it as it was. */
+    fun setFinishAnswerAfterLocking(enabled: Boolean) {
+        viewModelScope.launch {
+            try {
+                appLock.setFinishAnswerAfterLocking(enabled)
+                _state.update { it.copy(error = null) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _state.update { it.copy(error = SecurityError.FAILED) }
+            }
+        }
+    }
 }
 
 /**
@@ -274,6 +288,16 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
         onCheckedChange = viewModel::onFingerprintSwitch,
     )
     TimeoutPicker(status.lockTimeoutSeconds, viewModel::setLockTimeout)
+    SwitchRow(
+        title = stringResource(R.string.security_finish_answer),
+        support = pluralStringResource(
+            if (status.finishAnswerAfterLocking) R.plurals.security_finish_answer_on else R.plurals.security_finish_answer_off,
+            AppLock.LEASE_MINUTES,
+            AppLock.LEASE_MINUTES,
+        ),
+        checked = status.finishAnswerAfterLocking,
+        onCheckedChange = viewModel::setFinishAnswerAfterLocking,
+    )
     OutlinedButton(onClick = viewModel::lockNow) { Text(stringResource(R.string.security_lock_now)) }
     ScreenshotsRow(viewModel)
     Text(

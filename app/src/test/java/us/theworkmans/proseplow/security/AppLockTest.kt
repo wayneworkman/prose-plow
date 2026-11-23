@@ -56,6 +56,17 @@ class AppLockTest {
 
     private lateinit var lock: AppLock<FakeSession>
 
+    /** How often the lock ended the process since the last [startApp], and what had happened by the first time. */
+    private var processEnds = 0
+    private var logAtProcessEnd: List<String>? = null
+
+    /** What the lock asked of the heavy work beside it, in order; and how many "stand aside" have had no "carry on" yet. */
+    private val madeWay = mutableListOf<String>()
+    private var standingAside = 0
+
+    /** Uses of the key store while nothing was standing aside: a key derivation the model was not paused for. */
+    private var keyStoreUsesInTheWay = 0
+
     /** Uses of the lock manager's collaborators while nothing held the lock's mutex. */
     private val unserialised = mutableListOf<String>()
 
@@ -81,6 +92,27 @@ class AppLockTest {
 
         /** A write that was still in the disk when [close] gave up waiting; [awaitStopped] waits until the test completes it. */
         var hungWrite: CompletableDeferred<Unit>? = null
+
+        /** An answer that is being written; the test completes it when the answer is finished. */
+        var answer: CompletableDeferred<Unit>? = null
+        var finishOnly = 0
+        var resumed = 0
+
+        override fun hasUnfinishedWork(): Boolean = answer?.isActive == true
+
+        override suspend fun awaitWorkFinished() {
+            answer?.await()
+        }
+
+        override fun finishOnly() {
+            finishOnly++
+            log += "finish only"
+        }
+
+        override fun resume() {
+            resumed++
+            log += "resumed"
+        }
 
         override fun clearScreens() {
             screensCleared++
@@ -116,8 +148,14 @@ class AppLockTest {
         }
     }
 
-    /** A new "process" over the same files and keys. */
-    private fun TestScope.startApp(): AppLock<FakeSession> {
+    /**
+     * A new "process" over the same files and keys. [visible]: with an activity that is created
+     * with it and reaches the screen, as the app really starts; without one, nothing is ever on
+     * screen for this lock.
+     */
+    private fun TestScope.startApp(visible: Boolean = false): AppLock<FakeSession> {
+        processEnds = 0
+        logAtProcessEnd = null
         vault.onUse = ::insideTheManager
         val managerClock = object : Clock {
             override fun wallMillis(): Long {
@@ -153,8 +191,26 @@ class AppLockTest {
             screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
             mainDispatcher = dispatcher,
             ioDispatcher = dispatcher,
+            processEnder = {
+                if (processEnds++ == 0) logAtProcessEnd = log.toList()
+            },
+            heavyWork = object : MakesWay {
+                override fun standAside() {
+                    standingAside++
+                    madeWay += "stand aside"
+                }
+
+                override fun carryOn() {
+                    standingAside--
+                    madeWay += "carry on"
+                }
+            },
         )
         assertEquals("nothing is known before the configuration was read", LockState.Starting, lock.state.value)
+        if (visible) {
+            lock.onActivityCreated()
+            lock.onForeground()
+        }
         runCurrent()
         return lock
     }
@@ -1056,6 +1112,645 @@ class AppLockTest {
         lock.reset()
         runCurrent()
         assertEquals(LockState.SetupRequired, lock.state.value)
+    }
+
+    // --- Finishing an answer behind the lock ----------------------------------------------------------
+
+    /** The app leaves the screen with [session] in the middle of an answer, and locks by itself after its minute. */
+    private fun TestScope.lockItselfDuringAnAnswer(session: FakeSession): CompletableDeferred<Unit> {
+        val answer = CompletableDeferred<Unit>()
+        session.answer = answer
+        lock.onBackground()
+        pass(59_999)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        pass(1)
+        assertTrue(lock.state.value is LockState.Locked)
+        return answer
+    }
+
+    private fun storedConfig(): LockConfig = LockConfigStore(files.lockConfig).read()!!
+
+    @Test
+    fun anAnswerBeingWrittenWhenTheAppLocksItselfIsFinishedBehindTheLock() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        assertTrue("on unless the user turns it off", lock.status.value.finishAnswerAfterLocking)
+        val blob = session.cipher.seal("p", plaintext)
+        val generation = lock.sessionGeneration.value
+        val answer = lockItselfDuringAnAnswer(session)
+
+        // For whoever looks at the phone it is locked exactly as always.
+        assertEquals(1, session.screensCleared)
+        assertNotEquals(generation, lock.sessionGeneration.value)
+        assertTrue(WindowSecurity.mustBeSecure(lock.state.value is LockState.Unlocked, null, clock.elapsed, 33))
+        // Behind that, the session goes on, key included, and starts nothing new.
+        assertEquals(1, session.finishOnly)
+        assertFalse(session.closeStarted)
+        assertTrue(lock.sessionEnding.value)
+        assertArrayEquals(plaintext, session.cipher.open("p", blob))
+        pass(5 * 60_000L)
+        assertFalse("for as long as the answer takes, within the ceiling", session.closeStarted)
+
+        // The answer is finished: now the session ends as at any lock.
+        answer.complete(Unit)
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertEquals(listOf("screens cleared", "finish only", "session closed", "session stopped"), log)
+        pass(AppLock.LEASE_MILLIS) // And nothing is left that could do anything later.
+        assertEquals(4, log.size)
+
+        // The next unlock is an ordinary one, into a new session with the same key.
+        enter(passphrase)
+        assertEquals(2, sessions.size)
+        assertArrayEquals(plaintext, session().cipher.open("p", blob))
+    }
+
+    @Test
+    fun aLeaseEndsAfterTenMinutesWhateverTheAnswerIsDoing() = runTest(dispatcher) {
+        assertEquals(10, AppLock.LEASE_MINUTES)
+        assertEquals(600_000L, AppLock.LEASE_MILLIS)
+        startApp()
+        val session = createPassphrase()
+        lockItselfDuringAnAnswer(session)
+
+        pass(AppLock.LEASE_MILLIS - 1)
+        assertFalse("a millisecond before", session.closeStarted)
+        pass(1)
+        assertTrue("the session is closed, which stops the answer and saves it as stopped", session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertTrue(lock.state.value is LockState.Locked)
+    }
+
+    @Test
+    fun aCeilingItsTimerMissedIsEnforcedBeforeTheSessionIsHandedBack() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        lockItselfDuringAnAnswer(session)
+        // The process was not allowed to run: the clock moved on, no timer fired.
+        clock.advance(AppLock.LEASE_MILLIS)
+        assertFalse(session.closeStarted)
+
+        enter(passphrase)
+        assertTrue("the right passphrase does not bring an expired lease back", session.closed)
+        assertDestroyed(session.cipher)
+        assertEquals(0, session.resumed)
+        assertEquals(2, sessions.size)
+        assertFalse(session() === session)
+    }
+
+    @Test
+    fun comingToTheFrontEndsALeaseWhoseTimeIsUp() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        lockItselfDuringAnAnswer(session)
+        clock.advance(AppLock.LEASE_MILLIS - 1)
+        lock.onForeground()
+        runCurrent()
+        assertFalse(session.closeStarted)
+        lock.onBackground()
+        clock.advance(1)
+        lock.onForeground()
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+    }
+
+    @Test
+    fun lockNowStopsTheAnswerAndDestroysTheKeyAtOnceWhateverTheSetting() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        assertTrue(lock.status.value.finishAnswerAfterLocking)
+        session.answer = CompletableDeferred()
+
+        lock.lock()
+        runCurrent()
+        assertEquals("nothing is left to finish", 0, session.finishOnly)
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped"), log)
+    }
+
+    @Test
+    fun lockNowAlsoEndsALeaseThatIsRunning() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        lockItselfDuringAnAnswer(session)
+        assertFalse(session.closeStarted)
+        lock.lock()
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+    }
+
+    @Test
+    fun withTheSettingOffTheAppsOwnLockStopsTheAnswerAsItAlwaysDid() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        lock.setFinishAnswerAfterLocking(false)
+        assertFalse(lock.status.value.finishAnswerAfterLocking)
+        assertFalse(storedConfig().finishAnswerAfterLocking)
+        session.answer = CompletableDeferred()
+
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(0, session.finishOnly)
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+
+        // It is in the lock configuration, so a new process knows it while it is still locked.
+        startApp()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertFalse(lock.status.value.finishAnswerAfterLocking)
+        enter(passphrase)
+        lock.setFinishAnswerAfterLocking(true)
+        assertTrue(lock.status.value.finishAnswerAfterLocking)
+        assertTrue(storedConfig().finishAnswerAfterLocking)
+    }
+
+    @Test
+    fun withNoAnswerBeingWrittenTheAppsOwnLockIsAsItAlwaysWas() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        // An answer that was finished before the lock is no reason either.
+        session.answer = CompletableDeferred<Unit>().apply { complete(Unit) }
+        lock.onBackground()
+        pass(60_000)
+        assertEquals(0, session.finishOnly)
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+    }
+
+    @Test
+    fun theCheckOnComingBackToTheFrontLeavesTheAnswerRunningToo() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        session.answer = CompletableDeferred()
+        lock.onBackground()
+        // The timer could not run; the lock is found to be due when the app comes back.
+        clock.advance(60_000)
+        lock.onForeground()
+        assertTrue(lock.state.value is LockState.Locked)
+        runCurrent()
+        assertEquals(1, session.finishOnly)
+        assertFalse(session.closeStarted)
+        // The ten minutes count from that moment.
+        pass(AppLock.LEASE_MILLIS - 1)
+        assertFalse(session.closeStarted)
+        pass(1)
+        assertTrue(session.closed)
+    }
+
+    @Test
+    fun unlockingDuringALeaseChecksThePassphraseInFullAndGivesBackTheSameSession() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val blob = session.cipher.seal("p", plaintext)
+        val answer = lockItselfDuringAnAnswer(session)
+
+        // A wrong passphrase first: it is counted on disk, as at any lock.
+        enter(wrongPassphrase)
+        assertTrue(lock.unlockUi.value.wrongPassphrase)
+        assertEquals(1, storedConfig().failedAttempts)
+        assertFalse(session.closeStarted)
+        assertEquals(0, session.resumed)
+
+        var keyStoreUses = 0
+        vault.onUse = {
+            keyStoreUses++
+            insideTheManager()
+        }
+        enter(passphrase)
+        assertTrue("the key was derived again, through the key store, for this unlock", keyStoreUses > 0)
+        assertEquals("and the success ended the count, as it always does", 0, storedConfig().failedAttempts)
+        assertSame("the same session, not a new one", session, session())
+        assertEquals(1, sessions.size)
+        assertEquals(1, session.resumed)
+        assertFalse(session.closeStarted)
+        assertFalse(lock.sessionEnding.value)
+        assertArrayEquals(plaintext, session.cipher.open("p", blob))
+        assertEquals(listOf("screens cleared", "finish only", "resumed"), log)
+
+        // The answer finishing, and the lease's ten minutes passing, end nothing now: it is the session on screen.
+        answer.complete(Unit)
+        lock.onForeground()
+        pass(AppLock.LEASE_MILLIS)
+        assertFalse(session.closeStarted)
+        assertSame(session, session())
+
+        lock.lock()
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+    }
+
+    @Test
+    fun wrongPassphrasesDuringALeaseAreSlowedDownAsAlwaysAndLeaveTheLeaseAlone() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val answer = lockItselfDuringAnAnswer(session)
+
+        repeat(5) { enter(wrongPassphrase) }
+        assertEquals(lock.elapsedNow() + 30_000, lock.unlockUi.value.retryAtElapsed)
+        assertEquals(5, storedConfig().failedAttempts)
+        // The key is in memory, and still the right passphrase is refused unchecked during the wait.
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(0, session.resumed)
+        assertFalse(session.closeStarted)
+        assertTrue(lock.sessionEnding.value)
+
+        pass(30_000)
+        enter(passphrase)
+        assertSame(session, session())
+        assertEquals(0, storedConfig().failedAttempts)
+        answer.complete(Unit)
+    }
+
+    @Test
+    fun aFingerprintUnlockDuringALeaseGivesBackTheSameSessionToo() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        log.clear()
+        lockItselfDuringAnAnswer(session)
+
+        lock.requestBiometricUnlock()
+        runCurrent()
+        assertEquals(BiometricPurpose.UNLOCK, launcher.purpose)
+        // A prompt that is cancelled changes nothing.
+        lock.onBiometricError(AppLock.ERROR_USER_CANCELED)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertFalse(session.closeStarted)
+
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertSame(session, session())
+        assertEquals(1, sessions.size)
+        assertEquals(listOf("screens cleared", "finish only", "resumed"), log)
+    }
+
+    @Test
+    fun aResetDuringALeaseEndsItAndDeletesEverything() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val stored = someStoredData()
+        lockItselfDuringAnAnswer(session)
+        vault.afterDelete = { log += "key deleted" }
+
+        lock.reset() // On the lock screen, the passphrase forgotten.
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertEquals(listOf("screens cleared", "finish only", "session closed", "session stopped", "key deleted"), log)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        for (file in stored) assertFalse(file.path, file.exists())
+        nothingIsPersisted()
+        pass(AppLock.LEASE_MILLIS)
+        assertEquals("the lease left nothing behind that acts later", 5, log.size)
+    }
+
+    @Test
+    fun theKeyOfALeasedSessionCannotBeWrappedAnew() = runTest(dispatcher) {
+        biometric = BiometricStatus.AVAILABLE
+        startApp()
+        lock.attach(FakeLauncher())
+        val session = createPassphrase()
+        lock.declineFingerprintOffer()
+        val proof = (lock.checkPassphrase(passphrase.toCharArray()) as PassphraseCheck.Ok).proof
+        val before = files.lockConfig.readText()
+        lockItselfDuringAnAnswer(session)
+
+        assertFalse(lock.changePassphrase(proof, otherPassphrase.toCharArray()))
+        assertFalse(lock.startBiometricEnrollment(proof))
+        assertEquals(before, files.lockConfig.readText())
+        assertTrue(vault.biometricKeys.isEmpty())
+        assertFalse(session.closeStarted)
+    }
+
+    // --- Making way for the key derivation ------------------------------------------------------------
+
+    /** Uses of the key store while nothing was standing aside: a key derivation the model was not paused for. */
+    private var derivations = 0
+
+    /** From now on every key derivation (seen at its last step, the binding to the key store) is checked against the pause. */
+    private fun watchTheKeyDerivation() {
+        vault.onBind = {
+            derivations++
+            if (standingAside != 1) keyStoreUsesInTheWay++
+        }
+    }
+
+    @Test
+    fun theModelStandsAsideForExactlyAsLongAsAPassphraseIsCheckedDuringALease() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val answer = lockItselfDuringAnAnswer(session)
+        madeWay.clear()
+        watchTheKeyDerivation()
+
+        enter(wrongPassphrase)
+        assertEquals("once for the check, and over when the check is", listOf("stand aside", "carry on"), madeWay)
+        assertEquals(0, standingAside)
+        assertFalse("standing aside is not ending: the lease goes on", session.closeStarted)
+        assertTrue(lock.sessionEnding.value)
+
+        enter(passphrase)
+        assertEquals(listOf("stand aside", "carry on", "stand aside", "carry on"), madeWay)
+        assertSame(session, session())
+        assertEquals("both attempts were really derived", 2, derivations)
+        assertEquals("and neither with the model in its way", 0, keyStoreUsesInTheWay)
+        assertEquals(listOf("screens cleared", "finish only", "resumed"), log)
+        answer.complete(Unit)
+    }
+
+    @Test
+    fun everyKeyDerivationHasTheModelStandAside() = runTest(dispatcher) {
+        watchTheKeyDerivation()
+        startApp()
+        createPassphrase() // The first set-up derives a key too.
+        assertEquals(listOf("stand aside", "carry on"), madeWay)
+
+        // In Settings, while unlocked: the check of the current passphrase, right and wrong, and the change.
+        madeWay.clear()
+        assertEquals(PassphraseCheck.Wrong(0), lock.checkPassphrase(wrongPassphrase.toCharArray()))
+        val proof = (lock.checkPassphrase(passphrase.toCharArray()) as PassphraseCheck.Ok).proof
+        assertTrue(lock.changePassphrase(proof, otherPassphrase.toCharArray()))
+        assertEquals(List(3) { listOf("stand aside", "carry on") }.flatten(), madeWay)
+
+        // An unlock from an ordinary lock.
+        lock.lock()
+        runCurrent()
+        madeWay.clear()
+        enter(otherPassphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertEquals(listOf("stand aside", "carry on"), madeWay)
+
+        assertEquals(0, standingAside)
+        assertEquals("set-up, two checks, the change and the unlock", 5, derivations)
+        assertEquals("none of them ran with the model in its way", 0, keyStoreUsesInTheWay)
+    }
+
+    @Test
+    fun whatNeedsNoKeyDerivationAsksNothingToStandAside() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        lockItselfDuringAnAnswer(session)
+        madeWay.clear()
+        watchTheKeyDerivation()
+
+        // A fingerprint unlock derives nothing, and neither does changing a setting.
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertSame(session, session())
+        lock.setLockTimeout(300)
+        lock.setFinishAnswerAfterLocking(false)
+        lock.lock()
+        runCurrent()
+        assertEquals(0, derivations)
+        assertEquals(emptyList<String>(), madeWay)
+    }
+
+    @Test
+    fun aDerivationThatFailsStillLetsTheModelCarryOn() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val answer = lockItselfDuringAnAnswer(session)
+        madeWay.clear()
+
+        // The attempt cannot be counted: the check throws before it has derived anything.
+        val directory = files.lockConfig.parentFile!!
+        directory.setWritable(false)
+        try {
+            enter(passphrase)
+        } finally {
+            directory.setWritable(true)
+        }
+        assertTrue(lock.unlockUi.value.error, lock.unlockUi.value.error!!.contains("Exception"))
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("the pause ended with the failure", listOf("stand aside", "carry on"), madeWay)
+        assertEquals(0, standingAside)
+        assertFalse("and the answer goes on behind the lock", session.closeStarted)
+
+        // The same in Settings, where the failure reaches the caller.
+        enter(passphrase)
+        assertSame(session, session())
+        madeWay.clear()
+        directory.setWritable(false)
+        try {
+            assertFailsWith<IOException> { lock.checkPassphrase(passphrase.toCharArray()) }
+        } finally {
+            directory.setWritable(true)
+        }
+        assertEquals(listOf("stand aside", "carry on"), madeWay)
+        assertEquals(0, standingAside)
+        answer.complete(Unit)
+    }
+
+    /**
+     * Standing aside is not time off the ceiling: a check that is still deriving when the lease's
+     * ten minutes are up does not get the session back, although its passphrase was right.
+     */
+    @Test
+    fun theTenMinutesGoOnCountingWhileTheModelStandsAside() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        lockItselfDuringAnAnswer(session)
+        clock.advance(AppLock.LEASE_MILLIS - 1_000)
+        madeWay.clear()
+        // The derivation takes two seconds, and the lease has one left.
+        vault.onBind = { if (standingAside == 1) clock.advance(2_000) }
+
+        enter(passphrase)
+        assertEquals(listOf("stand aside", "carry on"), madeWay)
+        assertTrue("the lease was over: its session is closed", session.closed)
+        assertDestroyed(session.cipher)
+        assertEquals(0, session.resumed)
+        assertTrue("and the right passphrase opened a new one", lock.state.value is LockState.Unlocked)
+        assertEquals(2, sessions.size)
+    }
+
+    @Test
+    fun lockNowAndAResetTakeEffectAlthoughTheModelIsStandingAside() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        session.answer = CompletableDeferred()
+        var lockedDuringTheDerivation = false
+        vault.onBind = {
+            // "Lock now" is pressed while the passphrase is being checked in Settings.
+            if (standingAside == 1 && !lockedDuringTheDerivation) {
+                lockedDuringTheDerivation = true
+                lock.lock()
+            }
+        }
+        lock.checkPassphrase(passphrase.toCharArray())
+        runCurrent()
+        assertTrue(lockedDuringTheDerivation)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(0, standingAside)
+        assertTrue("the session was closed as soon as the check had returned", session.closed)
+        assertDestroyed(session.cipher)
+        assertEquals(0, session.finishOnly)
+
+        // And a reset during a check at the lock screen, with a lease running.
+        vault.onBind = {}
+        enter(passphrase)
+        val next = session()
+        lockItselfDuringAnAnswer(next)
+        var resetDuringTheDerivation = false
+        vault.onBind = {
+            if (standingAside == 1 && !resetDuringTheDerivation) {
+                resetDuringTheDerivation = true
+                lock.reset()
+            }
+        }
+        enter(passphrase)
+        assertTrue(resetDuringTheDerivation)
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertEquals(0, standingAside)
+        assertTrue(next.closed)
+        assertDestroyed(next.cipher)
+        nothingIsPersisted()
+    }
+
+    // --- The end of the process -----------------------------------------------------------------------
+
+    @Test
+    fun theProcessEndsOnceTheAppIsLockedHasNothingToFinishAndIsOutOfSight() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        lock.onBackground()
+        assertEquals("never while unlocked", 0, processEnds)
+        pass(59_999)
+        assertEquals(0, processEnds)
+        pass(1)
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+        assertEquals(1, processEnds)
+        assertEquals("only after the session was closed and had stopped", listOf("screens cleared", "session closed", "session stopped"), logAtProcessEnd)
+    }
+
+    @Test
+    fun theProcessNeverEndsWhileAnActivityIsOnScreen() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        enter(wrongPassphrase)
+        pass(3_600_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("the lock screen is being looked at", 0, processEnds)
+
+        // A rotation, or the activity being built again, is not leaving the screen.
+        lock.onActivityDestroyed(finished = false)
+        runCurrent()
+        assertEquals(0, processEnds)
+        lock.onActivityCreated()
+        runCurrent()
+        assertEquals(0, processEnds)
+        lock.onForeground()
+        assertEquals(0, processEnds)
+
+        lock.onBackground()
+        assertEquals("leaving it is", 1, processEnds)
+    }
+
+    @Test
+    fun theProcessDoesNotEndDuringALeaseAndEndsWhenTheAnswerIsSaved() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        val answer = lockItselfDuringAnAnswer(session)
+        pass(5 * 60_000L)
+        assertEquals(0, processEnds)
+
+        // A wrong passphrase typed meanwhile, and leaving again, change nothing about that.
+        lock.onForeground()
+        enter(wrongPassphrase)
+        lock.onBackground()
+        assertEquals(0, processEnds)
+
+        answer.complete(Unit)
+        runCurrent()
+        assertTrue(session.closed)
+        assertEquals(1, processEnds)
+        assertEquals(listOf("screens cleared", "finish only", "session closed", "session stopped"), logAtProcessEnd)
+    }
+
+    @Test
+    fun theProcessDoesNotEndBeforeTheLastWriteHasReturned() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        val hung = CompletableDeferred<Unit>()
+        session.hungWrite = hung
+        lock.onBackground()
+        pass(60_000)
+        assertTrue("the session is closed and its key gone", session.closed)
+        assertDestroyed(session.cipher)
+        pass(3_600_000)
+        assertEquals("but a write is still in the disk", 0, processEnds)
+
+        hung.complete(Unit)
+        runCurrent()
+        assertEquals(1, processEnds)
+        assertEquals("session stopped", logAtProcessEnd!!.last())
+    }
+
+    @Test
+    fun theProcessDoesNotEndWhileAPassphraseIsBeingChecked() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        lock.unlockWithPassphrase(passphrase.toCharArray())
+        // The user leaves while the key is being derived.
+        lock.onBackground()
+        assertEquals(0, processEnds)
+        runCurrent()
+        assertTrue("the unlock went through, out of sight", lock.state.value is LockState.Unlocked)
+        assertEquals(0, processEnds)
+        // Its timeout has been running since the app left; then it locks, closes and ends.
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(1, processEnds)
+    }
+
+    @Test
+    fun leavingTheLockScreenWithoutUnlockingEndsTheProcessToo() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        startApp(visible = true)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(0, processEnds)
+        enter(wrongPassphrase)
+        lock.onBackground()
+        assertEquals("whatever was typed there is released with the process", 1, processEnds)
+    }
+
+    @Test
+    fun firstRunSetUpDoesNotEndTheProcessButTheScreenAfterAResetDoes() = runTest(dispatcher) {
+        startApp(visible = true)
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        lock.onBackground()
+        assertEquals("nothing has ever been decrypted in this process", 0, processEnds)
+        lock.onForeground()
+
+        createPassphrase()
+        lock.reset()
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        assertEquals(0, processEnds)
+        lock.onBackground()
+        assertEquals("a conversation has been in this process's memory", 1, processEnds)
     }
 
     // --- The screenshot allowance -------------------------------------------------------------------

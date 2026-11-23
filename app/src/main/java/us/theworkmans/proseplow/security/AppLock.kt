@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentLinkedQueue
 import javax.crypto.Cipher
 
@@ -41,6 +43,8 @@ data class SecurityStatus(
     val biometricEnabled: Boolean = false,
     val lockTimeoutSeconds: Int = LockConfig.DEFAULT_TIMEOUT_SECONDS,
     val fingerprintInvalidated: Boolean = false,
+    /** An answer under way when the app locks by itself is finished behind the lock. */
+    val finishAnswerAfterLocking: Boolean = true,
 )
 
 enum class BiometricStatus {
@@ -62,6 +66,41 @@ enum class BiometricPurpose { UNLOCK, ENROLL }
 fun interface BiometricLauncher {
     /** False if the prompt could not be shown now (for example the activity's state was already saved). */
     fun authenticate(cipher: Cipher, purpose: BiometricPurpose): Boolean
+}
+
+/**
+ * Ends the app's process. In-place wiping cannot reach every copy of a conversation (strings
+ * the runtime made, buffers a native library has freed); the end of the process releases them
+ * all. [AppLock] decides when, and only ever calls this once nothing is unlocked, nothing is
+ * being finished or written, and nothing of the app is on screen. The act itself is behind this
+ * interface so that tests can see it happen, and so that a process that runs tests is never
+ * the one that ends.
+ */
+fun interface ProcessEnder {
+    fun end()
+}
+
+/**
+ * Heavy work elsewhere in the process that can stand aside for a moment: the model, while it
+ * writes an answer. Deriving a key from a passphrase takes more than a second of one processor
+ * core at full speed, and a person is waiting for it; next to a model that keeps the fast cores
+ * busy it takes several times as long. So the lock asks that work to stand aside for exactly as
+ * long as a derivation runs. The calls come in pairs, [carryOn] always follows [standAside],
+ * whatever became of the derivation; standing aside is not ending: what stood aside goes on
+ * where it was.
+ */
+interface MakesWay {
+    /** Returns at once; the work stops at its next safe point. */
+    fun standAside()
+
+    fun carryOn()
+
+    /** For a lock beside which nothing heavy runs. */
+    object None : MakesWay {
+        override fun standAside() = Unit
+
+        override fun carryOn() = Unit
+    }
 }
 
 /** Messages about fingerprint use, shown once. */
@@ -141,6 +180,27 @@ sealed interface PassphraseCheck {
  *   with them (opening a session, closing one, the reset's deletions).
  * - Sessions are closed, and their data keys destroyed, in exactly one place ([closeRetired]),
  *   under that mutex; and whether a session ends is decided in exactly one place ([endSession]).
+ *
+ * Finishing an answer behind the lock. When the app locks by itself (the background timeout,
+ * or the check on coming back) while the session has unfinished work and the setting allows it,
+ * the screens lock exactly as always, but the session is left alive, key included: a lease. It
+ * ends when the work is finished or after [LEASE_MILLIS], whichever comes first, and then the
+ * session is closed and its key destroyed as at any lock. "Lock now" never leaves anything
+ * alive. Nothing about unlocking changes: the passphrase or the fingerprint is checked in full,
+ * with the same back-off and counters, and only a success whose key is the leased session's
+ * key puts that same session back on screen.
+ *
+ * Making way for the key derivation. Every time a passphrase is put through the key derivation
+ * (an unlock, a check or a change in Settings, the first set-up), whatever else loads the
+ * processor is asked to stand aside for just that long ([MakesWay]), so that the wait at the
+ * lock screen is the same whether or not an answer is being written. It changes nothing else:
+ * the answer is neither finished nor stopped by it, a lease's ten minutes go on counting, and
+ * locking, a reset and stopping the answer work as they always do.
+ *
+ * The end of the process. A lock zeroes the key, but copies of a conversation stay in memory
+ * that nothing can wipe. So whenever the app is locked, nothing is being finished, closed or
+ * checked, and no activity is on screen, the process is ended ([ProcessEnder]); the next start
+ * is a cold one, into the lock screen.
  */
 class AppLock<S : UnlockedSession>(
     private val manager: LockManager,
@@ -157,6 +217,10 @@ class AppLock<S : UnlockedSession>(
     val screenshots: ScreenshotAllowance,
     private val mainDispatcher: CoroutineDispatcher,
     private val ioDispatcher: CoroutineDispatcher,
+    /** Ends the process once nothing needs it any more; see the class comment. The default does nothing. */
+    private val processEnder: ProcessEnder = ProcessEnder { },
+    /** What stands aside while a key is derived; see the class comment. */
+    private val heavyWork: MakesWay = MakesWay.None,
 ) {
     private val mutex = Mutex()
     private val main = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -207,6 +271,34 @@ class AppLock<S : UnlockedSession>(
     /** The session behind [LockState.Unlocked]. Written on the main thread only. */
     @Volatile private var live: Live<S>? = null
 
+    /**
+     * A session that is left alive behind the lock until its work is finished, and no later than
+     * [untilElapsed] ([Clock.elapsedMillis]). [watcher] waits for the work, [timer] for the time.
+     */
+    private class Lease<S>(val live: Live<S>, val untilElapsed: Long) {
+        var watcher: Job? = null
+        var timer: Job? = null
+    }
+
+    /** The lease that is running, if one is. Main thread only. */
+    private var lease: Lease<S>? = null
+
+    /** Sessions that have ended and have not stopped yet: retired, closing, or still writing. Main thread only. */
+    private var unfinished = 0
+
+    /** A session was shown in this process: something decrypted has been in its memory. Main thread only. */
+    private var everOpened = false
+
+    private val _sessionEnding = MutableStateFlow(false)
+
+    /**
+     * True while a session that is no longer on screen is still alive: a lease is running, or a
+     * session is being closed. Whatever keeps the process working out of sight (the answer
+     * service) must not let go before this is false, or the data key could stay in the memory
+     * of a process that was put to sleep on its way to destroying it.
+     */
+    val sessionEnding: StateFlow<Boolean> = _sessionEnding.asStateFlow()
+
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
     private val retired = ConcurrentLinkedQueue<Live<S>>()
 
@@ -226,6 +318,12 @@ class AppLock<S : UnlockedSession>(
     /** MainActivity instances alive (created and not destroyed). Main thread only. */
     private var activities = 0
 
+    /** The activities that are on screen (started and not stopped). Main thread only. */
+    private val onScreen = HashSet<Any>()
+
+    /** An activity has been created, or is being created again, and has not reached the screen yet. Main thread only. */
+    private var arriving = false
+
     @Volatile private var pendingPurpose: BiometricPurpose? = null
     @Volatile private var enrollmentProof: PassphraseProof? = null
     @Volatile private var offerProof: PassphraseProof? = null
@@ -237,6 +335,20 @@ class AppLock<S : UnlockedSession>(
     /** The only way to the lock manager: one caller at a time, see the class comment. */
     private suspend inline fun <T> withManager(block: (LockManager) -> T): T = mutex.withLock { block(manager) }
 
+    /**
+     * Runs [derivation], a call of the lock manager that puts a passphrase through the key
+     * derivation, while the heavy work of the process stands aside. It carries on when the
+     * derivation has returned or thrown, so a pause can never outlive the derivation it was for.
+     */
+    private inline fun <T> whileOthersStandAside(derivation: () -> T): T {
+        heavyWork.standAside()
+        try {
+            return derivation()
+        } finally {
+            heavyWork.carryOn()
+        }
+    }
+
     /** True while something is using the lock manager. For the unit tests, which assert it from inside the manager's calls. */
     internal val managerInUse: Boolean get() = mutex.isLocked
 
@@ -245,7 +357,7 @@ class AppLock<S : UnlockedSession>(
 
     private fun start() {
         _state.value = LockState.Starting
-        work.launch {
+        launchWork {
             withManager { m ->
                 closeRetired()
                 var waitMillis = 0L
@@ -287,6 +399,7 @@ class AppLock<S : UnlockedSession>(
             biometricEnabled = config?.biometric != null,
             lockTimeoutSeconds = config?.lockTimeoutSeconds ?: LockConfig.DEFAULT_TIMEOUT_SECONDS,
             fingerprintInvalidated = config?.fingerprintInvalidated == true,
+            finishAnswerAfterLocking = config?.finishAnswerAfterLocking != false,
         )
     }
 
@@ -309,8 +422,11 @@ class AppLock<S : UnlockedSession>(
 
     /** Why an open session's screens are going away. */
     private enum class SessionEnd {
-        /** The app locks: "Lock now", the background timeout, or the check on coming back. */
-        LOCK,
+        /** "Lock now": the user's own, strongest action. */
+        LOCK_NOW,
+
+        /** The app locks by itself: the background timeout, or the check on coming back. */
+        LOCK_BY_ITSELF,
 
         /** All data is about to be deleted. */
         RESET,
@@ -321,23 +437,101 @@ class AppLock<S : UnlockedSession>(
 
     /**
      * The single place where it is decided what becomes of an open session when the app leaves
-     * the unlocked state (main thread). Today there is one answer whatever the [reason]: the
-     * session ends now. Its screens are cleared at once, it is handed to [closeRetired], and
-     * with it goes the data key, which stops anything still working on decrypted data (a
-     * generation in progress included).
+     * the unlocked state (main thread). Its screens are cleared at once, whatever follows.
      *
-     * This is the point a future "lease" would hook into: if a background task (a generation
-     * that should finish and post a notification) were ever allowed to keep the data key while
-     * the screens are locked, this function is where a [SessionEnd.LOCK] would park the session
-     * instead of retiring it, to be handed back at the next unlock or retired when the task
-     * ends. Whether that is allowed at all is the owner's decision and has not been taken. A
-     * [SessionEnd.RESET] must always end the session: the reset deletes the files under it.
+     * Then, in one case only, the session is left alive behind the lock (a lease, see the class
+     * comment): the app locked by itself, the user has left "finish the answer after locking"
+     * on, and the session says it has unfinished work. In every other case it ends now: it is
+     * handed to [closeRetired], and with it goes the data key, which stops anything still
+     * working on decrypted data. "Lock now" always ends it, and so does a reset, which deletes
+     * the files under it.
      */
-    // [reason] is not looked at yet, because every reason has the same answer today. It is part of
-    // the signature so that every caller already says why, which is what a lease would decide on.
-    private fun endSession(session: Live<S>, @Suppress("UNUSED_PARAMETER") reason: SessionEnd) {
+    private fun endSession(session: Live<S>, reason: SessionEnd) {
         session.session.clearScreens()
+        val finishBehindTheLock = reason == SessionEnd.LOCK_BY_ITSELF && _status.value.finishAnswerAfterLocking && session.session.hasUnfinishedWork()
+        if (finishBehindTheLock) startLease(session) else retire(session)
+    }
+
+    /** Main thread: [session] has ended. It waits for [closeRetired], which whoever called this arranges. */
+    private fun retire(session: Live<S>) {
+        unfinished++
         retired.add(session)
+        refreshSessionEnding()
+    }
+
+    private fun refreshSessionEnding() {
+        _sessionEnding.value = lease != null || unfinished > 0
+    }
+
+    /**
+     * Main thread: leaves [session] alive behind the lock. It is told to start nothing new; when
+     * its work is finished, or [LEASE_MILLIS] have passed, it ends like any other session. The
+     * timer could be late (a process that was not allowed to run), so the deadline itself is
+     * looked at wherever the lease matters: when the app comes to the front, and before a
+     * session is handed back.
+     */
+    private fun startLease(session: Live<S>) {
+        session.session.finishOnly()
+        val parked = Lease(session, clock.elapsedMillis() + LEASE_MILLIS)
+        lease = parked
+        refreshSessionEnding()
+        parked.timer = main.launch {
+            delay(LEASE_MILLIS)
+            endLease(parked)
+        }
+        parked.watcher = main.launch {
+            session.session.awaitWorkFinished()
+            endLease(parked)
+        }
+    }
+
+    /** Main thread: ends [parked] if it is still the lease. Its session is closed, and its key destroyed, from here. */
+    private fun endLease(parked: Lease<S>) {
+        if (!release(parked)) return
+        retire(parked.live)
+        launchWork { withManager { closeRetired() } }
+    }
+
+    /** Main thread: [parked] is the lease no longer; false if it was not. What becomes of its session is the caller's to say. */
+    private fun release(parked: Lease<S>): Boolean {
+        if (lease !== parked) return false
+        lease = null
+        parked.timer?.cancel()
+        parked.watcher?.cancel()
+        refreshSessionEnding()
+        return true
+    }
+
+    /**
+     * Runs a piece of the lock's own work off the main thread, and afterwards, on the main
+     * thread, looks whether the process is still needed.
+     */
+    private fun launchWork(block: suspend () -> Unit): Job = work.launch {
+        try {
+            block()
+        } finally {
+            withContext(NonCancellable + mainDispatcher) { considerEndingProcess() }
+        }
+    }
+
+    /**
+     * Main thread: ends the process if nothing needs it any more. That is when no activity is on
+     * screen or on its way there; no session is open, leased or still stopping (a session only
+     * counts as stopped once its last write has returned, so nothing is lost); nothing is using
+     * the lock manager; and the app is locked. The screens that are neither unlocked nor
+     * locked (set-up, the error screens) count as locked once a session has been open in this
+     * process, which is the case after a reset: there is something in memory to release.
+     */
+    private fun considerEndingProcess() {
+        if (onScreen.isNotEmpty() || arriving) return
+        if (live != null || lease != null || unfinished != 0) return
+        if (mutex.isLocked || _unlockUi.value.busy || _setupUi.value.busy || pendingPurpose != null) return
+        val settled = when (_state.value) {
+            is LockState.Locked -> true
+            LockState.SetupRequired, is LockState.Unrecoverable, is LockState.Failed -> everOpened
+            LockState.Starting, is LockState.Unlocked -> false
+        }
+        if (settled) processEnder.end()
     }
 
     /**
@@ -372,6 +566,12 @@ class AppLock<S : UnlockedSession>(
                     throw e
                 } catch (_: Exception) {
                     // Whatever it was doing has ended, if not well.
+                } finally {
+                    withContext(NonCancellable + mainDispatcher) {
+                        unfinished--
+                        refreshSessionEnding()
+                        considerEndingProcess()
+                    }
                 }
             }
         }
@@ -415,36 +615,79 @@ class AppLock<S : UnlockedSession>(
                 endSession(opened, SessionEnd.NEVER_SHOWN)
                 return@withContext
             }
-            live = opened
-            _unlockUi.value = UnlockUi()
-            _setupUi.value = SetupUi()
-            if (offer != null) {
-                offerProof = offer.second
-                _fingerprintOffer.value = offer.first
-            }
-            _sessionGeneration.update { it + 1 }
-            _state.value = LockState.Unlocked(session)
-            // The activity may have left while the key was being derived: the timeout has been
-            // running since then, and with "immediately" this locks again before anything shows.
-            backgroundPolicy.remainingMillis(clock.elapsedMillis())?.let(::scheduleLock)
+            show(opened, offer)
         }
         closeRetired()
+    }
+
+    /** Main thread: [opened] becomes the session on screen. */
+    private fun show(opened: Live<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
+        live = opened
+        everOpened = true
+        _unlockUi.value = UnlockUi()
+        _setupUi.value = SetupUi()
+        if (offer != null) {
+            offerProof = offer.second
+            _fingerprintOffer.value = offer.first
+        }
+        _sessionGeneration.update { it + 1 }
+        _state.value = LockState.Unlocked(opened.session)
+        // The activity may have left while the key was being derived: the timeout has been
+        // running since then, and with "immediately" this locks again before anything shows.
+        backgroundPolicy.remainingMillis(clock.elapsedMillis())?.let(::scheduleLock)
+    }
+
+    /**
+     * Under the mutex, after the passphrase or the fingerprint has been checked in full and
+     * gave [key]: shows the session of that key. Normally that is a new session ([open]). While
+     * a lease is running it is the leased session itself, so the answer that is being written
+     * is neither lost nor begun again: but only if [key] is that session's key (it always is,
+     * unless the stored configuration was replaced behind the app's back; compared without
+     * regard to where they differ), and only within the lease's time. [key] is then a second
+     * copy of a key the session already has, and is destroyed.
+     */
+    private suspend fun openOrReattach(key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
+        val reattached = withContext(mainDispatcher) {
+            val parked = lease ?: return@withContext false
+            if (_state.value != from) return@withContext false
+            if (clock.elapsedMillis() >= parked.untilElapsed || !MessageDigest.isEqual(key.bytes, parked.live.key.bytes)) {
+                endLease(parked)
+                return@withContext false
+            }
+            release(parked)
+            parked.live.session.resume()
+            show(parked.live, offer)
+            true
+        }
+        if (reattached) key.destroy() else open(key, from, offer)
     }
 
     // --- Locking ----------------------------------------------------------------------------
 
     /**
-     * Locks now (main thread): "Lock now" in Settings, the background timer, and the check on
-     * coming back to the foreground. The state changes at once, so the activity tears the
-     * screens down before this returns; then, off the main thread, the session's queued writes
-     * get their (bounded) time to finish, it closes, and the data key is zeroed whether or not
-     * they did. No-op unless unlocked.
+     * "Lock now" (main thread): the user's own, strongest action. The state changes at once, so
+     * the activity tears the screens down before this returns; then, off the main thread, the
+     * session's queued writes get their (bounded) time to finish, it closes, and the data key
+     * is zeroed whether or not they did. Nothing is left alive, whatever the settings say: an
+     * answer that is being written is stopped, and a lease that is running ends here too.
      */
     fun lock() {
-        if (_state.value !is LockState.Unlocked) return
-        leaveUnlocked(SessionEnd.LOCK)
+        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW) else lease?.let(::endLease)
+    }
+
+    /**
+     * The app locks by itself (main thread): the background timer, and the check on coming back
+     * to the foreground. As [lock], except that [endSession] may leave the session alive to
+     * finish its work. No-op unless unlocked.
+     */
+    private fun lockByItself() {
+        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_BY_ITSELF)
+    }
+
+    private fun lockAs(reason: SessionEnd) {
+        leaveUnlocked(reason)
         enterLocked(waitMillis = 0)
-        work.launch {
+        launchWork {
             withManager { m ->
                 closeRetired()
                 // Unless the user is already back in: an enrolment of the new session is not this lock's to cancel.
@@ -474,10 +717,15 @@ class AppLock<S : UnlockedSession>(
         _sessionGeneration.update { it + 1 }
     }
 
-    /** The activity went to the background (not for a configuration change). Main thread. */
-    fun onBackground() {
+    /**
+     * The activity [who] went to the background (not for a configuration change). Main thread.
+     * With nothing unlocked and nothing left to finish, this is where the process ends.
+     */
+    fun onBackground(who: Any = Unit) {
+        onScreen.remove(who)
         val delayMillis = backgroundPolicy.onBackground(clock.elapsedMillis(), _status.value.lockTimeoutSeconds * 1000L)
         if (_state.value is LockState.Unlocked) scheduleLock(delayMillis)
+        considerEndingProcess()
     }
 
     /**
@@ -488,29 +736,34 @@ class AppLock<S : UnlockedSession>(
     private fun scheduleLock(delayMillis: Long) {
         lockTimer?.cancel()
         if (delayMillis <= 0L) {
-            lock()
+            lockByItself()
         } else {
             lockTimer = main.launch {
                 delay(delayMillis)
-                lock()
+                lockByItself()
             }
         }
     }
 
     /**
-     * The activity is visible again. Also catches the timers that could not run (process frozen,
-     * phone asleep): the lock's own, and the one that ends a screenshot allowance.
+     * The activity [who] is visible again. Also catches the timers that could not run (process
+     * frozen, phone asleep): the lock's own, the one that ends a screenshot allowance, and the
+     * one that ends a lease.
      */
-    fun onForeground() {
+    fun onForeground(who: Any = Unit) {
+        onScreen.add(who)
+        arriving = false
         lockTimer?.cancel()
         lockTimer = null
         screenshots.current()
-        if (backgroundPolicy.onForeground(clock.elapsedMillis())) lock()
+        lease?.let { if (clock.elapsedMillis() >= it.untilElapsed) endLease(it) }
+        if (backgroundPolicy.onForeground(clock.elapsedMillis())) lockByItself()
     }
 
-    /** A MainActivity was created. Main thread. */
+    /** A MainActivity was created. Main thread. Until it reaches the screen, the process is expected to be seen. */
     fun onActivityCreated() {
         activities++
+        arriving = true
     }
 
     /**
@@ -518,9 +771,13 @@ class AppLock<S : UnlockedSession>(
      * change. The screens' state is shared by every instance (it lives in the session), so it is
      * cleared only when the last instance finishes; the session stays until the lock engages.
      */
-    fun onActivityDestroyed(finished: Boolean) {
+    fun onActivityDestroyed(finished: Boolean, who: Any = Unit) {
         activities = (activities - 1).coerceAtLeast(0)
+        // Destroyed while still on screen and not for good: a rotation, or the activity being
+        // built again. Its successor is on its way, so the app has not left the screen.
+        if (onScreen.remove(who) && !finished) arriving = true
         if (finished && activities == 0) {
+            arriving = false
             // A prompt that was showing went with the activity; none is pending any more.
             if (pendingPurpose != null) {
                 if (pendingPurpose == BiometricPurpose.ENROLL) cancelEnrollment()
@@ -553,11 +810,11 @@ class AppLock<S : UnlockedSession>(
             return
         }
         _setupUi.value = SetupUi(busy = true)
-        work.launch {
+        launchWork {
             try {
                 withManager { m ->
                     closeRetired()
-                    val result = m.setUp(first)
+                    val result = whileOthersStandAside { m.setUp(first) }
                     publishStatus(m)
                     open(result.key, from, if (biometricAvailable()) FingerprintOffer.FIRST_SETUP to result.proof else null)
                 }
@@ -582,14 +839,14 @@ class AppLock<S : UnlockedSession>(
             return
         }
         _unlockUi.update { it.copy(busy = true, wrongPassphrase = false, rejected = null, notice = null, error = null) }
-        work.launch {
+        launchWork {
             try {
                 withManager { m ->
-                    when (val result = m.checkPassphrase(passphrase)) {
+                    when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {
                         is PassphraseResult.Success -> {
                             val again = m.config?.fingerprintInvalidated == true && biometricAvailable()
                             publishStatus(m)
-                            open(result.key, from, if (again) FingerprintOffer.AGAIN to result.proof else null)
+                            openOrReattach(result.key, from, if (again) FingerprintOffer.AGAIN to result.proof else null)
                         }
                         is PassphraseResult.Wrong -> _unlockUi.update {
                             it.copy(wrongPassphrase = true, retryAtElapsed = retryAt(result.retryInMillis))
@@ -624,7 +881,7 @@ class AppLock<S : UnlockedSession>(
 
     fun requestBiometricUnlock() {
         if (_unlockUi.value.biometricPromptShowing || _state.value !is LockState.Locked) return
-        work.launch {
+        launchWork {
             try {
                 val cipher = withManager { m ->
                     dropBiometricIfGone(m)
@@ -678,7 +935,7 @@ class AppLock<S : UnlockedSession>(
         pendingPurpose = null
         _unlockUi.update { it.copy(biometricPromptShowing = false) }
         val from = _state.value
-        work.launch {
+        launchWork {
             try {
                 withManager { m ->
                     if (purpose == BiometricPurpose.ENROLL) {
@@ -696,7 +953,7 @@ class AppLock<S : UnlockedSession>(
                     } else if (cipher != null && from is LockState.Locked) {
                         val key = m.unlockWithBiometric(cipher)
                         when {
-                            key != null -> open(key, from, offer = null)
+                            key != null -> openOrReattach(key, from, offer = null)
                             m.config?.biometric == null -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_FAILED) }
                             else -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_UNAVAILABLE) }
                         }
@@ -716,7 +973,7 @@ class AppLock<S : UnlockedSession>(
         val purpose = pendingPurpose ?: return
         pendingPurpose = null
         _unlockUi.update { it.copy(biometricPromptShowing = false) }
-        work.launch {
+        launchWork {
             try {
                 withManager { m ->
                     when (code) {
@@ -773,14 +1030,14 @@ class AppLock<S : UnlockedSession>(
 
     private fun cancelEnrollment() {
         enrollmentProof = null
-        work.launch { withManager { m -> m.cancelBiometricEnrollment() } }
+        launchWork { withManager { m -> m.cancelBiometricEnrollment() } }
     }
 
     // --- Settings (only while unlocked) -------------------------------------------------------
 
     /** Checks the passphrase for a change in Settings (counted like a lock screen attempt). */
     suspend fun checkPassphrase(passphrase: CharArray): PassphraseCheck = op { m ->
-        when (val result = m.checkPassphrase(passphrase)) {
+        when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {
             is PassphraseResult.Success -> {
                 result.key.destroy() // The session already has the key.
                 PassphraseCheck.Ok(result.proof)
@@ -795,7 +1052,7 @@ class AppLock<S : UnlockedSession>(
     /** False if the app locked meanwhile (nothing was changed). */
     suspend fun changePassphrase(proof: PassphraseProof, newPassphrase: CharArray): Boolean = op { m ->
         val key = live?.key ?: return@op false
-        m.changePassphrase(proof, key, newPassphrase)
+        whileOthersStandAside { m.changePassphrase(proof, key, newPassphrase) }
         true
     }
 
@@ -846,6 +1103,9 @@ class AppLock<S : UnlockedSession>(
 
     suspend fun setLockTimeout(seconds: Int) = op { m -> m.setLockTimeout(seconds) }
 
+    /** Whether an answer under way is finished behind the app's own lock; see the class comment. */
+    suspend fun setFinishAnswerAfterLocking(enabled: Boolean) = op { m -> m.setFinishAnswerAfterLocking(enabled) }
+
     private suspend fun <T> op(block: (LockManager) -> T): T = withContext(ioDispatcher) {
         withManager { m ->
             try {
@@ -875,11 +1135,13 @@ class AppLock<S : UnlockedSession>(
         // After a reset the app is as it was when first installed: nothing may be captured.
         screenshots.end()
         leaveUnlocked(SessionEnd.RESET)
+        // A session that was being finished behind the lock ends with the rest: its files are about to go.
+        lease?.let { if (release(it)) retire(it.live) }
         pendingPurpose = null
         _unlockUi.value = UnlockUi()
         _setupUi.value = SetupUi()
         _state.value = LockState.Starting
-        work.launch {
+        launchWork {
             val report = try {
                 withManager { m ->
                     closeRetired()
@@ -922,6 +1184,10 @@ class AppLock<S : UnlockedSession>(
     private fun retryAt(retryInMillis: Long) = if (retryInMillis > 0) clock.elapsedMillis() + retryInMillis else 0L
 
     companion object {
+        /** The longest a session is left alive behind the lock to finish its work. */
+        const val LEASE_MINUTES = 10
+        const val LEASE_MILLIS = LEASE_MINUTES * 60_000L
+
         // androidx.biometric.BiometricPrompt error codes (kept here so this file needs no Android UI library).
         const val ERROR_HW_UNAVAILABLE = 1
         const val ERROR_SECURITY_UPDATE_REQUIRED = 15

@@ -121,6 +121,31 @@ class SettingsStoreTest {
         assertTrue(text.contains("qwen3.5-0.8b"))
     }
 
+    // --- The stored form: whether the notification permission was asked for ---
+
+    @Test
+    fun thatTheUserWasAskedAboutNotificationsIsStoredOnceItIsTrue() {
+        val fresh = AppSettings()
+        assertFalse(fresh.notificationsAsked)
+        assertFalse("not written until it is true: an older file means the same", SettingsCodec.encode(fresh).contains("notificationsAsked"))
+
+        val asked = fresh.withNotificationsAsked()
+        assertTrue(asked.notificationsAsked)
+        assertSame("asked is asked", asked, asked.withNotificationsAsked())
+        assertTrue(SettingsCodec.encode(asked).contains("\"notificationsAsked\":true"))
+        val decoded = SettingsCodec.decode(SettingsCodec.encode(asked.withSystemPrompt("a", "x"))) as SettingsCodec.Decoded.Readable
+        assertTrue(decoded.complete)
+        assertEquals(AppSettings(systemPrompts = mapOf("a" to "x"), notificationsAsked = true), decoded.settings)
+
+        // A file written before the field existed, and one with something else in its place.
+        val older = SettingsCodec.decode("""{"schemaVersion":1,"settings":{"systemPrompts":{}}}""") as SettingsCodec.Decoded.Readable
+        assertFalse(older.settings.notificationsAsked)
+        assertTrue(older.complete)
+        val odd = SettingsCodec.decode("""{"schemaVersion":1,"settings":{"notificationsAsked":"yes"}}""") as SettingsCodec.Decoded.Readable
+        assertFalse(odd.settings.notificationsAsked)
+        assertEquals("counted as something that could not be read", 1, odd.skippedEntries)
+    }
+
     // --- The stored form: a temperature per model ---
 
     private fun decoded(json: String) = SettingsCodec.decode(json) as SettingsCodec.Decoded.Readable

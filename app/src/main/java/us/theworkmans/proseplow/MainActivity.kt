@@ -1,11 +1,14 @@
 package us.theworkmans.proseplow
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.View
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
@@ -27,7 +30,11 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import us.theworkmans.proseplow.background.NotificationPermission
 import us.theworkmans.proseplow.lock.FingerprintOfferDialog
 import us.theworkmans.proseplow.lock.LockedContent
 import us.theworkmans.proseplow.security.BiometricLauncher
@@ -79,6 +86,13 @@ class MainActivity : FragmentActivity() {
 
     /** Set when this instance is being replaced by [renewWindows], not left by the user. */
     private var renewing = false
+
+    /**
+     * Asks for the permission to post notifications (Android 13 and later). Whatever the answer
+     * is, nothing follows from it here: with the permission the two notifications of an answer
+     * are shown, without it they are not, and the app is the same otherwise.
+     */
+    private val askForNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     /** When the user was last told that a touch was discarded ([SystemClock.uptimeMillis]); null before the first time. */
     private var touchNoticeAt: Long? = null
@@ -168,6 +182,13 @@ class MainActivity : FragmentActivity() {
                 appLock.noticeShown()
             }
         }
+        // The first time an answer is started, and never again: may the app say when one is ready?
+        lifecycleScope.launch {
+            appLock.state.collectLatest { state ->
+                val session = (state as? LockState.Unlocked)?.session ?: return@collectLatest
+                session.chat.state.map { it.turn != null }.distinctUntilChanged().collect { writing -> if (writing) askForNotificationsOnce(session) }
+            }
+        }
         lifecycleScope.launch {
             var seen = appLock.resets.value
             appLock.resets.collect { count ->
@@ -238,6 +259,20 @@ class MainActivity : FragmentActivity() {
         recreate()
     }
 
+    /**
+     * Asks once whether the app may post notifications, at the moment that makes sense of the
+     * question: an answer has just been started. That it was asked is stored with the
+     * (encrypted) settings before the question is shown, so it is never asked twice.
+     */
+    private fun askForNotificationsOnce(session: AppSession) {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        if (!NotificationPermission.shouldAsk(Build.VERSION.SDK_INT, granted, session.settings.settings.value.notificationsAsked)) return
+        session.settings.update(urgent = true) { it.withNotificationsAsked() }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) askForNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     /** Says why nothing happens, when that is due; see [ObscuredTouchFilterLayout] and [DiscardedTouchNotice]. */
     private fun tellThatATouchWasDiscarded() {
         val now = SystemClock.uptimeMillis()
@@ -298,7 +333,9 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
-        container.appLock.onForeground()
+        container.appLock.onForeground(this)
+        // Whoever is looking at the app needs no notification that an answer is ready.
+        container.answerWork.onInFront(true)
         // Before anything is drawn again: an allowance that ran out while the app was away is over.
         applyWindowPolicy()
         renewWindowsIfDue()
@@ -321,12 +358,15 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         // Not the background: a rotation, or this instance making way for the one that
         // renewWindows asked for, which comes to the front in its place.
-        if (!isChangingConfigurations && !renewing) container.appLock.onBackground()
+        if (!isChangingConfigurations && !renewing) {
+            container.answerWork.onInFront(false)
+            container.appLock.onBackground(this)
+        }
     }
 
     override fun onDestroy() {
         container.appLock.detach(biometricLauncher)
-        container.appLock.onActivityDestroyed(finished = isFinishing && !isChangingConfigurations)
+        container.appLock.onActivityDestroyed(finished = isFinishing && !isChangingConfigurations, who = this)
         super.onDestroy()
     }
 

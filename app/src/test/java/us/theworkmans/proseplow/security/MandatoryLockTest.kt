@@ -126,6 +126,7 @@ class MandatoryLockTest {
                 "passphrase",
                 "biometric",
                 "lockTimeoutSeconds",
+                "finishAnswerAfterLocking",
                 "failedAttempts",
                 "lastFailureWallMillis",
                 "lastFailureElapsedMillis",
@@ -139,6 +140,7 @@ class MandatoryLockTest {
         assertEquals("\"PBKDF2-HMAC-SHA256+keystore-HMAC-SHA256\"", stored.getValue("passphrase").jsonObject.getValue("kdf").toString())
         assertEquals(JsonNull, stored.getValue("biometric"))
         assertEquals("60", stored.getValue("lockTimeoutSeconds").toString())
+        assertEquals("true", stored.getValue("finishAnswerAfterLocking").toString())
 
         m.completeBiometricEnrollment(created.proof, created.key, m.prepareBiometricEnrollment(created.proof))
         stored = Json.parseToJsonElement(configFile.readText()).jsonObject

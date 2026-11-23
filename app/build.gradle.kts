@@ -205,12 +205,17 @@ abstract class VerifyManifestPermissions : DefaultTask() {
 }
 
 androidComponents {
-    // Every permission a merged manifest may contain; the app itself declares none.
-    // USE_BIOMETRIC and USE_FINGERPRINT are merged in by androidx.biometric. androidx.core declares
-    // and requests the app's own signature-level DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION, added per
-    // variant below because it carries the application id. Anything else, android.permission.INTERNET
-    // above all, fails the build.
-    val libraryPermissions = setOf(
+    // Every permission a merged manifest may contain. The app itself declares the four that let an
+    // answer be finished while it is not on screen: the foreground service and its type, the
+    // notifications, and the wake lock. USE_BIOMETRIC and USE_FINGERPRINT are merged in by
+    // androidx.biometric. androidx.core declares and requests the app's own signature-level
+    // DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION, added per variant below because it carries the
+    // application id. Anything else, android.permission.INTERNET above all, fails the build.
+    val allowedPermissions = setOf(
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.WAKE_LOCK",
         "android.permission.USE_BIOMETRIC",
         "android.permission.USE_FINGERPRINT",
     )
@@ -225,7 +230,7 @@ androidComponents {
             group = "verification"
             description = "Fails if the merged ${variant.name} manifest has a permission outside the allow-list."
             variantName.set(variant.name)
-            allowed.set(variant.applicationId.map { id -> libraryPermissions + "$id.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" })
+            allowed.set(variant.applicationId.map { id -> allowedPermissions + "$id.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" })
             report.set(layout.buildDirectory.file("reports/manifest-permissions/${variant.name}.txt"))
         }
         variant.artifacts.use(verify)

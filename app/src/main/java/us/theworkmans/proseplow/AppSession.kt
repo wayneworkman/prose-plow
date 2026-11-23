@@ -5,14 +5,20 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.chat.ChatController
 import us.theworkmans.proseplow.chat.ModelRequestSettings
 import us.theworkmans.proseplow.core.chat.Clock
@@ -64,7 +70,9 @@ class DataLayout(files: AppFiles) {
 
 /**
  * Everything that holds or reads decrypted data, created when the app is unlocked and ended when
- * it locks: the encrypted stores and their writer, the chats with the generation that may be
+ * it locks (or, when the app locked by itself in the middle of an answer and the user allows
+ * it, as soon as that answer is finished behind the lock, and no later than the lock's ten
+ * minutes): the encrypted stores and their writer, the chats with the generation that may be
  * running in them ([chat]), and the ViewModels of the screens ([viewModelStore], which outlives
  * a rotation because it lives here and not in the activity).
  *
@@ -80,6 +88,8 @@ class DataLayout(files: AppFiles) {
  * @param mainDispatcher where [chat] keeps its state; the screens' thread.
  * @param ioDispatcher where files are read and written.
  * @param writeTimeoutMillis how long [close] waits for the writes that are queued.
+ * @param answerEvents told, on the main dispatcher, when an answer begins and ends being
+ *   written and when one is finished: what keeps the process alive out of sight goes by it.
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
  *   then shows that the data could not be opened, with Try again, instead of an empty app.
  */
@@ -88,11 +98,12 @@ class AppSession(
     layout: DataLayout,
     private val engine: InferenceEngine,
     val models: List<ModelSpec>,
-    mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     clock: Clock = SystemClock,
     ids: IdSource = RandomIds,
     private val writeTimeoutMillis: Long = WRITE_TIMEOUT_MILLIS,
+    private val answerEvents: AnswerEvents = AnswerEvents.None,
 ) : UnlockedSession {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
@@ -105,6 +116,9 @@ class AppSession(
     val writeFailure: StateFlow<String?> = _writeFailure.asStateFlow()
 
     private val writerScope = CoroutineScope(SupervisorJob() + ioDispatcher)
+
+    /** Where [answerEvents] is told what the chats are doing. Ended in [close]. */
+    private val watchScope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
     /** Every write to the session's files goes through here. [close] gives it time to finish before the data key goes. */
     private val writer = CoalescingWriter(writerScope, LAZY_WRITE_MILLIS) { _, failure -> _writeFailure.value = failure.javaClass.simpleName }
@@ -140,11 +154,17 @@ class AppSession(
                 ids = ids,
                 mainDispatcher = mainDispatcher,
                 ioDispatcher = ioDispatcher,
+                onReplyFinished = answerEvents::onReplyFinished,
             )
         } catch (e: Exception) {
             // The session was never opened: its writer must not stay behind.
             writerScope.cancel()
+            watchScope.cancel()
             throw e
+        }
+        val chats = chat
+        watchScope.launch {
+            chats.state.map { it.turn != null }.distinctUntilChanged().collect { writing -> answerEvents.onWriting(writing) }
         }
     }
 
@@ -171,6 +191,18 @@ class AppSession(
         writer.flush()
     }
 
+    /** An answer is being written, in whichever chat. */
+    override fun hasUnfinishedWork(): Boolean = chat.state.value.turn != null
+
+    override suspend fun awaitWorkFinished() {
+        chat.state.first { it.turn == null }
+    }
+
+    /** Behind the lock: the answer that is being written is finished and saved; nothing else begins. */
+    override fun finishOnly() = chat.finishOnly()
+
+    override fun resume() = chat.resume()
+
     /**
      * Ends the session, in this order:
      * 1. The reply in flight is stopped. What was written of it is kept, marked as stopped, and
@@ -194,6 +226,9 @@ class AppSession(
         try {
             chat.shutdown()
         } finally {
+            // No answer is being written any more, said here in case the watcher was not yet told.
+            watchScope.cancel()
+            withContext(NonCancellable + mainDispatcher) { answerEvents.onWriting(false) }
             try {
                 forgetConversation()
             } finally {

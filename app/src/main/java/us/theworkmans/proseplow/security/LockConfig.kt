@@ -26,6 +26,13 @@ data class LockConfig(
     val biometric: BiometricWrap? = null,
     /** How long the app may stay in the background before it locks (0: at once). */
     val lockTimeoutSeconds: Int = DEFAULT_TIMEOUT_SECONDS,
+    /**
+     * Whether an answer that is being written when the app locks by itself is finished behind
+     * the lock before the data key goes (see [AppLock]). It is here, and not with the encrypted
+     * settings, because it is needed while the app is locked. A file written before this field
+     * existed does not have it, which means on.
+     */
+    val finishAnswerAfterLocking: Boolean = true,
     /** Passphrase attempts that have not (yet) succeeded since the last success. */
     val failedAttempts: Int = 0,
     /**

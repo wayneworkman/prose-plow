@@ -400,7 +400,8 @@ class SourceRulesTest {
         val all = sources(main)
         val activity = code(File(module, "$main/MainActivity.kt"))
         assertEquals("the activity composes in one place", listOf("composeView.setContent {"), activity.filter { it.contains("setContent {") || it.contains("setContent(") })
-        assertEquals("and nothing else makes a composition of its own", listOf("MainActivity.kt"), users(all, "setContent"))
+        assertEquals("and nothing else makes a composition of its own", listOf("MainActivity.kt"), users(all, "setContent {"))
+        assertEquals(emptyList<String>(), users(all, ".setContent("))
         val content = File(module, "$main/MainActivity.kt").readText().substringAfter("private fun setAppContent() {").substringBefore("\n    }\n")
         val nesting = content.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("//") && it != "}" }
         assertEquals(
@@ -540,6 +541,170 @@ class SourceRulesTest {
         assertTrue(build.contains("tasks.named(\"check\") { dependsOn(verify) }"))
         assertTrue("no Compose tooling in any build type", !build.contains("ui.tooling") && !build.contains("ui-tooling"))
         assertTrue("and nothing is ever previewed", users(sources(main), "@Preview").isEmpty())
+    }
+
+    /**
+     * A notification is shown outside the app: on the phone's lock screen, and to whatever is
+     * allowed to read notifications. So each of the app's two is one fixed sentence from the
+     * resources, without a placeholder, and nothing that could carry a word of an answer, the
+     * title of a chat or the name of a model is ever set on one. The code that builds them
+     * cannot even reach a chat: it imports nothing of the chats, the stores or the models.
+     */
+    @Test
+    fun theNotificationsSayOneFixedSentenceAndNothingAboutAnAnswer() {
+        val all = sources(main)
+        assertEquals("notifications are built in one file", listOf("AnswerNotifications.kt"), users(all, "NotificationCompat.Builder("))
+        assertEquals(listOf("AnswerNotifications.kt"), users(all, ".notify("))
+        val notifications = code(File(module, "$main/background/AnswerNotifications.kt"))
+        assertEquals(
+            listOf(".setContentTitle(context.getString(R.string.answer_writing))", ".setContentTitle(context.getString(R.string.answer_ready))"),
+            notifications.filter { it.contains("setContentTitle(") },
+        )
+        for (word in listOf("setContentText(", "setSubText(", "setTicker(", "setStyle(", "setContentInfo(", "setLargeIcon(", "addAction(", "setExtras(", "addExtras(", "setRemoteInputHistory(")) {
+            assertEquals("$word could carry something of an answer into a notification", emptyList<String>(), users(all, word))
+        }
+        assertTrue("a text with arguments is not a fixed text", notifications.none { Regex("""getString\([^)]*,""").containsMatchIn(it) })
+        for (name in listOf("AnswerNotifications.kt", "AnswerService.kt", "AnswerWork.kt")) {
+            val reach = imports(File(module, "$main/background/$name")).filter { import -> listOf("$app.chat.", "$app.core.", "$app.data.", "$app.settings.").any(import::startsWith) }
+            assertEquals("$name can reach what an answer is made of", emptyList<String>(), reach)
+        }
+
+        val strings = File(module, "src/main/res/values/strings.xml").readText()
+        fun text(name: String) = Regex("""<string name="$name">([^<]*)</string>""").find(strings)?.groupValues?.get(1)
+        assertEquals("Writing an answer\u2026", text("answer_writing"))
+        assertEquals("Your answer is ready.", text("answer_ready"))
+        assertEquals("Answer in progress", text("channel_answer_writing"))
+        assertEquals("Answer ready", text("channel_answer_ready"))
+        for (name in listOf("answer_writing", "answer_ready", "channel_answer_writing", "channel_answer_ready")) {
+            assertTrue("$name takes an argument", !text(name)!!.contains("%"))
+        }
+    }
+
+    /**
+     * The answer service keeps the process alive and awake and does nothing else. No other app
+     * can start it; Android is told what it is for; it is never restarted without its process;
+     * it stops only itself (stopping it from outside before it has shown its notification is an
+     * error on Android); and the wake lock it holds always has a time limit.
+     */
+    @Test
+    fun theAnswerServiceIsNotExportedSaysWhatItIsForAndHoldsNoWakeLockForEver() {
+        val manifest = File(module, "src/main/AndroidManifest.xml").readText().replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
+        val services = Regex("""<service\b[^>]*>""").findAll(manifest).map { it.value }.toList()
+        assertEquals(1, services.size)
+        val service = services.single()
+        assertTrue(service.contains("android:name=\".background.AnswerService\""))
+        assertTrue("the service must stay closed to other apps", service.contains("android:exported=\"false\""))
+        assertTrue(service.contains("android:foregroundServiceType=\"specialUse\""))
+        val property = Regex("""<property\s+android:name="android\.app\.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\s+android:value="([^"]+)"""").find(manifest)
+        assertTrue("the special use must be stated", property != null && property.groupValues[1].length > 40)
+        assertTrue("no receiver, and no provider of the app's own", !manifest.contains("<receiver"))
+
+        val all = sources(main)
+        val file = File(module, "$main/background/AnswerService.kt")
+        val service_ = code(file)
+        assertTrue(service_.contains("override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY"))
+        assertTrue(service_.contains("override fun onBind(intent: Intent?): IBinder? = null"))
+        assertEquals(listOf("AnswerService.kt"), users(all, "startForegroundService("))
+        assertEquals(listOf("AnswerService.kt"), users(all, "stopService("))
+        assertEquals("only the end of the process stops the service from outside", listOf("ProcessEnd.kt"), users(all, "AnswerService.stop("))
+        // In the foreground first, before anything can stop it.
+        val created = file.readText().substringAfter("override fun onCreate() {").substringBefore("\n    }\n")
+        assertTrue(created.indexOf("ServiceCompat.startForeground(") in 0 until created.indexOf("stopSelf()"))
+
+        assertEquals(listOf("AnswerService.kt"), users(all, "newWakeLock("))
+        assertEquals(listOf("lock.acquire(WAKE_LOCK_MILLIS)"), service_.filter { it.contains(".acquire(") })
+        assertTrue(service_.contains("PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG) ?: return") || service_.any { it.contains("newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)") })
+        // The rules of when it runs are plain Kotlin, tested without a phone.
+        assertEquals(emptyList<String>(), imports(File(module, "$main/background/AnswerWork.kt")).filter { it.startsWith("android.") || it.startsWith("androidx.") })
+    }
+
+    /**
+     * The app asks for exactly four permissions, all for finishing an answer out of sight, and
+     * the build's allow-list for the merged manifest is those four and what the fingerprint
+     * library adds. The network is in neither, and the allow-list is what the build is checked
+     * against (see [theBuildCannotPackageAManifestThatWasNotChecked]).
+     */
+    @Test
+    fun theAppAsksForFourPermissionsAndNoneOfThemIsTheNetwork() {
+        val four = setOf(
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.WAKE_LOCK",
+        )
+        val manifest = File(module, "src/main/AndroidManifest.xml").readText().replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
+        val requested = Regex("""<uses-permission[^>]*android:name="([^"]+)"""").findAll(manifest).map { it.groupValues[1] }.toList()
+        assertEquals(four, requested.toSet())
+        assertEquals("each once", 4, requested.size)
+        assertTrue(!manifest.contains("INTERNET") && !manifest.contains("ACCESS_NETWORK_STATE") && !manifest.contains("<permission"))
+        for (other in listOf("uses-permission-sdk-23", "maxSdkVersion")) assertTrue(other, !manifest.contains(other))
+
+        val build = File(module, "build.gradle.kts").readLines().map { it.trim() }.filterNot { it.startsWith("//") || it.startsWith("*") || it.startsWith("/**") }.joinToString("\n")
+        val listed = build.substringAfter("val allowedPermissions = setOf(").substringBefore(")")
+        val allowed = Regex(""""([^"]+)"""").findAll(listed).map { it.groupValues[1] }.toSet()
+        assertEquals(four + setOf("android.permission.USE_BIOMETRIC", "android.permission.USE_FINGERPRINT"), allowed)
+        assertTrue(build.contains("allowed.set(variant.applicationId.map { id -> allowedPermissions + \"\$id.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\" })"))
+        assertTrue("the network is not allowed anywhere in the build", !build.contains("INTERNET") && !build.contains("NETWORK"))
+    }
+
+    /**
+     * The process is ended in one place, by one call, and that place first makes sure it is not
+     * a process that runs instrumented tests. The lock asks for it from one function, which is
+     * where every condition is checked (AppLockTest holds it to them).
+     */
+    @Test
+    fun theProcessIsEndedInOnePlaceAndNeverInATestRun() {
+        val all = sources(main)
+        assertEquals(listOf("ProcessEnd.kt"), users(all, "killProcess("))
+        for (word in listOf("exitProcess(", "System.exit(", ".halt(", "finishAndRemoveTask(", "finishAffinity(")) {
+            assertEquals("$word is another way to end the app", emptyList<String>(), users(all, word))
+        }
+        val end = File(module, "$main/ProcessEnd.kt").readText().substringAfter("override fun end() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(
+            listOf("if (InstrumentedRun.detected(app.classLoader)) return", "AnswerService.stop(app)", "Process.killProcess(Process.myPid())"),
+            end,
+        )
+        assertEquals("the real ender is made once, for the lock", listOf("ProsePlowApp.kt"), users(all, "= AndroidProcessEnder("))
+        val lock = code(File(module, "$main/security/AppLock.kt"))
+        assertEquals(listOf("if (settled) processEnder.end()"), lock.filter { it.contains("processEnder.") })
+        // The application object does not make the lock (and with it the ender) by itself: only an activity asks for the container.
+        val application = code(File(module, "$main/ProsePlowApp.kt")).joinToString("\n")
+        assertTrue(application.contains("private val lazyContainer = lazy { AppContainer(this) }"))
+        assertTrue(application.contains("get() = if (lazyContainer.isInitialized()) container.answerWork.keepAliveWanted else null"))
+        assertEquals("the service must not create the container", emptyList<String>(), users(sources("$main/background"), "container"))
+    }
+
+    /**
+     * Every call of the lock manager that derives a key from a passphrase is made while the
+     * model stands aside, the pause ends in a `finally`, and what stands aside is the very gate
+     * the engine's generations wait at.
+     */
+    @Test
+    fun theModelStandsAsideForEveryKeyDerivationAndNeverLongerThanIt() {
+        val lock = code(File(module, "$main/security/AppLock.kt"))
+        val derivations = lock.filter { line -> listOf("m.checkPassphrase(", "m.changePassphrase(", "m.setUp(").any(line::contains) }
+        assertEquals(
+            listOf(
+                "val result = whileOthersStandAside { m.setUp(first) }",
+                "when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {",
+                "when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {",
+                "whileOthersStandAside { m.changePassphrase(proof, key, newPassphrase) }",
+            ),
+            derivations,
+        )
+        val helper = File(module, "$main/security/AppLock.kt").readText().substringAfter("private inline fun <T> whileOthersStandAside(derivation: () -> T): T {").substringBefore("\n    }\n")
+        assertEquals(
+            listOf("heavyWork.standAside()", "try {", "return derivation()", "} finally {", "heavyWork.carryOn()", "}"),
+            helper.lines().map { it.trim() }.filter { it.isNotEmpty() },
+        )
+        assertEquals(listOf("heavyWork.standAside()", "heavyWork.carryOn()"), lock.filter { it.contains("heavyWork.") })
+
+        val application = code(File(module, "$main/ProsePlowApp.kt"))
+        assertTrue(application.contains("LlamaEngine(NativeEngine.factory(app), nativeThread.asCoroutineDispatcher(), gate = generationGate)"))
+        assertTrue(application.contains("override fun standAside() = generationGate.close()"))
+        assertTrue(application.contains("override fun carryOn() = generationGate.open()"))
+        assertEquals("one gate", listOf("private val generationGate = GenerationGate()"), application.filter { it.contains("GenerationGate(") })
+        assertEquals("nothing else opens or closes it", listOf("ProsePlowApp.kt"), users(sources(main), "generationGate"))
     }
 
     /**

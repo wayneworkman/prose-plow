@@ -25,8 +25,78 @@ import us.theworkmans.proseplow.core.prompt.PromptFormatException
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptRole
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.random.Random
+
+/**
+ * Lets something more urgent than an answer have the processor for a moment (the app's key
+ * derivation, which a person is waiting for with a finger on the lock screen). While the gate is
+ * closed, a generation stops at its next safe point, between two chunks of the prompt or between
+ * two tokens of the reply, and waits there; when it is opened, the generation goes on from where
+ * it was, with nothing lost. A generation that is waiting has not ended: it is neither finished
+ * nor stopped, and its collector sees no event until it goes on.
+ *
+ * The wait is between two native computations and never inside one. The native side polls for
+ * cancellation in the middle of a computation as well, with its worker threads spinning at a
+ * barrier meanwhile; waiting there would keep the processor as busy as computing does. Between
+ * computations the worker threads have nothing to do and go to sleep.
+ *
+ * A closed gate does not hold a generation that should end. Whoever waits is asked again, at
+ * least every [pollMillis], whether it has been cancelled or interrupted, and leaves the gate at
+ * once if so; so stopping an answer, locking the app and forgetting a conversation all work
+ * while the gate is closed.
+ *
+ * Thread-safe. [close] and [open] come in pairs and may nest: the gate is open again when every
+ * [close] has had its [open]. Whoever closes it must open it in a `finally`.
+ *
+ * @param pollMillis how long a waiting generation sleeps before it asks again whether it should
+ *   end. An [open] wakes it at once in any case.
+ * @param idle what a waiting generation does for one such period, in place of sleeping on the
+ *   gate's own condition. Only for single-threaded tests, where it is the one place at which
+ *   something else can happen while a generation waits; it is called with the gate's lock held.
+ */
+class GenerationGate(private val pollMillis: Long = 25, private val idle: (() -> Unit)? = null) {
+    private val lock = ReentrantLock()
+    private val opened = lock.newCondition()
+
+    /** How many [close] calls have not had their [open] yet. Written with [lock] held. */
+    @Volatile private var closers = 0
+
+    init {
+        require(pollMillis >= 1) { "pollMillis must be at least 1" }
+    }
+
+    val isClosed: Boolean get() = closers > 0
+
+    /** Asks the generation that is running, or the next one, to stand aside until [open]. Returns at once. */
+    fun close() {
+        lock.withLock { closers++ }
+    }
+
+    /** Takes one [close] back. One more [open] than there were [close] calls does nothing. */
+    fun open() {
+        lock.withLock {
+            if (closers > 0) closers--
+            if (closers == 0) opened.signalAll()
+        }
+    }
+
+    /**
+     * Blocks the calling thread while the gate is closed, unless [abandon] says that the caller
+     * should end instead. Returns at once when the gate is open, which costs one volatile read.
+     */
+    internal fun pass(abandon: () -> Boolean) {
+        if (closers == 0) return
+        lock.withLock {
+            while (closers > 0 && !abandon()) {
+                if (idle != null) idle.invoke() else opened.await(pollMillis, TimeUnit.MILLISECONDS)
+            }
+        }
+    }
+}
 
 /**
  * The real [InferenceEngine]: every decision about a generation, made in Kotlin on top of the
@@ -60,6 +130,9 @@ import kotlin.random.Random
  *   at any point and leave the engine consistent.
  * - At least one prompt token is always evaluated before sampling, because the model's
  *   prediction only exists after an evaluation. That is why at most all but one token are reused.
+ * - A generation stands aside while the [gate] is closed, at the points between two native
+ *   computations: before the first chunk of the prompt, after every chunk, and after every token
+ *   of the reply. The time it spends there is left out of the speeds it reports.
  *
  * @param factory loads models.
  * @param nativeDispatcher where every native call runs. In the app this is one dedicated thread;
@@ -67,6 +140,8 @@ import kotlin.random.Random
  * @param settings the engine's own tuning, independent of the model.
  * @param nanoTime a monotonic clock for the speeds in [GenerationStats]; replaceable in tests.
  * @param newSeed supplies the sampling seed when neither the request nor the model fixes one.
+ * @param gate closed by whoever needs the processor more urgently than an answer does; see
+ *   [GenerationGate]. An engine that is given none has one that nobody closes.
  */
 class LlamaEngine(
     private val factory: NativeLlamaFactory,
@@ -74,6 +149,7 @@ class LlamaEngine(
     private val settings: Settings = Settings(),
     private val nanoTime: () -> Long = System::nanoTime,
     private val newSeed: () -> Int = { Random.nextInt() },
+    private val gate: GenerationGate = GenerationGate(),
 ) : InferenceEngine {
 
     /**
@@ -293,11 +369,29 @@ class LlamaEngine(
         private var droppedMessages = 0
         private var deletions = 0
 
+        /** Time spent standing aside at the [gate], before and after the prompt was ready. */
+        private var asideBeforeReply = 0L
+        private var asideDuringReply = 0L
+
         /** True once [forget], [unload] or a [load] has asked this generation to end. */
         private fun interrupted(): Boolean = epoch.get() != startEpoch
 
         /** Polled by the native side: interrupted by the engine, or abandoned by the collector. */
         private fun shouldStop(): Boolean = interrupted() || !job.isActive
+
+        /**
+         * Waits while the [gate] is closed, unless this generation should end. Only ever called
+         * between two native computations (see [GenerationGate] for why), on the native thread,
+         * which has nothing else to do meanwhile: everything else that wants it is waiting for
+         * this generation's mutex.
+         */
+        private fun standAside() {
+            if (!gate.isClosed) return
+            val since = nanoTime()
+            gate.pass(::shouldStop)
+            val waited = nanoTime() - since
+            if (reply == null) asideBeforeReply += waited else asideDuringReply += waited
+        }
 
         suspend fun run() {
             if (interrupted()) {
@@ -426,6 +520,7 @@ class LlamaEngine(
                 if (stop > memory.size) {
                     val base = memory.size
                     val part = tokens.copyOfRange(base, stop)
+                    standAside()
                     val evaluated = native.evaluate(part, settings.evaluationChunk, PromptObserver(base, tokens.size))
                     memory.addAll(part, evaluated)
                     if (evaluated < part.size) {
@@ -457,6 +552,8 @@ class LlamaEngine(
                 // Not a suspending send: this runs inside a blocking native call. The buffer is
                 // unlimited, so nothing is lost. The final report comes from run().
                 if (base + evaluatedTokens < total) out.trySend(GenerationEvent.PromptProgress(base + evaluatedTokens, total))
+                // A chunk is done and the next has not begun: the place to make way.
+                standAside()
             }
 
             override fun isCancelled(): Boolean = shouldStop()
@@ -490,7 +587,8 @@ class LlamaEngine(
             this.reply = reply
             val single = IntArray(1)
             val observer = object : EvaluationObserver {
-                override fun onProgress(evaluatedTokens: Int) = Unit
+                // The token is in the memory and the next is not yet sampled: the place to make way.
+                override fun onProgress(evaluatedTokens: Int) = standAside()
                 override fun isCancelled(): Boolean = shouldStop()
             }
 
@@ -564,8 +662,8 @@ class LlamaEngine(
                         promptTokens = promptTokens,
                         reusedPromptTokens = reusedTokens,
                         generatedTokens = generatedTokens,
-                        promptMillis = ((if (generating) promptReadyAt else now) - startedAt) / NANOS_PER_MILLI,
-                        generationMillis = if (generating) (now - promptReadyAt) / NANOS_PER_MILLI else 0,
+                        promptMillis = ((if (generating) promptReadyAt else now) - startedAt - asideBeforeReply) / NANOS_PER_MILLI,
+                        generationMillis = if (generating) (now - promptReadyAt - asideDuringReply) / NANOS_PER_MILLI else 0,
                         droppedMessages = droppedMessages,
                         deletions = deletions,
                     ),

@@ -63,6 +63,15 @@ Chats:
 - **Long conversations.** When a conversation no longer fits the model's context, the oldest
   messages are left out of the latest answer and the app says how many.
 - **Drafts.** What you have typed and not sent is kept with its chat.
+- **An answer is finished when you leave.** While an answer is being written the app runs a
+  foreground service, with a silent notification that says "Writing an answer..." and nothing
+  else, so the answer goes on when the app is in the background or the screen is off. When one
+  is finished while you are not looking, a second notification says "Your answer is ready.";
+  neither ever contains a word of an answer, the name of a chat or of a model. The app asks
+  once, at the first answer, whether it may show notifications (Android 13 and later); without
+  the permission everything else works the same. Out of sight the phone gives the app fewer
+  and slower processor cores: on the one phone that was tested, reading the conversation into
+  the model was about a quarter slower, and writing the answer was as fast as in front.
 
 Privacy:
 
@@ -74,8 +83,20 @@ Privacy:
 - **Passphrase or fingerprint, never a PIN.** Fingerprint unlock is optional, uses strong
   (Class 3) biometrics only, and cannot fall back to the phone's PIN, pattern or password.
 - **Locks by itself.** The app is locked at every start and after it has been in the background
-  for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. Settings has "Lock
-  now".
+  for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
+  when Android reports that the app has left the screen, which is a fraction of a second after
+  you leave it; coming straight back within that moment finds the app still open, also with
+  "immediately". Settings has "Lock now", which does not wait for anything.
+- **Finishes the answer after locking**, unless you turn that off. If the app locks by itself
+  while an answer is being written, the screen is locked as always, and behind it that one
+  answer is finished and saved before the encryption key is erased. The price: until then, and
+  for at most ten minutes, the key is still in memory. Unlocking in that time takes the full
+  passphrase or fingerprint check as always and brings you back to the answer under way. "Lock
+  now" never waits: it stops the answer and erases the key at once.
+- **Ends its own process when it is locked.** Once the app is locked, has nothing left to
+  finish and is not on screen, it ends its process, because that is the only thing that
+  removes every copy of a conversation from memory. Opening it again starts it afresh, at the
+  lock screen; the model is then loaded again at the next unlock.
 - **No recovery.** A forgotten passphrase cannot be recovered. "Reset app data" deletes
   everything after you have typed the word `delete`, and the app starts again with first-time
   set-up.
@@ -88,8 +109,11 @@ Privacy:
   blocked again. The preview in the app switcher stays hidden in any case. On Android 12 and
   older that preview can only be hidden by blocking screenshots altogether, so there the
   allowance is not available and the setting says so.
-- **No network permission.** The app's manifest requests no permission, and the build fails if
-  a library adds one to the merged manifest that is not on a three-entry allow-list.
+- **No network permission.** The app asks for four permissions, all of them for finishing an
+  answer out of sight: the foreground service and its type, notifications, and keeping the
+  processor awake. The build fails if the merged manifest contains any permission that is not
+  on its allow-list (those four, and the three that the fingerprint and support libraries
+  add); the network is not on it.
 - **No backups.** The app's data is excluded from Android's cloud backup and from
   device-to-device transfer.
 
@@ -187,7 +211,7 @@ Everything is in the app's private storage.
 | `files/session-index.enc` | The list of chats | Encrypted |
 | `files/settings.enc` | The settings: the system prompt and the temperature of each model | Encrypted |
 | `files/kept/*.enc` | Exact copies of files that could not be read completely, kept before they are replaced | Encrypted, as the original was |
-| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, the count and time of wrong passphrase attempts | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
+| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
 
 The models are assets of the APK and are not encrypted: they are public files.
 
@@ -244,13 +268,48 @@ optionally a second time by a fingerprint key.
 - The app is locked whenever its process starts, and after it has been in the background for the
   chosen time (immediately, 1 minute by default, 5 or 15 minutes). The time is measured on the
   clock that keeps counting while the phone sleeps, and it is checked again before anything is
-  shown when the app comes back.
+  shown when the app comes back. "In the background" begins when Android stops the app's
+  screen, not when the screen merely loses the focus: the fingerprint prompt and the question
+  about notifications take the focus too, and must not lock the app. Android stops a screen a
+  fraction of a second after it was left (on the phone that was tested, between 0.2 and 0.5
+  seconds after the Home gesture), so someone who leaves and comes straight back within that
+  moment finds the app as it was, also with "immediately".
 - When it locks, the screens are torn down at once, a reply that is being written is stopped and
   kept as a stopped message, the inference engine is told to forget the conversation, the
   writes that are waiting get up to ten seconds to finish, and the data key is overwritten with
   zeros whether or not they did. A write that the storage does not complete in that time is
   not waited for, so that it cannot keep the key in memory; only a reset waits for it, because
   a reset deletes the files.
+- **An answer can be finished behind the lock.** When the app locks by itself (the timeout, or
+  the check on coming back) while an answer is being written, and "Finish the answer after
+  locking" is on (the default), everything above happens for the screen: it is torn down, the
+  lock screen is all there is to see or capture. But the unlocked session is left alive, data
+  key included, and told to start nothing new. When that one answer is finished, or ten
+  minutes after the moment of locking if it is not (it is then stopped and kept as a stopped
+  message), the session is closed in the order described above and the key is overwritten.
+  "Lock now" is the stronger action and never leaves anything alive, whatever the setting; a
+  reset ends it too. The setting is a field of `lock.json`, because it is needed while the app
+  is locked; a file without the field means on.
+- **Unlocking in that time is a real unlock.** The passphrase is put through the whole key
+  derivation and the Keystore, or the fingerprint through its prompt and its key, exactly as
+  from a cold lock, with the same count and the same waits; that a key happens to be in memory
+  shortens nothing, and a failed attempt changes nothing about the answer under way. Only a
+  success, and only if the key it produced is the key of the session behind the lock, puts
+  that same session back on the screen, so the answer is neither lost nor begun again.
+- **The process ends when it is no longer needed.** Whenever the app is locked, no session is
+  being finished or closed, nothing is being checked or written, and no screen of the app is
+  visible, it kills its own process. The session's last write has returned by then, so
+  nothing is lost, and the task stays in the list of recent apps: opening it is a cold start
+  into the lock screen. The app never does this while it is visible, while an answer is being
+  finished, or before the files are written.
+- **The model makes way for the key derivation.** Turning a passphrase into a key is meant to
+  take a second or two of one processor core, and next to a model that keeps the fast cores
+  busy it took several times as long. So while a passphrase is being checked (an unlock while
+  an answer is finished behind the lock, a check or a change in Settings), the answer under way
+  pauses between two tokens, or between two chunks of the conversation it is reading, and goes
+  on when the check has returned, whatever its result. The pause is not an end: nothing of the
+  answer is lost, the ten minutes above go on counting, and stopping the answer, "Lock now"
+  and a reset work during it as always.
 - **Wrong passphrases are slowed down.** The first four wrong attempts cost nothing. The fifth
   costs 30 seconds, and every further one doubles the wait, up to one hour. An attempt is
   counted on disk before it is checked, so killing the app in the middle of a check does not
@@ -279,9 +338,21 @@ it or losing the phone loses the chats.
 
 - While the app is unlocked, the data key, the decrypted chats and settings, and the model's
   working memory of the conversation are in the app's memory.
-- At a lock, the data key's array is zeroed and the key refuses every further use, and the
-  engine clears the model's memory of the conversation: the native session overwrites its
-  buffers and the saved checkpoints before it frees them.
+- When the session is closed (at a lock, or when an answer that was finished behind the lock
+  is saved), the data key's array is zeroed and the key refuses every further use, and the
+  engine clears the model's memory of the conversation: the native session overwrites its own
+  buffers and the saved checkpoints in place before it frees them, which takes between 15 and
+  about 160 milliseconds on the phone that was tested, depending on the model.
+- That does not reach everything. llama.cpp makes copies of its own while it works and frees
+  them without overwriting them: measured on that phone after the native clear, copies of the
+  prompt's text were still readable in the process for two of the four models, and copies of
+  the prompt's token numbers for all four, some of them even after the session was closed (the
+  token numbers of replies were not). Java strings cannot be overwritten at all.
+- **So the process is ended.** When the app is locked, has nothing left to finish and is not
+  on screen, it ends its own process (see "The lock"), and with the process every one of
+  those copies is released, in the app's memory and in the native library's. Until that
+  happens (the lock screen is still being looked at, or an answer is being finished) they
+  remain.
 - A passphrase is taken out of its text field as a character array, and that array and the keys
   derived from it are wiped after use. The text field itself is not the app's to wipe: it is
   emptied, but the buffers in which it held what was typed stay in memory, with what they
@@ -291,7 +362,10 @@ it or losing the phone loses the chats.
   the copies of keys inside the Java cryptography classes, the text fields' buffers just
   mentioned, and the strings in which the text fields, the Markdown renderer and the JSON codec
   held chat text.
-- The loaded model stays in memory across a lock. Its weights are no secret.
+- While an answer is being finished behind the lock, everything of the first point is still in
+  memory, the data key included, for at most ten minutes.
+- The loaded model stays in memory for as long as the process lives, across "Lock now" for
+  one. Its weights are no secret. After the process has ended, the next unlock loads it again.
 - Nothing decrypted is put into the saved instance state, and the main code contains no logging
   call; both are checked by tests that read the sources.
 
@@ -332,6 +406,13 @@ it or losing the phone loses the chats.
   through which the system's shell installs a start-up profile, which other apps cannot call
   (it requires the `DUMP` permission). No build type contains the user interface library's
   preview activity.
+- The app's two notifications are each one fixed sentence ("Writing an answer...", "Your
+  answer is ready."). The code that builds them has no access to a chat, and a test that reads
+  the sources fails if a notification is ever given a text with something filled in.
+- The service that keeps the process alive while an answer is written is not exported, takes
+  no commands and does nothing itself; its type is "special use", stated in the manifest,
+  because Android has no type for running a model on the device. The wake lock it holds has a
+  time limit and is renewed, so it cannot be left held.
 - The check of the merged manifest against the permission allow-list is a step of the build and
   not a task beside it: what is packaged is the manifest the check handed on, so no APK or
   bundle can be built or installed from a manifest that did not pass.
@@ -345,6 +426,12 @@ it or losing the phone loses the chats.
   fingerprint is enrolled on the phone.
 - **The unlocked app.** Whoever holds the phone while the app is unlocked reads everything, and
   the app stays unlocked in the background for the time you chose.
+- **The minutes in which an answer is finished behind the lock.** With "Finish the answer after
+  locking" on, the lock screen shows, but for up to ten minutes the data key and the
+  conversation are in memory as if the app were unlocked. Nothing on the screen or in the
+  app's interface gives access to them without the passphrase or the fingerprint; an attacker
+  who can read the memory of the process in that time (a compromised phone, see below) finds
+  them. Turn the setting off, or use "Lock now", if that matters more than the answer.
 - **A compromised phone.** Root access, malware with system privileges or an exploited system
   can read the app's memory while it is unlocked, record what is typed and capture the screen
   whatever the window says. The app relies on Android's separation of apps.
@@ -355,8 +442,12 @@ it or losing the phone loses the chats.
 - **A Keystore that gives up its keys.** If the phone's key store can be made to export the
   binding key, the passphrase key is only as strong as PBKDF2 with 600,000 iterations and your
   passphrase.
-- **Traces in memory after a lock**, as described above, and whatever the system moved to
-  compressed swap.
+- **Traces in memory after a lock**, as described above, for as long as the process lives: the
+  app ends it only once it is out of sight and has nothing to finish, and cannot end it while
+  a write to failing storage does not return. And whatever the system moved to compressed
+  swap.
+- **What the notifications tell.** Anyone who sees the phone's notifications learns that the
+  app is writing an answer, or has finished one, and when. They never learn anything else.
 - **The keyboard, the clipboard and accessibility services.** A keyboard sees everything typed
   into it. Text you copy leaves the app and can be read by the keyboard and by the app it is
   pasted into. An accessibility service that you have enabled can read what is on the screen,
@@ -384,7 +475,8 @@ it or losing the phone loses the chats.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
   sizes and the times they were changed, and the content of `lock.json` (whether fingerprint
-  unlock is on, how many wrong attempts were made and when).
+  unlock is on, whether an answer is finished after locking, how many wrong attempts were made
+  and when).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
   debugging can read its private files with `run-as` and attach a debugger to it, and a debug
   build accepts a model file that nothing has verified. Use a release build for chats that
@@ -993,8 +1085,8 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 327 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 443 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies) | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 336 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 496 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies) | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint and the permission check | | `./gradlew check` |
 | Native host suite (29 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

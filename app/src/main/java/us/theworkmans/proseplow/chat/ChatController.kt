@@ -155,6 +155,9 @@ enum class ChatNotice {
  *   reply when the reply is about to be generated, so a change in Settings applies from the next
  *   answer, whether that is a new message, an answer asked for again or one that is continued.
  * @param models the models this build offers.
+ * @param onReplyFinished called on the main dispatcher when the model has finished a reply by
+ *   itself (it reached its end, a stop string or its length limit), not when one was stopped or
+ *   failed.
  */
 class ChatController(
     private val store: SessionStore,
@@ -167,6 +170,7 @@ class ChatController(
     private val ids: IdSource,
     private val mainDispatcher: CoroutineDispatcher,
     private val ioDispatcher: CoroutineDispatcher,
+    private val onReplyFinished: () -> Unit = {},
 ) {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
@@ -192,6 +196,9 @@ class ChatController(
     private var loading: Loading? = null
     private var opening: Job? = null
     private var closed = false
+
+    /** Set while the session goes on behind the lock: the reply in flight may finish, nothing new begins. */
+    private var finishingOnly = false
 
     /** The index as it was last handed to the writer; null when what is on disk is known to be out of date. */
     private var writtenIndex: SessionIndex? = opened.index.takeUnless { opened.stale }
@@ -392,6 +399,20 @@ class ChatController(
     fun flush() = writer.flush()
 
     /**
+     * The app has locked and this session is only left alive to finish the reply that is being
+     * written: from now on no reply and no model load is started, whoever asks. The reply in
+     * flight goes on and is saved as it goes.
+     */
+    fun finishOnly() {
+        finishingOnly = true
+    }
+
+    /** The user has unlocked again and is back in this very session: replies can be asked for as before. */
+    fun resume() {
+        finishingOnly = false
+    }
+
+    /**
      * Ends everything, for the lock: a reply in flight is stopped and kept as a stopped message,
      * a load is abandoned, every change is handed to the writer, and when this returns nothing
      * here is using the engine any more. Waiting for the engine is bounded, so that a native call
@@ -527,7 +548,7 @@ class ChatController(
      */
     private fun preload(modelId: String) {
         val spec = models.firstOrNull { it.id == modelId } ?: return
-        if (closed || running != null) return
+        if (closed || finishingOnly || running != null) return
         val current = engine.state.value
         if (current is EngineState.Ready && current.modelId == spec.id) return
         val previous = loading
@@ -566,7 +587,7 @@ class ChatController(
 
     /** Stores [prepared], which ends in the reply to be written, and starts writing it. False when [prepared] is null. */
     private fun begin(prepared: ChatSession?): Boolean {
-        if (prepared == null) return false
+        if (prepared == null || finishingOnly) return false
         val assistantId = prepared.streamingMessageId ?: return false
         val interrupted = endRunning()
         if (interrupted != null && interrupted.sessionId != prepared.id) _notices.trySend(ChatNotice.OTHER_REPLY_STOPPED)
@@ -645,7 +666,10 @@ class ChatController(
                 phase(reply, TurnPhase.Writing)
                 commit(session.applyEvent(reply.assistantId, event, clock), urgent = false)
             }
-            is GenerationEvent.Done, is GenerationEvent.Error -> commit(session.applyEvent(reply.assistantId, event, clock), urgent = true)
+            is GenerationEvent.Done, is GenerationEvent.Error -> {
+                commit(session.applyEvent(reply.assistantId, event, clock), urgent = true)
+                if (event is GenerationEvent.Done && event.finishReason != FinishReason.CANCELLED) onReplyFinished()
+            }
         }
     }
 

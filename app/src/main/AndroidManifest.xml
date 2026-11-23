@@ -2,10 +2,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- No <uses-permission> on purpose, and none may be added: the model runs on the device and
-         the app never uses the network. The few permissions that libraries merge in are held to an
-         allow-list by the verify*Manifest tasks in app/build.gradle.kts, which fail the build on
-         anything else (android.permission.INTERNET above all). -->
+    <!-- No network permission, and none may be added: the model runs on the device and the app
+         never uses the network. The four permissions below are everything the app asks for, and
+         all of them serve one thing: letting an answer be finished while the app is not on
+         screen. Together with the few that libraries merge in they are held to an allow-list by
+         the verify*Manifest tasks in app/build.gradle.kts, which fail the build on anything else
+         (android.permission.INTERNET above all). -->
+
+    <!-- The answer service: a foreground service, of the "special use" type on Android 14 and
+         later (see the service below). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Its ongoing notification, and the one that says an answer is ready. Asked for once, on
+         Android 13 and later; refused, nothing else changes. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The processor stays awake while an answer is written with the screen off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".ProsePlowApp"
@@ -33,6 +45,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the process alive and awake while an answer is written out of sight; it does
+             nothing else and takes no commands (background/AnswerService.kt). Not exported: only
+             the app itself can start it. "specialUse" because no named type describes running a
+             language model on the device; the property states the use, as Android asks. -->
+        <service
+            android:name=".background.AnswerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Finishes an answer that a language model on this device is writing for the user, after the user has left the app or the screen has turned off." />
+        </service>
 
         <!-- Privacy: androidx.emoji2 (pulled in by Compose) registers EmojiCompatInitializer, which
              asks the Google Play Services downloadable-fonts provider for an emoji font and can

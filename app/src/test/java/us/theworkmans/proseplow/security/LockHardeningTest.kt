@@ -456,6 +456,51 @@ class LockHardeningTest {
         }
     }
 
+    /**
+     * "Finish the answer after locking" lives in the lock configuration because it is needed
+     * while the app is locked. It was added without a new version: a file that does not have the
+     * field, as every file written before it existed, means on. Nothing else about reading the
+     * file became more lenient for it.
+     */
+    @Test
+    fun finishingAnAnswerAfterLockingIsOnUnlessTheConfigurationSaysOff() {
+        val key = setUp()
+        assertEquals(1, LockConfig.CURRENT_VERSION)
+
+        // As an earlier version of the app wrote it.
+        editStored { it.remove("finishAnswerAfterLocking") }
+        assertFalse(configFile.readText().contains("finishAnswerAfterLocking"))
+        val (m, success) = unlocked()
+        assertArrayEquals(key.bytes, success.key.bytes)
+        assertTrue(m.config!!.finishAnswerAfterLocking)
+        assertTrue(m.config!!.isValid(minIterations = 1))
+
+        m.setFinishAnswerAfterLocking(false)
+        assertTrue(configFile.readText(), configFile.readText().contains("\"finishAnswerAfterLocking\":false"))
+        assertEquals(1, store.read()!!.version)
+        val restarted = manager()
+        assertEquals("known before any passphrase is entered", StartResult.Locked, restarted.start())
+        assertFalse(restarted.config!!.finishAnswerAfterLocking)
+        assertTrue("and nothing else changed", opens(passphrase))
+
+        restarted.setFinishAnswerAfterLocking(true)
+        assertTrue(store.read()!!.finishAnswerAfterLocking)
+
+        // Setting it to what it already is writes nothing.
+        var writeSteps = 0
+        val counting = LockManager(LockConfigStore(configFile, onWriteStep = { writeSteps++ }), vault, clock, iterations = 1_000, minIterations = 1, encryptedDataExists = { false })
+        counting.start()
+        writeSteps = 0
+        counting.setFinishAnswerAfterLocking(true)
+        assertEquals(0, writeSteps)
+
+        // A value that is not a truth value is a damaged configuration, like any other field of the wrong kind.
+        for (bad in listOf<Any?>("yes", 1, null)) {
+            editStored { it["finishAnswerAfterLocking"] = bad }
+            assertEquals("$bad", StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
+        }
+    }
+
     @Test
     fun fieldsThisVersionDoesNotKnowAreIgnored() {
         val key = setUp()

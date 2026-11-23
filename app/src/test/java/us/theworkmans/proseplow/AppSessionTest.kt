@@ -2,6 +2,7 @@ package us.theworkmans.proseplow
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
@@ -22,6 +23,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import us.theworkmans.proseplow.background.AnswerWork
+import us.theworkmans.proseplow.background.ReadyNotice
 import us.theworkmans.proseplow.core.chat.FakeClock
 import us.theworkmans.proseplow.core.chat.MessageStatus
 import us.theworkmans.proseplow.core.chat.SequentialIds
@@ -250,6 +253,20 @@ class AppSessionTest {
         }
 
         override suspend fun awaitStopped() = real.awaitStopped()
+
+        override fun hasUnfinishedWork(): Boolean = real.hasUnfinishedWork()
+
+        override suspend fun awaitWorkFinished() = real.awaitWorkFinished()
+
+        override fun finishOnly() {
+            log += "finish only"
+            real.finishOnly()
+        }
+
+        override fun resume() {
+            log += "resumed"
+            real.resume()
+        }
     }
 
     /** The app from the lock down to the files, on virtual time; only the engine is scripted. */
@@ -278,6 +295,30 @@ class AppSessionTest {
         private var unlocks = 0
         private val lockClock = LockClock()
 
+        /** How often the keep-alive was started and the "ready" notice shown and cleared, wired as the app wires them. */
+        var keepAliveStarts = 0
+        var readyShown = 0
+        var readyCleared = 0
+        val answers = AnswerWork(
+            keepAlive = {
+                keepAliveStarts++
+                true
+            },
+            readyNotice = object : ReadyNotice {
+                override fun show() {
+                    readyShown++
+                }
+
+                override fun clear() {
+                    readyCleared++
+                }
+            },
+        )
+        var processEnds = 0
+
+        /** The last thing in [log] when the lock ended the process for the first time. */
+        var lastBeforeProcessEnd: String? = null
+
         val lock: AppLock<WatchedSession> = AppLock(
             manager = LockManager(
                 LockConfigStore(files.lockConfig),
@@ -300,14 +341,37 @@ class AppSessionTest {
 
                     override fun open(purpose: String, blob: ByteArray): ByteArray = unlocked.open(purpose, blob)
                 }
-                val session = AppSession(recording, layout, engine, ModelCatalog.bundled, dispatcher, dispatcher, FakeClock(), SequentialIds("u${++unlocks}-"))
+                val session = AppSession(
+                    recording, layout, engine, ModelCatalog.bundled, dispatcher, dispatcher, FakeClock(), SequentialIds("u${++unlocks}-"),
+                    answerEvents = answers,
+                )
                 WatchedSession(session, unlocked, log)
             },
             biometricStatus = { BiometricStatus.NONE_ENROLLED },
             screenshots = ScreenshotAllowance(lockClock, FakeScreenOffWatch(), dispatcher),
             mainDispatcher = dispatcher,
             ioDispatcher = dispatcher,
+            processEnder = {
+                if (processEnds++ == 0) lastBeforeProcessEnd = log.lastOrNull()
+            },
         )
+
+        init {
+            // As the application does: the keep-alive stays while a session is ending behind the lock.
+            CoroutineScope(dispatcher).launch { lock.sessionEnding.collect(answers::onSessionEnding) }
+        }
+
+        /** The app's one activity reaches the screen. */
+        fun comeToFront() {
+            lock.onForeground()
+            answers.onInFront(true)
+        }
+
+        /** It leaves the screen. */
+        fun leave() {
+            answers.onInFront(false)
+            lock.onBackground()
+        }
 
         val session: AppSession get() = (lock.state.value as LockState.Unlocked).session.real
 
@@ -447,6 +511,226 @@ class AppSessionTest {
 
         unlock(app)
         assertEquals("the unlock found the model ready and loaded nothing", listOf(ModelCatalog.default.id), app.fake.loads)
+    }
+
+    // --- Finishing an answer behind the lock ---------------------------------------------------
+
+    /** Set-up in front, the lock set to "immediately", and an answer of three words begun: "Half " is written. */
+    private suspend fun TestScope.inTheMiddleOfAnAnswer(app: LockedApp): AppSession {
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        app.fake.enqueueReply(listOf("Half ", "way ", "there"), millisBetween = 500)
+        assertTrue(session.chat.send(session.openSession.id, "Say something long"))
+        runCurrent()
+        advanceTimeBy(500)
+        runCurrent()
+        assertEquals("Half ", session.openSession.messages.last().text)
+        app.log.clear()
+        return session
+    }
+
+    @Test
+    fun anAnswerIsFinishedBehindTheAppsOwnLockThenSavedForgottenAndOnlyThenTheKeyGoes() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        assertEquals(1, app.keepAliveStarts)
+        assertTrue("kept alive from the moment the answer began", app.answers.keepAliveWanted.value)
+
+        app.leave() // "Immediately": the app locks by itself now.
+        assertTrue("locked for whoever looks", app.lock.state.value is LockState.Locked)
+        assertEquals(listOf("screens cleared", "finish only"), app.log)
+        runCurrent()
+        assertEquals("the answer goes on", 1, app.fake.activeGenerations)
+        assertEquals(0, app.fake.forgetCount)
+        assertTrue(app.lock.sessionEnding.value)
+        assertEquals(0, app.processEnds)
+
+        assertFalse(session.chat.send(id, "Something else"))
+        runCurrent()
+        assertEquals(1, app.fake.startedGenerations)
+        assertEquals(1, app.fake.activeGenerations)
+
+        advanceTimeBy(5_000)
+        runCurrent()
+        // The answer was finished, by the model itself; then the session ended as at any lock, in the same order.
+        assertEquals(1, app.fake.completedGenerations)
+        assertEquals(0, app.fake.cancelledGenerations)
+        assertEquals(listOf("forget, with 0 generations running"), app.log.filter { it.startsWith("forget") })
+        assertTrue(app.log.contains("sealed session:$id"))
+        val closed = app.log.indexOf("closed, the key still works")
+        assertTrue("every write came before the close returned: ${app.log}", app.log.lastIndexOf("sealed session:$id") < closed)
+        assertTrue(app.log.indexOf("forget, with 0 generations running") < closed)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.lock.sessionEnding.value)
+
+        // Kept alive until the key was gone and no longer; told once that the answer is ready; then the process ended.
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals(1, app.keepAliveStarts)
+        assertEquals(1, app.readyShown)
+        assertEquals(1, app.processEnds)
+        assertEquals("the end of the process came after the close, and nothing after it", "closed, the key still works", app.lastBeforeProcessEnd)
+        assertEquals("closed, the key still works", app.log.last())
+
+        // A cold unlock finds the whole answer, finished; coming to the front took the notification away.
+        val cleared = app.readyCleared
+        app.comeToFront()
+        assertEquals(cleared + 1, app.readyCleared)
+        val again = unlock(app)
+        assertFalse(again === session)
+        val reply = again.openSession.messages.last()
+        assertEquals("Half way there", reply.text)
+        assertEquals(MessageStatus.COMPLETE, reply.status)
+    }
+
+    @Test
+    fun unlockingDuringALeaseFindsTheSameSessionAndTheAnswerUnbroken() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        app.leave()
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Locked)
+
+        app.comeToFront()
+        val back = unlock(app) // The passphrase, checked by the real lock manager.
+        assertTrue("the very same session", back === session)
+        assertEquals(listOf("screens cleared", "finish only", "resumed"), app.log.filterNot { it.startsWith("sealed") })
+        assertEquals(1, app.fake.activeGenerations)
+        assertTrue(app.answers.keepAliveWanted.value)
+
+        advanceTimeBy(5_000)
+        runCurrent()
+        val reply = session.openSession.messages.last()
+        assertEquals("written in one piece, by one generation", "Half way there", reply.text)
+        assertEquals(MessageStatus.COMPLETE, reply.status)
+        assertEquals(1, app.fake.startedGenerations)
+        assertEquals(0, app.fake.cancelledGenerations)
+        assertEquals(0, app.fake.forgetCount)
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals("the user is looking: no notification", 0, app.readyShown)
+        assertEquals(0, app.processEnds)
+
+        // The session takes new work again.
+        app.fake.enqueueReply(listOf("More."))
+        assertTrue(session.chat.send(id, "And then?"))
+        runCurrent()
+        assertEquals("More.", session.openSession.messages.last().text)
+        session.close()
+    }
+
+    @Test
+    fun aSessionToldToFinishOnlyStartsNothingNewUntilItIsResumed() = runTest {
+        val app = SessionFixture(temp.root, testScheduler)
+        val session = app.open()
+        runCurrent()
+        val id = session.openSession.id
+        assertFalse(session.hasUnfinishedWork())
+        session.awaitWorkFinished() // Nothing to wait for: returns at once.
+
+        session.finishOnly()
+        app.engine.enqueueReply(listOf("No."))
+        assertFalse("no answer is begun behind the lock", session.chat.send(id, "Hello"))
+        assertFalse(session.chat.retry(id))
+        session.chat.reloadModel()
+        runCurrent()
+        assertEquals(0, app.engine.startedGenerations)
+        assertEquals(emptyList<Any>(), session.openSession.messages)
+        assertFalse(session.hasUnfinishedWork())
+
+        session.resume()
+        assertTrue(session.chat.send(id, "Hello"))
+        assertTrue(session.hasUnfinishedWork())
+        runCurrent()
+        assertEquals("No.", session.openSession.messages.last().text)
+        assertFalse(session.hasUnfinishedWork())
+        session.close()
+    }
+
+    @Test
+    fun theCeilingStopsAnAnswerThatDoesNotEndAndKeepsWhatWasWritten() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        app.fake.enqueue(listOf(Step.Emit(GenerationEvent.TextDelta("Still wri")), Step.Hang))
+        session.chat.send(session.openSession.id, "Tell me everything")
+        runCurrent()
+        app.leave()
+        runCurrent()
+
+        advanceTimeBy(AppLock.LEASE_MILLIS - 1)
+        runCurrent()
+        assertEquals(1, app.fake.activeGenerations)
+        assertEquals(0, app.processEnds)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(0, app.fake.activeGenerations)
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals("an answer that was cut off is not announced as ready", 0, app.readyShown)
+        assertEquals(1, app.processEnds)
+
+        app.comeToFront()
+        val reply = unlock(app).openSession.messages.last()
+        assertEquals("Still wri", reply.text)
+        assertEquals(MessageStatus.STOPPED, reply.status)
+    }
+
+    @Test
+    fun theKeepAliveRunsExactlyWhileAnAnswerIsWrittenAndReadyIsOnlySaidToSomeoneNotLooking() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        val id = session.openSession.id
+        assertFalse("nothing is kept alive for an idle app", app.answers.keepAliveWanted.value)
+        assertEquals(0, app.keepAliveStarts)
+
+        // An answer written while the user watches.
+        app.fake.enqueueReply(listOf("One ", "two"), millisBetween = 500)
+        session.chat.send(id, "Count")
+        runCurrent()
+        assertTrue(app.answers.keepAliveWanted.value)
+        assertEquals(1, app.keepAliveStarts)
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertFalse("over with the answer", app.answers.keepAliveWanted.value)
+        assertEquals(0, app.readyShown)
+
+        // One that finishes while the app is in the background, unlocked (the lock's minute has not passed).
+        app.fake.enqueueReply(listOf("Three ", "four"), millisBetween = 500)
+        session.chat.send(id, "Go on")
+        runCurrent()
+        assertEquals(2, app.keepAliveStarts)
+        app.leave()
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals(1, app.readyShown)
+
+        // Coming back takes the notification away.
+        val cleared = app.readyCleared
+        app.comeToFront()
+        assertEquals(cleared + 1, app.readyCleared)
+
+        // One the user stops is not "ready".
+        app.fake.enqueue(listOf(Step.Emit(GenerationEvent.TextDelta("Five")), Step.Hang))
+        session.chat.send(id, "More")
+        runCurrent()
+        assertTrue(app.answers.keepAliveWanted.value)
+        app.leave()
+        session.chat.stop(id)
+        runCurrent()
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals(1, app.readyShown)
+        assertEquals(3, app.keepAliveStarts)
+        session.close()
     }
 
     // --- A disk that hangs ---------------------------------------------------------------------

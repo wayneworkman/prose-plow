@@ -88,12 +88,27 @@
     <string name="security_fingerprint_support">Your fingerprint unlocks the encryption key through the phone\'s secure hardware. Turning this on or off needs your passphrase.</string>
     <string name="security_fingerprint_unavailable">No strong fingerprint (or other Class 3 biometric) is set up on this phone.</string>
     <string name="security_lock_after">Lock after</string>
-    <string name="security_lock_after_support">Time in the background before the app locks. It is always locked after a restart.</string>
+    <string name="security_lock_after_support">Time in the background before the app locks. The time starts when the phone reports that the app has left the screen, a fraction of a second after you leave it: if you come straight back within that moment, the app is still open, also with Immediately. It is always locked after a restart.</string>
     <string name="timeout_immediately">Immediately</string>
     <string name="timeout_1_minute">1 minute</string>
     <string name="timeout_5_minutes">5 minutes</string>
     <string name="timeout_15_minutes">15 minutes</string>
+    <string name="security_finish_answer">Finish the answer after locking</string>
+    <plurals name="security_finish_answer_on">
+        <item quantity="one">On: if the app locks by itself while an answer is being written, the screen locks as always and the answer is finished behind it. Until it is finished, for at most %1$d minute, the encryption key stays in memory; then it is erased. Lock now always stops the answer and erases the key at once.</item>
+        <item quantity="other">On: if the app locks by itself while an answer is being written, the screen locks as always and the answer is finished behind it. Until it is finished, for at most %1$d minutes, the encryption key stays in memory; then it is erased. Lock now always stops the answer and erases the key at once.</item>
+    </plurals>
+    <plurals name="security_finish_answer_off">
+        <item quantity="one">Off: when the app locks, an answer that is being written is stopped and the encryption key is erased at once. Turn this on to let an answer be finished behind the lock screen, for at most %1$d minute.</item>
+        <item quantity="other">Off: when the app locks, an answer that is being written is stopped and the encryption key is erased at once. Turn this on to let an answer be finished behind the lock screen, for at most %1$d minutes.</item>
+    </plurals>
     <string name="security_lock_now">Lock now</string>
+
+    <!-- Notifications. Each is one fixed sentence: nothing of an answer, a chat or a model is ever put into one. -->
+    <string name="channel_answer_writing">Answer in progress</string>
+    <string name="channel_answer_ready">Answer ready</string>
+    <string name="answer_writing">Writing an answer…</string>
+    <string name="answer_ready">Your answer is ready.</string>
     <plurals name="security_screenshots">
         <item quantity="one">Allow screenshots for %1$d minute</item>
         <item quantity="other">Allow screenshots for %1$d minutes</item>

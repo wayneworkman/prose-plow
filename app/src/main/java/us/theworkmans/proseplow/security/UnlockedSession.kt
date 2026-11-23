@@ -11,6 +11,13 @@ package us.theworkmans.proseplow.security
  * works until [close] has returned, so writes that are queued can still be sealed; after that
  * every use of it fails ([KeyDestroyedException]), whatever [close] left running. A reset, which
  * deletes the files, also waits for [awaitStopped] before it deletes anything.
+ *
+ * Between [clearScreens] and [close] the lock may leave a session alive for a while, out of
+ * sight, so that work the user asked for can be finished ("finish the answer after locking").
+ * The lock knows nothing of what that work is: it asks [hasUnfinishedWork], tells the session
+ * with [finishOnly] that nothing new may begin, waits for [awaitWorkFinished] (not for ever),
+ * and either closes the session or, after the user has unlocked again, hands the same session
+ * back with [resume].
  */
 interface UnlockedSession {
     /**
@@ -20,6 +27,27 @@ interface UnlockedSession {
      * afterwards (the activity may come back) until [close] is called.
      */
     fun clearScreens()
+
+    /**
+     * Main thread. True while the session is doing something the user asked for and is waiting
+     * for (an answer that is being written), which could be finished without a screen.
+     */
+    fun hasUnfinishedWork(): Boolean = false
+
+    /** Returns when the work [hasUnfinishedWork] speaks of has ended, one way or the other. */
+    suspend fun awaitWorkFinished() {}
+
+    /**
+     * Main thread, when the app has locked but this session is left alive to finish its work:
+     * from now on it starts nothing new. What is running goes on, and is saved as it goes.
+     */
+    fun finishOnly() {}
+
+    /**
+     * Main thread, after the user has unlocked again while the session was left alive: it is
+     * the session on screen once more, and takes new work as before.
+     */
+    fun resume() {}
 
     /**
      * Stops all work of the session, gives the writes that are queued their time to reach the
