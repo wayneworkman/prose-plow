@@ -187,7 +187,7 @@ reported by ctest as skipped, never as failed.
 | `boris-2-instruct.chat-f32`, `.chat-f16` | A session of eight chat requests served from one context whose memory is kept between them (a turn appended, the same request again, an earlier message changed, another beginning): the encoder gives the reference's prompt tokens; every rewind goes through a checkpoint (the cut is refused before the restore and succeeds after it) or starts over when none fits; each reply, ended by the stop string, equals the reply the reference generated from scratch, as tokens and as text (F16: reported) |
 | `boris-2-instruct.no-ngram-lookup` | The F32 file with its four lookup arrays removed, against the reference with the lookup switched off: all the checks of `logits-f32`. It separates Canon and the hybrid memory from the n-gram input |
 | `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
-| `<model>.residue` | For the four bundled models: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
+| `<model>.residue` | For the three bundled models and shard-2: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
 What `logits-f32` and `logits-f16` check for boris2 beyond the list above, because its Canon
@@ -1079,12 +1079,12 @@ What packaging costs, measured for a debug build on a desktop with an SSD:
 | peacebell-v1-291m (583.7 MB) | 10 s | about 634 MB | 2.9 GB |
 | qwen3.5-0.8b (1,516.7 MB) | 27 s | about 1,567 MB | 7.4 GB |
 | three: peacebell, Boris-2, Qwen3.5 (2,392.3 MB) | 65 s | 2,442.5 MB | 12 GB |
-| all four, with Shard-2 (2,491.3 MB) | 76 s, which now includes hashing the models in the APK | 2,541.3 MB | not measured |
+| those three and Shard-2 (2,491.3 MB), measured while Shard-2 was bundled | 76 s, which now includes hashing the models in the APK | 2,541.3 MB | not measured |
 
 AGP keeps four copies of an asset on its way into an APK (the generated directory, the merged
 assets of the library, those of the app, and a packaging intermediate) besides the APK itself:
 five times the model. A build that changes nothing takes 3 seconds; installing the APK with
-three models over USB took 70 to 77 seconds, with all four 72. The times and the disk use of
+three models over USB took 70 to 77 seconds, with Shard-2 as well 72. The times and the disk use of
 the first four rows were measured before the libraries were stripped; the APK sizes of the two
 single-model rows are computed from the stripped build, the others were built. A debug APK
 that is packaged again with fewer models keeps its old size (AGP rewrites it in place and
@@ -1129,7 +1129,8 @@ test whose model is absent is reported as skipped.
 ```sh
 # 1. The test APK with the two smaller models inside (0.9 GB), built and installed by hand so
 #    that it stays installed; Qwen3.5 sideloaded as above with the test package's name. Or all
-#    four inside with -Pproseplow.models=all: 2.5 GB, 75 seconds to install over USB.
+#    three bundled models inside with -Pproseplow.models=all: 2.4 GB, over a minute to install
+#    over USB. Shard-2 is not bundled, so its tests only ever see a sideloaded file.
 ./gradlew :llama:assembleDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir=/path/to/models
 adb install -r llama/build/outputs/apk/androidTest/debug/llama-debug-androidTest.apk
 

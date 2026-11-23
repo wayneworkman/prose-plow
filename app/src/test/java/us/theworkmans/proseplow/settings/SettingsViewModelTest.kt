@@ -89,7 +89,9 @@ class SettingsViewModelTest {
 
     @Test
     fun aModelThatContinuesTextHasNoSystemPromptAndShowsItsOwnTemperature() = runTest {
-        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled }
+        // Shard-2 is known to the catalogue and not shipped, so the build that carries it is
+        // spelled out here.
+        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled + ModelCatalog.SHARD_2 }
         val session = app.open()
         val viewModel = SettingsViewModel(session.settings, session.models, decimalSeparator = { '.' })
         val shard = ModelCatalog.SHARD_2

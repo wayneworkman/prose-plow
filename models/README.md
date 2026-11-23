@@ -152,7 +152,10 @@ kernels, which are stored in the order and with the identity term the C++ convol
 
 ### shard-2
 
-Glint-Research/Shard-2, 49.4 M parameters, MIT. The converter reads three files:
+Glint-Research/Shard-2, 49.4 M parameters. It is `validation`, not `bundled`: its repository
+names a licence (MIT) only in the metadata of the model card and has no licence file and no
+copyright notice, and the app ships a model only when its licence is established (the root
+README, "Supported, not bundled: Shard-2"). The converter reads three files:
 `config.json`, `tokenizer.json` and the weights, `Shard-2.pt`.
 
 **The weights are a pickle.** `Shard-2.pt` is a PyTorch checkpoint, and a pickle can run code

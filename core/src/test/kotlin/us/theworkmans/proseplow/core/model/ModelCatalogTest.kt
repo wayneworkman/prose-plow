@@ -36,18 +36,19 @@ class ModelCatalogTest {
 
     @Test
     fun `what is offered is what is bundled, and a model can be known without being bundled`() {
-        // Every catalogue model ships today, so the rule is shown on a copy of one that does
-        // not: a model is bundled unless it says otherwise, and `bundled` alone decides whether
-        // the catalogue offers it.
+        // A model is bundled unless it says otherwise, and `bundled` alone decides whether the
+        // catalogue offers it. Shown on a copy of a model that ships, and on Shard-2, which is
+        // known and not shipped.
         val notShipped = ModelCatalog.BORIS_2_INSTRUCT.copy(id = "known-but-not-shipped", ggufFileName = "known-but-not-shipped.gguf", bundled = false)
         assertTrue(ModelCatalog.BORIS_2_INSTRUCT.bundled)
         assertFalse(notShipped.bundled)
         assertEquals(ModelCatalog.all.filter { it.bundled }, ModelCatalog.bundled)
         assertEquals(ModelCatalog.bundled, (ModelCatalog.all + notShipped).filter { it.bundled })
         assertEquals(
-            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),
+            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct"),
             ModelCatalog.bundled.map { it.id },
         )
+        assertEquals(listOf("shard-2"), ModelCatalog.all.filterNot { it.bundled }.map { it.id })
     }
 
     @Test
@@ -116,7 +117,7 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun `Shard-2 continues text with its reference sampling and a deletion token, and is offered`() {
+    fun `Shard-2 continues text with its reference sampling and a deletion token, and is known but not offered`() {
         val model = ModelCatalog.SHARD_2
         assertEquals("shard-2", model.id)
         assertEquals("Shard-2", model.displayName)
@@ -136,8 +137,9 @@ class ModelCatalogTest {
         assertFalse(model.supportsSystemPrompt)
         assertEquals("Glint-Research/Shard-2", model.sourceRepository)
         assertEquals("MIT", model.licence)
-        assertTrue(model.bundled)
-        assertTrue(model in ModelCatalog.bundled)
+        // Not shipped until the model's repository carries a licence; see the catalogue.
+        assertFalse(model.bundled)
+        assertFalse(model in ModelCatalog.bundled)
         assertSame(model, ModelCatalog.find("shard-2"))
     }
 

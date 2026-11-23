@@ -133,7 +133,12 @@ object ModelCatalog {
      *   couple of sentences; "Continue" carries on from wherever the limit fell.
      * - Context: 4,096, the length the model was trained at (`trained_sequence_length` in
      *   `config.json`). Its positions reach 8,192, which the model card calls untested.
-     * - Licence: `license: mit` in the model card.
+     * - Licence: `license: mit` in the metadata of the model card, and nowhere else: the model's
+     *   repository has no licence file and no copyright notice.
+     * - Not bundled, for that reason: this app ships a model only when its licence is
+     *   established. The entry, the architecture and their tests stay, so that switching
+     *   [ModelSpec.bundled] back on (together with the model's purpose in
+     *   `models/manifest.json`) is all it takes once the repository carries a licence.
      */
     val SHARD_2: ModelSpec = ModelSpec(
         id = "shard-2",
@@ -147,14 +152,14 @@ object ModelCatalog {
         stopTokenIds = listOf(1, 2),
         deletionTokenId = 4096,
         supportsSystemPrompt = false,
-        bundled = true,
+        bundled = false,
         sourceRepository = "Glint-Research/Shard-2",
         licence = "MIT",
     )
 
     /**
-     * Every known model, bundled or not, in the order the model picker shows them. Today every
-     * one of them is bundled; an entry with [ModelSpec.bundled] false is known (a chat can name
+     * Every known model, bundled or not, in the order the model picker shows them. An entry
+     * with [ModelSpec.bundled] false, which today is [SHARD_2] alone, is known (a chat can name
      * it, [find] returns it) but is not offered.
      */
     val all: List<ModelSpec> = listOf(QWEN35_0_8B, PEACEBELL_V1_291M, BORIS_2_INSTRUCT, SHARD_2)

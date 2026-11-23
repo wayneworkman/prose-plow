@@ -70,8 +70,8 @@
     {
       "id": "shard-2",
       "status": "ready",
-      "purpose": "bundled",
-      "note": "Architecture shard2 (a port of ours): a model that continues text and has a deletion token. The checkpoint is a pickle; the converter loads it with weights_only=True and in no other way, and infer.py is never run (the tests read it as text). Converted and tested as the file that would ship; the purpose becomes bundled in the same change that switches the model on in the app's catalogue.",
+      "purpose": "validation",
+      "note": "Architecture shard2 (a port of ours): a model that continues text and has a deletion token. The checkpoint is a pickle; the converter loads it with weights_only=True and in no other way, and infer.py is never run (the tests read it as text). Converted and tested as the file that would ship, and not bundled: the model's repository names a licence (MIT) only in the metadata of its model card and has no licence file and no copyright notice, and the app ships a model only when its licence is established. The purpose becomes bundled in the same change that switches the model on in the app's catalogue.",
       "name": "Shard-2",
       "repository": "Glint-Research/Shard-2",
       "revision": "46b9eb99c475694a1129ad8f3a9825d244a8ec79",
