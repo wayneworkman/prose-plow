@@ -952,7 +952,7 @@ class SourceRulesTest {
     @Test
     fun theLockDropsItsSessionBeforeTheSessionsKeyCanBeDestroyed() {
         val lock = File(module, "$main/security/AppLock.kt").readText()
-        val leaving = lock.substringAfter("private fun leaveUnlocked(reason: SessionEnd) {").substringBefore("\n    }\n").lines().map { it.trim() }.filterNot { it.startsWith("//") }
+        val leaving = lock.substringAfter("private fun leaveUnlocked(").substringAfter(") {").substringBefore("\n    }\n").lines().map { it.trim() }.filterNot { it.startsWith("//") }
         val dropped = leaving.indexOf("live = null")
         val retired = leaving.indexOfFirst { it.contains("endSession(") }
         assertTrue("leaveUnlocked must clear `live` and then retire the session, in that order: $leaving", dropped in 0 until retired)

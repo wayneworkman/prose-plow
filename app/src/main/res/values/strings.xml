@@ -38,6 +38,7 @@
     <string name="lock_checking">Checking the passphrase…</string>
     <string name="lock_wrong">Wrong passphrase.</string>
     <string name="lock_retry_in">Too many wrong attempts. Try again in %1$s.</string>
+    <string name="lock_fingerprint_period_over">Enter your passphrase this time: the phone was restarted, or the time set for fingerprint unlock is up. After that, your fingerprint works again.</string>
 
     <!-- Reset app data: the lock screen, the error screens and Settings -->
     <string name="reset_action">Reset app data</string>
@@ -85,6 +86,12 @@
     <string name="security_fingerprint">Unlock with fingerprint</string>
     <string name="security_fingerprint_support">Your fingerprint unlocks the encryption key through the phone\'s secure hardware. Turning this on or off needs your passphrase.</string>
     <string name="security_fingerprint_unavailable">No strong fingerprint (or other Class 3 biometric) is set up on this phone.</string>
+    <string name="security_fingerprint_period">Fingerprint works for</string>
+    <string name="security_fingerprint_period_support">The fingerprint unlocks the app for this long after it locks. After that, or after the phone restarts, the passphrase is needed.</string>
+    <string name="fingerprint_period_15_minutes">15 minutes</string>
+    <string name="fingerprint_period_1_hour">1 hour</string>
+    <string name="fingerprint_period_8_hours">8 hours</string>
+    <string name="fingerprint_period_24_hours">24 hours</string>
     <string name="security_lock_after">Lock after</string>
     <string name="security_lock_after_support">Time in the background before the app locks. The time starts when the phone reports that the app has left the screen, a fraction of a second after you leave it: if you come straight back within that moment, the app is still open, also with Immediately. It is always locked after a restart.</string>
     <string name="timeout_immediately">Immediately</string>

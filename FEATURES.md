@@ -216,8 +216,10 @@ is about things that are **not** built and is kept apart from everything else.
   reader as "Starting…".
 - **LOCK-04** The lock screen shows, in this order: the title "Prose Plow is locked"; one
   passphrase field labelled "Passphrase"; a place for messages; the button "Unlock"; when
-  fingerprint unlock is on, an outlined button "Use fingerprint"; and, set apart below them, the
-  action "Reset app data" in the colour for errors (RESET-05).
+  fingerprint unlock is on and its time has not run out (BIO-18), an outlined button "Use
+  fingerprint"; and, set apart below them, the action "Reset app data" in the colour for errors
+  (RESET-05). When fingerprint unlock is on but its time has run out, the place for messages
+  holds the line of BIO-19 instead of the button.
 - **LOCK-05** The passphrase is submitted with "Unlock" or with the keyboard's action key.
   Nothing is submitted while the field is empty, while a check is running or while a wait is in
   force (PASS-07). Submitting empties the field.
@@ -283,6 +285,18 @@ is about things that are **not** built and is kept apart from everything else.
      handed.
   6. The data key is overwritten with zeros, whatever became of the steps before. From then on
      every use of the session's cipher fails.
+  7. With fingerprint unlock on, the period of BIO-18 starts again from the moment the lock
+     was due, and that is stored. For "Lock now" that is the moment of step 1. For a lock by
+     itself it is the moment the app left the screen plus the timeout in force, or the moment
+     of step 1 if that is earlier: a lock that runs late, because its timer could not run while
+     the process was frozen or the device slept (LOCK-13), counts as having happened when it
+     was due, whether it is made up for when the app comes back or by the timer itself running
+     late. It is stored after step 6, so it never keeps the key in memory, and before the
+     process can end (END-01): the process is not ended while the lock's own work is still
+     running. When steps 3 to 6 are put off (LEASE-01), this step is not: it is taken at the
+     lock, and again when the lease ends, after its own step 6. The end of a lease counts at
+     the latest at the end of its 10 minutes, and at the latest 10 minutes after the lock that
+     began it was due, however late it is noticed.
 
   Steps 3 to 6 therefore take at most three waits of 10 seconds each, and they begin once a
   passphrase check that is running at that moment has returned (the two never overlap). LEASE-01
@@ -407,9 +421,10 @@ is about things that are **not** built and is kept apart from everything else.
 ## 5. Fingerprint unlock (BIO)
 
 **Source:** `security/AppLock.kt`, `security/LockManager.kt`, `security/AndroidKeyVault.kt`,
-`MainActivity.kt` (the prompt), `lock/LockScreens.kt`, `lock/SecuritySettings.kt`,
-`ProsePlowApp.kt` (availability); tests `security/AppLockTest.kt`,
-`security/LockHardeningTest.kt`, `security/LockManagerTest.kt`.
+`security/LockConfig.kt` (`FingerprintPeriod`), `MainActivity.kt` (the prompt),
+`lock/LockScreens.kt`, `lock/SecuritySettings.kt`, `ProsePlowApp.kt` (availability, the count
+of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardeningTest.kt`,
+`security/LockManagerTest.kt`, `security/FingerprintPeriodTest.kt`.
 
 - **BIO-01** Unlocking by fingerprint is optional and off until the user turns it on. It only
   ever accepts the platform's strongest class of biometrics, and it can never fall back to the
@@ -444,14 +459,16 @@ is about things that are **not** built and is kept apart from everything else.
 - **BIO-06** Turning it off asks for the passphrase (with the line "Enter your passphrase to
   turn off fingerprint unlock."), removes the wrap and deletes the hardware key.
 - **BIO-07** On the lock screen the biometric prompt appears by itself once for every lock, as
-  soon as the lock screen is in front. Its title is "Unlock Prose Plow" and its way out is "Use
+  soon as the lock screen is in front, unless the time of BIO-18 has run out. Its title is "Unlock Prose Plow" and its way out is "Use
   passphrase". A match unlocks without a further confirmation step. If the prompt could not be
   shown, it is tried again the next time the lock screen comes to the front.
 - **BIO-08** "Use fingerprint" on the lock screen shows the prompt again. It is disabled while
-  the prompt is showing and while a passphrase is being checked.
+  the prompt is showing and while a passphrase is being checked, and it is not there while the
+  time of BIO-18 has run out.
 - **BIO-09** A fingerprint unlock opens the same data key as the passphrase and ends a streak of
   wrong passphrases exactly as the right passphrase does: the count goes back to zero and no
-  wait is left. If that cannot be stored, the app is not unlocked and the failure is shown.
+  wait is left. It also starts the period of BIO-18 again. If that cannot be stored, the app is
+  not unlocked and the failure is shown.
 - **BIO-10** "Use passphrase", or cancelling the prompt, leaves the lock screen as it was and
   says nothing.
 - **BIO-11** When a fingerprint unlock does not succeed, the app says one of these, once:
@@ -494,6 +511,47 @@ is about things that are **not** built and is kept apart from everything else.
   fingerprint" is enabled again. An unlock prompt still waiting for its result when nothing of
   the app is on screen any more, or on its way there, is given up, so that it cannot keep the
   locked process alive (END-01); a result that arrives after that is ignored.
+- **BIO-18** Fingerprint unlock has a time limit, chosen in the security settings (SECSET-12):
+  15 minutes, 1 hour (the default), 8 hours or 24 hours; there is no choice without a limit.
+  The fingerprint opens the app only while both hold: the device has not been restarted since
+  the period last started, and less than the chosen time has passed since then on the device
+  clock. Exactly at the end the period has run out. The period starts again at every successful
+  unlock, by passphrase (the first, at set-up, included) or by fingerprint, and at every lock
+  (LOCK-17, step 7): the timeout, "Lock now", and the end of a lease (LEASE-01). A lock starts
+  it at the moment the lock was due, never later: a lock that could only be made up for hours
+  later (the device was asleep, the process frozen) does not count as recent use. A correct
+  passphrase entered in the security settings starts it too. Otherwise only the passphrase
+  opens the app; a correct one starts a new period, and the fingerprint works again.
+  - Every case that cannot be decided counts as run out: no start recorded, a count of the
+    device's starts that cannot be read, a device clock below the recorded start. After a
+    restart the period has run out whatever the device clock shows; unlike the wait of PASS-06,
+    nothing is measured against the new clock.
+  - The date and time are never consulted.
+  - Running out deletes nothing: the hardware key and the wrap stay, fingerprint unlock stays
+    on, and it is not marked as invalidated (BIO-12). The limit is a check the app makes when it
+    is opened, which is why deleting the key would add nothing against someone who can get past
+    that check, and would mean setting fingerprint unlock up again each time.
+  - **On Android:** the device clock is `SystemClock.elapsedRealtime()`, and the count of the
+    device's starts is `Settings.Global.BOOT_COUNT` (readable without a permission from Android
+    7). A start is stored as both values together (FMT-06).
+  - **Parity note:** what has to be preserved is that a restart of the device, and the chosen
+    time since the last unlock or lock, each end the period on their own, measured on nothing a
+    holder of the device can set; where the platform has no count of starts, something that
+    tells one start of the device from the next has to stand in for it.
+- **BIO-19** While fingerprint unlock is on and its time has run out, the lock screen shows no
+  prompt by itself and no "Use fingerprint", and says under the field, in the colour for
+  secondary text: "Enter your passphrase this time: the phone was restarted, or the time set
+  for fingerprint unlock is up. After that, your fingerprint works again." The time is looked
+  at whenever the lock state is read; should it run out while the lock screen is in front, the
+  automatic prompt is still not shown, because the fingerprint is refused before a prompt is
+  asked for (BIO-20), and the line appears then.
+- **BIO-20** The time is checked again at the moment the fingerprint is used. A prompt that
+  was showing while the time ran out opens nothing when a finger is then accepted: nothing is
+  decrypted, nothing is said to be wrong, fingerprint unlock stays on and is not offered again,
+  and the lock screen shows the line of BIO-19.
+- **BIO-21** A lock configuration written before the time limit existed has the default time
+  (1 hour) and no start of a period: after that update, the passphrase is needed once before
+  the fingerprint works again.
 
 ## 6. Finishing an answer behind the lock (LEASE)
 
@@ -1450,6 +1508,14 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **SECSET-03** The switch "Unlock with fingerprint", with the line "Your fingerprint unlocks the
   encryption key through the phone's secure hardware. Turning this on or off needs your
   passphrase." (BIO-03, BIO-06, BIO-15).
+- **SECSET-12** Right after it, the choice "Fingerprint works for": "15 minutes", "1 hour" (the
+  default), "8 hours" or "24 hours" (BIO-18), with the line "The fingerprint unlocks the app
+  for this long after it locks. After that, or after the phone restarts, the passphrase is
+  needed." It is shown whether or not fingerprint unlock is on, and is built and protected as
+  SECSET-04 is: the choice needs no passphrase and is stored in the lock configuration, because
+  it is needed while the app is locked; if it cannot be stored, the choice shows the stored
+  value again and the group says "That did not work: the phone's key store or storage reported
+  an error." A new choice applies to the period that is running.
 - **SECSET-04** The choice "Lock after": "Immediately", "1 minute", "5 minutes" or "15 minutes",
   with the line "Time in the background before the app locks. The time starts when the phone
   reports that the app has left the screen, a fraction of a second after you leave it: if you
@@ -2382,6 +2448,10 @@ This section is exact where the others describe. Each item carries one of three 
   | `lastFailureElapsedMillis` | number, default 0 | The same moment on the device clock; the one the wait is timed by | not negative |
   | `fingerprintInvalidated` | boolean, default false | Fingerprint unlock was removed because its key became unusable; offer it again (BIO-12) | |
   | `highestKeyGeneration` | number | The highest generation committed so far; generations are never reused | present, 1 to 999,999,999, and not below either generation in use |
+  | `fingerprintPeriodSeconds` | number, default 3600 | How long the fingerprint opens the app after the period starts (BIO-18, SECSET-12); a file without the field means the default | one of 900, 3600, 28800, 86400 |
+  | `fingerprintPeriodStart` | object or null, default null | When the period of BIO-18 last started; null means it has run out (BIO-21) | when not null, both fields below |
+  | `fingerprintPeriodStart.elapsedMillis` | number | That moment on the device clock | not negative |
+  | `fingerprintPeriodStart.bootCount` | number | The device's count of starts at that moment | not negative |
 
   The hardware keys are named `proseplow.passphrase.binding.` and `proseplow.dek.biometric.`
   followed by the generation in decimal without leading zeros. Every key of the app begins with
@@ -2992,6 +3062,16 @@ only state a rule, the item says so and states its effect instead of inventing a
 - **DEC-41** *A development build is a different app* (APP-16, BUILD-11). Reason: installing,
   clearing data, uninstalling and running the tests on a device must never be able to touch a
   real installation and the chats in it.
+- **DEC-42** *The fingerprint works only for a chosen time after the last unlock or the moment
+  the last lock was due, and never after a restart; running out deletes nothing* (BIO-18). The owner's decision. Reasons:
+  a device left alone for long, or restarted, should need the passphrase, while ordinary use
+  keeps the fingerprint working; the date and time can be set by anyone holding the device, so
+  only the device clock and the count of starts are used; and the check is made only when the
+  app is opened, so deleting the key when the time is up would add nothing against someone who
+  can get past the check, and would force setting fingerprint unlock up again each time.
+  Preserve: a restart always ends the period; whatever cannot be decided counts as run out; a
+  lock that ran late starts the period when it was due; the check is made again at the moment
+  of use; and running out never removes fingerprint unlock.
 
 ## 27. Planned tools: design considerations (TOOL)
 

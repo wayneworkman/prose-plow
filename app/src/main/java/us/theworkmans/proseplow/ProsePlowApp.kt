@@ -3,6 +3,7 @@ package us.theworkmans.proseplow
 import android.app.Application
 import android.content.Context
 import android.os.SystemClock
+import android.provider.Settings
 import androidx.biometric.BiometricManager
 import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -134,6 +135,17 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
 
         /** Counts the time the phone sleeps, unlike uptimeMillis: a wait or a timeout cannot be slept through. */
         override fun elapsedMillis() = SystemClock.elapsedRealtime()
+
+        /**
+         * The system's count of boots (Settings.Global.BOOT_COUNT, readable without a permission
+         * from Android 7). Null whenever it cannot be read: fingerprint unlock then asks for the
+         * passphrase, because a restart cannot be ruled out.
+         */
+        override fun bootCount(): Int? = try {
+            Settings.Global.getInt(app.contentResolver, Settings.Global.BOOT_COUNT)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Everything Android has to do for the window policy; see [ScreenSecurity]. */

@@ -251,6 +251,23 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
         }
     }
 
+    /**
+     * "Fingerprint works for". Like "Lock after" it needs no passphrase: the app is unlocked, and
+     * the choice opens no key. On a failure the picker shows the stored value, as that one does.
+     */
+    fun setFingerprintPeriod(seconds: Int) {
+        viewModelScope.launch {
+            try {
+                appLock.setFingerprintPeriod(seconds)
+                _state.update { it.copy(error = null) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _state.update { it.copy(error = SecurityError.FAILED) }
+            }
+        }
+    }
+
     /** "Finish the answer after locking". The switch shows what is stored, so a failure leaves it as it was. */
     fun setFinishAnswerAfterLocking(enabled: Boolean) {
         viewModelScope.launch {
@@ -267,8 +284,8 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
 }
 
 /**
- * The rows of the Security section: change passphrase, fingerprint unlock, the background
- * timeout, "Lock now", the temporary screenshot allowance and "Reset app data", with their
+ * The rows of the Security section: change passphrase, fingerprint unlock and how long the
+ * fingerprint works, the background timeout, "Lock now", the temporary screenshot allowance and "Reset app data", with their
  * dialogs. It emits its rows into the column of the Settings screen it is placed in (which
  * supplies the section title and the spacing), and needs nothing but its ViewModel.
  *
@@ -301,6 +318,7 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
         enabled = biometricAvailable || status.biometricEnabled,
         onCheckedChange = viewModel::onFingerprintSwitch,
     )
+    FingerprintPeriodPicker(status.fingerprintPeriodSeconds, viewModel::setFingerprintPeriod)
     TimeoutPicker(status.lockTimeoutSeconds, viewModel::setLockTimeout)
     SwitchRow(
         title = stringResource(R.string.security_finish_answer),
@@ -412,33 +430,62 @@ private fun SwitchRow(title: String, support: String, checked: Boolean, onChecke
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TimeoutPicker(seconds: Int, onSelect: (Int) -> Unit) {
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    val labels = mapOf(
-        0 to stringResource(R.string.timeout_immediately),
-        60 to stringResource(R.string.timeout_1_minute),
-        300 to stringResource(R.string.timeout_5_minutes),
-        900 to stringResource(R.string.timeout_15_minutes),
+    SecondsPicker(
+        label = stringResource(R.string.security_lock_after),
+        support = stringResource(R.string.security_lock_after_support),
+        labels = mapOf(
+            0 to stringResource(R.string.timeout_immediately),
+            60 to stringResource(R.string.timeout_1_minute),
+            300 to stringResource(R.string.timeout_5_minutes),
+            900 to stringResource(R.string.timeout_15_minutes),
+        ),
+        choices = LockConfig.TIMEOUT_CHOICES_SECONDS,
+        seconds = seconds,
+        onSelect = onSelect,
     )
+}
+
+@Composable
+private fun FingerprintPeriodPicker(seconds: Int, onSelect: (Int) -> Unit) {
+    SecondsPicker(
+        label = stringResource(R.string.security_fingerprint_period),
+        support = stringResource(R.string.security_fingerprint_period_support),
+        labels = mapOf(
+            15 * 60 to stringResource(R.string.fingerprint_period_15_minutes),
+            60 * 60 to stringResource(R.string.fingerprint_period_1_hour),
+            8 * 60 * 60 to stringResource(R.string.fingerprint_period_8_hours),
+            24 * 60 * 60 to stringResource(R.string.fingerprint_period_24_hours),
+        ),
+        choices = LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS,
+        seconds = seconds,
+        onSelect = onSelect,
+    )
+}
+
+/** A choice among [choices] (seconds), each shown by its entry in [labels]. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SecondsPicker(label: String, support: String, labels: Map<Int, String>, choices: List<Int>, seconds: Int, onSelect: (Int) -> Unit) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
         OutlinedTextField(
             value = labels[seconds].orEmpty(),
             onValueChange = {},
             readOnly = true,
             singleLine = true,
-            label = { Text(stringResource(R.string.security_lock_after)) },
-            supportingText = { Text(stringResource(R.string.security_lock_after_support)) },
+            label = { Text(label) },
+            supportingText = { Text(support) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier
                 .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
                 .fillMaxWidth(),
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            // The menu is a window of its own, and what is chosen in it is how long the app stays open.
+            // The menu is a window of its own, and what is chosen in it is part of how the app is locked.
             ProtectWindow()
-            for (choice in LockConfig.TIMEOUT_CHOICES_SECONDS) {
+            for (choice in choices) {
                 DropdownMenuItem(
                     text = { Text(labels[choice].orEmpty()) },
                     onClick = {

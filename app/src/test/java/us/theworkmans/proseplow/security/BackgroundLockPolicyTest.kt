@@ -25,6 +25,27 @@ class BackgroundLockPolicyTest {
         assertFalse("nothing pending afterwards", policy.onForeground(now + 1))
     }
 
+    /**
+     * The due moment is when the app left plus the timeout in force then, however late it is
+     * asked for; none in the foreground or after a lock. Catches a due moment taken from the
+     * time of asking (a late lock counted as recent use).
+     */
+    @Test
+    fun theDueMomentIsWhenTheAppLeftPlusTheTimeout() {
+        assertNull("in the foreground", policy.dueAt())
+        val left = now
+        policy.onBackground(left, 60_000)
+        assertEquals(left + 60_000, policy.dueAt())
+        now += 5 * 60 * 60_000L
+        assertEquals("however late it is asked", left + 60_000, policy.dueAt())
+        assertTrue(policy.onForeground(now))
+        assertNull("cleared by coming to the front", policy.dueAt())
+        policy.onBackground(now, 0)
+        assertEquals(now, policy.dueAt())
+        policy.reset()
+        assertNull("cleared by the lock", policy.dueAt())
+    }
+
     @Test
     fun withImmediatelyEveryTripToTheBackgroundIsDue() {
         policy.onBackground(now, 0)

@@ -414,7 +414,7 @@ class LockManagerTest {
         val restarted = manager()
         assertEquals(StartResult.Locked, restarted.start())
         val cipher = (restarted.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-        assertArrayEquals(key.bytes, restarted.unlockWithBiometric(cipher)!!.bytes)
+        assertArrayEquals(key.bytes, restarted.unlockWithBiometric(cipher).keyOrNull()!!.bytes)
         assertArrayEquals(key.bytes, restarted.unlock(passphrase).key.bytes)
     }
 
@@ -452,7 +452,7 @@ class LockManagerTest {
         m.completeBiometricEnrollment(proof, key, m.prepareBiometricEnrollment(proof))
         vault.createBiometricKey(m.config!!.biometric!!.keyGeneration) // a different key behind the same alias
         val wrongCipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-        assertNull(m.unlockWithBiometric(wrongCipher))
+        assertEquals(BiometricUnlockResult.Removed, m.unlockWithBiometric(wrongCipher))
         assertNull(m.config!!.biometric)
         assertTrue(m.config!!.fingerprintInvalidated)
     }
@@ -483,6 +483,231 @@ class LockManagerTest {
         assertNull(vault.biometric)
         assertEquals(BiometricCipherResult.NotEnabled, m.biometricUnlockCipher())
         assertEquals("the passphrase is all that is left, and it works", StartResult.Locked, manager().start())
+    }
+
+    // --- The time limit of fingerprint unlock --------------------------------------------------------
+
+    private val hourMillis = LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS * 1000L
+
+    /** Set up with fingerprint unlock; returns the data key. The period starts at the passphrase unlock that turned it on. */
+    private fun enrolled(): DataKey {
+        val key = setUp()
+        val m = manager()
+        m.start()
+        val proof = m.unlock(passphrase).proof
+        m.completeBiometricEnrollment(proof, key, m.prepareBiometricEnrollment(proof))
+        return key
+    }
+
+    /** A whole fingerprint unlock: the cipher, then the unwrap; null if there was no cipher. */
+    private fun LockManager.fingerprint(): BiometricUnlockResult? =
+        (biometricUnlockCipher() as? BiometricCipherResult.Ready)?.let { unlockWithBiometric(it.cipher) }
+
+    /** Fingerprint unlock is still set up, in memory and on disk, with its key, and not marked as invalidated. */
+    private fun assertStillSetUp(m: LockManager) {
+        assertNotNull(m.config!!.biometric)
+        assertFalse(m.config!!.fingerprintInvalidated)
+        val stored = LockConfigStore(configFile).read()!!
+        assertNotNull(stored.biometric)
+        assertFalse(stored.fingerprintInvalidated)
+        assertEquals(1, vault.biometricKeys.size)
+    }
+
+    /**
+     * Inside the period the fingerprint works, and every fingerprint unlock starts it again, so
+     * ordinary use keeps it working; an hour with no unlock and it is refused without anything
+     * being removed. Catches a period that does not end, one that a fingerprint unlock does not
+     * restart, and a refusal that removes fingerprint unlock.
+     */
+    @Test
+    fun theFingerprintWorksForThePeriodAfterTheLastUnlockAndThenOnlyThePassphraseDoes() {
+        val key = enrolled()
+        val m = manager()
+        m.start()
+        clock.advance(hourMillis - 1)
+        assertArrayEquals(key.bytes, m.fingerprint()!!.keyOrNull()!!.bytes)
+        assertEquals(FingerprintPeriodStart(clock.elapsed, 1), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        clock.advance(hourMillis - 1)
+        assertTrue("started again by the fingerprint unlock", m.fingerprintPeriodRunning())
+        assertTrue(m.fingerprint() is BiometricUnlockResult.Unlocked)
+
+        clock.advance(hourMillis)
+        assertFalse(m.fingerprintPeriodRunning())
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        assertStillSetUp(m)
+        assertEquals("a new process says the same", BiometricCipherResult.PeriodOver, manager().also { it.start() }.biometricUnlockCipher())
+    }
+
+    /**
+     * The right passphrase starts a new period. Catches a passphrase unlock that leaves the
+     * fingerprint locked out after the period ran out.
+     */
+    @Test
+    fun aPassphraseUnlockStartsANewPeriodAndTheFingerprintWorksAgain() {
+        val key = enrolled()
+        val m = manager()
+        m.start()
+        clock.advance(3 * hourMillis)
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        assertTrue("a wrong passphrase starts nothing", m.checkPassphrase("not the passphrase".toCharArray()) is PassphraseResult.Wrong)
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        m.unlock(passphrase).key.destroy()
+        assertEquals(FingerprintPeriodStart(clock.elapsed, 1), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        assertArrayEquals(key.bytes, m.fingerprint()!!.keyOrNull()!!.bytes)
+    }
+
+    /**
+     * A restart means the passphrase, whatever the time since boot shows: a boot that has been
+     * up for longer than the old one had (the time looks inside the period) and a young one
+     * (the time is below the start). Catches the back-off's "what is left on the new clock" rule
+     * applied here, and a check of the time alone.
+     */
+    @Test
+    fun aRestartOfThePhoneAsksForThePassphraseWhateverTheTimeSinceBootSays() {
+        val key = enrolled()
+        val start = LockConfigStore(configFile).read()!!.fingerprintPeriodStart!!
+
+        clock.reboot(upMillis = start.elapsedMillis + 60_000)
+        val longUp = manager()
+        assertEquals(StartResult.Locked, longUp.start())
+        assertEquals(BiometricCipherResult.PeriodOver, longUp.biometricUnlockCipher())
+        assertStillSetUp(longUp)
+
+        clock.reboot(upMillis = 5_000)
+        val young = manager()
+        young.start()
+        assertEquals(BiometricCipherResult.PeriodOver, young.biometricUnlockCipher())
+        assertStillSetUp(young)
+
+        // The passphrase on this boot, and the fingerprint works again.
+        young.unlock(passphrase).key.destroy()
+        assertEquals(FingerprintPeriodStart(5_000, 3), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        assertArrayEquals(key.bytes, young.fingerprint()!!.keyOrNull()!!.bytes)
+    }
+
+    /**
+     * When the boot count cannot be read, a restart cannot be ruled out: the passphrase is
+     * needed, and an unlock with it stores no start, so the fingerprint stays refused until the
+     * count can be read again. Catches an unreadable count taken as "no restart", and an
+     * exception from reading it reaching the caller.
+     */
+    @Test
+    fun aBootCountThatCannotBeReadAsksForThePassphraseAndNeverThrows() {
+        val key = enrolled()
+        val m = manager()
+        m.start()
+        assertTrue(m.fingerprintPeriodRunning())
+
+        clock.boots = null
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        clock.boots = 1
+        clock.bootCountFailure = SecurityException("not allowed to read the setting")
+        assertFalse(m.fingerprintPeriodRunning())
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        assertStillSetUp(m)
+
+        assertArrayEquals("the passphrase works as always", key.bytes, m.unlock(passphrase).key.bytes)
+        assertNull("no start without a boot count", LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        clock.bootCountFailure = null
+        assertEquals("still refused: nothing was started", BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        m.unlock(passphrase).key.destroy()
+        assertTrue(m.fingerprint() is BiometricUnlockResult.Unlocked)
+    }
+
+    /**
+     * The prompt can be showing while the period runs out; its success says nothing about the
+     * period. The unwrap is refused before the cipher is used, nothing is stored, and
+     * fingerprint unlock is neither removed nor marked as invalidated. Catches a check made only
+     * when the prompt is shown, and a refusal handled as a lost key.
+     */
+    @Test
+    fun aPeriodThatRunsOutWhileThePromptShowsRefusesTheUnlockAndKeepsFingerprintUnlock() {
+        val key = enrolled()
+        val m = manager()
+        m.start()
+        val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
+        val before = configFile.readText()
+        clock.advance(hourMillis)
+        assertEquals(BiometricUnlockResult.PeriodOver, m.unlockWithBiometric(cipher))
+        assertEquals("nothing was written", before, configFile.readText())
+        assertStillSetUp(m)
+
+        m.unlock(passphrase).key.destroy()
+        assertArrayEquals(key.bytes, m.fingerprint()!!.keyOrNull()!!.bytes)
+    }
+
+    /**
+     * A lock starts the period again from the moment it happened. A start already stored for a
+     * later moment of this boot (an unlock that came first) is kept; one from another boot is
+     * replaced. Nothing is written without fingerprint unlock. Catches a lock that does not move
+     * the start, and a late lock that takes a later unlock's start back.
+     */
+    @Test
+    fun aLockStartsThePeriodAgainButNeverMovesItBack() {
+        enrolled()
+        val m = manager()
+        m.start()
+        clock.advance(50 * 60_000L)
+        val lockedAt = clock.elapsed
+        clock.advance(1_000)
+        m.startFingerprintPeriod(lockedAt)
+        assertEquals(FingerprintPeriodStart(lockedAt, 1), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        clock.advance(50 * 60_000L)
+        assertTrue("an hour and 40 minutes after the unlock, 50 minutes after the lock", m.fingerprintPeriodRunning())
+
+        // An unlock recorded after the lock was decided is not undone by it.
+        m.unlock(passphrase).key.destroy()
+        val unlockedAt = clock.elapsed
+        m.startFingerprintPeriod(unlockedAt - 2_000)
+        assertEquals(FingerprintPeriodStart(unlockedAt, 1), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+
+        // A start from before a restart is replaced.
+        clock.reboot(upMillis = unlockedAt + 10_000)
+        val restarted = manager()
+        restarted.start()
+        restarted.startFingerprintPeriod(clock.elapsed)
+        assertEquals(FingerprintPeriodStart(clock.elapsed, 2), LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+
+        // Without a boot count no start is stored at all: run out.
+        clock.boots = null
+        clock.advance(1_000)
+        restarted.startFingerprintPeriod(clock.elapsed)
+        assertNull(LockConfigStore(configFile).read()!!.fingerprintPeriodStart)
+        clock.boots = 2
+
+        // Without fingerprint unlock nothing is written.
+        val proof = restarted.unlock(passphrase).proof
+        restarted.disableBiometric(proof)
+        val before = configFile.readText()
+        clock.advance(1_000)
+        restarted.startFingerprintPeriod(clock.elapsed)
+        assertEquals(before, configFile.readText())
+    }
+
+    /** Catches a choice that is not stored, a value outside the four accepted, and a choice that does not apply. */
+    @Test
+    fun theFingerprintPeriodIsOneOfFourChoicesAndPersisted() {
+        enrolled()
+        val m = manager()
+        m.start()
+        assertEquals("an hour by default", 3_600, m.config!!.fingerprintPeriodSeconds)
+        for (seconds in LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS) {
+            m.setFingerprintPeriod(seconds)
+            val restarted = manager()
+            restarted.start()
+            assertEquals(seconds, restarted.config!!.fingerprintPeriodSeconds)
+        }
+        for (bad in listOf(0, -1, 60, 42, Int.MAX_VALUE)) {
+            assertThrows("$bad", IllegalArgumentException::class.java) { m.setFingerprintPeriod(bad) }
+        }
+        assertEquals(86_400, LockConfigStore(configFile).read()!!.fingerprintPeriodSeconds)
+
+        m.setFingerprintPeriod(15 * 60)
+        m.unlock(passphrase).key.destroy()
+        clock.advance(15 * 60_000L - 1)
+        assertTrue(m.fingerprintPeriodRunning())
+        clock.advance(1)
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
     }
 
     // --- Settings and reset -----------------------------------------------------------------------

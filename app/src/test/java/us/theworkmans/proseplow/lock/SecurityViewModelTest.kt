@@ -256,6 +256,39 @@ class SecurityViewModelTest {
         assertNull(viewModel.state.value.error)
     }
 
+    /**
+     * "Fingerprint works for" is built as "Lock after" is: no passphrase, stored at once,
+     * reflected in the status, and a failure to store it shown with the stored value kept.
+     * Catches a choice that is not stored or not shown, one that asks for a dialog, and a
+     * failure that shows a value that was not stored.
+     */
+    @Test
+    fun theFingerprintPeriodIsSavedWithoutAPassphraseAndAFailureToSaveIsShown() = runTest(dispatcher) {
+        unlockedApp()
+        assertEquals("an hour by default", 3_600, viewModel.status.value.fingerprintPeriodSeconds)
+        viewModel.setFingerprintPeriod(8 * 3_600)
+        runCurrent()
+        assertNull("no passphrase asked for", viewModel.state.value.dialog)
+        assertEquals(8 * 3_600, viewModel.status.value.fingerprintPeriodSeconds)
+        assertEquals(8 * 3_600, LockConfigStore(files.lockConfig).read()!!.fingerprintPeriodSeconds)
+        assertNull(viewModel.state.value.error)
+
+        files.securityDir.setWritable(false)
+        try {
+            viewModel.setFingerprintPeriod(15 * 60)
+            runCurrent()
+        } finally {
+            files.securityDir.setWritable(true)
+        }
+        assertEquals(SecurityError.FAILED, viewModel.state.value.error)
+        assertEquals("the stored value is what is shown", 8 * 3_600, viewModel.status.value.fingerprintPeriodSeconds)
+
+        viewModel.setFingerprintPeriod(24 * 3_600)
+        runCurrent()
+        assertEquals(24 * 3_600, viewModel.status.value.fingerprintPeriodSeconds)
+        assertNull(viewModel.state.value.error)
+    }
+
     @Test
     fun theScreenshotSwitchGivesAnAllowanceThatEndsByItselfAndTheRowFollows() = runTest(dispatcher) {
         unlockedApp()

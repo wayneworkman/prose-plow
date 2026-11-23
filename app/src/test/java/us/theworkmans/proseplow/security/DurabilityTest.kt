@@ -419,7 +419,7 @@ class LockDurabilityTest {
             val stoppedAt = steps().last()
             afterAPowerLoss { restarted, config ->
                 val cipher = (restarted.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-                assertArrayEquals("stopped at $stoppedAt", dataKey, restarted.unlockWithBiometric(cipher)!!.bytes)
+                assertArrayEquals("stopped at $stoppedAt", dataKey, restarted.unlockWithBiometric(cipher).keyOrNull()!!.bytes)
                 assertArrayEquals(dataKey, restarted.unlock(passphrase).key.bytes)
                 assertEquals(listOf(KeyId(KeyKind.BIOMETRIC, config.biometric!!.keyGeneration)), vault.biometricKeys)
             }

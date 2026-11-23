@@ -13,6 +13,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
@@ -73,6 +74,9 @@ class AppLockTest {
 
     /** Uses of the lock manager's collaborators while nothing held the lock's mutex. */
     private val unserialised = mutableListOf<String>()
+
+    /** Called at every step of every write of the lock configuration, inside the lock manager. */
+    private var onConfigWrite: () -> Unit = {}
 
     /** True while the test itself drives the lock manager, as nothing in the app does. */
     private var testDrivesTheManager = false
@@ -174,9 +178,20 @@ class AppLockTest {
                 insideTheManager()
                 return clock.elapsed
             }
+
+            override fun bootCount(): Int? {
+                insideTheManager()
+                return clock.bootCount()
+            }
         }
         manager = LockManager(
-            store = LockConfigStore(files.lockConfig, onWriteStep = { insideTheManager() }),
+            store = LockConfigStore(
+                files.lockConfig,
+                onWriteStep = {
+                    insideTheManager()
+                    onConfigWrite()
+                },
+            ),
             vault = vault,
             clock = managerClock,
             iterations = 1_000,
@@ -903,6 +918,369 @@ class AppLockTest {
     }
 
     // --- Reset --------------------------------------------------------------------------------------
+
+    // --- The time limit of fingerprint unlock --------------------------------------------------------
+
+    private val hourMillis = LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS * 1000L
+
+    private fun storedStart(): FingerprintPeriodStart? = LockConfigStore(files.lockConfig).read()!!.fingerprintPeriodStart
+
+    /** The fingerprint prompt from the lock screen's button, and the user's finger on it. */
+    private fun TestScope.unlockByFingerprint(launcher: FakeLauncher) {
+        lock.requestBiometricUnlock()
+        runCurrent()
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+    }
+
+    /** Fingerprint unlock is still set up, its key is there, and nothing says it was invalidated. */
+    private fun assertFingerprintStillSetUp() {
+        assertTrue(lock.status.value.biometricEnabled)
+        assertFalse(lock.status.value.fingerprintInvalidated)
+        val stored = LockConfigStore(files.lockConfig).read()!!
+        assertNotNull(stored.biometric)
+        assertFalse(stored.fingerprintInvalidated)
+        assertEquals(1, vault.biometricKeys.size)
+    }
+
+    /**
+     * Ordinary use: every lock and every fingerprint unlock starts the period again, so the
+     * fingerprint goes on working for hours of use with the app locking in between. Catches a
+     * lock or a fingerprint unlock that does not move the start.
+     */
+    @Test
+    fun everyLockAndEveryFingerprintUnlockStartsThePeriodAgain() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        pass(30 * 60_000L)
+        lock.lock()
+        runCurrent()
+        assertEquals("the moment of the lock", FingerprintPeriodStart(clock.elapsed, 1), storedStart())
+        repeat(3) {
+            pass(50 * 60_000L)
+            assertFalse(lock.status.value.fingerprintPeriodOver)
+            unlockByFingerprint(launcher)
+            assertTrue(lock.state.value is LockState.Unlocked)
+            assertEquals("the moment of the fingerprint unlock", FingerprintPeriodStart(clock.elapsed, 1), storedStart())
+            pass(20 * 60_000L)
+            lock.lock()
+            runCurrent()
+            assertEquals("the moment of the lock", FingerprintPeriodStart(clock.elapsed, 1), storedStart())
+        }
+    }
+
+    /**
+     * Once the period has run out the lock screen says so, does not start the prompt by itself
+     * and does not offer the fingerprint; the passphrase opens the app, and after it the
+     * fingerprint works again. Catches a lock screen state that does not tell "run out" apart,
+     * an automatic prompt that is shown anyway, and a passphrase unlock that leaves it run out.
+     */
+    @Test
+    fun afterThePeriodTheLockScreenNeitherPromptsNorOffersTheFingerprintUntilThePassphrase() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.lock()
+        runCurrent()
+        assertFalse(lock.status.value.fingerprintPeriodOver)
+        pass(hourMillis)
+
+        // The app was out of sight, so the next start is a cold one.
+        startApp()
+        lock.attach(launcher)
+        val shown = launcher.shown
+        assertTrue(lock.status.value.biometricEnabled)
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        lock.autoPromptBiometric((lock.state.value as LockState.Locked).generation)
+        runCurrent()
+        assertEquals("no prompt by itself", shown, launcher.shown)
+        lock.requestBiometricUnlock() // Not offered; and refused should it be asked for anyway.
+        runCurrent()
+        assertEquals(shown, launcher.shown)
+        assertFalse(lock.unlockUi.value.biometricPromptShowing)
+        assertNull(lock.unlockUi.value.notice)
+        assertFingerprintStillSetUp()
+
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertFalse(lock.status.value.fingerprintPeriodOver)
+        assertNull("nothing to offer: fingerprint unlock is still on", lock.fingerprintOffer.value)
+        lock.lock()
+        runCurrent()
+        lock.autoPromptBiometric((lock.state.value as LockState.Locked).generation)
+        runCurrent()
+        assertEquals("the prompt comes by itself again", shown + 1, launcher.shown)
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    /**
+     * The lock screen stayed in front while the period ran out, so what it was told at the lock
+     * is out of date: the automatic prompt still does not appear, because the lock manager
+     * refuses the cipher, and the screen is told. Catches a decision taken from the published
+     * state alone.
+     */
+    @Test
+    fun aPeriodThatRunsOutInFrontOfTheLockScreenStartsNoPrompt() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.lock()
+        runCurrent()
+        val shown = launcher.shown
+        pass(hourMillis)
+        assertFalse("published at the lock", lock.status.value.fingerprintPeriodOver)
+        lock.autoPromptBiometric((lock.state.value as LockState.Locked).generation)
+        runCurrent()
+        assertEquals(shown, launcher.shown)
+        assertTrue("and now the screen knows", lock.status.value.fingerprintPeriodOver)
+        assertFingerprintStillSetUp()
+    }
+
+    /** A restart of the phone needs the passphrase, however soon after the lock. Catches a check of the time alone. */
+    @Test
+    fun aRestartOfThePhoneNeedsThePassphrase() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.lock()
+        runCurrent()
+        clock.reboot(upMillis = clock.elapsed + 1_000) // A time since boot just after the lock.
+        startApp()
+        lock.attach(launcher)
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        lock.autoPromptBiometric((lock.state.value as LockState.Locked).generation)
+        runCurrent()
+        assertFalse(lock.unlockUi.value.biometricPromptShowing)
+        assertFingerprintStillSetUp()
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertEquals(FingerprintPeriodStart(clock.elapsed, 2), storedStart())
+    }
+
+    /**
+     * The period runs out while the prompt is showing: the finger on the sensor no longer
+     * opens the app, nothing is said to be wrong with fingerprint unlock (no notice, no removal,
+     * no offer to set it up again), and the screen now asks for the passphrase. Catches a check
+     * made only when the prompt was shown, and a refusal taken for a lost key.
+     */
+    @Test
+    fun aPeriodThatRunsOutWhileThePromptShowsRefusesTheUnlockWithoutRemovingAnything() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.lock()
+        runCurrent()
+        pass(hourMillis - 60_000)
+        lock.requestBiometricUnlock()
+        runCurrent()
+        assertTrue(lock.unlockUi.value.biometricPromptShowing)
+        val opened = sessions.size
+        pass(60_000)
+        lock.onBiometricSucceeded(launcher.cipher)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("no session was opened", opened, sessions.size)
+        assertNull(lock.unlockUi.value.notice)
+        assertNull(lock.unlockUi.value.error)
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        assertFingerprintStillSetUp()
+
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertNull("not invalidated, so not offered again", lock.fingerprintOffer.value)
+    }
+
+    /**
+     * At a lock the start of the period is stored after the session is closed and its key
+     * destroyed, and before the process ends. Catches a write that keeps the key in memory
+     * longer, and one the end of the process could cut off.
+     */
+    @Test
+    fun theStartOfThePeriodIsStoredAfterTheKeyIsGoneAndBeforeTheProcessEnds() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        pass(60_000)
+        val lockedAt = clock.elapsed
+        val writes = mutableListOf<String>()
+        onConfigWrite = {
+            val key = try {
+                session.cipher.seal("p", plaintext)
+                "the key in memory"
+            } catch (_: KeyDestroyedException) {
+                "the key gone"
+            }
+            writes += "$key, ${if (session.closed) "closed" else "open"}, $processEnds process ends"
+        }
+        log.clear()
+        lock.lock()
+        runCurrent()
+        assertTrue("the start was written", writes.isNotEmpty())
+        assertEquals(listOf("the key gone, closed, 0 process ends"), writes.distinct())
+        assertEquals(FingerprintPeriodStart(lockedAt, 1), storedStart())
+        assertEquals(1, processEnds)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped"), logAtProcessEnd)
+    }
+
+    /**
+     * The end of a lease is a lock: the period starts again then, not only when the screen
+     * locked. Catches a lease end that does not move the start.
+     */
+    @Test
+    fun theEndOfALeaseStartsThePeriodAgain() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        val answer = lockItselfDuringAnAnswer(session)
+        val lockedAt = clock.elapsed
+        assertEquals(FingerprintPeriodStart(lockedAt, 1), storedStart())
+        pass(8 * 60_000L)
+        answer.complete(Unit)
+        runCurrent()
+        assertTrue(session.closed)
+        assertEquals("the moment the lease ended", FingerprintPeriodStart(lockedAt + 8 * 60_000L, 1), storedStart())
+
+        // So the fingerprint still works an hour after the screen locked, within the hour after the lease.
+        pass(hourMillis - 5 * 60_000L)
+        assertFalse(lock.status.value.fingerprintPeriodOver)
+        unlockByFingerprint(launcher)
+        assertTrue(lock.state.value is LockState.Unlocked)
+    }
+
+    // A lock that runs late counts from when it was due --------------------------------------------
+
+    /** The lock manager's own decision, asked by the test directly. */
+    private fun cipherResult(): BiometricCipherResult {
+        testDrivesTheManager = true
+        try {
+            return manager.biometricUnlockCipher()
+        } finally {
+            testDrivesTheManager = false
+        }
+    }
+
+    /**
+     * The app leaves the screen, the process is frozen so the one-minute timer never runs, and
+     * the phone lies untouched for hours; then the app is opened and the lock is made up for.
+     * The period starts when the lock was due, not when it was made up for, so it has run out:
+     * no prompt, no button, the lock manager refuses. Catches a late lock counted as recent use.
+     */
+    @Test
+    fun aLockMadeUpForHoursLateCountsFromWhenItWasDue() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onBackground()
+        val dueAt = clock.elapsed + 60_000
+        // Frozen: the clock moves on, the timer does not.
+        clock.advance(60_000 + 5 * hourMillis)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        lock.onForeground()
+        runCurrent()
+        val locked = lock.state.value as LockState.Locked
+        assertEquals(FingerprintPeriodStart(dueAt, 1), storedStart())
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        val shown = launcher.shown
+        lock.autoPromptBiometric(locked.generation)
+        runCurrent()
+        assertEquals("no prompt by itself", shown, launcher.shown)
+        assertEquals(BiometricCipherResult.PeriodOver, cipherResult())
+        assertFingerprintStillSetUp()
+    }
+
+    /**
+     * The same, made up for less than the period after it was due: the fingerprint still works,
+     * and the start stored is still the due moment, not the moment the lock ran. Catches a start
+     * taken from the late lock even where the outcome happens to be the same.
+     */
+    @Test
+    fun aLockMadeUpForWithinThePeriodStillStartsItWhenItWasDue() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onBackground()
+        val dueAt = clock.elapsed + 60_000
+        clock.advance(60_000 + 30 * 60_000L)
+        lock.onForeground()
+        runCurrent()
+        val locked = lock.state.value as LockState.Locked
+        assertEquals(FingerprintPeriodStart(dueAt, 1), storedStart())
+        assertFalse(lock.status.value.fingerprintPeriodOver)
+        val shown = launcher.shown
+        lock.autoPromptBiometric(locked.generation)
+        runCurrent()
+        assertEquals("the prompt comes by itself", shown + 1, launcher.shown)
+        // Half an hour later it has run out: an hour after the due moment, not after the late lock.
+        lock.onBiometricError(AppLock.ERROR_USER_CANCELED)
+        runCurrent()
+        clock.advance(30 * 60_000L)
+        assertEquals(BiometricCipherResult.PeriodOver, cipherResult())
+    }
+
+    /**
+     * A timer that fires late on its own, without the app coming to the front (the process was
+     * frozen and then thawed in the background). Catches a fix made only where the app comes to
+     * the front.
+     */
+    @Test
+    fun aTimerThatFiresLateOnItsOwnCountsFromWhenTheLockWasDue() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        setUpWithFingerprint(launcher)
+        lock.onBackground()
+        val dueAt = clock.elapsed + 60_000
+        clock.advance(5 * hourMillis) // The clock moves on while the timer stands still...
+        advanceTimeBy(60_000) // ...and then the timer runs, five hours late.
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(FingerprintPeriodStart(dueAt, 1), storedStart())
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        assertEquals(BiometricCipherResult.PeriodOver, cipherResult())
+    }
+
+    /**
+     * A lease whose ten-minute timer could not run, ended hours later when the app comes to the
+     * front: the period starts at the end of the ten minutes at the latest. Catches a lease end
+     * counted at the moment it was made up for.
+     */
+    @Test
+    fun aLeaseEndedLateCountsFromWhenItWasDueToEnd() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        lockItselfDuringAnAnswer(session)
+        val lockedAt = clock.elapsed
+        assertEquals(FingerprintPeriodStart(lockedAt, 1), storedStart())
+        clock.advance(5 * hourMillis) // Frozen: the lease's timer does not run.
+        assertFalse(session.closeStarted)
+        lock.onForeground()
+        runCurrent()
+        assertTrue(session.closed)
+        assertEquals(FingerprintPeriodStart(lockedAt + AppLock.LEASE_MILLIS, 1), storedStart())
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        assertEquals(BiometricCipherResult.PeriodOver, cipherResult())
+    }
+
+    /**
+     * A lock made up for hours late may still leave a lease (an answer under way, the keep-alive
+     * running). That lease lasts its ten minutes as always, but its end starts the period no
+     * later than ten minutes after the lock was due. Catches a late lock whose lease end counts
+     * as recent use.
+     */
+    @Test
+    fun theLeaseOfALateLockCannotMakeUpForTheHoursEither() = runTest(dispatcher) {
+        val launcher = FakeLauncher()
+        val session = setUpWithFingerprint(launcher)
+        val answer = CompletableDeferred<Unit>()
+        session.answer = answer
+        lock.onBackground()
+        val dueAt = clock.elapsed + 60_000
+        clock.advance(60_000 + 5 * hourMillis)
+        lock.onForeground()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("a lease began", 1, session.finishOnly)
+        assertFalse(session.closeStarted)
+        pass(60_000)
+        answer.complete(Unit)
+        runCurrent()
+        assertTrue(session.closed)
+        assertEquals(FingerprintPeriodStart(dueAt + AppLock.LEASE_MILLIS, 1), storedStart())
+        assertTrue(lock.status.value.fingerprintPeriodOver)
+        assertEquals(BiometricCipherResult.PeriodOver, cipherResult())
+    }
 
     private fun someStoredData(): List<File> {
         val stored = listOf(

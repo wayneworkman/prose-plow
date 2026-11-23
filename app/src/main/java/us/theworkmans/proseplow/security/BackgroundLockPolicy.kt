@@ -28,6 +28,14 @@ class BackgroundLockPolicy {
      */
     fun remainingMillis(now: Long): Long? = backgroundedAt?.let { (it + limitMillis - now).coerceIn(0, limitMillis) }
 
+    /**
+     * The moment the lock is due while the activity is in the background (when it left plus the
+     * timeout then in force); null while it is in the foreground. A lock that happens later than
+     * this (its timer could not run) still happened, for every purpose that looks back, at this
+     * moment. [onForeground] clears it, so it is read before that is called.
+     */
+    fun dueAt(): Long? = backgroundedAt?.let { it + limitMillis }
+
     /** The activity is visible again: true if the lock is due (its timer may not have run while frozen). */
     fun onForeground(now: Long): Boolean {
         val since = backgroundedAt ?: return false

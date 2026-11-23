@@ -109,6 +109,11 @@ Privacy:
   setting that turns the lock off.
 - **Passphrase or fingerprint, never a PIN.** Fingerprint unlock is optional, uses strong
   (Class 3) biometrics only, and cannot fall back to the phone's PIN, pattern or password.
+- **The fingerprint works for a time you choose.** After the app last locked or was unlocked,
+  the fingerprint opens it for 15 minutes, 1 hour (the default), 8 or 24 hours, and never after
+  the phone has restarted. After that only the passphrase opens it, and from then on the
+  fingerprint works again. Ordinary use keeps it working, since every lock and every unlock
+  starts the time again; a lock starts it at the moment the lock was due.
 - **Locks by itself.** The app is locked at every start and after it has been in the background
   for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
   when Android reports that the app has left the screen, which is a fraction of a second after
@@ -426,6 +431,8 @@ optionally a second time by a fingerprint key.
   unlock is then switched off, the passphrase is needed, and the app offers to set it up again.
 - Changing the passphrase, and turning fingerprint unlock on or off, need the current
   passphrase, entered within the last two minutes. A fingerprint unlock does not allow them.
+  How long the fingerprint works (see [The lock](#the-lock)) is chosen without the passphrase,
+  like the time before the app locks.
 
 ### The lock
 
@@ -504,6 +511,28 @@ optionally a second time by a fingerprint key.
   phone during a wait starts the full wait again. The right passphrase ends the count, and so
   does a successful fingerprint unlock. There is no wipe after a number of failures.
   Fingerprint attempts are limited by Android itself.
+- **The fingerprint has a time limit.** The fingerprint opens the app only while the phone has
+  not been restarted since the period last started and less than the chosen period has passed
+  since then: 15 minutes, 1 hour (the default), 8 hours or 24 hours, chosen in Settings
+  ("Fingerprint works for"); there is no choice without a limit. The period starts again at
+  every successful unlock, by passphrase or fingerprint, and at every lock: the timeout, "Lock
+  now", and the end of the time in which an answer is finished behind the lock. A lock starts it
+  at the moment the lock was due, never later: when the app left the screen plus the timeout,
+  even if Android kept the app frozen or the phone asleep so that the lock only happened when
+  the app was next opened, and for the finishing time at most ten minutes after that. Otherwise only
+  the passphrase opens the app, and the lock screen says so instead of showing the fingerprint
+  prompt or its button; after that unlock the fingerprint works again. The time is measured on
+  the clock that counts from the phone's start, never on the date and time, which anyone holding
+  the phone can set, and a restart is recognised by Android's count of boots
+  (`Settings.Global.BOOT_COUNT`). Whatever cannot be decided counts as run out: a count that
+  cannot be read, a time below the recorded start, a `lock.json` from before this existed
+  (after that update the passphrase is needed once). The check is made again at the moment the
+  fingerprint is used, so a prompt that was showing while the time ran out opens nothing.
+  Running out deletes nothing: the fingerprint key stays and fingerprint unlock stays on. The
+  app only looks at the time when it is opened, so deleting the key would add nothing against
+  someone who could get past that check (see below) and would mean setting fingerprint unlock
+  up again every time. The start of the period is stored in `lock.json` at a lock only after the
+  data key has been overwritten, and before the app ends its process.
 
 ### Reset, and no recovery
 
@@ -615,8 +644,8 @@ it or losing the phone loses the chats.
 
 ### What this does not protect against
 
-- **Anyone who knows the passphrase**, and, while fingerprint unlock is on, anyone whose
-  fingerprint is enrolled on the phone.
+- **Anyone who knows the passphrase**, and, while fingerprint unlock is on and within the time
+  you chose for it, anyone whose fingerprint is enrolled on the phone.
 - **The unlocked app.** Whoever holds the phone while the app is unlocked reads everything, and
   the app stays unlocked in the background for the time you chose.
 - **The minutes in which an answer is finished behind the lock.** With "Finish the answer after
@@ -633,6 +662,9 @@ it or losing the phone loses the chats.
   in a plain file and can be reset, and code that runs as the app can use the binding key. The
   600,000 iterations can then be computed elsewhere in advance, so that a guess costs one
   Keystore operation. In that situation only the strength of the passphrase protects the data.
+  The time limit of fingerprint unlock is a check the app makes, not a property of the key: with
+  root access it can be got around by editing `lock.json`, and the fingerprint then opens the
+  app as it would without the limit.
 - **A Keystore that gives up its keys.** If the phone's key store can be made to export the
   binding key, the passphrase key is only as strong as PBKDF2 with 600,000 iterations and your
   passphrase.
@@ -669,8 +701,9 @@ it or losing the phone loses the chats.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
   sizes and the times they were changed, and the content of `lock.json` (whether fingerprint
-  unlock is on, whether an answer is finished after locking, how many wrong attempts were made
-  and when).
+  unlock is on and for how long, whether an answer is finished after locking, how many wrong
+  attempts were made and when, and when, on the clock since the phone's start, the app last
+  locked or was unlocked).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
   debugging can read its private files with `run-as` and attach a debugger to it, and a debug
   build accepts a model file that nothing has verified. Use a release build for chats that
@@ -1275,7 +1308,7 @@ None of it has been tried.
 | Suite | What it covers | Command |
 | --- | --- | --- |
 | `core` (JVM, 410 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 590 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `app` (JVM, 620 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

@@ -47,6 +47,20 @@ data class LockConfig(
     val fingerprintInvalidated: Boolean = false,
     /** The highest binding or biometric key generation committed so far; generations are never reused. */
     val highestKeyGeneration: Int,
+    /**
+     * How long after [fingerprintPeriodStart] the fingerprint may open the app (see
+     * [FingerprintPeriod]). It is here, and not with the encrypted settings, because it is needed
+     * while the app is locked. A file written before this field existed does not have it, which
+     * means the default.
+     */
+    val fingerprintPeriodSeconds: Int = DEFAULT_FINGERPRINT_PERIOD_SECONDS,
+    /**
+     * When the period of [fingerprintPeriodSeconds] last started: the last successful unlock or
+     * the last lock, whichever was later. Null when none is known, which means the period has run
+     * out; a file written before this field existed does not have it, so after that update the
+     * passphrase is needed once before the fingerprint works again.
+     */
+    val fingerprintPeriodStart: FingerprintPeriodStart? = null,
 ) {
     /**
      * Every field is in range and every wrap well formed, so nothing read from the file can make
@@ -57,6 +71,8 @@ data class LockConfig(
     fun isValid(minIterations: Int = PassphraseWrap.MIN_ITERATIONS): Boolean {
         if (version != CURRENT_VERSION) return false
         if (lockTimeoutSeconds !in TIMEOUT_CHOICES_SECONDS) return false
+        if (fingerprintPeriodSeconds !in FINGERPRINT_PERIOD_CHOICES_SECONDS) return false
+        if (fingerprintPeriodStart != null && !fingerprintPeriodStart.isValid()) return false
         if (failedAttempts < 0 || lastFailureWallMillis < 0 || lastFailureElapsedMillis < 0) return false
         if (!passphrase.isValid(minIterations)) return false
         if (biometric != null && !biometric.isValid()) return false
@@ -76,6 +92,10 @@ data class LockConfig(
         const val CURRENT_VERSION = 1
         const val DEFAULT_TIMEOUT_SECONDS = 60
         val TIMEOUT_CHOICES_SECONDS = listOf(0, 60, 5 * 60, 15 * 60)
+        const val DEFAULT_FINGERPRINT_PERIOD_SECONDS = 60 * 60
+
+        /** There is deliberately no choice without a limit. */
+        val FINGERPRINT_PERIOD_CHOICES_SECONDS = listOf(15 * 60, 60 * 60, 8 * 60 * 60, 24 * 60 * 60)
 
         /** `iv (12) || ciphertext (32) || tag (16)` of the data key from a Keystore AES-GCM key. */
         const val KEY_WRAP_SIZE = 12 + DataKey.SIZE + 16
@@ -134,6 +154,17 @@ data class PassphraseWrap(
 @Serializable
 data class BiometricWrap(val wrappedKey: String, val keyGeneration: Int) {
     fun isValid(): Boolean = LockConfig.isKeyGeneration(keyGeneration) && LockConfig.decodedSize(wrappedKey) == LockConfig.KEY_WRAP_SIZE
+}
+
+/**
+ * A moment on the clock that counts since boot ([Clock.elapsedMillis]), with the boot it belongs
+ * to ([Clock.bootCount]). That clock starts again at every restart of the phone, so a time read
+ * from it means nothing without knowing which boot it was read in.
+ */
+@Serializable
+data class FingerprintPeriodStart(val elapsedMillis: Long, val bootCount: Int) {
+    /** Neither value can be negative on a phone; a negative one is a damaged configuration. */
+    fun isValid(): Boolean = elapsedMillis >= 0 && bootCount >= 0
 }
 
 class LockConfigUnreadableException(message: String, cause: Throwable? = null) : IOException(message, cause)
@@ -200,6 +231,38 @@ interface Clock {
     fun wallMillis(): Long
 
     fun elapsedMillis(): Long
+
+    /**
+     * Which start of the phone [elapsedMillis] counts from: a number the system raises at every
+     * boot. Null when it cannot be read, in which case a restart cannot be ruled out. Callers in
+     * the lock guard against an exception all the same.
+     */
+    fun bootCount(): Int?
+}
+
+/**
+ * The time limit of fingerprint unlock. The fingerprint opens the app only while the phone has
+ * not been restarted since the period last started, and less than the chosen period has passed
+ * since then on the clock that counts since boot. The period starts again at every successful
+ * unlock and at every lock; when it has run out, only the passphrase opens the app, and that
+ * unlock starts a new period.
+ *
+ * Unlike [Backoff], a restart is never measured against the new clock: whatever the time since
+ * boot says after a restart, the period has run out, because what matters is that the phone was
+ * restarted, not how long it took. Every case that cannot be decided counts as run out, the
+ * safe direction: no start recorded, a boot count that cannot be read, a time since boot below
+ * the recorded start (which no single boot can produce).
+ *
+ * The wall clock is not consulted: anyone holding the phone can set it.
+ */
+object FingerprintPeriod {
+    /** Whether the fingerprint may open the app now. Pure; [bootCount] and [nowElapsed] are read by the caller. */
+    fun allows(start: FingerprintPeriodStart?, bootCount: Int?, nowElapsed: Long, periodSeconds: Int): Boolean {
+        if (start == null || bootCount == null || !start.isValid() || bootCount < 0) return false
+        if (start.bootCount != bootCount) return false
+        if (nowElapsed < start.elapsedMillis || periodSeconds <= 0) return false
+        return nowElapsed - start.elapsedMillis < periodSeconds * 1000L
+    }
 }
 
 /**

@@ -161,15 +161,28 @@ class FakeClock(var wall: Long = 1_700_000_000_000L, var elapsed: Long = 50_000L
         return elapsed
     }
 
+    /** The system's count of boots; null stands for one that cannot be read. */
+    var boots: Int? = 1
+
+    /** Thrown by [bootCount] instead of answering, when set: reading the count failed. */
+    var bootCountFailure: RuntimeException? = null
+
+    override fun bootCount(): Int? {
+        onUse()
+        bootCountFailure?.let { throw it }
+        return boots
+    }
+
     fun advance(millis: Long) {
         wall += millis
         elapsed += millis
     }
 
-    /** The phone restarts after [downMillis] switched off: the time since boot starts again. */
+    /** The phone restarts after [downMillis] switched off: the time since boot starts again, and the boot count goes up. */
     fun reboot(downMillis: Long = 20_000L, upMillis: Long = 5_000L) {
         wall += downMillis + upMillis
         elapsed = upMillis
+        boots = boots?.plus(1)
     }
 }
 
@@ -203,6 +216,9 @@ class FakeScreenOffWatch : ScreenOffWatch {
         listener?.invoke()
     }
 }
+
+/** The key of a fingerprint unlock that succeeded; null for every other outcome. */
+fun BiometricUnlockResult.keyOrNull(): DataKey? = (this as? BiometricUnlockResult.Unlocked)?.key
 
 /** A configuration that validates, for tests that only care about some of its fields. */
 fun testConfig(

@@ -59,6 +59,32 @@ sealed interface BiometricCipherResult {
 
     /** The key was invalidated: fingerprint unlock has been removed (the passphrase still works). */
     data object Invalidated : BiometricCipherResult
+
+    /**
+     * The time limit has run out or the phone was restarted ([FingerprintPeriod]): only the
+     * passphrase opens the app now. Fingerprint unlock stays set up and works again after it.
+     */
+    data object PeriodOver : BiometricCipherResult
+}
+
+/** The outcome of [LockManager.unlockWithBiometric]. */
+sealed interface BiometricUnlockResult {
+    class Unlocked(val key: DataKey) : BiometricUnlockResult
+
+    /** Fingerprint unlock is not (or no longer) set up. */
+    data object NotEnabled : BiometricUnlockResult
+
+    /**
+     * The period ran out before the authorised cipher was used ([FingerprintPeriod]); nothing
+     * was decrypted. Fingerprint unlock stays set up and is not marked as invalidated.
+     */
+    data object PeriodOver : BiometricUnlockResult
+
+    /** The wrap did not open with its own, authorised key and has been removed. */
+    data object Removed : BiometricUnlockResult
+
+    /** It did not work this time, for a reason that may pass; fingerprint unlock stays as it is. */
+    data object Failed : BiometricUnlockResult
 }
 
 /** What a reset deleted. Anything false is still there and must be told to the user. */
@@ -178,7 +204,14 @@ class LockManager(
         val key = DataKey.generate(random)
         try {
             commitOrDelete(binding) {
-                val durable = save(LockConfig(passphrase = passphraseWrap(key, text, binding.generation), highestKeyGeneration = binding.generation))
+                val durable = save(
+                    LockConfig(
+                        passphrase = passphraseWrap(key, text, binding.generation),
+                        highestKeyGeneration = binding.generation,
+                        // Creating the passphrase is the first unlock.
+                        fingerprintPeriodStart = periodStartNow(),
+                    ),
+                )
                 if (!durable) {
                     config = null
                     ignoreFailure { store.delete() }
@@ -244,7 +277,16 @@ class LockManager(
             kek.fill(0)
         }
         try {
-            save(checkNotNull(config).copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0))
+            // The right passphrase also starts a new period of fingerprint unlock. (A check from
+            // Settings, made while unlocked, starts one too; the lock that follows starts it again.)
+            save(
+                checkNotNull(config).copy(
+                    failedAttempts = 0,
+                    lastFailureWallMillis = 0,
+                    lastFailureElapsedMillis = 0,
+                    fingerprintPeriodStart = periodStartNow(),
+                ),
+            )
             return PassphraseResult.Success(DataKey(dek), PassphraseProof(clock.elapsedMillis()))
         } finally {
             dek.fill(0)
@@ -345,9 +387,14 @@ class LockManager(
         deleteUnreferencedKeys()
     }
 
-    /** The cipher for a fingerprint unlock, or why there is none. */
+    /**
+     * The cipher for a fingerprint unlock, or why there is none. When the period has run out
+     * ([FingerprintPeriod]) the key store is not even asked: the key stays as it is, and nothing
+     * about fingerprint unlock changes.
+     */
     fun biometricUnlockCipher(): BiometricCipherResult {
         val wrap = config?.biometric ?: return BiometricCipherResult.NotEnabled
+        if (!fingerprintPeriodRunning()) return BiometricCipherResult.PeriodOver
         return try {
             val blob = wrap.wrappedKey.unbase64()
             BiometricCipherResult.Ready(vault.biometricDecryptCipher(wrap.keyGeneration, blob.copyOfRange(0, GCM_IV_SIZE)))
@@ -359,20 +406,25 @@ class LockManager(
     }
 
     /**
-     * Unwraps the data key with [cipher] after the biometric prompt authorised it; null if that
-     * fails. Only a wrap that its own, authorised key cannot open is removed (it is of no further
-     * use); any other failure may be passing and keeps fingerprint unlock as it is.
+     * Unwraps the data key with [cipher] after the biometric prompt authorised it. Only a wrap
+     * that its own, authorised key cannot open is removed (it is of no further use); any other
+     * failure may be passing and keeps fingerprint unlock as it is.
      *
-     * A success ends a streak of wrong passphrases exactly as the right passphrase does: the
-     * count goes back to zero and no wait is left. Someone who only ever unlocks by fingerprint
-     * would otherwise carry failures from months ago, and one more wrong passphrase would start
-     * at the long waits.
+     * The period of [FingerprintPeriod] is looked at again here, before the cipher is used: it
+     * may have run out while the prompt was showing, and the prompt's success says nothing about
+     * that. Refused, nothing is decrypted and fingerprint unlock stays set up.
      *
-     * @throws IOException if that reset could not be stored; the app is not unlocked then.
+     * A success starts a new period and ends a streak of wrong passphrases exactly as the right
+     * passphrase does: the count goes back to zero and no wait is left. Someone who only ever
+     * unlocks by fingerprint would otherwise carry failures from months ago, and one more wrong
+     * passphrase would start at the long waits.
+     *
+     * @throws IOException if that could not be stored; the app is not unlocked then.
      */
     @Throws(IOException::class)
-    fun unlockWithBiometric(cipher: Cipher): DataKey? {
-        val wrap = config?.biometric ?: return null
+    fun unlockWithBiometric(cipher: Cipher): BiometricUnlockResult {
+        val wrap = config?.biometric ?: return BiometricUnlockResult.NotEnabled
+        if (!fingerprintPeriodRunning()) return BiometricUnlockResult.PeriodOver
         val key = try {
             val blob = wrap.wrappedKey.unbase64()
             cipher.updateAAD(BIOMETRIC_AAD)
@@ -384,24 +436,86 @@ class LockManager(
             }
         } catch (_: AEADBadTagException) {
             biometricLost()
-            return null
+            return BiometricUnlockResult.Removed
         } catch (_: GeneralSecurityException) {
-            return null
+            return BiometricUnlockResult.Failed
         } catch (_: IllegalStateException) {
-            return null
+            return BiometricUnlockResult.Failed
         } catch (_: IllegalArgumentException) {
-            return null
+            return BiometricUnlockResult.Failed
         }
         val current = checkNotNull(config)
-        if (current.failedAttempts != 0 || current.lastFailureWallMillis != 0L || current.lastFailureElapsedMillis != 0L) {
-            try {
-                save(current.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0))
-            } catch (e: Exception) {
-                key.destroy()
-                throw e
-            }
+        try {
+            save(current.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0, fingerprintPeriodStart = periodStartNow()))
+        } catch (e: Exception) {
+            key.destroy()
+            throw e
         }
-        return key
+        return BiometricUnlockResult.Unlocked(key)
+    }
+
+    /**
+     * Whether fingerprint unlock is set up and its period is running now ([FingerprintPeriod]).
+     * False whenever that cannot be decided, a boot count that cannot be read included.
+     */
+    fun fingerprintPeriodRunning(): Boolean {
+        val current = config ?: return false
+        if (current.biometric == null) return false
+        return FingerprintPeriod.allows(current.fingerprintPeriodStart, bootCount(), clock.elapsedMillis(), current.fingerprintPeriodSeconds)
+    }
+
+    /**
+     * Starts the period of fingerprint unlock again from [atElapsed] ([Clock.elapsedMillis]):
+     * the moment the lock was due, which the caller passes and which is never later than the
+     * real lock (a lock that ran late, because a timer could not run, passes the moment it was
+     * due, not the moment it ran). Only with fingerprint unlock set up; best effort.
+     *
+     * A start that is already recorded for this boot and lies between [atElapsed] and now is
+     * kept: an unlock that was stored after this lock was decided is the later of the two. If
+     * the boot count cannot be read, no start is stored, so the period has run out.
+     *
+     * If the write fails, the start stored before stays in force: the period then ends earlier
+     * than it would have, never later, and the failure is not the lock's to report.
+     */
+    fun startFingerprintPeriod(atElapsed: Long) {
+        val current = config ?: return
+        if (current.biometric == null) return
+        val now = clock.elapsedMillis()
+        val boot = bootCount()
+        val existing = current.fingerprintPeriodStart
+        val at = atElapsed.coerceIn(0, now.coerceAtLeast(0))
+        if (existing != null && boot != null && existing.bootCount == boot && existing.elapsedMillis in at..now) return
+        val start = boot?.let { FingerprintPeriodStart(at, it) }
+        if (start == existing) return
+        try {
+            save(current.copy(fingerprintPeriodStart = start))
+        } catch (_: IOException) {
+            // The stored start stays; see above.
+        }
+    }
+
+    /** Stores [LockConfig.fingerprintPeriodSeconds]; one of [LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS]. */
+    @Throws(IOException::class)
+    fun setFingerprintPeriod(seconds: Int) {
+        require(seconds in LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS)
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (current.fingerprintPeriodSeconds != seconds) save(current.copy(fingerprintPeriodSeconds = seconds))
+    }
+
+    /** A start of the period of fingerprint unlock at this moment; null if the boot count cannot be read. */
+    private fun periodStartNow(): FingerprintPeriodStart? {
+        val boot = bootCount() ?: return null
+        return FingerprintPeriodStart(clock.elapsedMillis().coerceAtLeast(0), boot)
+    }
+
+    /**
+     * [Clock.bootCount], with every failure as "cannot be read": nothing that goes wrong in
+     * reading it may reach the lock, and a negative count is not one any phone gives.
+     */
+    private fun bootCount(): Int? = try {
+        clock.bootCount()?.takeIf { it >= 0 }
+    } catch (_: Exception) {
+        null
     }
 
     /**

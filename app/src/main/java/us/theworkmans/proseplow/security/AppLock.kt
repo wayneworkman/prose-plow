@@ -45,6 +45,15 @@ data class SecurityStatus(
     val fingerprintInvalidated: Boolean = false,
     /** An answer under way when the app locks by itself is finished behind the lock. */
     val finishAnswerAfterLocking: Boolean = true,
+    /** How long the fingerprint opens the app after it last locked or was unlocked ([FingerprintPeriod]). */
+    val fingerprintPeriodSeconds: Int = LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS,
+    /**
+     * Fingerprint unlock is set up, but its period has run out or the phone was restarted: only
+     * the passphrase opens the app now, and the lock screen neither shows the prompt by itself
+     * nor offers the fingerprint. As of the last time the lock manager was asked; the lock
+     * manager decides again, at the moment of use, whatever this says.
+     */
+    val fingerprintPeriodOver: Boolean = false,
 )
 
 enum class BiometricStatus {
@@ -286,8 +295,13 @@ class AppLock<S : UnlockedSession>(
     /**
      * A session that is left alive behind the lock until its work is finished, and no later than
      * [untilElapsed] ([Clock.elapsedMillis]). [watcher] waits for the work, [timer] for the time.
+     *
+     * [latestPeriodStart] is the latest moment its end may start the period of fingerprint
+     * unlock: the moment the lock that started it was due, plus [LEASE_MILLIS]. It differs from
+     * [untilElapsed] only when that lock ran late (a timer that could not run): the lease then
+     * lasts as always, but its end cannot make up for the hours the app was really unused.
      */
-    private class Lease<S>(val live: Live<S>, val untilElapsed: Long) {
+    private class Lease<S>(val live: Live<S>, val untilElapsed: Long, val latestPeriodStart: Long) {
         var watcher: Job? = null
         var timer: Job? = null
     }
@@ -422,6 +436,8 @@ class AppLock<S : UnlockedSession>(
             lockTimeoutSeconds = config?.lockTimeoutSeconds ?: LockConfig.DEFAULT_TIMEOUT_SECONDS,
             fingerprintInvalidated = config?.fingerprintInvalidated == true,
             finishAnswerAfterLocking = config?.finishAnswerAfterLocking != false,
+            fingerprintPeriodSeconds = config?.fingerprintPeriodSeconds ?: LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS,
+            fingerprintPeriodOver = config?.biometric != null && !m.fingerprintPeriodRunning(),
         )
     }
 
@@ -469,11 +485,11 @@ class AppLock<S : UnlockedSession>(
      * working on decrypted data. "Lock now" always ends it, and so does a reset, which deletes
      * the files under it.
      */
-    private fun endSession(session: Live<S>, reason: SessionEnd) {
+    private fun endSession(session: Live<S>, reason: SessionEnd, lockedAt: Long) {
         session.session.clearScreens()
         val finishBehindTheLock = reason == SessionEnd.LOCK_BY_ITSELF && _status.value.finishAnswerAfterLocking &&
             session.session.hasUnfinishedWork() && canFinishOutOfSight()
-        if (finishBehindTheLock) startLease(session) else retire(session)
+        if (finishBehindTheLock) startLease(session, lockedAt) else retire(session)
     }
 
     /** Main thread: [session] has ended. It waits for [closeRetired], which whoever called this arranges. */
@@ -494,9 +510,9 @@ class AppLock<S : UnlockedSession>(
      * looked at wherever the lease matters: when the app comes to the front, and before a
      * session is handed back.
      */
-    private fun startLease(session: Live<S>) {
+    private fun startLease(session: Live<S>, lockedAt: Long) {
         session.session.finishOnly()
-        val parked = Lease(session, clock.elapsedMillis() + LEASE_MILLIS)
+        val parked = Lease(session, clock.elapsedMillis() + LEASE_MILLIS, latestPeriodStart = lockedAt + LEASE_MILLIS)
         lease = parked
         refreshSessionEnding()
         parked.timer = main.launch {
@@ -520,11 +536,25 @@ class AppLock<S : UnlockedSession>(
         lease?.let(::endLease)
     }
 
-    /** Main thread: ends [parked] if it is still the lease. Its session is closed, and its key destroyed, from here. */
+    /**
+     * Main thread: ends [parked] if it is still the lease. Its session is closed, and its key
+     * destroyed, from here. The end of a lease is a lock, so the period of fingerprint unlock
+     * starts again; that is stored after the key is gone (see [lockAs]). It starts at the moment
+     * the lease was due to end at the latest, never later: every caller may run late (a timer
+     * that could not run, the check when the app comes to the front, an unlock), and a late end
+     * must not count as recent use. See [Lease.latestPeriodStart] for a lease that began late.
+     */
     private fun endLease(parked: Lease<S>) {
         if (!release(parked)) return
         retire(parked.live)
-        launchWork { withManager { closeRetired() } }
+        val endedAt = minOf(clock.elapsedMillis(), parked.untilElapsed, parked.latestPeriodStart)
+        launchWork {
+            withManager { m ->
+                closeRetired()
+                m.startFingerprintPeriod(endedAt)
+                publishStatus(m)
+            }
+        }
     }
 
     /** Main thread: [parked] is the lease no longer; false if it was not. What becomes of its session is the caller's to say. */
@@ -647,7 +677,7 @@ class AppLock<S : UnlockedSession>(
         val opened = Live(session, crypto, key)
         withContext(mainDispatcher) {
             if (_state.value != from) {
-                endSession(opened, SessionEnd.NEVER_SHOWN)
+                endSession(opened, SessionEnd.NEVER_SHOWN, lockedAt = clock.elapsedMillis())
                 return@withContext
             }
             show(opened, offer)
@@ -707,7 +737,7 @@ class AppLock<S : UnlockedSession>(
      * answer that is being written is stopped, and a lease that is running ends here too.
      */
     fun lock() {
-        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW) else lease?.let(::endLease)
+        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW, lockedAt = clock.elapsedMillis()) else lease?.let(::endLease)
     }
 
     /**
@@ -715,18 +745,35 @@ class AppLock<S : UnlockedSession>(
      * to the foreground. As [lock], except that [endSession] may leave the session alive to
      * finish its work. No-op unless unlocked.
      */
-    private fun lockByItself() {
-        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_BY_ITSELF)
+    private fun lockByItself(dueAt: Long? = backgroundPolicy.dueAt()) {
+        if (_state.value !is LockState.Unlocked) return
+        val now = clock.elapsedMillis()
+        // A lock by itself is due when the app left the screen plus the timeout; it may run
+        // later (a timer that could not run while the process was frozen or the phone slept),
+        // and then it counts as having happened when it was due. Without a due moment (none is
+        // expected) it is now.
+        lockAs(SessionEnd.LOCK_BY_ITSELF, lockedAt = dueAt?.let { minOf(it, now) } ?: now)
     }
 
-    private fun lockAs(reason: SessionEnd) {
-        leaveUnlocked(reason)
+    /**
+     * Main thread: the app locks. Every lock starts the period of fingerprint unlock again, from
+     * [lockedAt], the moment the lock was due ([Clock.elapsedMillis]), never later: now for "Lock
+     * now", and for a lock by itself the moment the app left the screen plus the timeout, if
+     * that is earlier than now (see [lockByItself]). A lock that ran late must not count as
+     * recent use. The start is stored only after [closeRetired] has destroyed the key (or, for a
+     * lease, left it to the lease), so the write never holds the key in memory. It is done under
+     * the mutex inside [launchWork], and the process is only ended when nothing holds the mutex
+     * ([considerEndingProcess]), so the write is finished before the process can be ended.
+     */
+    private fun lockAs(reason: SessionEnd, lockedAt: Long) {
+        leaveUnlocked(reason, lockedAt)
         enterLocked(waitMillis = 0)
         launchWork {
             withManager { m ->
                 closeRetired()
                 // Unless the user is already back in: an enrolment of the new session is not this lock's to cancel.
                 if (live == null) m.cancelBiometricEnrollment()
+                m.startFingerprintPeriod(lockedAt)
                 // Wrong passphrases entered in Settings count too; the lock screen shows their wait.
                 val waitMillis = m.backoffRemainingMillis()
                 if (waitMillis > 0) _unlockUi.update { it.copy(retryAtElapsed = retryAt(waitMillis)) }
@@ -736,7 +783,7 @@ class AppLock<S : UnlockedSession>(
     }
 
     /** Main thread: everything that belongs to the unlocked state goes, whatever the state is now. */
-    private fun leaveUnlocked(reason: SessionEnd) {
+    private fun leaveUnlocked(reason: SessionEnd, lockedAt: Long = clock.elapsedMillis()) {
         lockTimer?.cancel()
         lockTimer = null
         backgroundPolicy.reset()
@@ -755,7 +802,7 @@ class AppLock<S : UnlockedSession>(
         // order the work that follows runs in.
         val ending = live
         live = null
-        ending?.let { endSession(it, reason) }
+        ending?.let { endSession(it, reason, lockedAt) }
         _sessionGeneration.update { it + 1 }
     }
 
@@ -816,7 +863,9 @@ class AppLock<S : UnlockedSession>(
         lockTimer = null
         screenshots.current()
         lease?.let { if (clock.elapsedMillis() >= it.untilElapsed) endLease(it) }
-        if (backgroundPolicy.onForeground(clock.elapsedMillis())) lockByItself()
+        // Read before onForeground clears it: a lock made up for here counts from when it was due.
+        val dueAt = backgroundPolicy.dueAt()
+        if (backgroundPolicy.onForeground(clock.elapsedMillis())) lockByItself(dueAt)
     }
 
     /**
@@ -948,12 +997,16 @@ class AppLock<S : UnlockedSession>(
 
     /**
      * Shows the fingerprint prompt automatically, once per lock (main thread; called on every
-     * resume of the lock screen). If it could not be shown, the next resume tries again.
+     * resume of the lock screen). If it could not be shown, the next resume tries again. Not
+     * while the period of fingerprint unlock has run out ([SecurityStatus.fingerprintPeriodOver]);
+     * should that have changed since it was published, the lock manager refuses the cipher, and
+     * no prompt is shown either.
      */
     fun autoPromptBiometric(forGeneration: Int) {
         if (autoPromptedGeneration == forGeneration) return
         autoPromptedGeneration = forGeneration
-        if (_status.value.biometricEnabled) requestBiometricUnlock()
+        val status = _status.value
+        if (status.biometricEnabled && !status.fingerprintPeriodOver) requestBiometricUnlock()
     }
 
     fun requestBiometricUnlock() {
@@ -1028,11 +1081,15 @@ class AppLock<S : UnlockedSession>(
                         if (!ok) m.cancelBiometricEnrollment()
                         _unlockUi.update { it.copy(notice = if (ok) BiometricNotice.ENROLLED else BiometricNotice.ENROLL_FAILED) }
                     } else if (cipher != null && from is LockState.Locked) {
-                        val key = m.unlockWithBiometric(cipher)
-                        when {
-                            key != null -> openOrReattach(key, from, offer = null)
-                            m.config?.biometric == null -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_FAILED) }
-                            else -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_UNAVAILABLE) }
+                        when (val result = m.unlockWithBiometric(cipher)) {
+                            is BiometricUnlockResult.Unlocked -> openOrReattach(result.key, from, offer = null)
+                            BiometricUnlockResult.NotEnabled, BiometricUnlockResult.Removed ->
+                                _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_FAILED) }
+                            BiometricUnlockResult.Failed -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_UNAVAILABLE) }
+                            // The period ran out while the prompt was showing. Nothing to say but
+                            // what the lock screen now shows (publishStatus below): the passphrase
+                            // is needed, and fingerprint unlock stays set up.
+                            BiometricUnlockResult.PeriodOver -> Unit
                         }
                     }
                     publishStatus(m)
@@ -1189,6 +1246,9 @@ class AppLock<S : UnlockedSession>(
     }
 
     suspend fun setLockTimeout(seconds: Int) = op { m -> m.setLockTimeout(seconds) }
+
+    /** How long the fingerprint works after a lock; one of [LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS]. */
+    suspend fun setFingerprintPeriod(seconds: Int) = op { m -> m.setFingerprintPeriod(seconds) }
 
     /** Whether an answer under way is finished behind the app's own lock; see the class comment. */
     suspend fun setFinishAnswerAfterLocking(enabled: Boolean) = op { m -> m.setFinishAnswerAfterLocking(enabled) }

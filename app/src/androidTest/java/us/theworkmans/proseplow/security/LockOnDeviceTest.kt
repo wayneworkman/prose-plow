@@ -32,6 +32,9 @@ class LockOnDeviceTest {
         override fun wallMillis() = System.currentTimeMillis()
 
         override fun elapsedMillis() = SystemClock.elapsedRealtime()
+
+        /** One boot throughout: the test never restarts the phone. */
+        override fun bootCount(): Int? = 1
     }
 
     private val configFile get() = File(directory, "security/lock.json")

@@ -157,9 +157,10 @@ private fun LockScreen(appLock: AppLock<*>, state: LockState.Locked) {
     val field = remember { TextFieldState() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    // The fingerprint prompt, once per lock, as soon as the app is in front.
-    LaunchedEffect(state.generation, status.biometricEnabled) {
-        if (status.biometricEnabled) {
+    // The fingerprint prompt, once per lock, as soon as the app is in front; not once its period has run out.
+    val fingerprintOffered = status.biometricEnabled && !status.fingerprintPeriodOver
+    LaunchedEffect(state.generation, fingerprintOffered) {
+        if (fingerprintOffered) {
             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { appLock.autoPromptBiometric(state.generation) }
         }
     }
@@ -187,12 +188,19 @@ private fun LockScreen(appLock: AppLock<*>, state: LockState.Locked) {
         ui.rejected?.let { passphraseProblemText(it) }?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         RetryCountdown(waitMillis)
         ui.error?.let { Text(stringResource(R.string.error_detail, it), color = MaterialTheme.colorScheme.error) }
+        if (status.biometricEnabled && status.fingerprintPeriodOver) {
+            Text(
+                stringResource(R.string.lock_fingerprint_period_over),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
     if (ui.busy) Working(stringResource(R.string.lock_checking))
     Button(onClick = submit, enabled = canSubmit, modifier = Modifier.fillMaxWidth()) {
         Text(stringResource(R.string.lock_unlock))
     }
-    if (status.biometricEnabled) {
+    if (fingerprintOffered) {
         OutlinedButton(onClick = appLock::requestBiometricUnlock, enabled = !ui.busy && !ui.biometricPromptShowing, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.use_fingerprint))
         }

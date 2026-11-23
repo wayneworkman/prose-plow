@@ -7,6 +7,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -255,11 +256,15 @@ class LockHardeningTest {
         assertEquals(120_000L, m.backoffRemainingMillis())
 
         val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-        val unlocked = m.unlockWithBiometric(cipher)!!
+        val unlocked = m.unlockWithBiometric(cipher).keyOrNull()!!
         assertArrayEquals(key.bytes, unlocked.bytes)
 
         val after = store.read()!!
-        assertEquals("what the right passphrase leaves behind", failed.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0), after)
+        assertEquals(
+            "what the right passphrase leaves behind, a new period of fingerprint unlock included",
+            failed.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0, fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)),
+            after,
+        )
         assertEquals(0L, m.backoffRemainingMillis())
 
         // So the passphrase is not refused afterwards, and the next wrong ones are the free ones again.
@@ -274,7 +279,7 @@ class LockHardeningTest {
         failPatiently(restarted, 7)
         clock.advance(120_000)
         restarted.unlock(passphrase).key.destroy()
-        assertEquals(after, store.read()!!)
+        assertEquals(after.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)), store.read()!!)
     }
 
     @Test
@@ -285,29 +290,35 @@ class LockHardeningTest {
         failPatiently(m, 6)
         val before = store.read()!!
         // A cipher the platform did not leave usable (here: never initialised).
-        assertNull(m.unlockWithBiometric(Cipher.getInstance("AES/GCM/NoPadding")))
+        assertEquals(BiometricUnlockResult.Failed, m.unlockWithBiometric(Cipher.getInstance("AES/GCM/NoPadding")))
         assertEquals(before, store.read()!!)
         assertEquals(60_000L, m.backoffRemainingMillis())
     }
 
+    /**
+     * With no streak to end, a fingerprint unlock stores one thing: the new start of the period
+     * of fingerprint unlock. Catches a success that forgets to start the period again, and one
+     * that changes anything else on the way.
+     */
     @Test
-    fun aFingerprintUnlockWithNothingToResetWritesNothing() {
+    fun aFingerprintUnlockWithNothingToResetStoresOnlyTheNewPeriod() {
         enrolled()
         var writeSteps = 0
         val m = LockManager(LockConfigStore(configFile, onWriteStep = { writeSteps++ }), vault, clock, iterations = 1_000, minIterations = 1, encryptedDataExists = { false })
         m.start()
-        val before = configFile.readBytes()
+        val before = store.read()!!
+        clock.advance(10_000)
         writeSteps = 0
         val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-        assertTrue(m.unlockWithBiometric(cipher) != null)
-        assertEquals("the configuration was not written", 0, writeSteps)
-        assertArrayEquals(before, configFile.readBytes())
+        assertTrue(m.unlockWithBiometric(cipher) is BiometricUnlockResult.Unlocked)
+        assertTrue("the new period was stored", writeSteps > 0)
+        assertEquals(before.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)), store.read()!!)
 
         // With a streak to end it is written, once.
         fail(m, 1)
         writeSteps = 0
         val again = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
-        assertTrue(m.unlockWithBiometric(again) != null)
+        assertTrue(m.unlockWithBiometric(again) is BiometricUnlockResult.Unlocked)
         assertTrue("the reset was stored", writeSteps > 0)
         assertEquals(0, store.read()!!.failedAttempts)
     }
@@ -440,6 +451,13 @@ class LockHardeningTest {
             "a negative failure time since boot" to { it["lastFailureElapsedMillis"] = -1 },
             "an unknown lock timeout" to { it["lockTimeoutSeconds"] = 42 },
             "a lock timeout that never locks" to { it["lockTimeoutSeconds"] = -1 },
+            "an unknown fingerprint period" to { it["fingerprintPeriodSeconds"] = 42 },
+            "a fingerprint period of no time" to { it["fingerprintPeriodSeconds"] = 0 },
+            "a fingerprint period without a limit" to { it["fingerprintPeriodSeconds"] = -1 },
+            "a fingerprint period that is not a number" to { it["fingerprintPeriodSeconds"] = "3600x" },
+            "a negative start of the fingerprint period" to { it["fingerprintPeriodStart"] = mapOf("elapsedMillis" to -1, "bootCount" to 1) },
+            "a negative boot count" to { it["fingerprintPeriodStart"] = mapOf("elapsedMillis" to 5, "bootCount" to -1) },
+            "a start of the fingerprint period without its boot" to { it["fingerprintPeriodStart"] = mapOf("elapsedMillis" to 5) },
         )
         for ((name, edit) in cases) {
             temp.root.resolve("security").deleteRecursively()
@@ -499,6 +517,40 @@ class LockHardeningTest {
             editStored { it["finishAnswerAfterLocking"] = bad }
             assertEquals("$bad", StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
         }
+    }
+
+    /**
+     * The time limit of fingerprint unlock was added without a new version, as
+     * "finishAnswerAfterLocking" was. A file written before it existed reads, validates and has
+     * the default period, but no start of one: the period has run out, so an installation with
+     * fingerprint unlock asks for the passphrase once after the update, and after that the
+     * fingerprint works. Catches a default that would make old files unreadable (the data lost),
+     * one that would let the fingerprint in without a start, and an unlock that forgets to start
+     * the period.
+     */
+    @Test
+    fun aConfigurationFromBeforeTheTimeLimitReadsAndAsksForThePassphraseOnce() {
+        val key = enrolled()
+        editStored {
+            it.remove("fingerprintPeriodSeconds")
+            it.remove("fingerprintPeriodStart")
+        }
+        assertFalse(configFile.readText().contains("fingerprintPeriod"))
+        val m = manager()
+        assertEquals(StartResult.Locked, m.start())
+        val config = m.config!!
+        assertTrue(config.isValid(minIterations = 1))
+        assertEquals(1, config.version)
+        assertEquals(LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS, config.fingerprintPeriodSeconds)
+        assertNull(config.fingerprintPeriodStart)
+        assertFalse(m.fingerprintPeriodRunning())
+        assertEquals(BiometricCipherResult.PeriodOver, m.biometricUnlockCipher())
+        assertNotNull("fingerprint unlock stays set up", m.config!!.biometric)
+        assertFalse(m.config!!.fingerprintInvalidated)
+
+        assertArrayEquals(key.bytes, m.unlock(passphrase).key.bytes)
+        assertEquals(FingerprintPeriodStart(clock.elapsed, 1), store.read()!!.fingerprintPeriodStart)
+        assertTrue(fingerprintOpens(key))
     }
 
     @Test
@@ -644,7 +696,7 @@ class LockHardeningTest {
         val m = manager()
         m.start()
         val cipher = (m.biometricUnlockCipher() as? BiometricCipherResult.Ready)?.cipher ?: return false
-        return m.unlockWithBiometric(cipher)?.bytes?.contentEquals(expected.bytes) == true
+        return m.unlockWithBiometric(cipher).keyOrNull()?.bytes?.contentEquals(expected.bytes) == true
     }
 
     @Test
@@ -701,7 +753,7 @@ class LockHardeningTest {
         assertTrue(m.biometricUnlockCipher() is BiometricCipherResult.Ready)
         // A cipher the platform did not leave usable (here: never initialised) fails with IllegalStateException.
         val unusable = Cipher.getInstance("AES/GCM/NoPadding")
-        assertNull(m.unlockWithBiometric(unusable))
+        assertEquals(BiometricUnlockResult.Failed, m.unlockWithBiometric(unusable))
         assertTrue("not removed", m.config!!.biometric != null)
         assertTrue(fingerprintOpens(key))
     }

@@ -6,7 +6,6 @@ import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -85,7 +84,7 @@ class MandatoryLockTest {
         assertEquals(StartResult.Locked, cold.start())
         // Without fingerprint unlock there is no cipher to authorise, and no other one opens anything.
         assertEquals(BiometricCipherResult.NotEnabled, cold.biometricUnlockCipher())
-        assertNull(cold.unlockWithBiometric(Cipher.getInstance("AES/GCM/NoPadding")))
+        assertEquals(BiometricUnlockResult.NotEnabled, cold.unlockWithBiometric(Cipher.getInstance("AES/GCM/NoPadding")))
         assertTrue(cold.checkPassphrase("not the passphrase".toCharArray()) is PassphraseResult.Wrong)
         assertArrayEquals(key.bytes, cold.unlock(passphrase).key.bytes)
     }
@@ -132,6 +131,8 @@ class MandatoryLockTest {
                 "lastFailureElapsedMillis",
                 "fingerprintInvalidated",
                 "highestKeyGeneration",
+                "fingerprintPeriodSeconds",
+                "fingerprintPeriodStart",
             ),
             stored.keys,
         )
@@ -141,6 +142,8 @@ class MandatoryLockTest {
         assertEquals(JsonNull, stored.getValue("biometric"))
         assertEquals("60", stored.getValue("lockTimeoutSeconds").toString())
         assertEquals("true", stored.getValue("finishAnswerAfterLocking").toString())
+        assertEquals("3600", stored.getValue("fingerprintPeriodSeconds").toString())
+        assertEquals("creating the passphrase is the first unlock", setOf("elapsedMillis", "bootCount"), stored.getValue("fingerprintPeriodStart").jsonObject.keys)
 
         m.completeBiometricEnrollment(created.proof, created.key, m.prepareBiometricEnrollment(created.proof))
         stored = Json.parseToJsonElement(configFile.readText()).jsonObject
