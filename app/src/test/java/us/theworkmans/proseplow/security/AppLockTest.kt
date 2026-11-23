@@ -8,6 +8,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -55,6 +56,15 @@ class AppLockTest {
     private var openFails: Exception? = null
     private val screenWatch = FakeScreenOffWatch()
 
+    /** Every run of the locked clean-up: the readable limit and the trusted time it was given. */
+    private val sweeps = mutableListOf<Pair<Int, Long>>()
+
+    /** The readable copy of how long messages are kept that the lock handed to each session it opened. */
+    private val copiesHandedIn = mutableListOf<Int>()
+
+    /** What the sessions opened from now on say their setting of how long messages are kept is. */
+    private var sessionLifetime: Int? = null
+
     /** Whether the keep-alive (the answer service in the foreground) is running, as the lock is told. */
     private var keepAliveRunning = true
 
@@ -90,7 +100,11 @@ class AppLockTest {
         assertEquals("the lock manager was used outside the mutex", emptyList<String>(), unserialised)
     }
 
-    private class FakeSession(val cipher: BlobCipher, private val log: MutableList<String>) : UnlockedSession {
+    private class FakeSession(
+        val cipher: BlobCipher,
+        private val log: MutableList<String>,
+        override val messageLifetimeDays: Int? = null,
+    ) : UnlockedSession {
         var screensCleared = 0
         var closeStarted = false
         var closed = false
@@ -205,9 +219,10 @@ class AppLockTest {
             manager = manager,
             files = files,
             clock = clock,
-            openSession = { cipher ->
+            openSession = { cipher, lockedDays ->
                 openFails?.let { throw it }
-                FakeSession(cipher, log).also { sessions += it }
+                copiesHandedIn += lockedDays
+                FakeSession(cipher, log, sessionLifetime).also { sessions += it }
             },
             biometricStatus = { biometric },
             screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
@@ -228,6 +243,11 @@ class AppLockTest {
                 }
             },
             canFinishOutOfSight = { keepAliveRunning },
+            expiredData = { lifetime, now ->
+                insideTheManager()
+                log += "expired data swept"
+                sweeps += lifetime to now
+            },
         )
         assertEquals("nothing is known before the configuration was read", LockState.Starting, lock.state.value)
         if (visible) {
@@ -1932,7 +1952,9 @@ class AppLockTest {
 
         assertFalse(lock.changePassphrase(proof, otherPassphrase.toCharArray()))
         assertFalse(lock.startBiometricEnrollment(proof))
-        assertEquals(before, files.lockConfig.readText())
+        // The lock itself recorded the trusted time; nothing else was written.
+        val after = Json.decodeFromString(LockConfig.serializer(), files.lockConfig.readText())
+        assertEquals(Json.decodeFromString(LockConfig.serializer(), before).copy(trustedTime = after.trustedTime), after)
         assertTrue(vault.biometricKeys.isEmpty())
         assertFalse(session.closeStarted)
     }
@@ -2638,5 +2660,92 @@ class AppLockTest {
         runCurrent()
         createPassphrase()
         changed("the set-up after it")
+    }
+
+    // --- The expiry of messages while locked ------------------------------------------------------
+
+    /**
+     * Every start of the lock deletes what has expired without the key, under the lock's mutex
+     * and before the lock screen can take a passphrase, with the readable copy of the limit and
+     * the trusted time, which it stores. A first start has nothing to clean. Catches a clean-up
+     * that runs outside the mutex (the log of unserialised uses), one that runs after an unlock
+     * could begin, and a lock that does not record the trusted time.
+     */
+    @Test
+    fun theLockedCleanUpRunsAtEveryStartBeforeAnythingCanBeUnlocked() = runTest(dispatcher) {
+        startApp()
+        assertEquals("nothing is set up, so nothing is swept", emptyList<Pair<Int, Long>>(), sweeps)
+        createPassphrase()
+        clock.wall += 5_000
+        lock.lock()
+        runCurrent()
+        assertEquals("a lock records the trusted time", clock.wall, LockConfigStore(files.lockConfig).read()!!.trustedTime!!.wallMillis)
+
+        // The next process; the date was set back meanwhile, which must not take the time back.
+        val lockedAt = clock.wall
+        clock.wall -= 86_400_000L
+        clock.elapsed += 1_000
+        log.clear()
+        startApp()
+        assertEquals(listOf(7 to lockedAt + 1_000), sweeps)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(TimeMark(lockedAt + 1_000, clock.elapsed, 1), LockConfigStore(files.lockConfig).read()!!.trustedTime)
+        enter(passphrase)
+        assertEquals("the sweep came before the unlock", "expired data swept", log.first())
+    }
+
+    /**
+     * The clean-up deletes nothing while a session is alive: here one whose last write is still
+     * stuck in the disk, when Try again starts the lock over. Its files are that session's, and a
+     * late write could put back what was deleted. The trusted time is still recorded.
+     */
+    @Test
+    fun theLockedCleanUpIsSkippedWhileASessionIsStillAlive() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val hung = CompletableDeferred<Unit>()
+        session.hungWrite = hung
+        lock.lock()
+        runCurrent()
+
+        openFails = IOException("disk full")
+        enter(passphrase)
+        assertTrue(lock.state.value is LockState.Failed)
+        openFails = null
+        clock.wall += 7_000
+        lock.retry()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals("nothing swept while the old session can still write", emptyList<Pair<Int, Long>>(), sweeps)
+        assertEquals(clock.wall, LockConfigStore(files.lockConfig).read()!!.trustedTime!!.wallMillis)
+
+        hung.complete(Unit)
+        runCurrent()
+        startApp()
+        assertEquals(1, sweeps.size)
+    }
+
+    /**
+     * The readable copy follows the session's own setting at every unlock, whatever it said
+     * before: the locked app deletes by it. Catches an unlock that leaves a stale copy.
+     */
+    @Test
+    fun everyUnlockOverwritesTheReadableCopyFromTheRealSetting() = runTest(dispatcher) {
+        startApp()
+        sessionLifetime = 1
+        createPassphrase()
+        assertEquals(1, LockConfigStore(files.lockConfig).read()!!.messageLifetimeDays)
+
+        lock.lock()
+        runCurrent()
+        // Changed behind the session's back, as a failed write of the copy would leave it.
+        val store = LockConfigStore(files.lockConfig)
+        store.write(store.read()!!.copy(messageLifetimeDays = 90))
+        startApp()
+        assertEquals(90, sweeps.single().first)
+        sessionLifetime = LockConfig.MESSAGE_LIFETIME_NEVER
+        enter(passphrase)
+        assertEquals("the session was handed the copy as it stood, to fall back on", 90, copiesHandedIn.last())
+        assertEquals(0, LockConfigStore(files.lockConfig).read()!!.messageLifetimeDays)
     }
 }

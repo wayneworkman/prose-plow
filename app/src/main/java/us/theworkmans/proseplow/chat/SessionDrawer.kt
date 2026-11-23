@@ -38,6 +38,8 @@ import us.theworkmans.proseplow.core.chat.SessionSummary
  * own Delete, which asks before it deletes.
  *
  * @param generatingId the chat a reply is being written in, or null.
+ * @param nowMillis the time the chats' dates are measured against: the same trusted time they
+ *   were stamped by, so that a phone clock set back does not show a change in the future.
  */
 @Composable
 fun SessionDrawer(
@@ -48,6 +50,7 @@ fun SessionDrawer(
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
     onSettings: () -> Unit,
+    nowMillis: () -> Long,
 ) {
     ModalDrawerSheet {
         Text(
@@ -79,6 +82,7 @@ fun SessionDrawer(
                         chat = chat,
                         selected = chat.id == openId,
                         generating = chat.id == generatingId,
+                        nowMillis = nowMillis,
                         onOpen = { onOpen(chat.id) },
                         onDelete = { onDelete(chat.id) },
                     )
@@ -99,13 +103,13 @@ fun SessionDrawer(
 }
 
 @Composable
-private fun ChatRow(chat: SessionSummary, selected: Boolean, generating: Boolean, onOpen: () -> Unit, onDelete: () -> Unit) {
+private fun ChatRow(chat: SessionSummary, selected: Boolean, generating: Boolean, nowMillis: () -> Long, onOpen: () -> Unit, onDelete: () -> Unit) {
     val title = chat.title.ifEmpty { stringResource(R.string.chat_untitled) }
     val model = modelName(chat.modelId)
     // Worked out when the row is first shown; good enough for a list that is open for seconds.
     val justNow = stringResource(R.string.chat_just_now)
     val changed = remember(chat.updatedAtMillis, justNow) {
-        val now = System.currentTimeMillis()
+        val now = nowMillis()
         if (now - chat.updatedAtMillis < DateUtils.MINUTE_IN_MILLIS) {
             justNow
         } else {

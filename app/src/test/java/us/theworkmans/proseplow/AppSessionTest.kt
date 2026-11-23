@@ -448,7 +448,7 @@ class AppSessionTest {
             ),
             files = files,
             clock = lockClock,
-            openSession = { unlocked ->
+            openSession = { unlocked, _ ->
                 cipher = unlocked
                 val recording = object : BlobCipher {
                     override fun seal(purpose: String, plaintext: ByteArray): ByteArray {
@@ -1099,7 +1099,7 @@ class AppSessionTest {
             ),
             files = files,
             clock = lockClock,
-            openSession = { unlocked ->
+            openSession = { unlocked, _ ->
                 ciphers += unlocked
                 // The cipher itself is untouched. The write "hangs" after its bytes were sealed,
                 // which is where the real code writes, syncs and renames.

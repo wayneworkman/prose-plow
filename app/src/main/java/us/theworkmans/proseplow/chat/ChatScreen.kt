@@ -176,6 +176,7 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                     closeDrawer()
                     onOpenSettings()
                 },
+                nowMillis = viewModel::nowMillis,
             )
         },
     ) {

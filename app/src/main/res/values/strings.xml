@@ -98,6 +98,15 @@
     <string name="timeout_1_minute">1 minute</string>
     <string name="timeout_5_minutes">5 minutes</string>
     <string name="timeout_15_minutes">15 minutes</string>
+    <string name="security_message_lifetime">Delete messages after</string>
+    <string name="security_message_lifetime_support">Messages older than this are deleted from this phone whenever the app runs, also while it is locked. A question and its answers go together, up to a day early (3 hours with 1 day).</string>
+    <string name="message_lifetime_1_day">1 day</string>
+    <string name="message_lifetime_7_days">7 days</string>
+    <string name="message_lifetime_30_days">30 days</string>
+    <string name="message_lifetime_90_days">90 days</string>
+    <string name="message_lifetime_never">Never</string>
+    <string name="message_lifetime_confirm_title">Delete older messages now?</string>
+    <string name="message_lifetime_confirm_text">Messages older than %1$s will be deleted now, and from then on every message when it reaches that age. A chat left without messages is deleted. This cannot be undone.</string>
     <string name="security_finish_answer">Finish the answer after locking</string>
     <plurals name="security_finish_answer_on">
         <item quantity="one">On: if the app locks by itself while an answer is being written, the screen locks as always and the answer is finished behind it. Until it is finished, for at most %1$d minute, the encryption key stays in memory; then it is erased. Lock now always stops the answer and erases the key at once.</item>

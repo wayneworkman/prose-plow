@@ -262,7 +262,13 @@ class LockHardeningTest {
         val after = store.read()!!
         assertEquals(
             "what the right passphrase leaves behind, a new period of fingerprint unlock included",
-            failed.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0, fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)),
+            failed.copy(
+                failedAttempts = 0,
+                lastFailureWallMillis = 0,
+                lastFailureElapsedMillis = 0,
+                fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1),
+                trustedTime = TimeMark(clock.wall, clock.elapsed, 1),
+            ),
             after,
         )
         assertEquals(0L, m.backoffRemainingMillis())
@@ -279,7 +285,10 @@ class LockHardeningTest {
         failPatiently(restarted, 7)
         clock.advance(120_000)
         restarted.unlock(passphrase).key.destroy()
-        assertEquals(after.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)), store.read()!!)
+        assertEquals(
+            after.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1), trustedTime = TimeMark(clock.wall, clock.elapsed, 1)),
+            store.read()!!,
+        )
     }
 
     @Test
@@ -312,7 +321,11 @@ class LockHardeningTest {
         val cipher = (m.biometricUnlockCipher() as BiometricCipherResult.Ready).cipher
         assertTrue(m.unlockWithBiometric(cipher) is BiometricUnlockResult.Unlocked)
         assertTrue("the new period was stored", writeSteps > 0)
-        assertEquals(before.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1)), store.read()!!)
+        assertEquals(
+            "and the trusted time, which every unlock records",
+            before.copy(fingerprintPeriodStart = FingerprintPeriodStart(clock.elapsed, 1), trustedTime = TimeMark(clock.wall, clock.elapsed, 1)),
+            store.read()!!,
+        )
 
         // With a streak to end it is written, once.
         fail(m, 1)
@@ -517,6 +530,88 @@ class LockHardeningTest {
             editStored { it["finishAnswerAfterLocking"] = bad }
             assertEquals("$bad", StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
         }
+    }
+
+    /**
+     * The readable copy of how long messages are kept, and the trusted time, were added without
+     * a new version. A file without them reads and validates: the copy means 7 days and no time
+     * is trusted yet. A value outside the choices, or a mark no clock can give, is a damaged
+     * configuration like any other. Catches a default that would make old files unreadable, a
+     * copy that is not validated, and an unlock that does not record the trusted time.
+     */
+    @Test
+    fun theMessageLifetimeCopyAndTheTrustedTimeReadFromAnOlderFileAndAreValidated() {
+        setUp()
+        editStored {
+            it.remove("messageLifetimeDays")
+            it.remove("trustedTime")
+        }
+        assertFalse(configFile.readText().contains("messageLifetime") || configFile.readText().contains("trustedTime"))
+        val m = manager()
+        assertEquals(StartResult.Locked, m.start())
+        assertTrue(m.config!!.isValid(minIterations = 1))
+        assertEquals(7, m.messageLifetimeDays)
+        assertNull(m.config!!.trustedTime)
+
+        m.unlock(passphrase)
+        assertEquals("an unlock records the trusted time", TimeMark(clock.wall, clock.elapsed, 1), store.read()!!.trustedTime)
+
+        m.setMessageLifetimeDays(LockConfig.MESSAGE_LIFETIME_NEVER)
+        assertThrows(IllegalArgumentException::class.java) { m.setMessageLifetimeDays(2) }
+        assertTrue(configFile.readText(), configFile.readText().contains("\"messageLifetimeDays\":0"))
+        val restarted = manager()
+        assertEquals(StartResult.Locked, restarted.start())
+        assertEquals("known before any passphrase is entered", 0, restarted.messageLifetimeDays)
+
+        for (bad in listOf<Any?>(2, -7, 365, "never", null)) {
+            editStored { it["messageLifetimeDays"] = bad }
+            assertEquals("$bad", StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
+        }
+        editStored { it["messageLifetimeDays"] = 30 }
+        assertEquals(StartResult.Locked, manager().start())
+        for (bad in listOf(
+            """{"wallMillis":-1,"elapsedMillis":5,"bootCount":1}""",
+            """{"wallMillis":5,"elapsedMillis":-1,"bootCount":1}""",
+            """{"wallMillis":5,"elapsedMillis":5,"bootCount":-1}""",
+            """{"wallMillis":${TrustedTime.MAX_WALL_MILLIS + 1},"elapsedMillis":5}""",
+            "\"yesterday\"",
+        )) {
+            editStored { it["trustedTime"] = Json.parseToJsonElement(bad) }
+            assertEquals(bad, StartResult.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), manager().start())
+        }
+        editStored { it["trustedTime"] = Json.parseToJsonElement("""{"wallMillis":5,"elapsedMillis":5,"bootCount":null}""") }
+        assertEquals("an unknown boot count is a valid record", StartResult.Locked, manager().start())
+    }
+
+    /**
+     * The trusted time survives the process in the configuration: a later start is not taken
+     * back by a clock that was set back, it is credited with the time since boot within the same
+     * boot, and not after a restart. Catches a start that does not read the stored mark, and a
+     * record that follows the wall clock backwards.
+     */
+    @Test
+    fun theStoredTrustedTimeIsNotTakenBackByAClockSetBack() {
+        setUp()
+        val wall = clock.wall
+        manager().apply { start() }.unlock(passphrase)
+
+        clock.wall = wall - 86_400_000L
+        clock.elapsed += 1_000
+        val later = manager()
+        later.start()
+        assertEquals(wall + 1_000, later.recordTrustedTime())
+        assertEquals(wall + 1_000, store.read()!!.trustedTime!!.wallMillis)
+
+        // A restart: no credit for the clock since boot, but nothing is lost either.
+        clock.boots = 2
+        clock.elapsed = 10
+        val rebooted = manager()
+        rebooted.start()
+        assertEquals(wall + 1_000, rebooted.recordTrustedTime())
+
+        // The wall clock catches up and takes over.
+        clock.wall = wall + 5_000
+        assertEquals(wall + 5_000, rebooted.recordTrustedTime())
     }
 
     /**

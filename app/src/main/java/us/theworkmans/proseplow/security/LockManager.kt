@@ -123,6 +123,12 @@ class LockManager(
     private val minIterations: Int = PassphraseWrap.MIN_ITERATIONS,
     /** True if encrypted app data exists (see [AppFiles.encryptedDataExists]). */
     private val encryptedDataExists: () -> Boolean,
+    /**
+     * The trusted time of the process ([TrustedClock]). It is seeded from the stored
+     * configuration at [start], and its mark is stored at every unlock and wherever
+     * [recordTrustedTime] is called.
+     */
+    private val trustedClock: TrustedClock = TrustedClock(clock),
 ) {
     /**
      * The current configuration: null until a passphrase has been set up, and whenever [start]
@@ -174,6 +180,7 @@ class LockManager(
             return StartResult.Unrecoverable(UnrecoverableReason.KEY_LOST)
         }
         config = stored
+        trustedClock.observe(stored.trustedTime)
         // The run that wrote this configuration may have stopped between renaming it into place
         // and syncing the directory. It is made durable now, before the keys it no longer refers
         // to are deleted (left over from that stop, or from a reset that could not delete them).
@@ -210,6 +217,7 @@ class LockManager(
                         highestKeyGeneration = binding.generation,
                         // Creating the passphrase is the first unlock.
                         fingerprintPeriodStart = periodStartNow(),
+                        trustedTime = trustedClock.mark(),
                     ),
                 )
                 if (!durable) {
@@ -285,6 +293,7 @@ class LockManager(
                     lastFailureWallMillis = 0,
                     lastFailureElapsedMillis = 0,
                     fingerprintPeriodStart = periodStartNow(),
+                    trustedTime = trustedClock.mark(),
                 ),
             )
             return PassphraseResult.Success(DataKey(dek), PassphraseProof(clock.elapsedMillis()))
@@ -446,7 +455,15 @@ class LockManager(
         }
         val current = checkNotNull(config)
         try {
-            save(current.copy(failedAttempts = 0, lastFailureWallMillis = 0, lastFailureElapsedMillis = 0, fingerprintPeriodStart = periodStartNow()))
+            save(
+                current.copy(
+                    failedAttempts = 0,
+                    lastFailureWallMillis = 0,
+                    lastFailureElapsedMillis = 0,
+                    fingerprintPeriodStart = periodStartNow(),
+                    trustedTime = trustedClock.mark(),
+                ),
+            )
         } catch (e: Exception) {
             key.destroy()
             throw e
@@ -551,6 +568,42 @@ class LockManager(
         require(seconds in LockConfig.TIMEOUT_CHOICES_SECONDS)
         val current = checkNotNull(config) { "No passphrase has been set up" }
         save(current.copy(lockTimeoutSeconds = seconds))
+    }
+
+    /**
+     * Stores the trusted time now ([TrustedClock.mark]) and returns it. Best effort: when it
+     * cannot be written, the mark stored before stays, which only gives less credit for time that
+     * has passed (the wall clock is still believed), and the time is still returned. Without a
+     * configuration nothing is stored.
+     */
+    fun recordTrustedTime(): Long {
+        val mark = trustedClock.mark()
+        val current = config ?: return mark.wallMillis
+        if (current.trustedTime != mark) {
+            try {
+                save(current.copy(trustedTime = mark))
+            } catch (_: IOException) {
+                // The mark stored before stays in force; see above.
+            }
+        }
+        return mark.wallMillis
+    }
+
+    /**
+     * The readable copy of how long messages are kept, in days ([LockConfig.messageLifetimeDays]);
+     * the default while there is no configuration.
+     */
+    val messageLifetimeDays: Int get() = config?.messageLifetimeDays ?: LockConfig.DEFAULT_MESSAGE_LIFETIME_DAYS
+
+    /**
+     * Stores the readable copy of how long messages are kept; one of
+     * [LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS]. Nothing is written when it already is [days].
+     */
+    @Throws(IOException::class)
+    fun setMessageLifetimeDays(days: Int) {
+        require(days in LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS)
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (current.messageLifetimeDays != days) save(current.copy(messageLifetimeDays = days))
     }
 
     /** Stores [LockConfig.finishAnswerAfterLocking]. Nothing is written when it already is [enabled]. */

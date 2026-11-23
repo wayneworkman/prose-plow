@@ -133,6 +133,8 @@ class MandatoryLockTest {
                 "highestKeyGeneration",
                 "fingerprintPeriodSeconds",
                 "fingerprintPeriodStart",
+                "messageLifetimeDays",
+                "trustedTime",
             ),
             stored.keys,
         )

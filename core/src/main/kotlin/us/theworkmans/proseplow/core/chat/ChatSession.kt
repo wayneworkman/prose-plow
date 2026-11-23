@@ -242,6 +242,19 @@ data class ChatSession(
         return copy(messages = messages.dropLast(1) + reopened, error = null, updatedAtMillis = clock.nowMillis())
     }
 
+    /**
+     * Keeps only [kept], which are messages of this chat in their order, for messages that have
+     * expired ([MessageExpiry]). A title that followed the first user message follows what is
+     * now the first one, so the text of a removed message does not survive as the title; an
+     * error that belonged to a removed turn goes with it. [updatedAtMillis] stays: the
+     * conversation did not change by anyone's hand.
+     */
+    fun keepingOnly(kept: List<ChatMessage>): ChatSession {
+        val ids = kept.mapTo(HashSet()) { it.id }
+        val error = error?.takeIf { it.userMessageId == null || it.userMessageId in ids }
+        return copy(messages = kept, error = error).retitled(from = this)
+    }
+
     // --- Loading and listing ---
 
     /**
@@ -262,6 +275,7 @@ data class ChatSession(
         updatedAtMillis = updatedAtMillis,
         modelId = modelId,
         messageCount = messages.size,
+        oldestMessageAtMillis = messages.minOfOrNull { it.createdAtMillis },
     )
 
     /** The title the first user message gives ([deriveTitle]); empty without one. */

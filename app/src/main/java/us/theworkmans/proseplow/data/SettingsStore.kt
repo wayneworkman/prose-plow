@@ -12,6 +12,7 @@ import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.ReplyLength
 import us.theworkmans.proseplow.core.model.SamplingParams
@@ -84,11 +85,15 @@ data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int?
  *   models with something set have an entry.
  * @property notificationsAsked the user has been asked once whether the app may post
  *   notifications, and is not asked again.
+ * @property messageLifetime how long messages are kept. This is the setting itself; the lock
+ *   configuration holds a readable copy of it for what is deleted while the app is locked, which
+ *   every unlock writes again from this one.
  */
 data class AppSettings(
     val systemPrompts: Map<String, String> = emptyMap(),
     val modelOverrides: Map<String, ModelOverrides> = emptyMap(),
     val notificationsAsked: Boolean = false,
+    val messageLifetime: MessageLifetime = MessageLifetime.DEFAULT,
 ) {
 
     /** These settings once the user has been asked whether the app may post notifications. */
@@ -153,7 +158,8 @@ data class AppSettings(
 
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
     override fun toString(): String =
-        "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides, notificationsAsked=$notificationsAsked)"
+        "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides, notificationsAsked=$notificationsAsked, " +
+            "messageLifetime=$messageLifetime)"
 }
 
 /**
@@ -163,8 +169,13 @@ data class AppSettings(
  * {"schemaVersion": 1, "settings": {
  *     "systemPrompts": {"<model id>": "<text>", ...},
  *     "models": {"<model id>": {"temperature": 0.7, "maxNewTokens": 512, "contextTokens": 8192}, ...},
- *     "notificationsAsked": true}}
+ *     "notificationsAsked": true, "messageLifetimeDays": 30}}
  * ```
+ *
+ * `messageLifetimeDays` is how long messages are kept, in days, 0 for Never
+ * ([MessageLifetime.storedDays]); it is only written when it is not the default (7), and was
+ * added without a new schema version: a file without it means the default. A value that is not
+ * one of the choices is left out (the default applies) and counted.
  *
  * `notificationsAsked` is only written once it is true, and was added, like `models`, without a
  * new schema version: a file without it means what it always meant.
@@ -193,8 +204,17 @@ object SettingsCodec {
          * @property schemaVersion the version found in the stored text.
          * @property skippedEntries how many stored values were left out because they could not
          *   be read.
+         * @property messageLifetimeRead false when a limit for messages was stored but could not
+         *   be used: [AppSettings.messageLifetime] is then the default only because nothing
+         *   better was known, and must not be acted on (see [SettingsStore.open]). True when it
+         *   was read, and when none was stored, which means the default.
          */
-        data class Readable(val settings: AppSettings, val schemaVersion: Int, val skippedEntries: Int = 0) : Decoded {
+        data class Readable(
+            val settings: AppSettings,
+            val schemaVersion: Int,
+            val skippedEntries: Int = 0,
+            val messageLifetimeRead: Boolean = true,
+        ) : Decoded {
             /** True when [settings] is everything that was stored. */
             val complete: Boolean get() = skippedEntries == 0 && schemaVersion <= SCHEMA_VERSION
         }
@@ -219,6 +239,7 @@ object SettingsCodec {
                 }
             }
             if (settings.notificationsAsked) put("notificationsAsked", true)
+            if (settings.messageLifetime != MessageLifetime.DEFAULT) put("messageLifetimeDays", settings.messageLifetime.storedDays)
         }
     }.toString()
 
@@ -286,7 +307,24 @@ object SettingsCodec {
             val value = (storedAsked as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
             if (value == null) skipped++ else asked = value
         }
-        return Decoded.Readable(AppSettings(systemPrompts = prompts, modelOverrides = overrides, notificationsAsked = asked), version, skipped)
+        var lifetime = MessageLifetime.DEFAULT
+        var lifetimeRead = true
+        val storedLifetime = stored["messageLifetimeDays"]
+        if (storedLifetime != null) {
+            val value = (storedLifetime as? JsonPrimitive)?.takeUnless { it.isString }?.content?.toIntOrNull()?.let(MessageLifetime::fromStoredDays)
+            if (value == null) {
+                skipped++
+                lifetimeRead = false
+            } else {
+                lifetime = value
+            }
+        }
+        return Decoded.Readable(
+            AppSettings(systemPrompts = prompts, modelOverrides = overrides, notificationsAsked = asked, messageLifetime = lifetime),
+            version,
+            skipped,
+            messageLifetimeRead = lifetimeRead,
+        )
     }
 }
 
@@ -348,18 +386,29 @@ class SettingsStore private constructor(
         /**
          * Reads the stored settings. Blocking; called when a session is opened.
          *
+         * How long messages are kept decides what is deleted, so its default (7 days) is only
+         * taken from settings that were read and simply do not name a limit. When the limit is
+         * not known from them (there is no settings file, it cannot be read, or the stored value
+         * is not a choice), [knownMessageLifetime] is used instead: the readable copy the lock
+         * keeps, which follows the setting. It is then written into the settings with their next
+         * change, so that the two agree again. Without one either, the default applies.
+         *
          * @throws IOException when the file is there but could not be read from the disk.
          */
         @Throws(IOException::class)
-        fun open(file: SealedFile, writer: CoalescingWriter): SettingsStore {
+        fun open(file: SealedFile, writer: CoalescingWriter, knownMessageLifetime: MessageLifetime? = null): SettingsStore {
+            val fallback = knownMessageLifetime ?: MessageLifetime.DEFAULT
             val decoded = when (val read = file.read()) {
-                SealedRead.Missing -> return SettingsStore(file, writer, AppSettings(), issue = null)
+                SealedRead.Missing -> return SettingsStore(file, writer, AppSettings(messageLifetime = fallback), issue = null)
                 SealedRead.Undecryptable -> SettingsCodec.Decoded.Unreadable
                 is SealedRead.Opened -> SettingsCodec.decode(read.plaintext.toString(Charsets.UTF_8))
             }
             if (decoded is SettingsCodec.Decoded.Readable && decoded.complete) {
                 file.contentUnderstood()
                 return SettingsStore(file, writer, decoded.settings, issue = null)
+            }
+            val usable = (decoded as? SettingsCodec.Decoded.Readable)?.let { readable ->
+                if (readable.messageLifetimeRead) readable.settings else readable.settings.copy(messageLifetime = fallback)
             }
             try {
                 file.keepCopy()
@@ -370,8 +419,8 @@ class SettingsStore private constructor(
                 // tries again and fails rather than replace it.
             }
             return when (decoded) {
-                is SettingsCodec.Decoded.Readable -> SettingsStore(file, writer, decoded.settings, LoadIssue.PARTLY_READ)
-                SettingsCodec.Decoded.Unreadable -> SettingsStore(file, writer, AppSettings(), LoadIssue.UNREADABLE)
+                is SettingsCodec.Decoded.Readable -> SettingsStore(file, writer, checkNotNull(usable), LoadIssue.PARTLY_READ)
+                SettingsCodec.Decoded.Unreadable -> SettingsStore(file, writer, AppSettings(messageLifetime = fallback), LoadIssue.UNREADABLE)
             }
         }
     }

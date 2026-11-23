@@ -117,7 +117,10 @@ class SealedFile(
      * a digest of those bytes, so keeping the same content twice makes one copy, however often
      * the app is started with it. The copy is still sealed for [purpose] and its name still ends
      * in [AppFiles.ENCRYPTED_SUFFIX]: it remains encrypted data as far as the lock is concerned,
-     * and a reset deletes it with everything else.
+     * and a reset deletes it with everything else. It also keeps the file's date (its
+     * last-modified time), which for a chat is the date of its newest message: the copy then
+     * expires by the same rule as the file it is a copy of, without being decrypted. When the
+     * date cannot be set the copy has the time it was made, which is later, never earlier.
      *
      * @return the copy, or null when there is no file to copy.
      * @throws IOException when the copy could not be written.
@@ -128,7 +131,11 @@ class SealedFile(
         if (!file.exists()) return null
         val bytes = file.readBytes()
         val copy = File(keptDirectory, "$keptName.${digest(bytes)}${AppFiles.ENCRYPTED_SUFFIX}")
-        if (!copy.exists() || copy.length() != bytes.size.toLong()) writeAtomically(copy, bytes)
+        if (!copy.exists() || copy.length() != bytes.size.toLong()) {
+            val date = file.lastModified()
+            writeAtomically(copy, bytes)
+            if (date > 0) copy.setLastModified(date)
+        }
         return copy
     }
 

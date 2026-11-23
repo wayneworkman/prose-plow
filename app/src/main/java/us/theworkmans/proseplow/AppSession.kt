@@ -23,6 +23,7 @@ import us.theworkmans.proseplow.chat.ChatController
 import us.theworkmans.proseplow.chat.ModelRequestSettings
 import us.theworkmans.proseplow.core.chat.Clock
 import us.theworkmans.proseplow.core.chat.IdSource
+import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.RandomIds
 import us.theworkmans.proseplow.core.chat.SystemClock
 import us.theworkmans.proseplow.core.engine.DeviceContextLimits
@@ -33,6 +34,7 @@ import us.theworkmans.proseplow.data.SealedDirectory
 import us.theworkmans.proseplow.data.SealedFile
 import us.theworkmans.proseplow.data.SessionStore
 import us.theworkmans.proseplow.data.SettingsStore
+import us.theworkmans.proseplow.lock.MessageLifetimeSetting
 import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.BlobCipher
 import us.theworkmans.proseplow.security.Purposes
@@ -82,7 +84,9 @@ class DataLayout(files: AppFiles) {
  * user while the app is unlocked, and makes it forget when the session ends.
  *
  * Constructing a session reads the settings, the list of chats and the chat that was on screen
- * last, so it is done off the main thread, where the lock opens it.
+ * last, so it is done off the main thread, where the lock opens it. Before any chat is shown,
+ * what has expired under the user's limit is removed from the stored chats
+ * ([SessionStore.expireAll]), and the entries of chats the locked app deleted are dropped.
  *
  * @param cipher the cipher of this unlock. It works until [close] has returned.
  * @param models the models this build offers.
@@ -93,6 +97,14 @@ class DataLayout(files: AppFiles) {
  *   user's choice of size; the longest reply is held to what follows from it, and the settings
  *   show the sizes and what they cost by it. A session that is given none assumes a device
  *   with plenty of memory.
+ * @param clock the time messages are dated and aged by: the trusted time of the lock, so that a
+ *   date set back on the phone neither stamps nor keeps a message.
+ * @param expiryIntervalMillis how often expired messages are looked for while the session lives:
+ *   [ChatController.EXPIRY_INTERVAL_MILLIS] in the app, none unless a unit test asks for it.
+ * @param lockedMessageLifetimeDays the readable copy of how long messages are kept, as the lock
+ *   holds it when it opens the session. It is the limit whenever the settings do not say one
+ *   that could be read ([SettingsStore.open]), so that a settings file that cannot be read never
+ *   makes the default delete what the user chose to keep.
  * @param answerEvents told, on the main dispatcher, when an answer begins and ends being
  *   written and when one is finished: what keeps the process alive out of sight goes by it.
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
@@ -110,7 +122,9 @@ class AppSession(
     private val writeTimeoutMillis: Long = WRITE_TIMEOUT_MILLIS,
     private val answerEvents: AnswerEvents = AnswerEvents.None,
     val contextLimits: DeviceContextLimits = DeviceContextLimits(),
-) : UnlockedSession {
+    expiryIntervalMillis: Long? = null,
+    lockedMessageLifetimeDays: Int? = null,
+) : UnlockedSession, MessageLifetimeSetting {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
 
@@ -140,18 +154,21 @@ class AppSession(
             val settingsStore = SettingsStore.open(
                 SealedFile(layout.settings, DataLayout.SETTINGS_PURPOSE, cipher, layout.kept, "settings"),
                 writer,
+                knownMessageLifetime = lockedMessageLifetimeDays?.let(MessageLifetime::fromStoredDays),
             )
             val sessionStore = SessionStore(
                 sessions = SealedDirectory(layout.sessions, DataLayout::sessionPurpose, cipher, layout.kept, "session"),
                 indexFile = SealedFile(layout.sessionIndex, DataLayout.SESSION_INDEX_PURPOSE, cipher, layout.kept, "session-index"),
             )
             settings = settingsStore
+            // Nothing else uses the files yet: what has expired goes before anything is shown.
+            val opened = sessionStore.expireAll(sessionStore.open(), settingsStore.settings.value.messageLifetime, clock.nowMillis())
             chat = ChatController(
                 store = sessionStore,
                 writer = writer,
                 engine = engine,
                 models = models,
-                opened = sessionStore.open(),
+                opened = opened,
                 requestSettings = { model ->
                     val current = settingsStore.settings.value
                     val chosen = contextLimits.chosen(model, current.contextTokens(model.id))
@@ -167,6 +184,8 @@ class AppSession(
                 mainDispatcher = mainDispatcher,
                 ioDispatcher = ioDispatcher,
                 onReplyFinished = answerEvents::onReplyFinished,
+                lifetime = { settingsStore.settings.value.messageLifetime },
+                expiryIntervalMillis = expiryIntervalMillis,
             )
         } catch (e: Exception) {
             // The session was never opened: its writer must not stay behind.
@@ -181,6 +200,26 @@ class AppSession(
     }
 
     val viewModelStore = ViewModelStore()
+
+    /** How long messages are kept, by the encrypted setting. */
+    val messageLifetime: MessageLifetime get() = settings.settings.value.messageLifetime
+
+    /** [messageLifetime] as the lock counts it, in days; the lock copies it at every unlock. */
+    override val messageLifetimeDays: Int get() = messageLifetime.storedDays
+
+    override fun changeMessageLifetimeDays(days: Int) {
+        MessageLifetime.fromStoredDays(days)?.let(::changeMessageLifetime)
+    }
+
+    /**
+     * Makes [lifetime] how long messages are kept, and removes at once what has expired under
+     * it. Main thread. The screen asks for confirmation before a limit that deletes messages now
+     * (a shorter one, or any after Never); the readable copy of the lock is the caller's to write.
+     */
+    fun changeMessageLifetime(lifetime: MessageLifetime) {
+        settings.update(urgent = true) { it.copy(messageLifetime = lifetime) }
+        chat.expireMessages()
+    }
 
     fun writeFailureShown() {
         _writeFailure.value = null

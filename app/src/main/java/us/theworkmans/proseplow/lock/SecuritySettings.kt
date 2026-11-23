@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -73,6 +74,26 @@ sealed interface SecurityDialog {
 
     /** "Reset app data": the typed confirmation. */
     data object Reset : SecurityDialog
+
+    /**
+     * A limit for messages, of [toDays] days, that deletes some now
+     * ([LockConfig.messageLifetimeDeletesNow]): asked before it applies.
+     */
+    data class ShortenMessageLifetime(val toDays: Int) : SecurityDialog
+}
+
+/**
+ * The setting of how long messages are kept, as the unlocked session holds it (encrypted), in
+ * days as [LockConfig.messageLifetimeDays] counts them. The security settings read it and change
+ * it through this; the readable copy in the lock configuration is written beside it
+ * ([AppLock.setMessageLifetimeDays]).
+ */
+interface MessageLifetimeSetting {
+    /** How long messages are kept now; one of [LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS]. */
+    val messageLifetimeDays: Int
+
+    /** Makes [days] the setting and deletes at once what has expired under it. Main thread. */
+    fun changeMessageLifetimeDays(days: Int)
 }
 
 /** What went wrong, said once in words. A wait after wrong attempts is not one of these: it is counted down ([SecurityViewModel.unlockUi]). */
@@ -103,8 +124,13 @@ data class SecurityUiState(
  *
  * It lives in the unlocked session's ViewModel store, so a lock or a reset clears it.
  */
-class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
+class SecurityViewModel(private val appLock: AppLock<*>, private val lifetimeSetting: MessageLifetimeSetting) : ViewModel() {
     val status: StateFlow<SecurityStatus> = appLock.status
+
+    private val _messageLifetimeDays = MutableStateFlow(lifetimeSetting.messageLifetimeDays)
+
+    /** How long messages are kept, in days, as stored; what "Delete messages after" shows. */
+    val messageLifetimeDays: StateFlow<Int> = _messageLifetimeDays.asStateFlow()
 
     /** The screenshot allowance that is running, or null. It ends by itself, and the switch follows. */
     val screenshots: StateFlow<ScreenshotsAllowed?> = appLock.screenshots.allowed
@@ -268,6 +294,46 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
         }
     }
 
+    /**
+     * "Delete messages after". A choice that deletes messages now (a shorter limit, or any limit
+     * after Never) is only applied once the user has confirmed it ([confirmMessageLifetime]);
+     * any other is applied at once. Choosing what is set already does nothing.
+     */
+    fun selectMessageLifetime(days: Int) {
+        val current = _messageLifetimeDays.value
+        if (days == current || days !in LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS || _state.value.busy) return
+        if (LockConfig.messageLifetimeDeletesNow(days, current)) open(SecurityDialog.ShortenMessageLifetime(days)) else applyMessageLifetime(days)
+    }
+
+    /** The user confirmed [SecurityDialog.ShortenMessageLifetime]. */
+    fun confirmMessageLifetime() {
+        val dialog = _state.value.dialog as? SecurityDialog.ShortenMessageLifetime ?: return
+        _state.value = SecurityUiState()
+        applyMessageLifetime(dialog.toDays)
+    }
+
+    /**
+     * Writes the readable copy in the lock configuration first, then the setting itself, which
+     * also deletes what has expired under it. When the copy cannot be written nothing changes and
+     * the picker keeps showing the stored value, as the other choices do. (Should the setting
+     * then fail to reach the disk, the next unlock writes the copy back from it.)
+     */
+    private fun applyMessageLifetime(days: Int) {
+        viewModelScope.launch {
+            try {
+                appLock.setMessageLifetimeDays(days)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _state.update { it.copy(error = SecurityError.FAILED) }
+                return@launch
+            }
+            lifetimeSetting.changeMessageLifetimeDays(days)
+            _messageLifetimeDays.value = days
+            _state.update { it.copy(error = null) }
+        }
+    }
+
     /** "Finish the answer after locking". The switch shows what is stored, so a failure leaves it as it was. */
     fun setFinishAnswerAfterLocking(enabled: Boolean) {
         viewModelScope.launch {
@@ -285,8 +351,8 @@ class SecurityViewModel(private val appLock: AppLock<*>) : ViewModel() {
 
 /**
  * The rows of the Security section: change passphrase, fingerprint unlock and how long the
- * fingerprint works, the background timeout, "Lock now", the temporary screenshot allowance and "Reset app data", with their
- * dialogs. It emits its rows into the column of the Settings screen it is placed in (which
+ * fingerprint works, the background timeout, how long messages are kept, "Lock now", the
+ * temporary screenshot allowance and "Reset app data", with their dialogs. It emits its rows into the column of the Settings screen it is placed in (which
  * supplies the section title and the spacing), and needs nothing but its ViewModel.
  *
  * There is no switch for the lock itself, for the app switcher's preview or for the keyboard:
@@ -320,6 +386,8 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
     )
     FingerprintPeriodPicker(status.fingerprintPeriodSeconds, viewModel::setFingerprintPeriod)
     TimeoutPicker(status.lockTimeoutSeconds, viewModel::setLockTimeout)
+    val messageLifetimeDays by viewModel.messageLifetimeDays.collectAsStateWithLifecycle()
+    MessageLifetimePicker(messageLifetimeDays, viewModel::selectMessageLifetime)
     SwitchRow(
         title = stringResource(R.string.security_finish_answer),
         support = pluralStringResource(
@@ -376,6 +444,11 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
             onDismiss = viewModel::dismissDialog,
         )
         SecurityDialog.Reset -> ResetDataDialog(onConfirm = viewModel::confirmReset, onDismiss = viewModel::dismissDialog)
+        is SecurityDialog.ShortenMessageLifetime -> ShortenMessageLifetimeDialog(
+            toDays = dialog.toDays,
+            onConfirm = viewModel::confirmMessageLifetime,
+            onDismiss = viewModel::dismissDialog,
+        )
         null -> Unit
     }
 }
@@ -430,9 +503,57 @@ private fun SwitchRow(title: String, support: String, checked: Boolean, onChecke
     }
 }
 
+/** What each choice of how long messages are kept ([LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS]) is called. */
+@Composable
+private fun messageLifetimeLabel(days: Int): String = stringResource(
+    when (days) {
+        1 -> R.string.message_lifetime_1_day
+        7 -> R.string.message_lifetime_7_days
+        30 -> R.string.message_lifetime_30_days
+        90 -> R.string.message_lifetime_90_days
+        else -> R.string.message_lifetime_never
+    },
+)
+
+@Composable
+private fun MessageLifetimePicker(days: Int, onSelect: (Int) -> Unit) {
+    val choices = LockConfig.MESSAGE_LIFETIME_CHOICES_DAYS
+    ChoicePicker(
+        label = stringResource(R.string.security_message_lifetime),
+        support = stringResource(R.string.security_message_lifetime_support),
+        labels = choices.associateWith { messageLifetimeLabel(it) },
+        choices = choices,
+        value = days,
+        onSelect = onSelect,
+    )
+}
+
+/**
+ * Asked before a limit that deletes messages now. The text names the new limit; nothing is
+ * deleted until "Delete" is pressed, and Cancel leaves the setting as it was.
+ */
+@Composable
+private fun ShortenMessageLifetimeDialog(toDays: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.message_lifetime_confirm_title)) },
+        text = {
+            ProtectWindow()
+            Text(stringResource(R.string.message_lifetime_confirm_text, messageLifetimeLabel(toDays)))
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            ) { Text(stringResource(R.string.delete)) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
+    )
+}
+
 @Composable
 private fun TimeoutPicker(seconds: Int, onSelect: (Int) -> Unit) {
-    SecondsPicker(
+    ChoicePicker(
         label = stringResource(R.string.security_lock_after),
         support = stringResource(R.string.security_lock_after_support),
         labels = mapOf(
@@ -442,14 +563,14 @@ private fun TimeoutPicker(seconds: Int, onSelect: (Int) -> Unit) {
             900 to stringResource(R.string.timeout_15_minutes),
         ),
         choices = LockConfig.TIMEOUT_CHOICES_SECONDS,
-        seconds = seconds,
+        value = seconds,
         onSelect = onSelect,
     )
 }
 
 @Composable
 private fun FingerprintPeriodPicker(seconds: Int, onSelect: (Int) -> Unit) {
-    SecondsPicker(
+    ChoicePicker(
         label = stringResource(R.string.security_fingerprint_period),
         support = stringResource(R.string.security_fingerprint_period_support),
         labels = mapOf(
@@ -459,19 +580,19 @@ private fun FingerprintPeriodPicker(seconds: Int, onSelect: (Int) -> Unit) {
             24 * 60 * 60 to stringResource(R.string.fingerprint_period_24_hours),
         ),
         choices = LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS,
-        seconds = seconds,
+        value = seconds,
         onSelect = onSelect,
     )
 }
 
-/** A choice among [choices] (seconds), each shown by its entry in [labels]. */
+/** A choice among [choices] (numbers such as seconds or days), each shown by its entry in [labels]; [value] is the one chosen. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SecondsPicker(label: String, support: String, labels: Map<Int, String>, choices: List<Int>, seconds: Int, onSelect: (Int) -> Unit) {
+private fun ChoicePicker(label: String, support: String, labels: Map<Int, String>, choices: List<Int>, value: Int, onSelect: (Int) -> Unit) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
         OutlinedTextField(
-            value = labels[seconds].orEmpty(),
+            value = labels[value].orEmpty(),
             onValueChange = {},
             readOnly = true,
             singleLine = true,

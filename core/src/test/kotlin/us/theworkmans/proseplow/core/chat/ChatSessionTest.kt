@@ -525,7 +525,7 @@ class ChatSessionTest {
     fun `the summary is what the list of chats needs`() {
         val session = oneExchange()
         assertEquals(
-            SessionSummary(id = "s1", title = "Hello", createdAtMillis = 1_000, updatedAtMillis = session.updatedAtMillis, modelId = "model-a", messageCount = 2),
+            SessionSummary(id = "s1", title = "Hello", createdAtMillis = 1_000, updatedAtMillis = session.updatedAtMillis, modelId = "model-a", messageCount = 2, oldestMessageAtMillis = 1_000),
             session.summary(),
         )
     }

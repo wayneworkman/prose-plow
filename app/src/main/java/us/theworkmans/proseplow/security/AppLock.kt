@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentLinkedQueue
 import javax.crypto.Cipher
@@ -109,6 +110,25 @@ interface MakesWay {
         override fun standAside() = Unit
 
         override fun carryOn() = Unit
+    }
+}
+
+/**
+ * Deletes, without the data key, what has expired of the stored messages: the clean-up that runs
+ * while the app is locked ([AppLock] calls it, serialised with its own work). It needs only the
+ * readable copy of how long messages are kept and the trusted time; what it deletes is the
+ * storage's business, not the lock's.
+ */
+fun interface ExpiredDataSweep {
+    /**
+     * Deletes what has expired at [nowMillis] (trusted time) when messages are kept for
+     * [lifetimeDays] ([LockConfig.messageLifetimeDays]). Blocking; best effort.
+     */
+    fun sweep(lifetimeDays: Int, nowMillis: Long)
+
+    companion object {
+        /** For a lock beside which nothing is stored. */
+        val None = ExpiredDataSweep { _, _ -> }
     }
 }
 
@@ -218,8 +238,13 @@ class AppLock<S : UnlockedSession>(
     private val manager: LockManager,
     private val files: AppFiles,
     private val clock: Clock,
-    /** Makes the session of an unlock. Called off the main thread; may read the stores and may fail. */
-    private val openSession: (BlobCipher) -> S,
+    /**
+     * Makes the session of an unlock, from its cipher and the readable copy of how long messages
+     * are kept ([LockConfig.messageLifetimeDays]), which the session falls back on when its own
+     * setting cannot be read. Called off the main thread, under the mutex; may read the stores
+     * and may fail.
+     */
+    private val openSession: (BlobCipher, Int) -> S,
     private val biometricStatus: () -> BiometricStatus,
     /**
      * The temporary permission to take screenshots. It is not part of the lock (locking leaves
@@ -242,6 +267,12 @@ class AppLock<S : UnlockedSession>(
      * nothing beside it, is that nothing does.
      */
     private val canFinishOutOfSight: () -> Boolean = { false },
+    /**
+     * The clean-up of expired messages that needs no key, run under the mutex at every start of
+     * the lock (the start of the process, Try again, the start after a reset) before anything can
+     * be unlocked, and only while no session is alive; see [cleanUpWhileLocked].
+     */
+    private val expiredData: ExpiredDataSweep = ExpiredDataSweep.None,
 ) {
     private val mutex = Mutex()
     private val main = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -402,6 +433,7 @@ class AppLock<S : UnlockedSession>(
                         StartResult.SetupRequired -> LockState.SetupRequired
                         StartResult.Locked -> {
                             dropBiometricIfGone(m)
+                            cleanUpWhileLocked(m)
                             waitMillis = m.backoffRemainingMillis()
                             LockState.Locked(0)
                         }
@@ -419,6 +451,48 @@ class AppLock<S : UnlockedSession>(
                     if (next is LockState.Locked) enterLocked(waitMillis) else _state.value = next
                 }
             }
+        }
+    }
+
+    /**
+     * Under the mutex, with the app locked: stores the trusted time (which advances it) and
+     * deletes what has expired without the key ([expiredData]), by the readable copy of how long
+     * messages are kept. Holding the mutex keeps it from overlapping an unlock, which takes the
+     * mutex to check the passphrase and to open the session, and a reset.
+     *
+     * Skipped, apart from the trusted time, while a session is alive (one that is being finished
+     * behind the lock, or one that is still closing or writing): its files are that session's,
+     * and its own expiry covers them; a late write could otherwise put back what was just
+     * deleted. A failure deletes less, never stops the lock.
+     */
+    private suspend fun cleanUpWhileLocked(m: LockManager) {
+        val sessionAlive = withContext(mainDispatcher) { live != null || lease != null || unfinished != 0 }
+        val now = m.recordTrustedTime()
+        if (sessionAlive) return
+        try {
+            expiredData.sweep(m.messageLifetimeDays, now)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // What could not be deleted now is tried again at the next start.
+        }
+    }
+
+    /**
+     * Under the mutex, at an unlock: writes the readable copy of how long messages are kept from
+     * [session]'s own setting, which is the truth. Best effort: a copy that cannot be written
+     * stays as it was until the next unlock, and only what is deleted while locked follows it.
+     */
+    private fun copyMessageLifetime(m: LockManager, session: S) {
+        val days = session.messageLifetimeDays ?: return
+        try {
+            m.setMessageLifetimeDays(days)
+        } catch (_: IOException) {
+            // See above.
+        } catch (_: IllegalStateException) {
+            // No configuration (a reset began meanwhile): nothing to copy into.
+        } catch (_: IllegalArgumentException) {
+            // Not one of the choices: the copy keeps what it had.
         }
     }
 
@@ -552,6 +626,7 @@ class AppLock<S : UnlockedSession>(
             withManager { m ->
                 closeRetired()
                 m.startFingerprintPeriod(endedAt)
+                m.recordTrustedTime()
                 publishStatus(m)
             }
         }
@@ -657,13 +732,13 @@ class AppLock<S : UnlockedSession>(
      * unlocked from ([from]) is no longer the current one (a reset began meanwhile), in which
      * case the session is ended again unseen. [offer] is made with the new session.
      */
-    private suspend fun open(key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
+    private suspend fun open(m: LockManager, key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
         // The session of the unlock before may still be closing: its last writes get their
         // (bounded) time to land before this one reads.
         closeRetired()
         val crypto = DataCrypto(key)
         val session = try {
-            openSession(crypto)
+            openSession(crypto, m.messageLifetimeDays)
         } catch (e: CancellationException) {
             crypto.destroy()
             throw e
@@ -674,6 +749,7 @@ class AppLock<S : UnlockedSession>(
             }
             return
         }
+        copyMessageLifetime(m, session)
         val opened = Live(session, crypto, key)
         withContext(mainDispatcher) {
             if (_state.value != from) {
@@ -711,20 +787,25 @@ class AppLock<S : UnlockedSession>(
      * regard to where they differ), and only within the lease's time. [key] is then a second
      * copy of a key the session already has, and is destroyed.
      */
-    private suspend fun openOrReattach(key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
-        val reattached = withContext(mainDispatcher) {
-            val parked = lease ?: return@withContext false
-            if (_state.value != from) return@withContext false
+    private suspend fun openOrReattach(m: LockManager, key: DataKey, from: LockState<S>, offer: Pair<FingerprintOffer, PassphraseProof>?) {
+        val reattached: S? = withContext(mainDispatcher) {
+            val parked = lease ?: return@withContext null
+            if (_state.value != from) return@withContext null
             if (clock.elapsedMillis() >= parked.untilElapsed || !MessageDigest.isEqual(key.bytes, parked.live.key.bytes)) {
                 endLease(parked)
-                return@withContext false
+                return@withContext null
             }
             release(parked)
             parked.live.session.resume()
             show(parked.live, offer)
-            true
+            parked.live.session
         }
-        if (reattached) key.destroy() else open(key, from, offer)
+        if (reattached != null) {
+            key.destroy()
+            copyMessageLifetime(m, reattached)
+        } else {
+            open(m, key, from, offer)
+        }
     }
 
     // --- Locking ----------------------------------------------------------------------------
@@ -774,6 +855,7 @@ class AppLock<S : UnlockedSession>(
                 // Unless the user is already back in: an enrolment of the new session is not this lock's to cancel.
                 if (live == null) m.cancelBiometricEnrollment()
                 m.startFingerprintPeriod(lockedAt)
+                m.recordTrustedTime()
                 // Wrong passphrases entered in Settings count too; the lock screen shows their wait.
                 val waitMillis = m.backoffRemainingMillis()
                 if (waitMillis > 0) _unlockUi.update { it.copy(retryAtElapsed = retryAt(waitMillis)) }
@@ -938,7 +1020,7 @@ class AppLock<S : UnlockedSession>(
                     closeRetired()
                     val result = whileOthersStandAside { m.setUp(first) }
                     publishStatus(m)
-                    open(result.key, from, if (biometricAvailable()) FingerprintOffer.FIRST_SETUP to result.proof else null)
+                    open(m, result.key, from, if (biometricAvailable()) FingerprintOffer.FIRST_SETUP to result.proof else null)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -972,7 +1054,7 @@ class AppLock<S : UnlockedSession>(
                         is PassphraseResult.Success -> {
                             val again = m.config?.fingerprintInvalidated == true && biometricAvailable()
                             publishStatus(m)
-                            openOrReattach(result.key, from, if (again) FingerprintOffer.AGAIN to result.proof else null)
+                            openOrReattach(m, result.key, from, if (again) FingerprintOffer.AGAIN to result.proof else null)
                         }
                         is PassphraseResult.Wrong -> _unlockUi.update {
                             it.copy(wrongPassphrase = true, retryAtElapsed = retryAt(result.retryInMillis))
@@ -1082,7 +1164,7 @@ class AppLock<S : UnlockedSession>(
                         _unlockUi.update { it.copy(notice = if (ok) BiometricNotice.ENROLLED else BiometricNotice.ENROLL_FAILED) }
                     } else if (cipher != null && from is LockState.Locked) {
                         when (val result = m.unlockWithBiometric(cipher)) {
-                            is BiometricUnlockResult.Unlocked -> openOrReattach(result.key, from, offer = null)
+                            is BiometricUnlockResult.Unlocked -> openOrReattach(m, result.key, from, offer = null)
                             BiometricUnlockResult.NotEnabled, BiometricUnlockResult.Removed ->
                                 _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_FAILED) }
                             BiometricUnlockResult.Failed -> _unlockUi.update { it.copy(notice = BiometricNotice.UNLOCK_UNAVAILABLE) }
@@ -1249,6 +1331,12 @@ class AppLock<S : UnlockedSession>(
 
     /** How long the fingerprint works after a lock; one of [LockConfig.FINGERPRINT_PERIOD_CHOICES_SECONDS]. */
     suspend fun setFingerprintPeriod(seconds: Int) = op { m -> m.setFingerprintPeriod(seconds) }
+
+    /**
+     * The readable copy of how long messages are kept, written when the user changes the setting
+     * (the setting itself is the session's). @throws IOException when it could not be written.
+     */
+    suspend fun setMessageLifetimeDays(days: Int) = op { m -> m.setMessageLifetimeDays(days) }
 
     /** Whether an answer under way is finished behind the app's own lock; see the class comment. */
     suspend fun setFinishAnswerAfterLocking(enabled: Boolean) = op { m -> m.setFinishAnswerAfterLocking(enabled) }

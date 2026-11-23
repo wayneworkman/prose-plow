@@ -311,6 +311,15 @@ is about things that are **not** built and is kept apart from everything else.
   state of the screens but does not lock: the session stays until the time of LOCK-11 is up.
 - **LOCK-21** The lock screen, like every screen on which the app is not unlocked, can never be
   captured in a screenshot or a recording (PRIV-03).
+- **LOCK-22** Every time the lock starts and finds a passphrase set up (the start of the
+  process, "Try again", the start after a reset), it stores the trusted time (CHAT-24) and then
+  deletes what has expired without the key (STORE-22), before a passphrase can be checked: both
+  are the lock's own work, which an unlock waits for, so the deletion can never run beside an
+  unlock. While a session is alive, being finished behind the lock (LEASE-01) or still closing
+  (LOCK-18), nothing is deleted and only the trusted time is stored: the files are that
+  session's, and its own expiry covers them. Every unlock and every lock (step 7 of LOCK-17,
+  and the end of a lease) store the trusted time as well, and every unlock writes the readable
+  copy of the limit of SECSET-13 in the lock configuration again from the setting itself.
 
 ## 4. The passphrase (PASS)
 
@@ -801,7 +810,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
 **Source:** `AppSession.kt` (`DataLayout`), `security/AppFiles.kt`, `security/AtomicFiles.kt`,
 `data/SealedFile.kt`, `data/CoalescingWriter.kt`, `data/SessionStore.kt`,
-`data/SettingsStore.kt`, `app/src/main/res/xml/data_extraction_rules.xml`; tests in
+`data/SettingsStore.kt`, `data/ExpiredFiles.kt`, `app/src/main/res/xml/data_extraction_rules.xml`; tests in
 `app/src/test/java/us/theworkmans/proseplow/data/`, `security/AppFilesTest.kt`,
 `security/DurabilityTest.kt`.
 
@@ -809,11 +818,11 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
   | Path under the private files directory | Content | Form |
   | --- | --- | --- |
-  | `sessions/<id>.enc` | One chat: its messages, its unsent draft, its model, its title and the failure of its last request, if any | Encrypted, purpose `session:<id>` |
+  | `sessions/<id>.enc` | One chat: its messages, its unsent draft, its model, its title and the failure of its last request, if any. The file's last-modified time is the date of its newest message (STORE-21) | Encrypted, purpose `session:<id>` |
   | `session-index.enc` | The list of chats (a summary of each) and which chat was on screen last | Encrypted, purpose `session-index` |
-  | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); and whether the question about notifications has been asked | Encrypted, purpose `settings` |
+  | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); whether the question about notifications has been asked; and how long messages are kept (SECSET-13) | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
-  | `security/lock.json` | The lock configuration (FMT-06) | Plain JSON without a secret in the clear |
+  | `security/lock.json` | The lock configuration (FMT-06), with a readable copy of how long messages are kept and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
 
   The model files are part of the installed app and are not encrypted: they are public files.
 - **STORE-02** Every file that is encrypted with the data key has a name ending in `.enc` and
@@ -893,13 +902,50 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 - **STORE-20** Nothing in the storage layer is specific to chats: an encrypted file is a blob
   sealed with a namespaced purpose, written atomically and protected by the rule of STORE-09
   (TOOL-07).
+- **STORE-21** Every time a chat is written, its file's last-modified time is set to the date of
+  its newest message (CHAT-24). When that cannot be done, or no message has a date, the file
+  keeps the time it was written, which is later: a deletion by the date (STORE-22) then comes
+  later, never earlier. A kept copy (STORE-09) keeps the date of the file it was made from.
+  Without the key, the dates are therefore all that shows when each chat last changed.
+- **STORE-22** What expires without the key (LOCK-22), by the dates of the files alone and under
+  the readable copy of the limit of SECSET-13:
+  - a chat file whose date plus the limit lies in the past holds nothing that has not expired,
+    and is deleted, with what an interrupted write left beside it and every kept copy of that
+    chat, whatever the copies' own dates;
+  - a kept copy of a chat, or of the list of chats, whose own date plus the limit lies in the
+    past is deleted; kept copies of the settings hold no message and stay;
+  - what interrupted writes of chats, of kept copies or of the list of chats left behind
+    (`*.enc.tmp`) is deleted once its own date plus the limit lies in the past.
+
+  With "Never" nothing is deleted. A file whose date cannot be read is left alone. The
+  directories are flushed after a deletion (STORE-13). The list of chats cannot be changed
+  without the key: it names the deleted chats until the next unlock (STORE-23).
+- **STORE-23** At every unlock, before any chat is shown and once the list has been corrected by
+  the files (STORE-11), the expiry of CHAT-22 is applied to every stored chat whose entry in the
+  list does not rule it out: an entry records the date of the chat's oldest message, and a chat
+  whose oldest message is within the limit is not read. A chat left without messages is deleted
+  with its kept copies; one that keeps some is written again with what remains and its title
+  derived again. A chat that holds only a draft, or cannot be read, goes by its file's date as in
+  STORE-22. A chat that could only be read in part is deleted only when its file's date is past
+  the limit as well, since the messages that could not be read may be newer. A chat that was
+  read and kept has the date of its oldest message recorded in its entry, so that later
+  unlocks do not read it again until that date is past the limit. Entries of chats that were
+  deleted while the app was locked are dropped without a word (unlike CHAT-12); a chat whose
+  file is missing although its entry says it changed within the limit was not known to have
+  expired, and stays listed, so that opening it says so (CHAT-12). A message stored without a
+  date takes its file's date, and one dated in the future takes the present; both are stored
+  so.
 
 ## 11. Chats (CHAT)
 
 **Source:** `chat/ChatController.kt`, `chat/ChatViewModel.kt`, `chat/ChatScreen.kt`,
-`chat/SessionDrawer.kt`, `core/src/main/kotlin/us/theworkmans/proseplow/core/chat/ChatSession.kt`;
+`chat/SessionDrawer.kt`, `core/src/main/kotlin/us/theworkmans/proseplow/core/chat/ChatSession.kt`,
+`core/.../chat/MessageExpiry.kt`, `core/.../chat/TrustedTime.kt`, `security/TrustedClock.kt`;
 tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeTest.kt`,
-`core/src/test/kotlin/us/theworkmans/proseplow/core/chat/ChatSessionTest.kt`.
+`chat/MessageExpiryChatTest.kt`, `security/TrustedClockTest.kt`,
+`core/src/test/kotlin/us/theworkmans/proseplow/core/chat/ChatSessionTest.kt`,
+`core/src/test/kotlin/us/theworkmans/proseplow/core/chat/MessageExpiryTest.kt`,
+`core/src/test/kotlin/us/theworkmans/proseplow/core/chat/TrustedTimeTest.kt`.
 
 - **CHAT-01** The app keeps several chats. One is on screen at a time. A chat is a single line
   of messages: editing an earlier message or asking for an answer again cuts the line at that
@@ -926,7 +972,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   described as "An answer is being written", while a reply is being written in it; and a delete
   button described as "Delete {title}".
 - **CHAT-07** "{when}" is "just now" for a change less than a minute ago and otherwise the
-  platform's short relative time, to the minute. It is worked out when the row is first shown.
+  platform's short relative time, to the minute. It is worked out when the row is first shown,
+  against the trusted time (CHAT-24) by which the change was dated, not against the device's
+  date and time, so a date set back never shows a change in the future.
 - **CHAT-08** The list is ordered by when each conversation last changed, the latest first
   (then by creation time, the latest first, then by id). Typing a draft or switching the model
   does not count as a change, so the list does not reshuffle for those.
@@ -987,6 +1035,35 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   one-sentence description of the model (MODEL-01). When the chat's model cannot answer (it is
   not in this build, the build has no model, or it failed to load) only the first line is shown;
   the card of MODEL-14 to MODEL-16 says why.
+- **CHAT-22** Messages expire after the limit chosen in SECSET-13, one limit for every chat. A
+  user message and the replies that follow it up to the next user message form a turn, and go
+  together; replies before the first user message form a turn of their own. A turn's age is that
+  of its newest message. Nothing is removed until some turn is older than the limit; then every
+  turn older than the limit less one step is removed, the step being 1 day for the limits of 7
+  days and more and 3 hours for 1 day. Messages therefore go up to one step early and never
+  late, and a long chat does not lose a turn every few minutes (each removal changes the start
+  of the conversation, which the model must then read again). "Older than" is strict: a turn
+  exactly at the limit stays. A chat left without messages is deleted whole, with its file and
+  its kept copies, without a word; if it was on screen, a new chat with the same model takes its
+  place, carrying the draft that was being typed (a draft is not a message and has no date), and
+  is stored as any chat with a draft is (CHAT-03). The draft of a chat that was not on screen
+  goes with it. A chat that keeps messages takes its title from what is now its
+  first user message (CHAT-09), and the failure of a removed turn goes with it.
+- **CHAT-23** While the app is unlocked, the expiry of CHAT-22 is applied at the unlock
+  (STORE-23), when a stored chat is opened (before it is shown), every hour, and at once when
+  the limit is shortened (SECSET-13). A chat whose reply is being written is never changed by
+  it: it is pruned as soon as that reply has ended. When the engine holds the conversation of a
+  chat that was pruned or deleted this way, it is made to forget it (ENG-21), in turn with the
+  replies, so that no expired text stays in the model's memory. A stored chat that has expired
+  whole between two passes and is then opened is reported as gone (CHAT-12).
+- **CHAT-24** Messages are dated, and their age is measured, by the trusted time: the latest
+  time seen, which never goes back. It is the date and time now, or the last trusted time plus
+  the time that has passed since it was recorded on the device clock, whichever is later; that
+  credit is only given within the same start of the device, known by its count of starts, and
+  not at all when the count cannot be read. The trusted time is stored in the lock
+  configuration (FMT-06) at every unlock, every lock and every start of the lock (LOCK-22).
+  Setting the date back therefore keeps no message alive and dates no message in the past;
+  setting it forward is believed, and messages then expire early.
 
 ## 12. Messages and replies (MSG)
 
@@ -1524,6 +1601,25 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   configuration, because it is needed while the app is locked. If it cannot be stored, the
   choice shows the stored value again and the group says "That did not work: the phone's key
   store or storage reported an error."
+- **SECSET-13** Right after it, the choice "Delete messages after": "1 day", "7 days" (the
+  default), "30 days", "90 days" or "Never", with the line "Messages older than this are
+  deleted from this phone whenever the app runs, also while it is locked. A question and its
+  answers go together, up to a day early (3 hours with 1 day)." (CHAT-22). No passphrase is
+  asked for. The setting itself is stored encrypted with the settings, and a readable copy in
+  the lock configuration (FMT-06) for what is deleted while the app is locked (STORE-22); the
+  copy is written first, and if it cannot be written nothing changes, the choice shows the
+  stored value again and the group says "That did not work: the phone's key store or storage
+  reported an error." A choice that deletes messages now (a shorter limit, or any limit after
+  "Never") first asks: title "Delete older messages now?"; text "Messages older than {limit}
+  will be deleted now, and from then on every message when it reaches that age. A chat left
+  without messages is deleted. This cannot be undone."; buttons "Delete" (in the colour for
+  errors) and "Cancel", which leaves the setting as it was. Any other choice applies at once.
+  The default of 7 days is only ever taken from settings that were read and do not name a
+  limit. When the limit cannot be known from the settings (there is no settings file, it cannot
+  be read, or the stored value is not one of the choices), the readable copy in the lock
+  configuration is the limit for everything the unlocked app does and shows; that copy is not
+  changed by it, and the settings get the limit back with their next change. So a settings
+  file that cannot be read never deletes what the user chose to keep.
 - **SECSET-05** The switch "Finish the answer after locking" (section 6), on by default and
   stored in the lock configuration. The line under it says, when on: "On: if the app locks by
   itself while an answer is being written, the screen locks as always and the answer is
@@ -2452,6 +2548,11 @@ This section is exact where the others describe. Each item carries one of three 
   | `fingerprintPeriodStart` | object or null, default null | When the period of BIO-18 last started; null means it has run out (BIO-21) | when not null, both fields below |
   | `fingerprintPeriodStart.elapsedMillis` | number | That moment on the device clock | not negative |
   | `fingerprintPeriodStart.bootCount` | number | The device's count of starts at that moment | not negative |
+  | `messageLifetimeDays` | number, default 7 | The readable copy of SECSET-13, in days, 0 for "Never"; a file without the field means 7 | one of 1, 7, 30, 90, 0 |
+  | `trustedTime` | object or null, default null | The trusted time of CHAT-24 as last recorded; null when none was, which a file without the field means | when not null, the fields below |
+  | `trustedTime.wallMillis` | number | The trusted time, in milliseconds since 1970 | 0 to 253,402,300,799,999 (the end of the year 9999) |
+  | `trustedTime.elapsedMillis` | number | That moment on the device clock | not negative |
+  | `trustedTime.bootCount` | number or null | The device's count of starts at that moment; null when it could not be read | when not null, not negative |
 
   The hardware keys are named `proseplow.passphrase.binding.` and `proseplow.dek.biometric.`
   followed by the generation in decimal without leading zeros. Every key of the app begins with
@@ -2465,7 +2566,7 @@ This section is exact where the others describe. Each item carries one of three 
   | --- | --- | --- |
   | `id` | string | The chat's id; must equal the id in the file's name |
   | `title` | string | CHAT-09; empty for a chat without messages |
-  | `createdAtMillis`, `updatedAtMillis` | number | Milliseconds since 1970, by the date and time |
+  | `createdAtMillis`, `updatedAtMillis` | number | Milliseconds since 1970, by the trusted time (CHAT-24) |
   | `modelId` | string | The model of the replies to come |
   | `draft` | string | CHAT-15 |
   | `messages` | array | The conversation, oldest first |
@@ -2479,7 +2580,7 @@ This section is exact where the others describe. Each item carries one of three 
   | `status` | string | `STREAMING`, `COMPLETE` or `STOPPED` |
   | `finishReason` | string or null | `END_OF_TURN`, `STOP_STRING`, `LENGTH` or `CANCELLED`; null for a message of the user, while streaming and after a failure |
   | `modelId` | string or null | For a reply, the model that wrote it |
-  | `createdAtMillis` | number | When the message was added |
+  | `createdAtMillis` | number | When the message was added, by the trusted time (CHAT-24); what it expires by (CHAT-22). 0, or missing, means not known (STORE-23) |
 
   | Field of `error` | Type | Meaning |
   | --- | --- | --- |
@@ -2506,17 +2607,20 @@ This section is exact where the others describe. Each item carries one of three 
   - The list of chats: `{"schemaVersion": 1, "index": {"activeId": ..., "sessions": [...]}}`,
     where `activeId` is the id of the chat that was on screen last (null when that was an empty
     chat) and each entry of `sessions` has `id`, `title`, `createdAtMillis`, `updatedAtMillis`,
-    `modelId` and `messageCount`. Unknown fields are ignored; a list that cannot be read is
+    `modelId`, `messageCount` and `oldestMessageAtMillis` (the date of the chat's oldest message,
+    or null; STORE-23). Unknown fields are ignored; a list that cannot be read is
     rebuilt from the chat files (STORE-11).
   - The settings: `{"schemaVersion": 1, "settings": {...}}`, where `settings` has `systemPrompts`
     (an object from model id to text), `models` (an object from model id to an object with the
     optional numbers `temperature`, `maxNewTokens` and `contextTokens`, the last being the size
-    chosen for the context, MSET-22) and the boolean `notificationsAsked`. A value that is not set
-    is not written, a model with nothing set has no entry, and `notificationsAsked` is written only
-    once it is true. On reading, unknown fields are ignored; a system prompt that is not text, a
+    chosen for the context, MSET-22), the boolean `notificationsAsked` and the number
+    `messageLifetimeDays` (SECSET-13, as in FMT-06). A value that is not set is not written, a
+    model with nothing set has no entry, `notificationsAsked` is written only once it is true, and
+    `messageLifetimeDays` only when it is not 7. On reading, unknown fields are ignored; a system prompt that is not text, a
     temperature that is not a number from 0 to 2, a longest reply that is not a whole number of at
     least 16 written as one, a context size that is not a whole number of at least 1,024 written as
-    one, and a flag that is not a boolean are left out and counted; anything counted, or a higher
+    one, a flag that is not a boolean and a limit for messages that is not one of the choices are
+    left out and counted; anything counted, or a higher
     schema version, makes the settings "partly read" (STORE-16); text that is not such an object is
     "unreadable".
 
@@ -2853,6 +2957,18 @@ without these properties has not reached parity.
   attempts were made and when).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
   one, and when. Nothing else.
+- **THREAT-25** What the expiry of messages (CHAT-22) does not do. Deleting is not erasing:
+  the medium may keep the encrypted bytes of an expired message (THREAT-20), and text that
+  was decrypted stays in the memory of the process until it ends (MEM-04, MEM-05). Nothing
+  expires while the app does not run: deletion happens when it starts, is unlocked, or runs
+  while unlocked. A date set forward on the device makes messages expire early, and the trusted
+  time then stays ahead until the real date catches up (CHAT-24). A kept copy of a chat that
+  could not be read completely (STORE-09) cannot be rewritten: its older messages stay until
+  the copy's own date, that of its newest message, is past the limit, which can be up to one
+  more limit period after they expired. The list of chats cannot be changed without the key: it
+  keeps the titles of the chats deleted while the app was locked, encrypted, until the next
+  unlock (STORE-22). The files' dates (STORE-21) tell anyone who can read the private storage
+  when each chat last changed.
 - **THREAT-20** Old data on the storage medium. Deleting a chat deletes its file, but the medium
   may keep the encrypted bytes until it reuses the space; they stay as unreadable as they were,
   and after a reset the keys that could open them are gone. Changing the passphrase does not

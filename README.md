@@ -114,6 +114,11 @@ Privacy:
   the phone has restarted. After that only the passphrase opens it, and from then on the
   fingerprint works again. Ordinary use keeps it working, since every lock and every unlock
   starts the time again; a lock starts it at the moment the lock was due.
+- **Messages expire.** Messages older than the age you choose are deleted: 1 day, 7 days (the
+  default), 30 or 90 days, or never. A question and its answers go together, up to a day early.
+  Deletion happens whenever the app runs, also when it is opened and not unlocked, and is timed
+  by a clock that setting the phone's date back cannot hold up (see
+  [Messages expire](#messages-expire)).
 - **Locks by itself.** The app is locked at every start and after it has been in the background
   for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
   when Android reports that the app has left the screen, which is a fraction of a second after
@@ -380,11 +385,11 @@ Everything is in the app's private storage.
 
 | File | Content | Protection |
 | --- | --- | --- |
-| `files/sessions/<id>.enc` | One chat: its messages, its draft, its model and title | Encrypted |
-| `files/session-index.enc` | The list of chats | Encrypted |
-| `files/settings.enc` | The settings: the system prompt, the temperature, the longest reply and the context size of each model, and whether the app has asked for permission to show notifications | Encrypted |
+| `files/sessions/<id>.enc` | One chat: its messages, its draft, its model and title. The file's last-modified time is set to the date of its newest message | Encrypted |
+| `files/session-index.enc` | The list of chats: the title, dates, model and number of messages of each, and the date of its oldest message | Encrypted |
+| `files/settings.enc` | The settings: the system prompt, the temperature, the longest reply and the context size of each model, whether the app has asked for permission to show notifications, and how long messages are kept | Encrypted |
 | `files/kept/*.enc` | Exact copies of files that could not be read completely, kept before they are replaced | Encrypted, as the original was |
-| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
+| `files/security/lock.json` | The lock configuration: salt, iteration count, the wrapped data key or keys, the lock timeout, whether an answer is finished after locking, the count and time of wrong passphrase attempts, a copy of how long messages are kept, and the trusted time (see [Messages expire](#messages-expire)) | Plain JSON, because it must be readable before the app is unlocked. It holds no secret in the clear |
 
 The models are assets of the APK and are not encrypted: they are public files.
 
@@ -533,6 +538,42 @@ optionally a second time by a fingerprint key.
   someone who could get past that check (see below) and would mean setting fingerprint unlock
   up again every time. The start of the period is stored in `lock.json` at a lock only after the
   data key has been overwritten, and before the app ends its process.
+
+### Messages expire
+
+Messages are deleted when they reach the age chosen in Settings ("Delete messages after"): 1
+day, 7 days (the default), 30 days, 90 days or never. There are no keys per day: deletion goes
+by the dates of the messages.
+
+- **What goes together.** A question and the answers that follow it up to the next question
+  form a turn, aged by its newest message, and go together. Nothing is removed until some turn
+  has passed the limit; then every turn within a day of it goes as well (within three hours for
+  the one-day limit), so that a long conversation does not lose a turn every few minutes and
+  the model does not have to read it again each time. Messages go up to that much early, never
+  late. A chat left without messages is deleted whole, with its kept copies (if it is the chat
+  on screen, the draft being typed moves to the new chat that takes its place); a chat that
+  keeps some takes its title from what is now its first question. If the settings cannot be
+  read, the limit is the copy kept with the lock and never the default, so a damaged file
+  cannot delete what you chose to keep.
+- **When, while unlocked.** At every unlock before any chat is shown, when a stored chat is
+  opened, every hour, and at once when the limit is shortened (which asks for confirmation
+  first). A chat whose answer is being written is left alone until that answer has ended. If
+  the model still holds the conversation of a chat that was pruned, it is made to forget it.
+- **When, while locked.** Every time the app's process starts, before anything can be
+  unlocked, including when it is opened and not unlocked. Without the key it can only judge
+  whole files: every save sets a chat file's last-modified time to the date of its newest
+  message, so a file whose date is past the limit holds nothing that has not expired, and it is
+  deleted with its kept copies; kept copies and the leftovers of interrupted writes go by their
+  own dates. This uses a readable copy of the limit in `lock.json`, which every unlock writes
+  again from the encrypted setting. It runs as part of the lock's own work, so it never runs
+  beside an unlock, and it deletes nothing while a session is still alive behind the lock. The
+  list of chats names the deleted chats until the next unlock, which drops them without a word.
+- **Which time.** Anyone holding the phone can set its date. Messages are therefore dated, and
+  aged, by a trusted time that never goes back: the date and time, or the last trusted time
+  plus the time the phone has been running since it was recorded (within the same start of the
+  phone, by Android's count of boots), whichever is later. It is stored in `lock.json` at every
+  unlock, every lock and every start. Setting the date back keeps nothing alive; setting it
+  forward is believed.
 
 ### Reset, and no recovery
 
@@ -700,10 +741,10 @@ it or losing the phone loses the chats.
   covered taps does not help against what is drawn around a button.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
-  sizes and the times they were changed, and the content of `lock.json` (whether fingerprint
+  sizes and the dates of their newest messages, and the content of `lock.json` (whether fingerprint
   unlock is on and for how long, whether an answer is finished after locking, how many wrong
-  attempts were made and when, and when, on the clock since the phone's start, the app last
-  locked or was unlocked).
+  attempts were made and when, how long messages are kept, the latest trusted time, and when,
+  on the clock since the phone's start, the app last locked or was unlocked).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
   debugging can read its private files with `run-as` and attach a debugger to it, and a debug
   build accepts a model file that nothing has verified. Use a release build for chats that
@@ -711,6 +752,17 @@ it or losing the phone loses the chats.
 - **Loss.** A forgotten passphrase, an uninstalled app or a lost phone loses the chats. "Reset
   app data" needs no passphrase, so anyone who holds the phone can delete everything, though
   not read it.
+- **What the expiry of messages does not do.** Deleting is not forensic erasure: the flash
+  storage may keep the encrypted bytes (see below), and text that was decrypted stays in the
+  app's memory until its process ends. Nothing expires while the app does not run: deletion
+  happens when it starts, when it is unlocked, and while it is open. A date set forward on the
+  phone makes messages expire early, and the trusted time then stays ahead until the real date
+  catches up. A kept copy of a chat that could not be read completely cannot be rewritten: its
+  older messages stay until the copy's own date (that of its newest message) is past the limit,
+  up to one more limit period after they expired. The list of chats cannot be changed without
+  the key, so it keeps the titles of the chats deleted while the app was locked, encrypted,
+  until the next unlock. The dates of the chat files show anyone who can read the private
+  storage when each chat last changed.
 - **Old ciphertext on the flash storage.** Deleting a chat deletes its file; the phone's storage
   may keep the encrypted bytes until it reuses the space. They stay as unreadable as they were,
   and after a reset the keys that could open them are gone.
@@ -1307,8 +1359,8 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 410 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 620 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 430 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 669 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

@@ -67,6 +67,17 @@ class SecurityViewModelTest {
     private lateinit var lock: AppLock<UnlockedSession>
     private lateinit var viewModel: SecurityViewModel
 
+    /** The session's setting of how long messages are kept, and every change made to it. */
+    private val lifetimeSetting = object : MessageLifetimeSetting {
+        override var messageLifetimeDays: Int = 7
+        val changes = mutableListOf<Int>()
+
+        override fun changeMessageLifetimeDays(days: Int) {
+            messageLifetimeDays = days
+            changes += days
+        }
+    }
+
     @Before
     fun viewModelsRunOnTheTestDispatcher() = Dispatchers.setMain(dispatcher)
 
@@ -79,7 +90,7 @@ class SecurityViewModelTest {
             manager = LockManager(LockConfigStore(files.lockConfig), vault, clock, iterations = 1_000, minIterations = 1, encryptedDataExists = files::encryptedDataExists),
             files = files,
             clock = clock,
-            openSession = {
+            openSession = { _, _ ->
                 object : UnlockedSession {
                     override fun clearScreens() = Unit
 
@@ -101,7 +112,7 @@ class SecurityViewModelTest {
         lock.setUp(passphrase.toCharArray(), passphrase.toCharArray())
         runCurrent()
         assertTrue(lock.state.value is LockState.Unlocked)
-        viewModel = SecurityViewModel(lock)
+        viewModel = SecurityViewModel(lock, lifetimeSetting)
     }
 
     private fun TestScope.confirmWith(text: String) {
@@ -359,5 +370,66 @@ class SecurityViewModelTest {
         assertEquals(LockState.SetupRequired, lock.state.value)
         assertFalse(files.lockConfig.exists())
         assertTrue(vault.aliases.isEmpty())
+    }
+
+    /**
+     * "Delete messages after": a longer limit applies at once; a shorter one, or any limit after
+     * Never, asks first and changes nothing until confirmed. Both the setting and the readable
+     * copy in the lock configuration follow; a copy that cannot be written changes neither.
+     * Catches a shortening without confirmation, a confirmation that does not apply, and a
+     * picker that shows a value that was not stored.
+     */
+    @Test
+    fun aLimitThatDeletesNowIsConfirmedFirstAndOneThatDoesNotIsAppliedAtOnce() = runTest(dispatcher) {
+        unlockedApp()
+        fun copy() = LockConfigStore(files.lockConfig).read()!!.messageLifetimeDays
+        assertEquals(7, viewModel.messageLifetimeDays.value)
+
+        viewModel.selectMessageLifetime(30)
+        runCurrent()
+        assertNull("a longer limit deletes nothing now and asks nothing", viewModel.state.value.dialog)
+        assertEquals(30, viewModel.messageLifetimeDays.value)
+        assertEquals(listOf(30), lifetimeSetting.changes)
+        assertEquals(30, copy())
+
+        viewModel.selectMessageLifetime(1)
+        runCurrent()
+        assertEquals(SecurityDialog.ShortenMessageLifetime(1), viewModel.state.value.dialog)
+        assertEquals("nothing changes before it is confirmed", 30, viewModel.messageLifetimeDays.value)
+        viewModel.dismissDialog()
+        runCurrent()
+        assertEquals(listOf(30), lifetimeSetting.changes)
+        assertEquals(30, copy())
+
+        viewModel.selectMessageLifetime(1)
+        viewModel.confirmMessageLifetime()
+        runCurrent()
+        assertNull(viewModel.state.value.dialog)
+        assertEquals(1, viewModel.messageLifetimeDays.value)
+        assertEquals(listOf(30, 1), lifetimeSetting.changes)
+        assertEquals(1, copy())
+
+        viewModel.selectMessageLifetime(0)
+        runCurrent()
+        assertNull("Never deletes nothing", viewModel.state.value.dialog)
+        assertEquals(0, copy())
+        viewModel.selectMessageLifetime(90)
+        runCurrent()
+        assertEquals("any limit after Never deletes now", SecurityDialog.ShortenMessageLifetime(90), viewModel.state.value.dialog)
+        viewModel.selectMessageLifetime(2)
+        assertEquals("not a choice", SecurityDialog.ShortenMessageLifetime(90), viewModel.state.value.dialog)
+
+        val changes = lifetimeSetting.changes.size
+        files.securityDir.setWritable(false)
+        try {
+            viewModel.confirmMessageLifetime()
+            runCurrent()
+        } finally {
+            files.securityDir.setWritable(true)
+        }
+        assertEquals(SecurityError.FAILED, viewModel.state.value.error)
+        assertEquals(0, viewModel.messageLifetimeDays.value)
+        assertEquals("the setting is not changed either", changes, lifetimeSetting.changes.size)
+        assertEquals(0, copy())
     }
 }

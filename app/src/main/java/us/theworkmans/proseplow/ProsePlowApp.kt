@@ -18,11 +18,14 @@ import us.theworkmans.proseplow.background.AnswerService
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.KeepAliveSource
 import us.theworkmans.proseplow.background.MemoryPressure
+import us.theworkmans.proseplow.chat.ChatController
+import us.theworkmans.proseplow.core.chat.Clock as MessageClock
 import us.theworkmans.proseplow.core.engine.ContextPolicy
 import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
+import us.theworkmans.proseplow.data.ExpiredFiles
 import us.theworkmans.proseplow.llama.NativeEngine
 import us.theworkmans.proseplow.security.AndroidKeyVault
 import us.theworkmans.proseplow.security.AppFiles
@@ -33,6 +36,7 @@ import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
 import us.theworkmans.proseplow.security.MakesWay
 import us.theworkmans.proseplow.security.ScreenshotAllowance
+import us.theworkmans.proseplow.security.TrustedClock
 import java.util.concurrent.Executors
 
 /**
@@ -148,6 +152,12 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         }
     }
 
+    /**
+     * The time messages are dated and aged by, for the life of the process: the lock seeds it from
+     * and stores it in the lock configuration, and every session dates its messages by it.
+     */
+    private val trustedClock = TrustedClock(clock)
+
     /** Everything Android has to do for the window policy; see [ScreenSecurity]. */
     val screenSecurity = ScreenSecurity(app)
 
@@ -165,15 +175,19 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
             vault = AndroidKeyVault(),
             clock = clock,
             encryptedDataExists = files::encryptedDataExists,
+            trustedClock = trustedClock,
         ),
         files = files,
         clock = clock,
         // The models offered are the ones whose files this build really carries, asked at every unlock.
-        openSession = { cipher ->
+        openSession = { cipher, lockedMessageLifetimeDays ->
             AppSession(
                 cipher, layout, engine, NativeEngine.availableModels(app),
+                clock = MessageClock { trustedClock.nowMillis() },
                 answerEvents = answerWork,
                 contextLimits = contextLimits,
+                expiryIntervalMillis = ChatController.EXPIRY_INTERVAL_MILLIS,
+                lockedMessageLifetimeDays = lockedMessageLifetimeDays,
             )
         },
         biometricStatus = {
@@ -196,6 +210,8 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
 
             override fun carryOn() = generationGate.open()
         },
+        // What has expired is deleted at every start of the lock, before anything can be unlocked.
+        expiredData = ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex),
     )
 
     init {

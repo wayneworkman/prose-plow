@@ -163,6 +163,9 @@ class ChatViewModel(
 
     private val local = MutableStateFlow(Local())
 
+    /** The time the chats are dated by ([ChatController.nowMillis]), for showing how long ago something changed. */
+    fun nowMillis(): Long = controller.nowMillis()
+
     val state: StateFlow<ChatUiState> = combine(controller.state, local, writeFailure, settings.loadIssue) { chat, local, failure, issue ->
         ChatUiState(chat, local.editingMessageId, local.deleteRequest, local.linkRequest, failure, issue)
     }.stateIn(

@@ -3,9 +3,12 @@ package us.theworkmans.proseplow.data
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import us.theworkmans.proseplow.core.chat.ChatSession
+import us.theworkmans.proseplow.core.chat.MessageExpiry
+import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.SessionCodec
 import us.theworkmans.proseplow.core.chat.SessionSummary
 import us.theworkmans.proseplow.security.KeyDestroyedException
+import java.io.File
 import java.io.IOException
 
 /**
@@ -35,11 +38,22 @@ data class SessionIndex(val activeId: String? = null, val sessions: List<Session
  *
  * Nothing here ever replaces a file it could not read completely without keeping a copy
  * ([SealedFile]), and a session file that cannot be read at all is never written to: it stays as
- * it is until the user deletes that chat.
+ * it is until the user deletes that chat, or it expires by its date ([expire]).
+ *
+ * A session file is dated by its newest message: every [save] sets the file's last-modified time
+ * to that message's date. That is what lets expired chats be deleted while the app is locked,
+ * without the key (see [ExpiredFiles]).
  *
  * All methods block; call them off the main thread.
+ *
+ * @param setFileDate sets a file's last-modified time and says whether that worked; replaced in
+ *   the unit tests to make it fail.
  */
-class SessionStore(private val sessions: SealedDirectory, private val indexFile: SealedFile) {
+class SessionStore(
+    private val sessions: SealedDirectory,
+    private val indexFile: SealedFile,
+    private val setFileDate: (File, Long) -> Boolean = { file, millis -> file.setLastModified(millis) },
+) {
 
     /**
      * What of a stored session could not be read, when some of it could.
@@ -141,10 +155,134 @@ class SessionStore(private val sessions: SealedDirectory, private val indexFile:
         )
     }
 
-    /** Stores [session] in its file. @throws IOException when it was not stored. */
+    /**
+     * Stores [session] in its file, and dates the file by its newest message. When the date
+     * cannot be set (or no message has one) the file keeps the time it was written, which is
+     * later than its newest message: a deletion by the date then comes later, never earlier.
+     *
+     * @throws IOException when it was not stored.
+     */
     @Throws(IOException::class)
     fun save(session: ChatSession) {
-        sessions.file(session.id).write(SessionCodec.encode(session).toByteArray(Charsets.UTF_8))
+        val file = sessions.file(session.id)
+        file.write(SessionCodec.encode(session).toByteArray(Charsets.UTF_8))
+        MessageExpiry.newestMessageMillis(session)?.let { setFileDate(file.file, it) }
+    }
+
+    /** What [expire] did to a stored session. */
+    sealed interface Expiry {
+        /** Nothing of it had expired, or it was not looked at; its file is as it was. */
+        data object Unchanged : Expiry
+
+        /**
+         * It was read and nothing of it had expired; its file is as it was. [oldestMessageAtMillis]
+         * is the date of its oldest message, for its entry in the list, so that a later pass need
+         * not read it again before that date is past the limit.
+         */
+        data class Checked(val oldestMessageAtMillis: Long) : Expiry
+
+        /** Messages were removed (or their dates made usable); [session] is what is stored now. */
+        data class Pruned(val session: ChatSession) : Expiry
+
+        /** It is no longer stored: everything in it had expired, and it was deleted. */
+        data object Deleted : Expiry
+
+        /** There was no file. That is not an expiry in itself; see [expireAll]. */
+        data object Missing : Expiry
+    }
+
+    /**
+     * Applies the expiry of messages ([MessageExpiry]) to the stored session [id] at [nowMillis]
+     * (trusted time), for a session that nothing else is using:
+     * - a readable session loses its expired turns and is saved, with its title derived again;
+     *   one that keeps no message is deleted with its kept copies. A session without messages
+     *   (only a draft) has nothing to date it by but its file, and is deleted when that is past
+     *   the limit, as the locked clean-up does;
+     * - message dates that cannot be used (none, or in the future) are made usable first, from
+     *   the file's date and from now, and stored;
+     * - a session that cannot be read is deleted when its file is past the limit;
+     * - a session that could only be read in part is never deleted on the strength of the
+     *   messages that could be read alone, since those that could not may be newer: only when
+     *   its file, too, is past the limit.
+     *
+     * Two calls exclude each other, so that two passes over the same chat (the one that runs
+     * every hour, and the one of a chat that is being opened) cannot undo each other's work.
+     *
+     * @throws IOException when the file could not be read, written or deleted; it is then as it
+     *   was, or as far as the deletion got.
+     */
+    @Synchronized
+    @Throws(IOException::class)
+    fun expire(id: String, lifetime: MessageLifetime, nowMillis: Long): Expiry {
+        if (lifetime.limitMillis == null || !SealedDirectory.isValidId(id)) return Expiry.Unchanged
+        val fileDate = sessions.file(id).file.lastModified()
+        val fileExpired = MessageExpiry.fileExpired(fileDate, lifetime, nowMillis)
+        val loaded = when (val read = load(id)) {
+            Loaded.Missing -> return Expiry.Missing
+            Loaded.Unreadable -> return if (fileExpired) deleted(id) else Expiry.Unchanged
+            is Loaded.Readable -> read
+        }
+        if (loaded.session.messages.isEmpty()) return if (fileExpired) deleted(id) else Expiry.Unchanged
+        val normalised = MessageExpiry.normalised(loaded.session, nowMillis, fileDate)
+        val kept = when (val outcome = MessageExpiry.prune(normalised, lifetime, nowMillis)) {
+            MessageExpiry.Outcome.Unchanged -> if (normalised === loaded.session) return checked(normalised) else normalised
+            is MessageExpiry.Outcome.Pruned -> outcome.session
+            MessageExpiry.Outcome.Emptied -> return if (loaded.incomplete == null || fileExpired) deleted(id) else checked(normalised)
+        }
+        save(kept)
+        return Expiry.Pruned(kept)
+    }
+
+    /**
+     * The expiry of messages applied to every listed session of [opened] whose summary does not
+     * rule it out ([MessageExpiry.mayHaveExpired]), for the unlock, before any chat is shown.
+     * Entries of deleted sessions are dropped quietly and pruned ones get their new summary; one
+     * that was read and kept learns the date of its oldest message, so that the next pass can
+     * skip it. A session whose file could not be read, written or deleted now is left as it is
+     * (it is tried again at the next pass).
+     *
+     * A file that is missing is dropped quietly only when its entry says the whole chat had
+     * expired (its last change is past the limit), which is what the locked clean-up leaves
+     * behind. Otherwise the entry stays: the chat was not known to have expired, and opening it
+     * says that it is no longer on the phone. Returns [opened] itself when nothing changed.
+     */
+    fun expireAll(opened: Opened, lifetime: MessageLifetime, nowMillis: Long): Opened {
+        if (lifetime.limitMillis == null) return opened
+        var changed = false
+        val remaining = opened.index.sessions.mapNotNull { summary ->
+            if (!MessageExpiry.mayHaveExpired(summary.oldestMessageAtMillis, lifetime, nowMillis)) return@mapNotNull summary
+            val expiry = try {
+                expire(summary.id, lifetime, nowMillis)
+            } catch (_: IOException) {
+                Expiry.Unchanged
+            }
+            when (expiry) {
+                Expiry.Unchanged -> summary
+                is Expiry.Checked ->
+                    if (summary.oldestMessageAtMillis == expiry.oldestMessageAtMillis) summary
+                    else summary.copy(oldestMessageAtMillis = expiry.oldestMessageAtMillis).also { changed = true }
+                is Expiry.Pruned -> expiry.session.summary().also { changed = true }
+                Expiry.Deleted -> null.also { changed = true }
+                Expiry.Missing -> if (wholeChatExpired(summary, lifetime, nowMillis)) null.also { changed = true } else summary
+            }
+        }
+        if (!changed) return opened
+        val ids = remaining.mapTo(HashSet()) { it.id }
+        val index = SessionIndex(activeId = opened.index.activeId?.takeIf { it in ids }, sessions = remaining)
+        return Opened(index, stale = true)
+    }
+
+    /** True when [summary] says the whole chat had expired: its last change is past the limit. */
+    private fun wholeChatExpired(summary: SessionSummary, lifetime: MessageLifetime, nowMillis: Long): Boolean =
+        MessageExpiry.fileExpired(summary.updatedAtMillis, lifetime, nowMillis)
+
+    /** What was learned of [session], which was read and not changed. */
+    private fun checked(session: ChatSession): Expiry =
+        session.summary().oldestMessageAtMillis?.let(Expiry::Checked) ?: Expiry.Unchanged
+
+    private fun deleted(id: String): Expiry {
+        delete(id)
+        return Expiry.Deleted
     }
 
     /**

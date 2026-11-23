@@ -61,6 +61,20 @@ data class LockConfig(
      * passphrase is needed once before the fingerprint works again.
      */
     val fingerprintPeriodStart: FingerprintPeriodStart? = null,
+    /**
+     * A readable copy of how long messages are kept, in days ([MESSAGE_LIFETIME_NEVER] is
+     * Never), for what the app deletes while it is locked. The setting itself is in the
+     * encrypted settings, and every unlock writes this copy from it again. A file written before
+     * this field existed does not have it, which means the default, 7 days.
+     */
+    val messageLifetimeDays: Int = DEFAULT_MESSAGE_LIFETIME_DAYS,
+    /**
+     * The latest trusted time ([TrustedTime]), with where the clock since boot and the boot count
+     * stood when it was recorded: at every unlock, every lock and every run of the locked
+     * clean-up. Null when none has been recorded, which a file written before this field existed
+     * means; the wall clock is then trusted as it is.
+     */
+    val trustedTime: TimeMark? = null,
 ) {
     /**
      * Every field is in range and every wrap well formed, so nothing read from the file can make
@@ -73,6 +87,8 @@ data class LockConfig(
         if (lockTimeoutSeconds !in TIMEOUT_CHOICES_SECONDS) return false
         if (fingerprintPeriodSeconds !in FINGERPRINT_PERIOD_CHOICES_SECONDS) return false
         if (fingerprintPeriodStart != null && !fingerprintPeriodStart.isValid()) return false
+        if (messageLifetimeDays !in MESSAGE_LIFETIME_CHOICES_DAYS) return false
+        if (trustedTime != null && !trustedTime.isValid()) return false
         if (failedAttempts < 0 || lastFailureWallMillis < 0 || lastFailureElapsedMillis < 0) return false
         if (!passphrase.isValid(minIterations)) return false
         if (biometric != null && !biometric.isValid()) return false
@@ -96,6 +112,27 @@ data class LockConfig(
 
         /** There is deliberately no choice without a limit. */
         val FINGERPRINT_PERIOD_CHOICES_SECONDS = listOf(15 * 60, 60 * 60, 8 * 60 * 60, 24 * 60 * 60)
+
+        /** How long messages are kept when nothing says otherwise, in days. */
+        const val DEFAULT_MESSAGE_LIFETIME_DAYS = 7
+
+        /** What [messageLifetimeDays] holds for "Never". */
+        const val MESSAGE_LIFETIME_NEVER = 0
+
+        /**
+         * The choices of how long messages are kept, in days, in the order the settings offer
+         * them. They are the chats' own choices (`MessageLifetime` in the core), which this
+         * package does not know; a unit test holds the two to each other.
+         */
+        val MESSAGE_LIFETIME_CHOICES_DAYS = listOf(1, 7, 30, 90, MESSAGE_LIFETIME_NEVER)
+
+        /**
+         * True when changing how long messages are kept from [fromDays] to [toDays] deletes
+         * messages now that [fromDays] would have kept: [toDays] is a limit, and [fromDays] is
+         * Never or a longer one. Such a change asks for confirmation.
+         */
+        fun messageLifetimeDeletesNow(toDays: Int, fromDays: Int): Boolean =
+            toDays != MESSAGE_LIFETIME_NEVER && (fromDays == MESSAGE_LIFETIME_NEVER || toDays < fromDays)
 
         /** `iv (12) || ciphertext (32) || tag (16)` of the data key from a Keystore AES-GCM key. */
         const val KEY_WRAP_SIZE = 12 + DataKey.SIZE + 16

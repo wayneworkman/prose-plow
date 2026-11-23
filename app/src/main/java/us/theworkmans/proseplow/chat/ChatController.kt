@@ -9,6 +9,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +24,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.Clock
 import us.theworkmans.proseplow.core.chat.IdSource
+import us.theworkmans.proseplow.core.chat.MessageExpiry
+import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.MessageStatus
 import us.theworkmans.proseplow.core.chat.Role
 import us.theworkmans.proseplow.core.chat.SessionSummary
@@ -164,6 +167,13 @@ enum class ChatNotice {
  *   as it streams and for a draft as it is typed. The index of chats follows.
  * - **A chat with nothing in it is not stored.** A new chat is listed and written with its first
  *   message or draft, and a chat that is left empty is forgotten when the user moves on.
+ * - **Expired messages go.** Under the limit [lifetime] gives, turns that have expired are
+ *   removed ([MessageExpiry]) when a stored chat is opened, every [expiryIntervalMillis] while
+ *   the session lives (hourly in the app), when [expireMessages] is called (the setting was shortened), and from a
+ *   chat whose reply was being written as soon as that reply has ended, never during it. A chat
+ *   left without messages is deleted whole, quietly. When the engine holds the conversation of
+ *   a chat that was pruned, it is made to forget it. (What expired before the unlock was
+ *   removed before this class was made; see [SessionStore.expireAll].)
  *
  * Threading: everything except the constructor and [shutdown] is called on the main dispatcher
  * and all state is confined to it. The constructor reads the chat that was on screen last from
@@ -177,6 +187,11 @@ enum class ChatNotice {
  * @param onReplyFinished called on the main dispatcher when the model has finished a reply by
  *   itself (it reached its end, a stop string or its length limit), not when one was stopped or
  *   failed.
+ * @param lifetime how long messages are kept, as the settings say now; asked at every pass.
+ *   [clock] is the time they are dated and aged by.
+ * @param expiryIntervalMillis how often expired messages are looked for while the session lives
+ *   ([EXPIRY_INTERVAL_MILLIS] in the app); null for no timer. The unit tests leave it out,
+ *   because a timer that repeats for ever never lets virtual time come to rest.
  */
 class ChatController(
     private val store: SessionStore,
@@ -190,6 +205,8 @@ class ChatController(
     private val mainDispatcher: CoroutineDispatcher,
     private val ioDispatcher: CoroutineDispatcher,
     private val onReplyFinished: () -> Unit = {},
+    private val lifetime: () -> MessageLifetime = { MessageLifetime.NEVER },
+    private val expiryIntervalMillis: Long? = null,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
@@ -207,6 +224,12 @@ class ChatController(
     private class Loading(val modelId: String, val job: Job)
 
     private var running: Running? = null
+
+    /**
+     * The chat whose conversation the engine was last given, and so may still hold in its
+     * memory; null when it was made to forget since. Main thread only.
+     */
+    private var engineHolds: String? = null
 
     /** The job of the latest turn, running or not: the next turn waits until it has let go of the engine. */
     private var lastTurn: Job? = null
@@ -245,6 +268,14 @@ class ChatController(
         }
         // The model of the chat on screen, so that the first message does not have to wait for it.
         (first as? OpenChat.Ready)?.let { preload(it.session.modelId) }
+        expiryIntervalMillis?.let { interval ->
+            scope.launch {
+                while (true) {
+                    delay(interval)
+                    expireMessages()
+                }
+            }
+        }
     }
 
     // --- Chats ---------------------------------------------------------------------------------
@@ -276,8 +307,14 @@ class ChatController(
             return
         }
         val title = _state.value.chats.firstOrNull { it.id == id }?.title.orEmpty()
+        val now = clock.nowMillis()
+        val limit = lifetime()
         opening = scope.launch {
-            val loaded = withContext(ioDispatcher) { loadOrUnreadable(id) }
+            val loaded = withContext(ioDispatcher) {
+                // What has expired goes before the chat is shown; a chat that has expired whole is gone.
+                expireStored(id, limit, now)
+                loadOrUnreadable(id)
+            }
             val chat = openChatFor(id, loaded, title)
             if (chat != null) {
                 show(chat)
@@ -319,6 +356,38 @@ class ChatController(
         }
         saveIndex(urgent = true)
     }
+
+    /**
+     * Removes what has expired under the limit of [lifetime] at the time of [clock], from every
+     * chat: from those in memory here, and from the stored chats that are not, unless their
+     * summaries rule it out. A chat whose reply is being written is left until that reply ends.
+     * Main thread; the stored chats are read and written by the writer, in turn with everything
+     * else written to them.
+     */
+    fun expireMessages() {
+        if (closed) return
+        val limit = lifetime()
+        if (limit.limitMillis == null) return
+        val now = clock.nowMillis()
+        for (id in sessions.keys.toList()) expireLoaded(id, limit, now)
+        for (summary in _state.value.chats) {
+            if (summary.id in sessions || !MessageExpiry.mayHaveExpired(summary.oldestMessageAtMillis, limit, now)) continue
+            val id = summary.id
+            // Nothing else is pending for this chat: it is listed and not in memory, so it was
+            // neither changed nor deleted since the unlock read it.
+            writer.submit(sessionKey(id), urgent = false) {
+                val expiry = expireStored(id, limit, now)
+                scope.launch { storedExpired(id, expiry) }
+            }
+        }
+    }
+
+    /**
+     * The time the chats are dated and aged by: the trusted time, which a phone clock set back
+     * cannot take back. Whatever shows how long ago a chat changed measures against this, never
+     * against the raw wall clock, or it could show a change in the future.
+     */
+    fun nowMillis(): Long = clock.nowMillis()
 
     /** The user has read that part of the chat [sessionId] could not be loaded. */
     fun incompleteNoticeShown(sessionId: String) {
@@ -559,6 +628,107 @@ class ChatController(
         writer.submit(INDEX_KEY, urgent || structural) { store.saveIndex(index) }
     }
 
+    // --- Internals: expiry ---------------------------------------------------------------------
+
+    /**
+     * Applies the expiry of messages to the stored chat [id] (blocking, off the main thread). A
+     * failure to read, write or delete leaves it as it is until the next pass.
+     */
+    private fun expireStored(id: String, limit: MessageLifetime, now: Long): SessionStore.Expiry = try {
+        store.expire(id, limit, now)
+    } catch (_: IOException) {
+        SessionStore.Expiry.Unchanged
+    }
+
+    /** Main thread: what [expireStored] did to [id], which was not in memory, made known to the list. */
+    private fun storedExpired(id: String, expiry: SessionStore.Expiry) {
+        // Opened meanwhile: it was expired again on the way, and what is in memory is the truth.
+        if (closed || id in sessions || _state.value.chats.none { it.id == id }) return
+        when (expiry) {
+            // A missing file is not an expiry: the entry stays, and opening it says the chat is gone.
+            SessionStore.Expiry.Unchanged, SessionStore.Expiry.Missing -> return
+            is SessionStore.Expiry.Checked -> {
+                _state.update { state ->
+                    state.copy(chats = state.chats.map { if (it.id == id) it.copy(oldestMessageAtMillis = expiry.oldestMessageAtMillis) else it })
+                }
+                saveIndex(urgent = false)
+                return
+            }
+            is SessionStore.Expiry.Pruned -> _state.update { it.copy(chats = withSummary(it.chats, expiry.session.summary())) }
+            SessionStore.Expiry.Deleted -> _state.update { state -> state.copy(chats = state.chats.filterNot { it.id == id }) }
+        }
+        forgetIfHeld(id)
+        saveIndex(urgent = false)
+    }
+
+    /**
+     * Main thread: applies the expiry of messages to the chat [id] in memory. A chat whose reply
+     * is being written is left alone; [run] calls this again when the reply has ended. A chat
+     * without messages has nothing to date it by here, and is judged by its file at the next
+     * unlock. Messages without a date take the time the conversation last changed, the nearest
+     * thing to their file's date in memory (the unlock has normally given them one already).
+     */
+    private fun expireLoaded(id: String, limit: MessageLifetime, now: Long) {
+        val session = sessions[id] ?: return
+        if (running?.sessionId == id || session.isGenerating || session.messages.isEmpty()) return
+        val normalised = MessageExpiry.normalised(session, now, fileMillis = session.updatedAtMillis)
+        when (val outcome = MessageExpiry.prune(normalised, limit, now)) {
+            MessageExpiry.Outcome.Unchanged -> if (normalised !== session) commit(normalised, urgent = false)
+            is MessageExpiry.Outcome.Pruned -> {
+                commit(outcome.session, urgent = true)
+                forgetIfHeld(id)
+            }
+            MessageExpiry.Outcome.Emptied -> removeExpired(id)
+        }
+    }
+
+    /**
+     * Main thread: deletes the chat [id], all of whose messages have expired, as [deleteChat]
+     * does but quietly: its file, its kept copies and its entry go, and a chat on screen gives
+     * way to a new one with the same model and the same draft, which the user may be typing.
+     */
+    private fun removeExpired(id: String) {
+        val removed = sessions.remove(id)
+        incomplete.remove(id)
+        writer.submit(sessionKey(id), urgent = true) { store.delete(id) }
+        val replacement = if (_state.value.open.id == id) OpenChat.Ready(newSession(removed?.modelId)) else null
+        // What the user may be typing at this very moment is not a message, and has not expired.
+        val draft = removed?.draft.orEmpty()
+        _state.update { state ->
+            state.copy(
+                chats = state.chats.filterNot { it.id == id },
+                open = replacement ?: state.open,
+                trimmedMessages = state.trimmedMessages - id,
+                contextNotes = state.contextNotes - id,
+            )
+        }
+        if (replacement != null && draft.isNotEmpty()) commit(replacement.session.withDraft(draft), urgent = true)
+        forgetIfHeld(id)
+        saveIndex(urgent = true)
+    }
+
+    /**
+     * Main thread: when the engine may still hold the conversation of the chat [id], whose
+     * messages have just been removed, it is made to forget it, so that no expired text stays
+     * in its memory. Done in turn with the replies: the next one waits for it, as it waits for
+     * the one before.
+     */
+    private fun forgetIfHeld(id: String) {
+        if (engineHolds != id || closed) return
+        engineHolds = null
+        val previous = lastTurn
+        lastTurn = scope.launch {
+            previous?.join()
+            try {
+                engine.forget()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: RuntimeException) {
+                // The engine promises not to throw; the lock makes it forget in any case.
+            }
+        }
+    }
+
     // --- Internals: models ---------------------------------------------------------------------
 
     /**
@@ -657,6 +827,7 @@ class ChatController(
             // Read again: the draft may have changed while the model was loading.
             val settings = requestSettings(spec)
             val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)
+            engineHolds = reply.sessionId
             engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
         } catch (e: CancellationException) {
             throw e
@@ -671,6 +842,11 @@ class ChatController(
             if (running === reply) {
                 running = null
                 _state.update { it.copy(turn = null) }
+            }
+            // It could not be pruned while the reply was being written; it can now.
+            if (running?.sessionId != reply.sessionId && !closed) {
+                val limit = lifetime()
+                if (limit.limitMillis != null) expireLoaded(reply.sessionId, limit, clock.nowMillis())
             }
         }
     }
@@ -720,6 +896,9 @@ class ChatController(
 
         /** The key of the index in the [CoalescingWriter]. */
         const val INDEX_KEY: String = "session-index"
+
+        /** How often expired messages are looked for while a session lives: hourly. */
+        const val EXPIRY_INTERVAL_MILLIS: Long = 60 * 60 * 1000L
 
         /** How long [shutdown] waits for the engine to let go of a generation or a load. */
         const val ENGINE_TIMEOUT_MILLIS: Long = 10_000L

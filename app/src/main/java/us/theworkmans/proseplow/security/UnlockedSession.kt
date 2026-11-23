@@ -50,6 +50,15 @@ interface UnlockedSession {
     fun resume() {}
 
     /**
+     * How long messages are kept, in days as [LockConfig.messageLifetimeDays] counts them, as the
+     * session's own (encrypted) settings say. Read under the lock's mutex at every unlock, which
+     * writes the readable copy in the lock configuration from it, so that what the locked app
+     * deletes follows the real setting. Null for a session that has no such setting, whose
+     * unlock then leaves the copy as it is.
+     */
+    val messageLifetimeDays: Int? get() = null
+
+    /**
      * Stops all work of the session, gives the writes that are queued their time to reach the
      * disk, and lets go of everything decrypted. Called once, off the main thread, after
      * [clearScreens].
