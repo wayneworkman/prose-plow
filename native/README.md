@@ -1365,6 +1365,7 @@ What is checked, for each model that is present:
 | `ThreadMoveDeviceTest` | With the smallest model present: the test's activity leaves the front while one long prompt is being evaluated, and when that same call returns the session runs the plan's free threads and no longer claims to be pinned; the time of each chunk before and after the move is reported |
 | `BackgroundSpeedDeviceTest` | Nothing is required: for Qwen3.5 and peacebell, the speed of a prompt and of generation with the test's activity in front and then with nothing of the test in front, each line with the set of cores the process was in |
 | `ContextGrowthDeviceTest` | Nothing is required beyond the sizes and codes: opt-in (`-e contextGrowth true`, and `-e contextFraction` for another share than a quarter). For Qwen3.5, peacebell and Boris-2 it reports the cost of the opening context and of the largest, the speed of a prompt and of generation at the opening size nearly empty and full, then doubles the context for as long as the growth stays inside that share of the memory the system reports free above its low-memory threshold, with 256 tokens in memory to carry over: for each size the time, how many tokens were still in memory, the process's memory before and after, and the speeds nearly empty; then the time of forgetting at the largest size and the memory after it, which shows whether a freed context goes back to the system |
+| `ReadingDepthDeviceTest` | Nothing is required: opt-in (`-e readingDepth` with a number of tokens; `-e readingChunk`, `-e readingModel` and `-e contextFraction` as its header says). With the test's activity in front it reads a model to that depth in blocks of 512 tokens, reports the time of each block and of generation at that depth, and fits a line through the cost of a token against the tokens already read |
 | `ScreenOffSpeedDeviceTest` | Nothing is required, and nothing happens unless it is asked for with `-e screenOff true`: it turns the screen off, which locks the phone, and measures the same two speeds without and with a partial wake lock. **Built, never run**: the figures for a locked phone below come from a run of the whole suite during which the phone had locked itself |
 
 `JniBoundaryDeviceTest` also times the longest text a session accepts, for every model present
@@ -1462,6 +1463,43 @@ not be pinned and ran its prompt at 137 instead of 184; the line said so.
   anonymous part, whatever the length of the conversation: clearing the memory writes zeros
   over all of it. A model with recurrent state adds its checkpoints: the engine keeps four,
   so 81 MB for Qwen3.5.
+- **A context that grows** (`ContextGrowthDeviceTest`). The session's count of a context of
+  4,096 tokens is 544 MiB for Qwen3.5 and 392 MiB for peacebell (346 MiB for Boris-2 at its
+  2,048), of which the process had 143, 284 and 145 MiB resident as anonymous memory: the
+  reservations that are never touched stay untouched on the phone as on the desktop. Growing
+  Qwen3.5 with a short conversation in memory took 90 ms to 8,192 tokens, 133 ms to 16,384
+  and 291 ms to 32,768, every token kept, and added 39, 87 and 184 MiB of resident memory,
+  which is the new key-value buffers less the old; peacebell took 294 ms to 8,192 and added
+  258 MiB. Forgetting at 32,768 tokens took Qwen3.5 100 ms and brought its anonymous memory
+  from 490 back to 143 MiB at once; peacebell at 8,192 took 180 ms, from 535 to 272 MiB.
+  Before the session gave the allocator's free pages back between freeing a context and
+  creating the next (see "Forgetting"), the same run left Qwen3.5 at about 540 MiB after
+  forgetting: this phone's allocator keeps freed pages resident, and the new context's
+  untouched reservations had settled on them. A model in a large context that is nearly
+  empty is as fast as in a small one.
+- **Reading a long conversation** (`ReadingDepthDeviceTest`, the test's activity in front,
+  four pinned threads). A token costs more the more tokens were already read, and so does
+  every chunk that is evaluated in one go. Milliseconds for one token:
+
+  | Tokens already read | Qwen3.5, chunks of 32 | chunks of 128 | chunks of 256 | peacebell, chunks of 32 | chunks of 256 |
+  | --- | --- | --- | --- | --- | --- |
+  | 0 | 11.3 | 14.0 | 11.0 | 7.5 | 6.6 |
+  | 2,048 | 16.2 | 15.6 | 12.9 | 16.8 | 8.9 |
+  | 4,096 | 21.2 | 17.0 | 17.4 | 28.0 | 11.2 |
+  | 7,168 | 33.7 | 19.7 | 19.2 | 48.7 | 14.5 |
+  | 15,360 | 71.7 | 25.2 | | | 23.4 |
+
+  From nothing, Qwen3.5 read 4,096 tokens in 64 s, 8,192 in 180 s and 15,872 in 619 s in
+  chunks of 32, and in 64, 139 and 314 s in chunks of 128. peacebell read 4,096 tokens in
+  65 s and 7,680 in 198 s in chunks of 32, and in 36 and 82 s in chunks of 256, where 15,872
+  took 242 s. Boris-2 read its first 1,536 tokens in 5 s in chunks of 128. Generation with
+  15,872 tokens in memory ran at 5.7 tokens a second for Qwen3.5 and 6.7 for peacebell. The
+  runs were taken one after another while the phone warmed (its battery from 26 to 34 degrees
+  Celsius), and with nothing read the same model was about a quarter slower at the end than at
+  the beginning, which is why the columns do not start alike. These figures are behind the
+  reading times of the model catalogue and the engine's larger chunk for a long read (128
+  tokens for a model with recurrent state, which can be stopped only between chunks, and 256
+  for the others).
 
 ## Changing things
 
