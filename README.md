@@ -117,8 +117,9 @@ Privacy:
 - **No backups.** The app's data is excluded from Android's cloud backup and from
   device-to-device transfer.
 
-The About screen lists the models in the build with their sources and licences, and shows the
-licence of llama.cpp.
+The About screen lists the models in the build with their sources and licences, and opens the
+third-party notices: every library, model and icon in the app that is someone else's work, with
+its copyright lines, and the text of every licence.
 
 ## The models
 
@@ -160,8 +161,9 @@ it.** The reason is its licence: the model's repository names one (MIT) only in 
 its model card and has no licence file and no copyright notice, and this app ships a model only
 when its licence is established. When that is settled, switching it on is a small change:
 `"purpose": "bundled"` for `shard-2` in `models/manifest.json`, `bundled = true` for it in
-`core/src/main/kotlin/us/theworkmans/proseplow/core/model/ModelCatalog.kt`, and the model's
-lines in this file and in the store description.
+`core/src/main/kotlin/us/theworkmans/proseplow/core/model/ModelCatalog.kt`, its entry in the
+third-party notices (`app/notices/`; a test fails while a bundled model has none), and the
+model's lines in this file and in the store description.
 
 What it is, for when that happens: Shard-2 is not a chat model. It is given only the latest
 message, exactly as written, and writes on from it (context 4,096 tokens, replies of up to 200,
@@ -800,8 +802,9 @@ patched copy of llama.cpp is not a git checkout). `native/README.md` describes e
 ./gradlew check
 ```
 
-This runs the unit tests of all three Gradle modules on the JVM, Android lint, and the check of
-the merged manifests against the permission allow-list. The first Gradle command downloads
+This runs the unit tests of all three Gradle modules on the JVM, Android lint, the check of
+the merged manifests against the permission allow-list, and the check of the third-party
+notices against the libraries the build packages. The first Gradle command downloads
 Gradle 9.7.0 and every plugin and library. It must end with `BUILD SUCCESSFUL`. It builds no
 native code and needs no model. To leave no Gradle process behind when you are done, run
 `./gradlew --stop`; otherwise the idle daemon exits after ten minutes.
@@ -1098,9 +1101,9 @@ None of it has been tried.
 | Suite | What it covers | Command |
 | --- | --- | --- |
 | `core` (JVM, 336 tests) | The chat model and its stored form, the prompt format of each model against the models' own templates, the model catalogue against the models' files, and the inference engine over a scripted native layer: context budget, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 496 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies) | `./gradlew :app:testDebugUnitTest` |
+| `app` (JVM, 523 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock; the encrypted stores; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 11 tests) | The thread plan for a phone's processor, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
-| All of the above, lint and the permission check | | `./gradlew check` |
+| All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (29 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark | `./gradlew :app:connectedDebugAndroidTest` |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
@@ -1127,6 +1130,9 @@ A model is a build change, never a download by the app. In outline:
    needs that architecture ported first, with reference data from its PyTorch implementation.
 4. Add it to the catalogue in `core` (`ModelCatalog.kt`) with its prompt format, sampling
    settings, context length and licence, and its name to the app's strings.
+5. Add it to the third-party notices (`app/notices/`): its licence, its copyright lines and
+   what the conversion changed. A model is bundled only when its licence is established; a
+   test fails while a bundled model has no entry there.
 
 Removing a model is the reverse. The details are in `models/README.md` (the manifest, getting
 checkpoints, converting, "Adding a model", "Removing a model") and in `native/README.md`
@@ -1175,21 +1181,65 @@ License 2.0 says.
 
 Prose Plow is licensed under the Apache License, Version 2.0; the text is in `LICENSE`.
 
-An APK built from this repository also contains the following, each under its own licence.
+An APK built from this repository also contains other people's work, each under its own
+licence. The complete list is `app/notices/notices.json`: one entry for each component, with
+its version, licence, copyright lines and NOTICE text, and where each of them was read.
+`app/notices/NOTICES.txt` is the text the app shows (Settings, About, "Third-party notices"),
+with every licence once; the licence texts are also files in `app/notices/licences/`. In
+summary:
 
 | Component | Licence | Notice |
 | --- | --- | --- |
-| llama.cpp and ggml, built from the pinned commit with this project's patches. Only the libraries `libllama` and `ggml` are built; llama.cpp's helper library and its tools are not | MIT | Copyright (c) 2023-2026 The ggml authors. The licence is in `third_party/llama.cpp/LICENSE` and is shown in the app's About screen |
-| `libc++_shared.so`, the C++ runtime, taken from the Android NDK | Apache-2.0 with LLVM exceptions | Part of the LLVM project |
-| Kotlin standard library, kotlinx.coroutines, kotlinx.serialization | Apache-2.0 | JetBrains s.r.o. and contributors |
-| AndroidX libraries: Compose (through its BOM), Material 3, activity, core, lifecycle, navigation, biometric, fragment | Apache-2.0 | The Android Open Source Project |
-| `com.mikepenz:multiplatform-markdown-renderer-m3`, and the JetBrains Markdown parser and Compose Multiplatform libraries it uses | Apache-2.0 | Mike Penz; JetBrains s.r.o. |
-| Libraries the ones above depend on: AndroidX AppCompat, Guava's ListenableFuture, JSpecify, JetBrains annotations | Apache-2.0 | Their respective authors |
-| The models, when they are bundled | See [The models](#the-models): Apache-2.0 each | Qwen3.5-0.8B by the Qwen team of Alibaba Cloud; peacebell-v1-291M, whose model card reserves the name Peacebell for the unmodified weights; Boris-2-Instruct by opencerebral |
+| llama.cpp and ggml, built from the pinned commit with this project's patches. Only the libraries `libllama` and `ggml` are built; llama.cpp's helper library, its tools and everything under its `vendor/` directory are not | MIT | Copyright (c) 2023-2026 The ggml authors. Inside them, with notices of their own: tinyBLAS (Copyright 2024 Mozilla Foundation), the YaRN algorithm (Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng) and a tokenizer adapted from ggllm.cpp, all MIT. Listed as a precaution, because the source credits them without a notice: code after OpenVINO (Apache-2.0), Arm Optimized Routines and the FP16 library (MIT), and tables made from the Unicode Character Database (Unicode-3.0) |
+| `libc++_shared.so`, the C++ runtime (libc++, libc++abi, libunwind and compiler-rt builtins), taken from the Android NDK with its debugging symbols stripped | Apache-2.0 with LLVM exceptions | The LLVM project; its licence file, which includes the older NCSA and MIT texts, is in the notices |
+| Start-up objects of Android's C library, which the NDK links into every native library that is built here | BSD-2-Clause | The Android Open Source Project |
+| Kotlin standard library, kotlinx.coroutines, kotlinx.serialization, kotlinx.collections.immutable | Apache-2.0 | JetBrains s.r.o. and contributors; the notices carry the NOTICE files of the first three. The standard library contains code derived from the ThreeTen backport (BSD-3-Clause) and from Boost (BSL-1.0) |
+| AndroidX libraries: Compose (through its BOM), Material 3, activity, core, lifecycle, navigation, biometric, fragment, and the ones these depend on, AppCompat among them. One of them, `androidx.graphics:graphics-path`, brings the native library `libandroidx.graphics.path.so`; `androidx.emoji2` contains a repackaged FlatBuffers runtime | Apache-2.0 | The Android Open Source Project; FlatBuffers: Copyright 2014 Google Inc. |
+| `com.mikepenz:multiplatform-markdown-renderer-m3`, and the JetBrains Markdown parser and Compose Multiplatform libraries it uses | Apache-2.0; parts of the renderer MIT | Mike Penz; JetBrains s.r.o.; Copyright (c) 2021 Erik Hellman |
+| Other libraries the ones above depend on: Guava's ListenableFuture, JSpecify, JetBrains annotations | Apache-2.0 | Their respective authors |
+| The icons of the app's buttons and of its notification: Material Design icons | Apache-2.0 | Google LLC |
+| Support classes that the Android build tools (D8/R8) write into the app's code | BSD-3-Clause | The R8 project authors; listed as a precaution |
+| The models, when they are bundled | See [The models](#the-models): Apache-2.0 each | Qwen3.5-0.8B: Copyright 2026 Alibaba Cloud; peacebell-v1-291M, whose model card reserves the name Peacebell for the unmodified weights; Boris-2-Instruct: Copyright 2026 OpenCerebral. The files in the app are conversions, and the notices say what each conversion changed. The `boris2` architecture was written against that model's reference implementation, which the notices credit |
 
-The exact versions are in `gradle/libs.versions.toml`. Used for building and testing only, and
-not part of an APK: Gradle and the Android Gradle plugin (Apache-2.0), JUnit 4 (Eclipse Public
-License 1.0), the AndroidX Test libraries (Apache-2.0), the Python packages of
-`native/requirements.txt` under their own licences, and the Android SDK and NDK under the
-Android Software Development Kit License Agreement, which you accept yourself when you install
-them.
+The exact versions are in `gradle/libs.versions.toml` and in `app/notices/notices.json`. Used
+for building and testing only, and not part of an APK: Gradle and the Android Gradle plugin
+(Apache-2.0), JUnit 4 (Eclipse Public License 1.0), the AndroidX Test libraries (Apache-2.0),
+the Python packages of `native/requirements.txt` under their own licences, and the Android SDK
+and NDK under the Android Software Development Kit License Agreement, which you accept yourself
+when you install them.
+
+### Keeping the notices right
+
+The files under `app/notices/` are kept by hand, and three checks hold them to what is packaged.
+The tasks `generateDebugThirdPartyNotices` and `generateReleaseThirdPartyNotices` (part of every
+build of the app and of `check`) compare the `jvm-library` entries of `notices.json` with the
+libraries Gradle resolved, and only when the two agree write `NOTICES.txt` into the app, as the
+raw resource `third_party_notices`. `ThirdPartyNoticesTest` in `app` holds the models of the
+list to the ones `models/manifest.json` marks as bundled, llama.cpp, the NDK and the Android
+Gradle plugin to the versions the build pins, and the text to the list and the licence files,
+word for word. A native library of an unknown name in an APK fails the task that wrote the APK
+(`llama/apk-checks.gradle.kts`).
+
+A failure names what differs. It asks for the notices of the new thing to be read before a
+number is changed:
+
+- **A library was added or updated.** Read the `<licenses>` of the artifact's POM and any
+  LICENSE or NOTICE file inside the artifact and in its repository at that version (and, for the
+  Kotlin standard library and the Markdown renderer, their lists of other people's code inside
+  them). Then correct or add its entry in `notices.json` and its mention in part 1 of
+  `NOTICES.txt`. A licence the app does not have yet needs its text in `app/notices/licences/`
+  and in part 2.
+- **llama.cpp was moved to another commit.** Search the files that are compiled (the compile
+  commands under `llama/.cxx` name them; nothing of `vendor/` or `common/` may be among them) for
+  copyright and licence statements and for "adapted from", "borrowed" and "ported from", and
+  bring the entries that sit inside llama.cpp up to date with the commit.
+- **The NDK or the Android Gradle plugin changed.** Compare the libc++ block of the NDK's
+  `toolchains/llvm/prebuilt/<host>/NOTICE` and the licence of R8 in the plugin's `builder`
+  artifact with the two texts in `app/notices/licences/`.
+- **A model is bundled, or no longer bundled.** A bundled model has an entry with its
+  repository, revision and licence, the copyright lines its repository states and a statement
+  of what the conversion changed, and the same in `NOTICES.txt`; any other model has neither.
+
+In `NOTICES.txt` the list of part 1 has one paragraph on one line, which the app wraps to the
+screen. The licence texts of part 2 are copied unchanged, line breaks included; the app joins
+the lines of each paragraph again when it shows them.

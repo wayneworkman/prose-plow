@@ -1,6 +1,8 @@
 import com.android.build.api.artifact.SingleArtifact
+import groovy.json.JsonSlurper
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.w3c.dom.Element
 
@@ -204,6 +206,95 @@ abstract class VerifyManifestPermissions : DefaultTask() {
     }
 }
 
+/**
+ * Writes the third-party notices into a variant as the raw resource `third_party_notices`, after
+ * checking that they are about that variant: the libraries that [components] lists must be
+ * exactly the libraries on the variant's runtime classpath, each in the same version.
+ *
+ * The licences of what an APK contains ask for their notices to go with every copy of it. Which
+ * libraries an APK contains is decided when Gradle resolves the dependencies, and it changes
+ * with one edited version number, with a new dependency, and with a library that starts to
+ * depend on another. A list that is kept by hand beside that would be right until it silently
+ * was not, so the list is compared with what was resolved, and a difference in either direction
+ * fails the build with what to do about it.
+ *
+ * Like [VerifyManifestPermissions] this is a step of the build and not a check beside it. The
+ * resource is the output of this task and of nothing else (no source directory holds a file of
+ * that name; a test that reads the sources holds that), and the screen that shows the notices
+ * does not compile without it. There is therefore no task that can package an app whose notices
+ * were not compared with what it contains.
+ *
+ * What a classpath cannot show is checked by ThirdPartyNoticesTest: the models, llama.cpp and
+ * the NDK against the versions the build pins, and [text] against [components] and the licence
+ * files.
+ */
+abstract class GenerateThirdPartyNotices : DefaultTask() {
+
+    @get:Input
+    abstract val variantName: Property<String>
+
+    /** `group:artifact:version` of every artifact of an external module on the variant's runtime classpath. */
+    @get:Input
+    abstract val resolved: SetProperty<String>
+
+    /** `notices/notices.json`. Its entries of the kind `jvm-library` are what is compared. */
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val components: RegularFileProperty
+
+    /** `notices/NOTICES.txt`, the text the app shows. It is copied as it is, and only when the list passed. */
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val text: RegularFileProperty
+
+    /** A resource directory that belongs to this task alone; the Android Gradle plugin decides where it is. */
+    @get:OutputDirectory
+    abstract val output: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val raw = output.get().asFile.resolve("raw")
+        // What an earlier run let through is no answer for this one.
+        raw.deleteRecursively()
+
+        @Suppress("UNCHECKED_CAST") // The shape of the file is the one ThirdPartyNoticesTest reads.
+        val entries = (JsonSlurper().parse(components.get().asFile) as Map<String, Any?>)["components"] as List<Map<String, Any?>>
+        val libraries = entries.filter { it["kind"] == "jvm-library" }.map { "${it["group"]}:${it["artifact"]}:${it["version"]}" }
+        val listed = libraries.toSortedSet()
+        val packaged = resolved.get().toSortedSet()
+
+        val unlisted = packaged - listed
+        val stale = listed - packaged
+        val repeated = libraries.groupingBy { it }.eachCount().filterValues { it > 1 }.keys.sorted()
+        if (unlisted.isNotEmpty() || stale.isNotEmpty() || repeated.isNotEmpty()) {
+            val lines = { artifacts: Collection<String> -> if (artifacts.isEmpty()) "  (none)" else artifacts.joinToString("\n") { "  - $it" } }
+            throw GradleException(
+                "The third-party notices do not describe what the ${variantName.get()} build packages.\n\n" +
+                    "On the runtime classpath, but not in app/notices/notices.json:\n" + lines(unlisted) + "\n" +
+                    "In app/notices/notices.json, but not on the runtime classpath:\n" + lines(stale) + "\n" +
+                    (if (repeated.isEmpty()) "" else "Listed more than once:\n" + lines(repeated) + "\n") +
+                    "\nWhat to do, in app/notices/notices.json and in app/notices/NOTICES.txt alike:\n" +
+                    "1. An artifact that is in both lists has another version. Read the <licenses> of its new POM and any\n" +
+                    "   LICENSE or NOTICE file inside the artifact and in its repository at that version; if nothing changed,\n" +
+                    "   correct \"version\" in its entry and the version in the line of part 1 that names it.\n" +
+                    "2. An artifact that is only in the first list is new. Read the same files, add an entry of the kind\n" +
+                    "   \"jvm-library\" with its licence, copyright lines and NOTICE text, and name it in part 1 under its\n" +
+                    "   licence. A licence the app does not have yet also needs its text in app/notices/licences/ and in part 2.\n" +
+                    "3. An artifact that is only in the second list is gone. Remove its entry and its mention in part 1.\n" +
+                    "Then run ./gradlew :app:testDebugUnitTest --tests \"*ThirdPartyNoticesTest\", which holds the text to the list.\n" +
+                    "README.md, \"Licence and third-party notices\", says more.",
+            )
+        }
+        raw.mkdirs()
+        text.get().asFile.copyTo(raw.resolve(RESOURCE_FILE))
+    }
+
+    private companion object {
+        /** The file name is the resource's name: `R.raw.third_party_notices`. */
+        const val RESOURCE_FILE = "third_party_notices.txt"
+    }
+}
+
 androidComponents {
     // Every permission a merged manifest may contain. The app itself declares the four that let an
     // answer be finished while it is not on screen: the foreground service and its type, the
@@ -237,6 +328,33 @@ androidComponents {
             .wiredWithFiles(VerifyManifestPermissions::mergedManifest, VerifyManifestPermissions::checkedManifest)
             .toTransform(SingleArtifact.MERGED_MANIFEST)
         tasks.named("check") { dependsOn(verify) }
+
+        // generateDebugThirdPartyNotices and generateReleaseThirdPartyNotices. Each compares
+        // notices/notices.json with the libraries its variant really packages and, when they agree,
+        // writes notices/NOTICES.txt into a resource directory of its own, which becomes one of the
+        // variant's. Merging the resources, and through it compiling and packaging, therefore waits
+        // for the comparison, and nothing else can supply the resource. `check` runs both as well.
+        val notices = tasks.register<GenerateThirdPartyNotices>("generate${variant.name.replaceFirstChar(Char::uppercaseChar)}ThirdPartyNotices") {
+            group = "build"
+            description = "Checks the third-party notices against the ${variant.name} runtime classpath and writes them as a raw resource."
+            variantName.set(variant.name)
+            resolved.set(
+                variant.runtimeConfiguration.incoming.artifactView {
+                    // The project's own modules are not third-party (and their artifacts could not be
+                    // asked for here without the attributes the Android Gradle plugin selects them by).
+                    componentFilter { it is ModuleComponentIdentifier }
+                }.artifacts.resolvedArtifacts.map { artifacts ->
+                    artifacts.map { artifact ->
+                        val id = artifact.id.componentIdentifier as ModuleComponentIdentifier
+                        "${id.group}:${id.module}:${id.version}"
+                    }.toSet()
+                },
+            )
+            components.set(layout.projectDirectory.file("notices/notices.json"))
+            text.set(layout.projectDirectory.file("notices/NOTICES.txt"))
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(notices, GenerateThirdPartyNotices::output)
+        tasks.named("check") { dependsOn(notices) }
     }
 }
 

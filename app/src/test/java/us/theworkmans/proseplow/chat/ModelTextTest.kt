@@ -5,7 +5,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.w3c.dom.Element
 import us.theworkmans.proseplow.R
@@ -13,7 +12,7 @@ import us.theworkmans.proseplow.core.model.ModelCatalog
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 
-/** What the app calls its models, and the licence text it shows, checked against their sources. */
+/** What the app calls its models, checked against their sources. */
 class ModelTextTest {
 
     /** The module directory: Gradle runs the unit tests from it. */
@@ -104,14 +103,5 @@ class ModelTextTest {
         }
         assertEquals("Shard-2", strings.getValue("model_name_shard_2"))
         assertTrue("not a chat model" in strings.getValue("system_prompt_unsupported_completion"))
-    }
-
-    @Test
-    fun theLicenceShownForTheInferenceLibraryIsTheOneItShipsWith() {
-        val licence = File(module.parentFile, "third_party/llama.cpp/LICENSE")
-        // The library is a submodule; a checkout without it cannot be compared against.
-        assumeTrue(licence.isFile)
-        val normalise = { text: String -> text.trim().split(Regex("\\s+")).joinToString(" ") }
-        assertEquals(normalise(licence.readText()), normalise(strings.getValue("about_llama_cpp_licence")))
     }
 }

@@ -43,7 +43,13 @@ import java.util.zip.ZipFile
  *   result instead of trusted;
  * - each native library has all of its loadable segments aligned to at least 16 KiB, the
  *   requirement for devices with 16 KB pages. The NDK links that way from r28 on; a prebuilt
- *   library pulled in by a dependency might not.
+ *   library pulled in by a dependency might not;
+ * - each native library is **one of the [KNOWN_LIBRARIES]**, the ones the third-party notices
+ *   of the app account for. A library is code with an author and a licence, and one that a new
+ *   dependency or a new build target brings along is in the APK before anyone has asked whose
+ *   it is. The Java libraries are compared with the notices when they are resolved (the
+ *   application module's `generate<Variant>ThirdPartyNotices`); a native library only shows
+ *   itself here, in what was packaged.
  *
  * An app bundle is checked for the first and the last of these. Where a model lies in an APK
  * is only decided when APKs are made from the bundle, and it is checked on those: an APK set is
@@ -63,6 +69,33 @@ class NativePackaging {
 
         /** Enough of an ELF file for its header and program headers. */
         const val ELF_HEAD = 4096
+
+        /**
+         * The native libraries an APK of this project may contain, by file name: the ones whose
+         * authors and licences `app/notices/notices.json` and `app/notices/NOTICES.txt` name.
+         * A name is added here only together with its entry there (a test of the application
+         * module reads this list and fails for a name the notices do not explain).
+         */
+        val KNOWN_LIBRARIES = setOf(
+            // llama.cpp and ggml, built by this module from the pinned commit: the library, the
+            // backend loader, the common code, and the CPU backend once for each instruction set.
+            "libllama.so",
+            "libggml.so",
+            "libggml-base.so",
+            "libggml-cpu-android_armv8.0_1.so",
+            "libggml-cpu-android_armv8.2_1.so",
+            "libggml-cpu-android_armv8.2_2.so",
+            "libggml-cpu-android_armv8.6_1.so",
+            "libggml-cpu-android_armv9.0_1.so",
+            "libggml-cpu-android_armv9.2_1.so",
+            "libggml-cpu-android_armv9.2_2.so",
+            // This project's own JNI binding.
+            "libproseplow_jni.so",
+            // The C++ runtime, taken from the NDK.
+            "libc++_shared.so",
+            // Inside the artifact androidx.graphics:graphics-path, which Compose depends on.
+            "libandroidx.graphics.path.so",
+        )
 
         /**
          * The models an app may carry: the id and the pinned SHA-256 of every entry of the
@@ -96,8 +129,8 @@ class NativePackaging {
             report.writeText(lines.joinToString(separator = "\n", postfix = "\n"))
             if (problems.isNotEmpty()) {
                 throw GradleException(
-                    "What was packaged is not what the native code needs:\n" + problems.joinToString("\n") { "- $it" } +
-                        "\nSee native/README.md, \"Models in the APK\".",
+                    "What was packaged is not what the native code needs, or not what the notices describe:\n" + problems.joinToString("\n") { "- $it" } +
+                        "\nSee native/README.md, \"Models in the APK\", and README.md, \"Licence and third-party notices\".",
                 )
             }
         }
@@ -200,10 +233,19 @@ class NativePackaging {
 
         private fun checkLibrary(zip: ZipFile, entry: ZipEntry, name: String, label: String, lines: MutableList<String>, problems: MutableList<String>) {
             val alignment = zip.getInputStream(entry).use { smallestLoadAlignment(it.readNBytes(ELF_HEAD)) }
-            lines += "  $name: loadable segments aligned to ${alignment ?: "?"}"
+            val known = name.substringAfterLast('/') in KNOWN_LIBRARIES
+            lines += "  $name: loadable segments aligned to ${alignment ?: "?"}" + if (known) "" else "; NOT a library the notices account for"
             when {
                 alignment == null -> problems += "$label: $name is not a 64-bit little-endian ELF file this check can read."
                 alignment < PAGE -> problems += "$label: $name has a loadable segment aligned to $alignment bytes; devices with 16 KB pages need $PAGE."
+            }
+            if (!known) {
+                problems += "$label: $name is a native library that the third-party notices do not account for. An APK of this project " +
+                    "may carry the ${KNOWN_LIBRARIES.size} libraries of KNOWN_LIBRARIES in llama/apk-checks.gradle.kts and no other; this one " +
+                    "came with a new dependency or a new build target, or is another CPU variant of ggml. Find out whose code it is and under " +
+                    "which licence (for a dependency: ./gradlew :app:dependencies --configuration releaseRuntimeClasspath shows what brings " +
+                    "it), give it its entry in app/notices/notices.json and its lines in app/notices/NOTICES.txt, and only then add its name " +
+                    "to KNOWN_LIBRARIES. Another CPU variant of ggml is covered by the entry of llama.cpp and needs its name added, no more."
             }
         }
 

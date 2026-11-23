@@ -1,0 +1,1919 @@
+{
+  "format": 1,
+  "about": "The third-party components inside an APK of Prose Plow, maintained by hand. The build (generate<Variant>ThirdPartyNotices in app/build.gradle.kts) fails unless the jvm-library entries are exactly the runtime classpath; ThirdPartyNoticesTest ties the models, llama.cpp and the NDK to the build's pins and this list to NOTICES.txt, which is the text the app shows. README.md, \"Licence and third-party notices\", says what to do when either fails.",
+  "licence_texts": {
+    "licences/Apache-2.0.txt": {
+      "spdx": "Apache-2.0",
+      "taken_from": "the text as published at apache.org (byte for byte the COPYING file of Guava and the LICENSE of Kotlin, JSpecify, FlatBuffers and kotlinx.collections.immutable)"
+    },
+    "licences/Apache-2.0-WITH-LLVM-exception.txt": {
+      "spdx": "Apache-2.0 WITH LLVM-exception",
+      "taken_from": "the libc++ block of toolchains/llvm/prebuilt/<host>/NOTICE in Android NDK r29, which is libcxx/LICENSE.TXT of the LLVM project"
+    },
+    "licences/MIT.txt": {
+      "spdx": "MIT",
+      "taken_from": "LICENSE of llama.cpp at the pinned commit, with its copyright line replaced by the placeholder of the SPDX text; the permission notice is word for word the one of every MIT component here"
+    },
+    "licences/BSD-3-Clause-ThreeTen.txt": {
+      "spdx": "BSD-3-Clause",
+      "taken_from": "license/third_party/threetenbp_license.txt of JetBrains/kotlin at tag v2.4.21"
+    },
+    "licences/BSD-3-Clause-R8.txt": {
+      "spdx": "BSD-3-Clause",
+      "taken_from": "the LICENSE file inside com.android.tools.build:builder:9.3.3, which embeds R8 9.3.28 (the first licence in that file)"
+    },
+    "licences/BSD-2-Clause-bionic.txt": {
+      "spdx": "BSD-2-Clause",
+      "taken_from": "the header of libc/arch-common/bionic/crtbegin_so.c in platform/bionic (main branch), without the comment markers"
+    },
+    "licences/BSL-1.0.txt": {
+      "spdx": "BSL-1.0",
+      "taken_from": "license/third_party/boost_LICENSE.txt of JetBrains/kotlin at tag v2.4.21"
+    },
+    "licences/Unicode-3.0.txt": {
+      "spdx": "Unicode-3.0",
+      "taken_from": "https://www.unicode.org/license.txt"
+    }
+  },
+  "components": [
+    {
+      "kind": "jvm-library",
+      "name": "Activity",
+      "group": "androidx.activity",
+      "artifact": "activity",
+      "version": "1.13.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Activity Compose",
+      "group": "androidx.activity",
+      "artifact": "activity-compose",
+      "version": "1.13.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Activity Kotlin Extensions",
+      "group": "androidx.activity",
+      "artifact": "activity-ktx",
+      "version": "1.13.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Experimental annotation",
+      "group": "androidx.annotation",
+      "artifact": "annotation-experimental",
+      "version": "1.4.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Annotation",
+      "group": "androidx.annotation",
+      "artifact": "annotation-jvm",
+      "version": "1.10.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android AppCompat Library v7",
+      "group": "androidx.appcompat",
+      "artifact": "appcompat",
+      "version": "1.2.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Resources Library",
+      "group": "androidx.appcompat",
+      "artifact": "appcompat-resources",
+      "version": "1.2.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Arch-Common",
+      "group": "androidx.arch.core",
+      "artifact": "core-common",
+      "version": "2.2.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Arch-Runtime",
+      "group": "androidx.arch.core",
+      "artifact": "core-runtime",
+      "version": "2.2.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "AndroidX Autofill",
+      "group": "androidx.autofill",
+      "artifact": "autofill",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Biometric",
+      "group": "androidx.biometric",
+      "artifact": "biometric",
+      "version": "1.1.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "collections",
+      "group": "androidx.collection",
+      "artifact": "collection-jvm",
+      "version": "1.6.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Collections Kotlin Extensions",
+      "group": "androidx.collection",
+      "artifact": "collection-ktx",
+      "version": "1.6.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Animation",
+      "group": "androidx.compose.animation",
+      "artifact": "animation-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Animation Core",
+      "group": "androidx.compose.animation",
+      "artifact": "animation-core-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Foundation",
+      "group": "androidx.compose.foundation",
+      "artifact": "foundation-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Layouts",
+      "group": "androidx.compose.foundation",
+      "artifact": "foundation-layout-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Material Ripple",
+      "group": "androidx.compose.material",
+      "artifact": "material-ripple-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Material3 Components",
+      "group": "androidx.compose.material3",
+      "artifact": "material3-android",
+      "version": "1.4.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Runtime",
+      "group": "androidx.compose.runtime",
+      "artifact": "runtime-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Runtime Annotation",
+      "group": "androidx.compose.runtime",
+      "artifact": "runtime-annotation-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Runtime Retain",
+      "group": "androidx.compose.runtime",
+      "artifact": "runtime-retain-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Saveable",
+      "group": "androidx.compose.runtime",
+      "artifact": "runtime-saveable-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose UI",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Geometry",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-geometry-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Graphics",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-graphics-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose UI Text",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-text-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Unit",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-unit-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Util",
+      "group": "androidx.compose.ui",
+      "artifact": "ui-util-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "AndroidX Futures",
+      "group": "androidx.concurrent",
+      "artifact": "concurrent-futures",
+      "version": "1.1.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Core",
+      "group": "androidx.core",
+      "artifact": "core",
+      "version": "1.19.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Core Kotlin Extensions",
+      "group": "androidx.core",
+      "artifact": "core-ktx",
+      "version": "1.19.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "androidx.core:core-viewtree",
+      "group": "androidx.core",
+      "artifact": "core-viewtree",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library Cursor Adapter",
+      "group": "androidx.cursoradapter",
+      "artifact": "cursoradapter",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library Custom View",
+      "group": "androidx.customview",
+      "artifact": "customview",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "androidx.customview:poolingcontainer",
+      "group": "androidx.customview",
+      "artifact": "customview-poolingcontainer",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library Drawer Layout",
+      "group": "androidx.drawerlayout",
+      "artifact": "drawerlayout",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Emoji2",
+      "group": "androidx.emoji2",
+      "artifact": "emoji2",
+      "version": "1.4.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "fragment",
+      "group": "androidx.fragment",
+      "artifact": "fragment",
+      "version": "1.9.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Graphics Path",
+      "group": "androidx.graphics",
+      "artifact": "graphics-path",
+      "version": "1.0.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library Interpolators",
+      "group": "androidx.interpolator",
+      "artifact": "interpolator",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle-Common for Java 8",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-common-java8",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle-Common",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-common-jvm",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle LiveData",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-livedata",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle LiveData Core",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-livedata-core",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "LiveData Core Kotlin Extensions",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-livedata-core-ktx",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle Process",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-process",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle Runtime",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-runtime-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle Runtime Compose",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-runtime-compose-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle Kotlin Extensions",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-runtime-ktx-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle ViewModel",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-viewmodel",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle ViewModel",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-viewmodel-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle ViewModel Compose",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-viewmodel-compose-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle ViewModel Kotlin Extensions",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-viewmodel-ktx",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Lifecycle ViewModel with SavedState",
+      "group": "androidx.lifecycle",
+      "artifact": "lifecycle-viewmodel-savedstate-android",
+      "version": "2.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library loader",
+      "group": "androidx.loader",
+      "artifact": "loader",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Navigation Common",
+      "group": "androidx.navigation",
+      "artifact": "navigation-common-android",
+      "version": "2.10.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Navigation",
+      "group": "androidx.navigation",
+      "artifact": "navigation-compose-android",
+      "version": "2.10.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Navigation Runtime",
+      "group": "androidx.navigation",
+      "artifact": "navigation-runtime-android",
+      "version": "2.10.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Navigation Event",
+      "group": "androidx.navigationevent",
+      "artifact": "navigationevent-android",
+      "version": "1.1.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "NavigationEvent Compose",
+      "group": "androidx.navigationevent",
+      "artifact": "navigationevent-compose-android",
+      "version": "1.1.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Profile Installer",
+      "group": "androidx.profileinstaller",
+      "artifact": "profileinstaller",
+      "version": "1.4.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Saved State",
+      "group": "androidx.savedstate",
+      "artifact": "savedstate-android",
+      "version": "1.5.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Saved State Compose",
+      "group": "androidx.savedstate",
+      "artifact": "savedstate-compose-android",
+      "version": "1.5.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "SavedState Kotlin Extensions",
+      "group": "androidx.savedstate",
+      "artifact": "savedstate-ktx",
+      "version": "1.5.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android App Startup Runtime",
+      "group": "androidx.startup",
+      "artifact": "startup-runtime",
+      "version": "1.1.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Tracing",
+      "group": "androidx.tracing",
+      "artifact": "tracing-android",
+      "version": "2.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support VectorDrawable",
+      "group": "androidx.vectordrawable",
+      "artifact": "vectordrawable",
+      "version": "1.1.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support AnimatedVectorDrawable",
+      "group": "androidx.vectordrawable",
+      "artifact": "vectordrawable-animated",
+      "version": "1.1.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "VersionedParcelable",
+      "group": "androidx.versionedparcelable",
+      "artifact": "versionedparcelable",
+      "version": "1.1.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Android Support Library View Pager",
+      "group": "androidx.viewpager",
+      "artifact": "viewpager",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "WindowManager",
+      "group": "androidx.window",
+      "artifact": "window",
+      "version": "1.5.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "WindowManager Core",
+      "group": "androidx.window",
+      "artifact": "window-core-android",
+      "version": "1.5.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. No copyright line in the artifact; no NOTICE file in it or at the root of androidx/androidx."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Guava ListenableFuture only",
+      "group": "com.google.guava",
+      "artifact": "listenablefuture",
+      "version": "1.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Guava Authors"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the parent POM; no licence file in the artifact. The jar and its POM state no copyright line; \"The Guava Authors\" is how Guava's source headers and other projects' licence summaries name the holder (inferred). No NOTICE file in the jar or at the root of google/guava at tag v26.0, the release whose parent POM this artifact uses."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Multiplatform Markdown Renderer",
+      "group": "com.mikepenz",
+      "artifact": "multiplatform-markdown-renderer-android",
+      "version": "0.46.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Mike Penz"
+      ],
+      "copyright_lines": [
+        "Copyright 2022 Mike Penz"
+      ],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. Appendix of LICENSE of mikepenz/multiplatform-markdown-renderer at tag v0.46.0. No NOTICE file in the artifacts or at the root of the repository at tag v0.46.0. Its LICENSE file ends with an MIT notice for work by Erik Hellman, listed separately."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Multiplatform Markdown Renderer - Material 3",
+      "group": "com.mikepenz",
+      "artifact": "multiplatform-markdown-renderer-m3-android",
+      "version": "0.46.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Mike Penz"
+      ],
+      "copyright_lines": [
+        "Copyright 2022 Mike Penz"
+      ],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. Appendix of LICENSE of mikepenz/multiplatform-markdown-renderer at tag v0.46.0. No NOTICE file in the artifacts or at the root of the repository at tag v0.46.0. Its LICENSE file ends with an MIT notice for work by Erik Hellman, listed separately."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "JetBrains Java Annotations",
+      "group": "org.jetbrains",
+      "artifact": "annotations",
+      "version": "23.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o."
+      ],
+      "copyright_lines": [
+        "Copyright 2000-2016 JetBrains s.r.o."
+      ],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. Appendix of LICENSE.txt of JetBrains/java-annotations at tag 23.0.0. No NOTICE file in the jar or at the root of the repository at tag 23.0.0."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "markdown",
+      "group": "org.jetbrains",
+      "artifact": "markdown-jvm",
+      "version": "0.7.17",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Valentin Fondaratov)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line: LICENSE of JetBrains/markdown is the unfilled Apache text. Read on the master branch, because the repository has no tag for 0.7.17. No NOTICE file in the jar or at the root of the repository (master)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Animation",
+      "group": "org.jetbrains.compose.animation",
+      "artifact": "animation-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Animation Core",
+      "group": "org.jetbrains.compose.animation",
+      "artifact": "animation-core-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Foundation",
+      "group": "org.jetbrains.compose.foundation",
+      "artifact": "foundation-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Layouts",
+      "group": "org.jetbrains.compose.foundation",
+      "artifact": "foundation-layout-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Runtime",
+      "group": "org.jetbrains.compose.runtime",
+      "artifact": "runtime-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Saveable",
+      "group": "org.jetbrains.compose.runtime",
+      "artifact": "runtime-saveable-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose UI",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Geometry",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-geometry-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Graphics",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-graphics-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose UI Text",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-text-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Unit",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-unit-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Compose Util",
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-util-android",
+      "version": "1.12.1",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: Compose Multiplatform Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM and the LICENSE.txt inside the artifact. It holds no class: on Android it only depends on the AndroidX artifact of the same name. No NOTICE file in it or at the root of JetBrains/compose-multiplatform-core at v1.12.1."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "Kotlin Stdlib",
+      "group": "org.jetbrains.kotlin",
+      "artifact": "kotlin-stdlib",
+      "version": "2.4.21",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. and Kotlin Programming Language contributors"
+      ],
+      "copyright_lines": [
+        "Copyright 2010-2024 JetBrains s.r.o. and Kotlin Programming Language contributors."
+      ],
+      "notice": "Kotlin Compiler\nCopyright 2010-2024 JetBrains s.r.o and respective authors and developers",
+      "source": "Licence from the POM; no licence file in the artifact. license/COPYRIGHT.txt of JetBrains/kotlin at tag v2.4.21. license/NOTICE.txt of JetBrains/kotlin at tag v2.4.21 (the jar itself carries no LICENSE or NOTICE file)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "kotlinx-collections-immutable",
+      "group": "org.jetbrains.kotlinx",
+      "artifact": "kotlinx-collections-immutable-jvm",
+      "version": "0.5.2",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. (POM developer: JetBrains Team)"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. No copyright line: LICENSE.txt at tag v0.5.2 is the unfilled Apache text. No NOTICE file in the jar or at the root of the repository at tag v0.5.2."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "kotlinx-coroutines-android",
+      "group": "org.jetbrains.kotlinx",
+      "artifact": "kotlinx-coroutines-android",
+      "version": "1.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. and contributors"
+      ],
+      "copyright_lines": [
+        "Copyright 2000-2020 JetBrains s.r.o. and Kotlin Programming Language contributors."
+      ],
+      "notice": "kotlinx.coroutines library.\nCopyright 2016-2025 JetBrains s.r.o and contributors",
+      "source": "Licence from the POM; no licence file in the artifact. Appendix of LICENSE.txt of Kotlin/kotlinx.coroutines at tag 1.11.0. license/NOTICE.txt of Kotlin/kotlinx.coroutines at tag 1.11.0 (the jars carry no LICENSE or NOTICE file)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "kotlinx-coroutines-core",
+      "group": "org.jetbrains.kotlinx",
+      "artifact": "kotlinx-coroutines-core-jvm",
+      "version": "1.11.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. and contributors"
+      ],
+      "copyright_lines": [
+        "Copyright 2000-2020 JetBrains s.r.o. and Kotlin Programming Language contributors."
+      ],
+      "notice": "kotlinx.coroutines library.\nCopyright 2016-2025 JetBrains s.r.o and contributors",
+      "source": "Licence from the POM; no licence file in the artifact. Appendix of LICENSE.txt of Kotlin/kotlinx.coroutines at tag 1.11.0. license/NOTICE.txt of Kotlin/kotlinx.coroutines at tag 1.11.0 (the jars carry no LICENSE or NOTICE file)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "kotlinx-serialization-core",
+      "group": "org.jetbrains.kotlinx",
+      "artifact": "kotlinx-serialization-core-jvm",
+      "version": "1.12.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. and respective authors and developers"
+      ],
+      "copyright_lines": [
+        "Copyright 2017-2019 JetBrains s.r.o."
+      ],
+      "notice": "kotlinx.serialization library.\nCopyright 2017-2019 JetBrains s.r.o and respective authors and developers",
+      "source": "Licence from the POM; no licence file in the artifact. license/LICENSE.txt of Kotlin/kotlinx.serialization at tag v1.12.0. license/NOTICE.txt of Kotlin/kotlinx.serialization at tag v1.12.0 (the jars carry no LICENSE or NOTICE file)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "kotlinx-serialization-json",
+      "group": "org.jetbrains.kotlinx",
+      "artifact": "kotlinx-serialization-json-jvm",
+      "version": "1.12.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "JetBrains s.r.o. and respective authors and developers"
+      ],
+      "copyright_lines": [
+        "Copyright 2017-2019 JetBrains s.r.o."
+      ],
+      "notice": "kotlinx.serialization library.\nCopyright 2017-2019 JetBrains s.r.o and respective authors and developers",
+      "source": "Licence from the POM; no licence file in the artifact. license/LICENSE.txt of Kotlin/kotlinx.serialization at tag v1.12.0. license/NOTICE.txt of Kotlin/kotlinx.serialization at tag v1.12.0 (the jars carry no LICENSE or NOTICE file)."
+    },
+    {
+      "kind": "jvm-library",
+      "name": "JSpecify annotations",
+      "group": "org.jspecify",
+      "artifact": "jspecify",
+      "version": "1.0.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Google LLC",
+        "SpotBugs Team"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "Licence from the POM; no licence file in the artifact. AUTHORS of jspecify/jspecify at tag v1.0.0 (\"the list of JSpecify authors for copyright purposes\"); LICENSE is the unfilled Apache text. No NOTICE file in the jar or at the root of the repository at tag v1.0.0."
+    },
+    {
+      "id": "embedded:kotlin-stdlib:gwt",
+      "kind": "code-inside-a-library",
+      "name": "Collections code derived from GWT, inside the Kotlin standard library",
+      "version": "as in kotlin-stdlib 2.4.21",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Google Inc."
+      ],
+      "copyright_lines": [
+        "(C) 2007-08 Google Inc."
+      ],
+      "notice": null,
+      "source": "license/README.md of JetBrains/kotlin at tag v2.4.21: \"Path: libraries/stdlib/src/kotlin/collections, License: Apache 2, Origin: Derived from GWT, (C) 2007-08 Google Inc.\" license/third_party/gwt_license.txt is the plain Apache text; no NOTICE content is given.",
+      "in_apk": "part of kotlin-stdlib (kotlin.collections is in the dex)"
+    },
+    {
+      "id": "embedded:kotlin-stdlib:guava-unsigned",
+      "kind": "code-inside-a-library",
+      "name": "Unsigned arithmetic derived from Guava's UnsignedLongs, inside the Kotlin standard library",
+      "version": "as in kotlin-stdlib 2.4.21",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The Guava Authors"
+      ],
+      "copyright_lines": [
+        "(C) 2011 The Guava Authors"
+      ],
+      "notice": null,
+      "source": "license/README.md of JetBrains/kotlin at tag v2.4.21: \"Path: libraries/stdlib/jvm/src/kotlin/util/UnsignedJVM.kt, License: Apache 2, Origin: Derived from Guava's UnsignedLongs, (C) 2011 The Guava Authors\" license/third_party/guava_license.txt is the plain Apache text.",
+      "in_apk": "part of kotlin-stdlib (kotlin.UnsignedKt is in the jar)"
+    },
+    {
+      "id": "embedded:kotlin-stdlib:threetenbp",
+      "kind": "code-inside-a-library",
+      "name": "kotlin.time code derived from the ThreeTen backport (JSR-310), inside the Kotlin standard library",
+      "version": "as in kotlin-stdlib 2.4.21",
+      "licence": "BSD-3-Clause",
+      "licence_text": "licences/BSD-3-Clause-ThreeTen.txt",
+      "holders": [
+        "Stephen Colebourne",
+        "Michael Nascimento Santos"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2007-present, Stephen Colebourne & Michael Nascimento Santos."
+      ],
+      "notice": null,
+      "source": "license/third_party/threetenbp_license.txt of JetBrains/kotlin at tag v2.4.21; license/README.md there names the path libraries/stdlib/src/kotlin/time. The licence text is the notice.",
+      "in_apk": "part of kotlin-stdlib (kotlin.time.Instant and its helpers are in the jar and in the dex)"
+    },
+    {
+      "id": "embedded:kotlin-stdlib:boost-math",
+      "kind": "code-inside-a-library",
+      "name": "Inverse hyperbolic functions derived from Boost special math functions, inside the Kotlin standard library",
+      "version": "as in kotlin-stdlib 2.4.21",
+      "licence": "BSL-1.0",
+      "licence_text": "licences/BSL-1.0.txt",
+      "holders": [
+        "Eric Ford",
+        "Hubert Holin"
+      ],
+      "copyright_lines": [
+        "Copyright Eric Ford & Hubert Holin 2001."
+      ],
+      "notice": null,
+      "source": "license/README.md of JetBrains/kotlin at tag v2.4.21: \"Path: libraries/stdlib/jvm/src/kotlin/util/MathJVM.kt, License: Boost Software License 1.0, Origin: Derived from boost special math functions, Copyright Eric Ford & Hubert Holin 2001.\" The Boost licence does not ask for its notice on copies that are only compiled code; it is listed for completeness.",
+      "in_apk": "part of kotlin-stdlib (kotlin.math.MathKt is in the jar)"
+    },
+    {
+      "id": "embedded:markdown-renderer:markdown-composer",
+      "kind": "code-inside-a-library",
+      "name": "Parts of the Multiplatform Markdown Renderer based on Erik Hellman's MarkdownComposer",
+      "version": "as in multiplatform-markdown-renderer 0.46.0",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Erik Hellman"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2021 Erik Hellman"
+      ],
+      "notice": null,
+      "source": "The end of LICENSE of mikepenz/multiplatform-markdown-renderer at tag v0.46.0: \"Parts of the markdown composer are based on Erik Hellman's work as found: https://github.com/ErikHellman/MarkdownComposer\", followed by this MIT notice. The MIT notice is the notice.",
+      "in_apk": "part of com.mikepenz:multiplatform-markdown-renderer-android"
+    },
+    {
+      "id": "embedded:emoji2:flatbuffers",
+      "kind": "code-inside-a-library",
+      "name": "FlatBuffers Java runtime, repackaged inside androidx.emoji2",
+      "version": "as in emoji2 1.4.0",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Google Inc."
+      ],
+      "copyright_lines": [
+        "Copyright 2014 Google Inc. All rights reserved."
+      ],
+      "notice": null,
+      "source": "Header of java/com/google/flatbuffers/Table.java in google/flatbuffers (tag v2.0.0); the repackaged jar carries no licence file and does not say which FlatBuffers release it was made from. No NOTICE file at the root of google/flatbuffers (tags v1.12.0 and v2.0.0, and master).",
+      "in_apk": "49 classes, all in the dex"
+    },
+    {
+      "id": "native:llama.cpp",
+      "kind": "native-library",
+      "name": "llama.cpp and ggml",
+      "commit": "8d60873dfb8619f2b5ed31adfbab07cccb40db5c",
+      "version": "commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c of https://github.com/ggml-org/llama.cpp",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "The ggml authors"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2023-2026 The ggml authors"
+      ],
+      "notice": null,
+      "source": "LICENSE at the pinned commit of the submodule third_party/llama.cpp. The MIT notice is the notice. The repository has no NOTICE file.",
+      "changes": "Built from a patched copy: four patches (architecture hooks; an ARM kernel for 16-bit float weights in tinyBLAS; a memory-mapping window for models embedded in an APK; a linear byte fallback in the SentencePiece tokenizer) and three architectures added by the Prose Plow project (peacebell, boris2, shard2). Only the targets llama, ggml, ggml-base and the seven ggml-cpu variants are built.",
+      "in_apk": "libllama.so, libggml.so, libggml-base.so and seven libggml-cpu-android_*.so"
+    },
+    {
+      "id": "native:tinyblas",
+      "kind": "code-inside-a-library",
+      "name": "tinyBLAS (ggml/src/ggml-cpu/llamafile/sgemm.cpp), inside ggml",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Mozilla Foundation"
+      ],
+      "copyright_lines": [
+        "Copyright 2024 Mozilla Foundation"
+      ],
+      "notice": null,
+      "source": "The header of ggml/src/ggml-cpu/llamafile/sgemm.cpp at the pinned commit, which is the complete MIT notice. The MIT notice in the file header.",
+      "changes": "Changed by patch 0002 of the Prose Plow project (a kernel for 16-bit float weights on ARM).",
+      "in_apk": "in the seven libggml-cpu-android_*.so"
+    },
+    {
+      "id": "native:yarn",
+      "kind": "code-inside-a-library",
+      "name": "YaRN rotary scaling (rope_yarn in ggml/src/ggml-cpu/ops.cpp), inside ggml",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Jeffrey Quesnelle",
+        "Bowen Peng"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng"
+      ],
+      "notice": null,
+      "source": "Comment in ggml/src/ggml-cpu/ops.cpp at the pinned commit: \"YaRN algorithm based on LlamaYaRNScaledRotaryEmbedding.py from https://github.com/jquesnelle/yarn. MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.\"; the same line is in LICENSE of jquesnelle/yarn. The MIT notice.",
+      "in_apk": "in the seven libggml-cpu-android_*.so"
+    },
+    {
+      "id": "native:ggllm-bpe",
+      "kind": "code-inside-a-library",
+      "name": "BPE tokenizer adapted from ggllm.cpp (src/llama-vocab.cpp), inside llama.cpp",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "cmp-nct (the author of ggllm.cpp)"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2023 https://github.com/cmp-nct"
+      ],
+      "notice": null,
+      "source": "LICENSE of cmp-nct/ggllm.cpp (master). llama.cpp itself only says \"adapted from https://github.com/cmp-nct/ggllm.cpp [MIT License]\". The MIT notice.",
+      "in_apk": "in libllama.so"
+    },
+    {
+      "id": "native:openvino-exp",
+      "kind": "code-inside-a-library",
+      "name": "SVE exponential function borrowed from OpenVINO (exp_ps_sve in ggml/src/ggml-cpu/vec.h), inside ggml",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Intel Corporation"
+      ],
+      "copyright_lines": [
+        "Copyright (C) 2018-2026 Intel Corporation"
+      ],
+      "notice": null,
+      "source": "Header of src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/common.hpp in openvinotoolkit/openvino (master, read 2026-11-22), the file that the comment in vec.h names. llama.cpp itself carries no notice for it. No NOTICE file at the root of openvinotoolkit/openvino (default branch, listed 2026-11-22).",
+      "in_apk": "in the three CPU variants built with SVE (android_armv9.0_1, android_armv9.2_1, android_armv9.2_2)",
+      "precaution": true
+    },
+    {
+      "id": "native:arm-optimized-routines",
+      "kind": "code-inside-a-library",
+      "name": "Vector exponential functions adapted from Arm Optimized Routines (ggml_v_expf and others in ggml/src/ggml-cpu/vec.h), inside ggml",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "MIT OR Apache-2.0 WITH LLVM-exception",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Arm Limited"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 1999-2022, Arm Limited."
+      ],
+      "notice": null,
+      "source": "LICENSE of ARM-software/optimized-routines (master, read 2026-11-22). llama.cpp only says \"adapted from arm limited optimized routine\". The MIT notice (the MIT alternative of the dual licence is taken).",
+      "in_apk": "in the seven libggml-cpu-android_*.so",
+      "precaution": true
+    },
+    {
+      "id": "native:fp16",
+      "kind": "code-inside-a-library",
+      "name": "Half-precision conversion after the FP16 library (ggml/src/ggml-impl.h), inside ggml",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Facebook Inc.",
+        "Georgia Institute of Technology",
+        "Google LLC"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2017 Facebook Inc.",
+        "Copyright (c) 2017 Georgia Institute of Technology",
+        "Copyright 2019 Google LLC"
+      ],
+      "notice": null,
+      "source": "LICENSE of Maratyszcza/FP16 (master, read 2026-11-22). llama.cpp only says \"ref: https://github.com/Maratyszcza/FP16\". The MIT notice.",
+      "in_apk": "in libggml-base.so and the libraries that include ggml-impl.h",
+      "precaution": true
+    },
+    {
+      "id": "native:unicode-data",
+      "kind": "data-inside-a-library",
+      "name": "Unicode character tables (src/unicode-data.cpp), inside llama.cpp",
+      "version": "as in llama.cpp 8d60873",
+      "licence": "Unicode-3.0",
+      "licence_text": "licences/Unicode-3.0.txt",
+      "holders": [
+        "Unicode, Inc."
+      ],
+      "copyright_lines": [
+        "Copyright © 1991-2026 Unicode, Inc."
+      ],
+      "notice": null,
+      "source": "https://www.unicode.org/license.txt (read 2026-11-22). The first line of src/unicode-data.cpp names scripts/gen-unicode-data.py as what wrote it, and that script reads https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt. llama.cpp carries no Unicode notice. The Unicode licence asks for its notice with copies of the data files or in the documentation.",
+      "in_apk": "in libllama.so",
+      "precaution": true
+    },
+    {
+      "id": "ndk:libc++_shared",
+      "kind": "native-library",
+      "name": "LLVM C++ runtime: libc++, libc++abi, libunwind and compiler-rt builtins (libc++_shared.so)",
+      "ndk_version": "29.0.14206865",
+      "version": "as shipped in Android NDK 29.0.14206865 (r29), clang 21",
+      "licence": "Apache-2.0 WITH LLVM-exception",
+      "licence_text": "licences/Apache-2.0-WITH-LLVM-exception.txt",
+      "holders": [
+        "The LLVM project contributors"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2009-2019 by the contributors listed in CREDITS.TXT",
+        "Copyright (c) 2009-2014 by the contributors listed in CREDITS.TXT",
+        "Copyright (c) 2009-2015 by the contributors listed in CREDITS.TXT"
+      ],
+      "notice": null,
+      "source": "The legacy-licence sections of the libc++, libc++abi and compiler-rt blocks of toolchains/llvm/prebuilt/<host>/NOTICE in the NDK (the 2009-2015 line is compiler-rt's MIT text). libunwind/LICENSE.TXT of llvm-project has the same lines as libc++. The LLVM runtimes have no NOTICE file in the Apache sense; the NDK's NOTICE file is a collection of licence texts.",
+      "in_apk": "libc++_shared.so, as a whole library; in addition the linker takes compiler-rt builtins, libatomic and libunwind from static archives of the NDK into each library the project builds, for which the LLVM exception waives the notice"
+    },
+    {
+      "id": "ndk:bionic-crt",
+      "kind": "code-inside-a-library",
+      "name": "Android bionic start-up objects (crtbegin_so.o, crtend_so.o), linked into every library the project builds",
+      "version": "as shipped in Android NDK 29.0.14206865 (r29), API level 28",
+      "licence": "BSD-2-Clause",
+      "licence_text": "licences/BSD-2-Clause-bionic.txt",
+      "holders": [
+        "The Android Open Source Project"
+      ],
+      "copyright_lines": [
+        "Copyright (C) 2012 The Android Open Source Project",
+        "Copyright (C) 2013 The Android Open Source Project",
+        "Copyright (C) 2015 The Android Open Source Project"
+      ],
+      "notice": null,
+      "source": "Headers of crtbegin_so.c, __dso_handle.h, __dso_handle_so.h and atexit.h (2012), crtend_so.S (2013), crtbrand.S and pthread_atfork.h (2015) under libc/arch-common/bionic in platform/bionic, main branch read 2026-11-22: the revision the NDK was built from is not identified. The BSD notice.",
+      "in_apk": "a few hundred bytes in each of libllama.so, libggml.so, libggml-base.so, the seven libggml-cpu-android_*.so and libproseplow_jni.so"
+    },
+    {
+      "id": "build:r8-support",
+      "kind": "code-added-by-the-build-tools",
+      "name": "D8/R8 support classes and backported methods written into the dex files",
+      "version": "R8 9.3.28, embedded in com.android.tools.build:builder:9.3.3 (Android Gradle plugin 9.3.3)",
+      "licence": "BSD-3-Clause",
+      "licence_text": "licences/BSD-3-Clause-R8.txt",
+      "holders": [
+        "The R8 project authors"
+      ],
+      "copyright_lines": [
+        "Copyright (c) 2016, the R8 project authors."
+      ],
+      "notice": null,
+      "source": "LICENSE inside builder-9.3.3.jar, with r8-version.properties in the same jar. The BSD notice.",
+      "in_apk": "five classes named com.android.tools.r8.* and ten ...$$ExternalSyntheticBackport classes",
+      "precaution": true
+    },
+    {
+      "id": "model:qwen3.5-0.8b",
+      "kind": "model",
+      "name": "Qwen3.5-0.8B",
+      "model_id": "qwen3.5-0.8b",
+      "repository": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "version": "revision 2fc06364715b967f1860aea9cf38778875588b17 of https://huggingface.co/Qwen/Qwen3.5-0.8B",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Alibaba Cloud (the Qwen team)"
+      ],
+      "copyright_lines": [
+        "Copyright 2026 Alibaba Cloud"
+      ],
+      "notice": null,
+      "source": "Appendix of the LICENSE file of the model repository at the pinned revision; the model card states license: apache-2.0 and links that file. The repository at the pinned revision has no NOTICE file (13 files listed).",
+      "changes": "The file in the app is a conversion made by the Prose Plow project with the converter of llama.cpp: the weights were written as a GGUF file of 16-bit floats (133 tensors stay 32-bit), the vision tower and the multi-token-prediction head of the checkpoint were left out, and the tokenizer and chat template were embedded in the file. SHA-256 of the result: 91bcb80bb68c2a51e7eb4e28cf088f79678e236f9f16120060b84a57ae7f0978.",
+      "in_apk": "assets/models/qwen3.5-0.8b.gguf.so, 1,516,742,752 bytes, when the build bundles it"
+    },
+    {
+      "id": "model:peacebell-v1-291m",
+      "kind": "model",
+      "name": "peacebell-v1-291M",
+      "model_id": "peacebell-v1-291m",
+      "repository": "wayneworkman2012/peacebell-v1-291M",
+      "revision": "a44de191d94e8bf944b31a482fc0f04fa4433eb1",
+      "version": "revision a44de191d94e8bf944b31a482fc0f04fa4433eb1 of https://huggingface.co/wayneworkman2012/peacebell-v1-291M",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "The author named in the model card, who is also the author of this app"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "The repository states no copyright line and has no LICENSE file; the model card says \"The weights are released under Apache 2.0\". The repository at the pinned revision has no NOTICE file (12 files listed).",
+      "attribution": "Released by its author under the Apache License 2.0, as its model card states; the repository gives no copyright line.",
+      "changes": "The file in the app is a conversion made by the Prose Plow project: the weights were written as a GGUF file with the matrices cast from 32-bit to 16-bit floats, no tensor was otherwise transformed, the per-layer ReZero scalars were stored as metadata, and the SentencePiece vocabulary was embedded in the file. SHA-256 of the result: df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868.",
+      "name_reservation": "The model card reserves the name Peacebell: it is not licensed by Apache 2.0 (section 6), and fine-tunes, merges, quantisations and other derivatives may not carry it. The card counts the weights cast to 16-bit floats as still being Peacebell, and the name is used in this app with the permission of the model's author.",
+      "in_apk": "assets/models/peacebell-v1-291m.gguf.so, 583,680,096 bytes, when the build bundles it"
+    },
+    {
+      "id": "model:boris-2-instruct",
+      "kind": "model",
+      "name": "Boris-2-Instruct",
+      "model_id": "boris-2-instruct",
+      "repository": "opencerebral/Boris-2-Instruct",
+      "revision": "9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d",
+      "version": "revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d of https://huggingface.co/opencerebral/Boris-2-Instruct",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "OpenCerebral"
+      ],
+      "copyright_lines": [
+        "Copyright 2026 OpenCerebral"
+      ],
+      "notice": null,
+      "source": "The section \"Copyright & License\" of the model card at the pinned revision. The LICENSE file of the repository is the Apache text whose appendix reads \"Copyright 2023 HuggingFace Inc.\", which looks like a line left from the file it was copied from. The repository at the pinned revision has no NOTICE file (11 files listed).",
+      "changes": "The file in the app is a conversion made by the Prose Plow project: the weights were written as a GGUF file with the matrices and the n-gram table cast from 32-bit to 16-bit floats, the 31 Canon kernels were stored in the order and with the identity term the C++ convolution expects, the n-gram lookup keys became metadata arrays, and the tokenizer and chat template were embedded in the file. SHA-256 of the result: 758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6.",
+      "in_apk": "assets/models/boris-2-instruct.gguf.so, 291,853,184 bytes, when the build bundles it"
+    },
+    {
+      "id": "asset:material-icons",
+      "kind": "artwork",
+      "name": "Material Design icons",
+      "version": "google/material-design-icons, compared with the master branch on 2026-11-22",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "Google LLC"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "LICENSE of google/material-design-icons is the Apache text without a filled-in copyright line; the holder is inferred from the publisher. No NOTICE file at the root of google/material-design-icons (default branch, listed 2026-11-22).",
+      "changes": "Used as vector drawables with the outlines unchanged.",
+      "in_apk": "16 drawables res/drawable/ic_*.xml (every ic_*.xml of commit 5418261 except ic_launcher_foreground.xml, which is the project's own artwork)"
+    },
+    {
+      "id": "port:boris2",
+      "kind": "port",
+      "name": "Reference implementation of Boris-2 (modeling_boris2.py), which the boris2 architecture of this app was written against",
+      "version": "revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d of https://huggingface.co/opencerebral/Boris-2-Instruct",
+      "licence": "Apache-2.0",
+      "licence_text": "licences/Apache-2.0.txt",
+      "holders": [
+        "OpenCerebral"
+      ],
+      "copyright_lines": [
+        "Copyright 2026 OpenCerebral"
+      ],
+      "notice": null,
+      "source": "The model card says that the project and all associated files are under the Apache License 2.0, Copyright 2026 OpenCerebral; the Python files themselves have no licence header. No NOTICE file in the repository.",
+      "changes": "A new implementation in C++ for llama.cpp's graph interface, with a memory for incremental decoding that the reference does not have. No line of the Python code is copied.",
+      "in_apk": "compiled into libllama.so",
+      "precaution": true
+    }
+  ]
+}

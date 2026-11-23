@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -25,6 +26,9 @@ import us.theworkmans.proseplow.security.AppLock
 import us.theworkmans.proseplow.settings.AboutScreen
 import us.theworkmans.proseplow.settings.SettingsScreen
 import us.theworkmans.proseplow.settings.SettingsViewModel
+import us.theworkmans.proseplow.settings.ThirdPartyNoticesScreen
+import us.theworkmans.proseplow.settings.ThirdPartyNoticesViewModel
+import us.theworkmans.proseplow.settings.readThirdPartyNotices
 
 @Serializable
 private data object ChatRoute
@@ -35,11 +39,15 @@ private data object SettingsRoute
 @Serializable
 private data object AboutRoute
 
+@Serializable
+private data object ThirdPartyNoticesRoute
+
 /**
- * The unlocked app: the chat, with Settings and About behind it. It is composed only while
- * [session] is open, under a ViewModelStoreOwner that is the session's, so a lock clears every
- * screen's ViewModel. The chats and the reply that may be running are not in any ViewModel: they
- * are the session's ([AppSession.chat]) and carry on whichever screen is in front.
+ * The unlocked app: the chat, with Settings, About and the third-party notices behind it. It is
+ * composed only while [session] is open, under a ViewModelStoreOwner that is the session's, so a
+ * lock clears every screen's ViewModel. The chats and the reply that may be running are not in
+ * any ViewModel: they are the session's ([AppSession.chat]) and carry on whichever screen is in
+ * front.
  *
  * Two things here belong to the whole unlocked app rather than to one screen:
  * - The screen stays on while a reply is being written, on any of the screens.
@@ -89,7 +97,18 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
             )
         }
         composable<AboutRoute> {
-            AboutScreen(models = session.models, onBack = dropUnlessResumed { navController.popBackStack() })
+            AboutScreen(
+                models = session.models,
+                onBack = dropUnlessResumed { navController.popBackStack() },
+                onOpenNotices = dropUnlessResumed { navController.navigate(ThirdPartyNoticesRoute) },
+            )
+        }
+        composable<ThirdPartyNoticesRoute> {
+            val resources = LocalResources.current
+            val noticesViewModel: ThirdPartyNoticesViewModel = viewModel(
+                factory = viewModelFactory { initializer { ThirdPartyNoticesViewModel(read = { readThirdPartyNotices(resources) }) } },
+            )
+            ThirdPartyNoticesScreen(viewModel = noticesViewModel, onBack = dropUnlessResumed { navController.popBackStack() })
         }
     }
 }

@@ -4,18 +4,17 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -32,14 +31,18 @@ import us.theworkmans.proseplow.ui.SectionTitle
 
 /**
  * About: which version this is, where each model in this build comes from and under which
- * licence, and the licence of llama.cpp, which does the inference. The licence text is in the
- * app because the licence asks for it to accompany every copy.
+ * licence, and the way to the third-party notices.
+ *
+ * The notices are a screen of their own ([ThirdPartyNoticesScreen]): the app is built with
+ * llama.cpp, the C++ runtime and about a hundred libraries, and their licences ask for their
+ * notices and texts to accompany every copy. This screen only says so and opens them.
  *
  * @param models the models this build offers.
+ * @param onOpenNotices opens the third-party notices.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit) {
+fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit, onOpenNotices: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -89,18 +92,12 @@ fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit) {
                     }
                 }
 
-                SectionTitle(stringResource(R.string.about_llama_cpp))
-                Text(stringResource(R.string.about_llama_cpp_summary), style = MaterialTheme.typography.bodyMedium)
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        stringResource(R.string.about_llama_cpp_licence),
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(12.dp),
-                    )
+                SectionTitle(stringResource(R.string.about_third_party))
+                Text(stringResource(R.string.about_third_party_summary), style = MaterialTheme.typography.bodyMedium)
+                // The label of a button is not text to select: a long press on it would start a
+                // selection instead of doing nothing.
+                DisableSelection {
+                    OutlinedButton(onClick = onOpenNotices) { Text(stringResource(R.string.about_third_party_open)) }
                 }
             }
         }

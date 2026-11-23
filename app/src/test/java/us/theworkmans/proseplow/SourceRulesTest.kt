@@ -544,6 +544,51 @@ class SourceRulesTest {
     }
 
     /**
+     * The third-party notices reach the app in one way: as the raw resource that the build writes
+     * after it has compared the list of libraries with what the variant packages. Like the
+     * permission check, the comparison is a step of the build: the resource directory is the
+     * task's own and one of the variant's, the text is written into it only after the list has
+     * passed, and what an earlier run wrote is removed first. No source directory holds a file
+     * of the resource's name, which would be merged with the task's or take its place. And the
+     * app reads the resource in one function, which the ViewModel of the notices calls once, off
+     * the main thread.
+     */
+    @Test
+    fun theThirdPartyNoticesReachTheAppOnlyThroughTheTaskThatComparesThemWithWhatIsPackaged() {
+        val build = File(module, "build.gradle.kts").readLines().map { it.trim() }.filterNot { it.startsWith("//") || it.startsWith("*") || it.startsWith("/**") }.joinToString("\n")
+        assertTrue(
+            "the task's directory must be one of the variant's resource directories",
+            build.contains("variant.sources.res?.addGeneratedSourceDirectory(notices, GenerateThirdPartyNotices::output)"),
+        )
+        assertTrue("what is compared is the variant's runtime classpath", build.contains("variant.runtimeConfiguration.incoming.artifactView {"))
+        assertTrue(build.contains("tasks.named(\"check\") { dependsOn(notices) }"))
+        val action = build.substringAfter("fun generate() {").substringBefore("private companion object")
+        val refused = action.indexOf("throw GradleException(")
+        val written = action.indexOf("text.get().asFile.copyTo(raw.resolve(RESOURCE_FILE))")
+        assertTrue("the text is written only after the list passed", refused in 0 until written)
+        assertTrue("and what an earlier run wrote is removed first", action.indexOf("raw.deleteRecursively()") in 0 until refused)
+        assertTrue(build.contains("const val RESOURCE_FILE = \"third_party_notices.txt\""))
+
+        val strays = File(module, "src").walkTopDown().filter { it.isFile && it.nameWithoutExtension == "third_party_notices" }.map { it.relativeTo(module).path }.toList()
+        assertEquals("a source directory supplies the resource that only the build may write", emptyList<String>(), strays)
+
+        val all = sources(main)
+        assertEquals(listOf("ThirdPartyNoticesScreen.kt"), users(all, "R.raw.third_party_notices"))
+        assertEquals("the app has no other raw resource, and no other way to this one", listOf("ThirdPartyNoticesScreen.kt"), users(all, "openRawResource("))
+        assertEquals(
+            "the text is read where the ViewModel of its screen is made, and nowhere else",
+            listOf("AppNavigation.kt", "ThirdPartyNoticesScreen.kt"),
+            users(all, "readThirdPartyNotices("),
+        )
+        val viewModel = code(File(module, "$main/settings/ThirdPartyNoticesViewModel.kt"))
+        assertEquals(
+            "once, and off the main thread",
+            listOf("withContext(ioDispatcher) { ThirdPartyNoticesState.Shown(ThirdPartyNoticesText.blocks(read())) }"),
+            viewModel.filter { it.contains("read()") },
+        )
+    }
+
+    /**
      * A notification is shown outside the app: on the phone's lock screen, and to whatever is
      * allowed to read notifications. So each of the app's two is one fixed sentence from the
      * resources, without a placeholder, and nothing that could carry a word of an answer, the
