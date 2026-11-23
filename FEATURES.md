@@ -2153,8 +2153,9 @@ is what a port has to reproduce, whatever it is written in.
   so now. The context's memory may then occupy at most the budget: the smaller of a quarter of the
   device's memory, and what the context holds now plus what is available above the floor. The floor
   is the larger of a fifth of the device's memory and twice the system's own low-memory amount. A
-  step that costs more than the budget is not asked for; the largest step that fits it is taken
-  instead, if there is one (ENG-33). What a size costs is asked of the loaded model (ENG-37). The
+  step that costs more than the budget is not asked for; the largest size below it that fits the
+  budget is taken instead, if there is one above the present size: a step, or any whole multiple
+  of 256 tokens, found by halving with the loaded model's cost of each candidate (ENG-33). What a size costs is asked of the loaded model (ENG-37). The
   budget counts what the tokens of a context take (the model's bytes for each token times the
   size). The native side counts more: what a loaded model reserves whatever the size of its
   context, most of which is never touched. That part is the same before and after a step, so it is
@@ -2186,8 +2187,13 @@ is what a port has to reproduce, whatever it is written in.
     preserve: for a while after a warning the app takes no more memory.
 - **ENG-33** When a step cannot be taken, the size the context has becomes its limit. When the
   budget of ENG-31 does not hold the step that is needed, the context grows as far as the budget
-  allows, which may be not at all, and the size it then has is the limit for that model until it is
-  loaded again. The same holds when the native side refuses a step, and when a larger context could
+  allows (the largest whole multiple of 256 tokens, or step, that the loaded model costs within
+  it), which may be not at all, and the size it then has is the limit for that model until it is
+  loaded again. This is what makes the largest sizes reachable: the loaded model counts a size
+  beyond any it has created 2% higher on what that size adds (a margin in the cost of NAT-16), while the limit of ENG-29 is
+  reckoned at the model's bytes for each token, so a limit at the very edge of the quarter (Qwen3.5's
+  111,616 tokens with the memory of ENG-29) can cost the model just more than the budget; the
+  context then grows to the largest size below the limit that fits, and that size is the limit. The same holds when the native side refuses a step, and when a larger context could
   not be created although the budget held it: the native side then sets up the previous size again,
   with what the model had read if that could be saved, or failing that a smaller size (ENG-37), and
   whatever exists is the limit. If no context exists at all any more, the model counts as not loaded

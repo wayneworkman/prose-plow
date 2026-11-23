@@ -668,8 +668,9 @@ class LlamaEngine(
         /**
          * Makes the context larger, towards [wanted] tokens and never beyond [limit]: to the
          * smallest step that holds [wanted] if the device's memory allows that now, otherwise
-         * to the largest step it does allow. Where it ends below what was wanted, that size is
-         * the model's limit from now on, and the collector is told so once.
+         * to the largest size it does allow below that step, a step or any whole multiple of
+         * [NATIVE_CONTEXT_STEP] tokens ([largestWithin]). Where it ends below what was wanted,
+         * that size is the model's limit from now on, and the collector is told so once.
          *
          * The device's memory is read here, at the moment of the decision. The policy budgets
          * what the tokens of a context take. The native side counts more: what a session
@@ -677,6 +678,13 @@ class LlamaEngine(
          * is the same before and after a step, so it is added to the policy's budget, and the
          * sum is what the native side is given; it keeps the context's memory within it at
          * every moment, choosing itself whether the model's memory can be carried over.
+         *
+         * The native side counts a size larger than any it has created a little higher than its
+         * own line through the sizes it has (a margin it keeps against costing too low), while
+         * the policy's limit is the token arithmetic alone. At the very largest sizes the step
+         * the policy allows can therefore cost the native side just more than the budget; the
+         * size taken is then the largest below it that the native side costs within the budget,
+         * not the step before, which can be tens of thousands of tokens smaller.
          */
         private suspend fun growTowards(wanted: Int, limit: Int) {
             val from = native.contextSize()
@@ -699,7 +707,9 @@ class LlamaEngine(
                 announceLimit(from, GenerationEvent.ContextLimited.Reason.MEMORY)
                 return
             }
-            val affordable = steps.lastOrNull { step -> step > from && step <= target && nativeCost(step).let { it != null && it <= budget } }
+            fun fits(size: Int): Boolean = nativeCost(size).let { it != null && it <= budget }
+            val step = steps.lastOrNull { step -> step > from && step <= target && fits(step) }
+            val affordable = if (step == target) step else largestWithin(above = step ?: from, below = target, fits = ::fits) ?: step
             if (affordable == null) {
                 limitFound(from, GenerationEvent.ContextLimited.Reason.MEMORY)
                 return
@@ -724,6 +734,24 @@ class LlamaEngine(
             announcedContextLimit = null
             out.send(GenerationEvent.ContextGrown(fromTokens = from, toTokens = native.contextSize(), rereading = held > 0 && memory.size == 0))
             if (affordable < target) limitFound(affordable, GenerationEvent.ContextLimited.Reason.MEMORY)
+        }
+
+        /**
+         * The largest whole multiple of [NATIVE_CONTEXT_STEP] tokens strictly between [above] and
+         * [below] that [fits], or null when none does. What a context costs rises with its size,
+         * so the multiples are searched by halving: a few questions to the native side, each of
+         * which is arithmetic on figures it already has, and none of which allocates anything.
+         */
+        private fun largestWithin(above: Int, below: Int, fits: (Int) -> Boolean): Int? {
+            var low = above / NATIVE_CONTEXT_STEP + 1
+            var high = (below - 1) / NATIVE_CONTEXT_STEP
+            if (low > high || !fits(low * NATIVE_CONTEXT_STEP)) return null
+            // Invariant: the multiple low fits; every multiple above high does not, or is out of range.
+            while (low < high) {
+                val middle = low + (high - low + 1) / 2
+                if (fits(middle * NATIVE_CONTEXT_STEP)) low = middle else high = middle - 1
+            }
+            return low * NATIVE_CONTEXT_STEP
         }
 
         /**
@@ -1063,6 +1091,12 @@ class LlamaEngine(
          * available now, so that whoever words the failure for the user can tell it from the others.
          */
         const val TOO_LITTLE_MEMORY: String = "too little memory available for this model"
+
+        /**
+         * Every size of context the native side creates is a whole multiple of this many tokens:
+         * llama.cpp rounds a size up to it, and the native side costs a size as so rounded.
+         */
+        private const val NATIVE_CONTEXT_STEP: Int = 256
 
         /** No model is opened with a context smaller than this. */
         const val MIN_OPENING_CONTEXT: Int = 1024

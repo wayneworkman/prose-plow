@@ -278,7 +278,14 @@ needs more.
   is added. On Android 14 and later a running app is no longer told most of those levels,
   which is why the reading at the moment is the guard and the callbacks only add to it.
 - **When a step cannot be taken**, the context grows as far as it can, and the size it then
-  has is the limit for that model until it is loaded again. The chat says so once, and from
+  has is the limit for that model until it is loaded again. "As far as it can" is not only the
+  step before: it is the largest size, in whole 256 tokens, that the model itself says fits
+  the memory. That matters at the largest sizes. The model counts a size it has not created
+  yet about 2% higher than its line through the sizes it has, to be safe, while the limit
+  above is reckoned at the model's bytes for each token. A limit at the very edge of the
+  memory (Qwen3.5's 111,616 tokens on the tested phone) can therefore cost the model just
+  more than the memory allows; the context then grows to the largest size below it that
+  fits, instead of staying at 65,536. The chat says so once, and from
   there the oldest messages are left out, as at any limit. If a larger context cannot be
   created although the memory seemed to be there, the previous one is set up again with what
   the model had read, and the same applies.
@@ -1449,7 +1456,7 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 439 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `core` (JVM, 442 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
 | `app` (JVM, 699 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |

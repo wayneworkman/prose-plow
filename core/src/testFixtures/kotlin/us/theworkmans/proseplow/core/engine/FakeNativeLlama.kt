@@ -279,6 +279,13 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     /** What a context costs whatever its size, as a real session's reservations do. */
     var reservedBytes: Long = 0
 
+    /**
+     * What a context of so many tokens costs, in place of [reservedBytes] plus [bytesPerToken]
+     * times the size; null for that line. For a cost that is not a straight line, such as the
+     * real session's margin on sizes it has not created.
+     */
+    var contextCost: ((tokens: Int) -> Long)? = null
+
     /** When false, the session does not know what a context costs: [contextBytes] says so and every resize is refused. */
     var costKnown: Boolean = true
 
@@ -303,7 +310,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
             throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "a context of $tokens tokens has no cost")
         }
         if (!costKnown) throw NativeLlamaException(NativeLlamaException.CONTEXT_REFUSED, "what a context costs is not known")
-        return reservedBytes + tokens * bytesPerToken
+        return contextCost?.invoke(tokens) ?: (reservedBytes + tokens * bytesPerToken)
     }
 
     override fun resizeContext(tokens: Int, budgetBytes: Long) {

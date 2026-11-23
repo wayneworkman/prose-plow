@@ -177,6 +177,69 @@ class LlamaEngineContextTest {
         assertEquals("Yes.", events.text())
     }
 
+    /**
+     * A device whose quarter holds 3,072 tokens of 1,000 bytes, with plenty available beside it: the policy's limit
+     * for a chosen size of 3,072 is 3,072, and the budget for the tokens is the quarter, 3,072,000 bytes. The sizes
+     * the engine asks about to learn the cost of a token (1,024 and 2,048) are costed on the straight line, as the
+     * native side costs sizes it has created.
+     */
+    private val quarterOf3072 = DeviceMemory(totalBytes = 12_288_000, availableBytes = 1_000_000_000, thresholdBytes = 0, low = false)
+
+    /** The context at 2,048 first, then a conversation that needs the step of 3,072 (the limit) and fits in 2,816. */
+    private suspend fun TestEngine.growToTheLimit(): List<GenerationEvent> {
+        assertEquals(listOf(2048), ask(talk(8), limit = 3072).grown().map { it.toTokens })
+        return ask(talk(14), limit = 3072)
+    }
+
+    @Test
+    fun `a limit the native side costs just above the budget is not given up, and the largest size below it that fits is taken`() = runTest {
+        device = quarterOf3072
+        // As the native side counts a size it has not created yet: 2% above the token arithmetic.
+        val test = engine { fake -> fake.contextCost = { tokens -> if (tokens > 2048) tokens * 1020L else tokens * 1000L } }
+
+        val events = test.growToTheLimit()
+
+        assertEquals("not left at 2,048", listOf(GenerationEvent.ContextGrown(2048, 2816, rereading = false)), events.grown())
+        assertEquals("the size found is the limit, and the chat is told which", listOf(GenerationEvent.ContextLimited(2816, GenerationEvent.ContextLimited.Reason.MEMORY)), events.limited())
+        assertEquals(2816, test.fake.contextSize())
+        assertTrue("the conversation fits in it whole", events.trimmed().isEmpty())
+        assertEquals("Yes.", events.text())
+        assertTrue("nothing was asked for that the native side costs above the budget", test.fake.resizes.all { (tokens, budget) -> tokens * 1020L <= budget || tokens <= 2048 })
+
+        // The next answer runs into the same limit without another word about it, and without asking again.
+        val asked = test.fake.resizes.size
+        val next = test.ask(talk(15), limit = 3072)
+        assertTrue(next.limited().isEmpty() && next.grown().isEmpty())
+        assertEquals(asked, test.fake.resizes.size)
+    }
+
+    @Test
+    fun `a limit the native side costs within the budget is reached as before`() = runTest {
+        device = quarterOf3072
+        val test = engine { fake -> fake.contextCost = { tokens -> tokens * 1000L } }
+
+        val events = test.growToTheLimit()
+
+        assertEquals(listOf(GenerationEvent.ContextGrown(2048, 3072, rereading = false)), events.grown())
+        assertTrue(events.limited().isEmpty())
+        assertEquals(listOf(2048, 3072), test.fake.resizes.map { it.first })
+    }
+
+    @Test
+    fun `when the native side costs every larger size above the budget the context stays as it is, as before`() = runTest {
+        device = quarterOf3072
+        // Twice the token arithmetic beyond 2,048: 2,304 tokens already cost 4,608,000 bytes.
+        val test = engine { fake -> fake.contextCost = { tokens -> if (tokens > 2048) tokens * 2000L else tokens * 1000L } }
+
+        val events = test.growToTheLimit()
+
+        assertTrue(events.grown().isEmpty())
+        assertEquals(listOf(GenerationEvent.ContextLimited(2048, GenerationEvent.ContextLimited.Reason.MEMORY)), events.limited())
+        assertEquals("nothing more was asked for", listOf(2048), test.fake.resizes.map { it.first })
+        assertEquals(2048, test.fake.contextSize())
+        assertEquals(1, events.trimmed().size)
+    }
+
     @Test
     fun `a session that cannot say what a context costs keeps the size it has and still answers`() = runTest {
         val test = engine { it.costKnown = false }
