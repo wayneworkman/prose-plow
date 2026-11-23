@@ -201,8 +201,9 @@ is about things that are **not** built and is kept apart from everything else.
 ## 3. The lock (LOCK)
 
 **Source:** `security/AppLock.kt`, `security/BackgroundLockPolicy.kt`,
-`security/UnlockedSession.kt`, `AppSession.kt`, `lock/LockScreens.kt`, `MainActivity.kt`; tests
-`security/AppLockTest.kt`, `security/MandatoryLockTest.kt`, `AppSessionTest.kt`.
+`security/UnlockedSession.kt`, `security/LockManager.kt`, `data/ExpiredFiles.kt`, `AppSession.kt`,
+`lock/LockScreens.kt`, `MainActivity.kt`; tests `security/AppLockTest.kt`,
+`security/BackgroundLockPolicyTest.kt`, `security/MandatoryLockTest.kt`, `AppSessionTest.kt`.
 
 - **LOCK-01** The lock is mandatory. There is no setting that turns it off, the stored
   configuration has no field for that, and a configuration without a passphrase cannot be read
@@ -885,9 +886,10 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   into `kept/`. The copy's name ends in a digest of its bytes, so the same content is kept once
   however often the app starts with it. When the copy cannot be made, the write fails and the
   file stays as it was. Kept copies are not shown anywhere in the app; they go when their chat
-  is deleted and at a reset.
+  is deleted, when they expire by their own dates (STORE-22) and at a reset.
 - **STORE-10** A chat file that cannot be read at all is never written to. It stays exactly as
-  it is until the user deletes that chat (CHAT-16).
+  it is until the user deletes that chat (CHAT-16) or the date of its file is past the limit of
+  SECSET-13 (STORE-22, STORE-23).
 - **STORE-11** The list of chats is a convenience; the chat files are the truth. At every unlock
   the list is corrected by the files that are really there: an entry without a file is dropped
   (the chat was deleted); a file without an entry is adopted (its listing did not reach the
@@ -943,7 +945,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
   It runs at every start of the lock, which includes every run of the background maintenance
   job (BG-12) while that is on. With "Never" nothing is deleted. A file whose date cannot be read
-  is left alone. The
+  is left alone, and so is a file among the chats whose name is not that of a chat. The
   directories are flushed after a deletion (STORE-13). The list of chats cannot be changed
   without the key: it names the deleted chats until the next unlock (STORE-23).
 - **STORE-23** At every unlock, before any chat is shown and once the list has been corrected by
@@ -966,12 +968,12 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
 **Source:** `chat/ChatController.kt`, `chat/ChatViewModel.kt`, `chat/ChatScreen.kt`,
 `chat/SessionDrawer.kt`, `core/src/main/kotlin/us/theworkmans/proseplow/core/chat/ChatSession.kt`,
-`core/.../chat/MessageExpiry.kt`, `core/.../chat/TrustedTime.kt`, `security/TrustedClock.kt`;
+`core/.../chat/MessageExpiry.kt`, `security/TrustedTime.kt`, `security/TrustedClock.kt`;
 tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeTest.kt`,
 `chat/MessageExpiryChatTest.kt`, `security/TrustedClockTest.kt`,
 `core/src/test/kotlin/us/theworkmans/proseplow/core/chat/ChatSessionTest.kt`,
 `core/src/test/kotlin/us/theworkmans/proseplow/core/chat/MessageExpiryTest.kt`,
-`core/src/test/kotlin/us/theworkmans/proseplow/core/chat/TrustedTimeTest.kt`.
+`security/TrustedTimeTest.kt`.
 
 - **CHAT-01** The app keeps several chats. One is on screen at a time. A chat is a single line
   of messages: editing an earlier message or asking for an answer again cuts the line at that
@@ -1037,6 +1039,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   file is damaged, or was written by a newer version of the app. The file has been left exactly
   as it is, in case a later version can read it. You can also delete the chat.", with the
   buttons "New chat" and "Delete chat". There is no input field and no model in the top bar.
+  Such a chat expires all the same: it is deleted once the date of its file is past the limit
+  of SECSET-13 (STORE-23).
 - **CHAT-17** A stored chat of which only a part could be read can be used. A card titled "Part
   of this chat could not be read" says what is missing, followed by "The file as it was has been
   kept.", until "OK" is pressed. It names the first of these that applies:
@@ -1878,8 +1882,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 
 - **BG-12** While "Background maintenance" is on (SECSET-14), a job runs about every 6 hours,
   also after the device restarts, in which the app deletes what has expired without the key
-  (STORE-22). It is scheduled at every start of the lock while the switch is on, so that an
-  update or a schedule that was lost puts itself right; a job that is already scheduled as it
+  (STORE-22). It is scheduled when a passphrase is first set up and at every start of the lock
+  while the switch is on, so that an update or a schedule that was lost puts itself right; a job that is already scheduled as it
   should be is left as it is, so the next run is not put off. Turning the switch off cancels it,
   and with no passphrase set up (after a reset) it is cancelled too: then nothing of the app runs
   at start-up or in the background. The job never unlocks anything, never touches a key, never
@@ -1890,6 +1894,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     decides when within each period a run comes, may put runs off or stop them for an app that
     is not used, cancels the job when the app is force-stopped, and runs nothing before the
     device's first unlock after a restart, because the app's files are not readable until then.
+    On the phone that was tested (Android 17), a run that was forced while the app was locked
+    and not running started the process, was recorded by the platform as finished by the app
+    after about half a second, and the process had ended a moment later; under the limit of 7
+    days it deleted a file dated 8 days back and left one dated 1 day back.
 - **BG-13** A run that starts the app's process: the process starts and the lock starts as it
   always does (LOCK-22), which runs the clean-up under the lock's own serialisation. The run
   waits for that start to end and does nothing more, so the clean-up is not done twice. A run
@@ -1933,7 +1941,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     `startForeground` without putting the service in the foreground, which is recognised as a
     refusal. The wake lock is taken for 2 minutes at a time and renewed every minute while the
     service is in the foreground, so it covers the longest pending lock (15 minutes) and the 10
-    minutes of LEASE-03 after it, and is never held more than 2 minutes beyond the service.
+    minutes of LEASE-03 after it, and is never held more than 2 minutes beyond the service. On
+    the phone that was tested (Android 17) the service was in the foreground 3 seconds after
+    the app had left the screen, allowed by that grace period; with a lock after 5 minutes the
+    process was not frozen at any point and had ended 300 seconds after the app left the
+    screen, the lock done.
 
 ## 19. The inference engine (ENG)
 
@@ -2254,6 +2266,7 @@ is what a port has to reproduce, whatever it is written in.
 
 **Source:** `native/README.md` ("The generation session", "Forgetting", "On the phone"),
 `native/session/include/proseplow_session.h`, `native/session/src/session.cpp`,
+`native/session/src/state_stream.cpp`,
 `native/lib/include/proseplow_native.h`,
 `llama/src/main/kotlin/us/theworkmans/proseplow/llama/CpuTopology.kt`, `NativeEngine.kt`,
 `native/patches/`, `native/llama-ext/`; tests `native/session/tests/`, `native/tests/`,
@@ -2323,7 +2336,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   of memory, 8 invalid argument, 9 context refused, 10 context not created (ENG-37), 11 memory
   export or import stopped by the caller, 12 memory image not written or not accepted. The
   first ten are shared with the engine; the last two belong to writing the model's memory out
-  and reading it back, which the native session provides and nothing above it uses yet. A short
+  and reading it back (NAT-17), which the native session provides and nothing above it uses
+  yet. A short
   technical description
   goes with it and never contains text of a conversation.
 - **NAT-13** Forgetting a conversation frees the context, the token batch and the sampler and
@@ -2345,16 +2359,103 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   is given back to the system.
 - **NAT-16** The size of the context can change while the model stays loaded. The native layer
   says what the model's largest context is and what a context of a given size costs in memory
-  (llama.cpp's own figures for the buffers it allocates, read when a context is created), and
+  (llama.cpp's own figures for the buffers it allocates, read when a context is created; a size
+  larger than any it has created is reckoned from the sizes it has, with what the larger size
+  adds counted 2% higher, so that the figure errs on the high side), and
   changes the size when asked, within a budget in bytes. A size above the model's largest, or
   whose cost is above the budget, is refused with nothing touched (code 9). Otherwise the old
-  context is overwritten and freed and the new one created; the memory is carried over when the
+  context is overwritten and freed, the allocator is asked to give its free pages back, and
+  only then is the new one created, so that the old one's memory is not still held beside it; the memory is carried over when the
   budget also covers the block it is copied through, and comes back empty otherwise;
   checkpoints survive exactly when the memory does, and no prediction is ready afterwards. A
   size that cannot be created falls back to the previous size, then to halves (code 10). Sizes
   are whole multiples of 256 tokens, as llama.cpp rounds them. Not promised: surviving an
   allocation that the system grants and cannot back, where the budget is the protection, or a
   failure inside ggml's own bookkeeping allocation.
+- **NAT-17** The memory of a conversation can be written out and read back, so that a
+  conversation need not be read again from its first token. The session hands its caller a
+  memory image and takes one back. An image holds, in this order: 176 bytes that say what
+  follows and how large each part is; the session's record of the tokens in memory, 4 bytes
+  each; the state of the sequence exactly as llama.cpp writes it (every cell in use with its
+  key and value rows, and the recurrent state of a model that has one); and the checkpoints the
+  caller named (NAT-09), each as it sits in memory, with the length of memory it belongs to.
+  The checkpoints belong in it because a model whose memory cannot be cut back can only go back
+  through one, and nearly every request after a memory was read back goes back a little. Not in
+  it: the sampler, which both directions leave as it is, and a prediction: after an image was
+  read back, at least one token is evaluated before the next is sampled.
+
+  An image never exists as one block. It leaves the session and enters it in pieces, through a
+  buffer that the caller owns and a function of the caller's that is called once for every
+  piece; the size of a piece is the caller's choice, from 4,096 bytes up, and the caller can
+  keep room at the start of the first piece for a header of its own. The key and value rows are
+  copied straight between the model's buffers and that buffer. The native code writes no part
+  of a memory to a file, and a test fails if either of llama.cpp's two functions that write a
+  state to a file in clear is referred to anywhere in it. The session also says beforehand
+  exactly how many bytes it would hand over, and gives the record of the tokens to a caller
+  that keeps a copy of its own.
+
+  Nothing above the session uses this yet: the binding has no entry for it, the engine does not
+  know it, and the app writes no model's memory to storage.
+  - **Parity note:** an image is not a stored form to adopt. It is written as the machine holds
+    it, its state is that of the pinned llama.cpp for this model, and it is only ever read by
+    the build that wrote it, on the same model file; the size of the context is not part of
+    that, since an image goes into any context that has room for its tokens. What a port has
+    to keep is what NAT-18 promises and NAT-19 requires, not the layout.
+- **NAT-18** What writing a memory out and reading it back promise. Writing out only reads:
+  whatever becomes of it (complete, stopped by the caller at any piece, failed), the memory,
+  every checkpoint, the record of the tokens, the sampler and a prediction that was ready are as
+  they were, and a reply goes on as if nothing had happened. Reading back is all or nothing. It
+  needs an empty memory and no checkpoint (as after NAT-13) and a context with room for the
+  image's tokens, which the caller gives its size first (NAT-16); after any result but success,
+  at whatever byte it ended, the memory is empty with its buffers overwritten, the record of
+  the tokens is overwritten and empty, no checkpoint is held, and the session works as one
+  whose memory was never filled. Both overwrite the caller's buffer before they return; what
+  the caller copied elsewhere is the caller's. Neither allocates with the size of the state:
+  writing out allocates nothing in the session, and reading back only the image's checkpoints,
+  which stay as checkpoints of the session, beside llama.cpp's bookkeeping for the cells it
+  restores. Their own results are: the caller's function ended it (code 11), the image could
+  not be written or is not accepted (code 12), and an image with more tokens than the context
+  holds (code 4), which is known from its first piece (NAT-12).
+
+  A memory that was read back continues exactly as the one that was written out: for the three
+  bundled models the predictions are the same bit for bit, in a context of the size it came
+  from and in one of another size, and a restored checkpoint rewinds to the same prediction. A
+  model with windowed layers (Shard-2) writes only the window of those layers, so the
+  predictions after a memory longer than the window was read back are the uninterrupted
+  memory's to within rounding (1.3e-4 at most where the test looks), not bit for bit.
+
+  Measured on a desktop with four checkpoints, and not yet on the phone: Qwen3.5 with 7,100
+  tokens in memory makes an image of 179.7 MiB that is read back in 46 ms, where reading the
+  same tokens again took 24.7 s; Peacebell with 9,100 tokens makes 577.8 MiB, read back in 80
+  ms against 26.0 s. An image grows with every token by 12,316 bytes for Qwen3.5, 66,576 for
+  Peacebell and 63,516 for Boris-2.
+- **NAT-19** What the caller of a read-back must guarantee, because the session cannot check
+  it: the bytes are, complete and in order, what one write-out of this same build wrote for
+  this same model file, and nobody could have changed them since. llama.cpp reads a state as
+  its own writer left it: it holds the number of cells to the context, and the layers and the
+  type and size of every row to the model, and it believes the rest (the positions of the
+  cells, the token ids in them, the rows themselves). A state changed there can leave the
+  memory in a condition over which a later call ends the process, or one that predicts wrongly
+  without a sign; the same holds for a checkpoint of an image. So whoever stores an image has
+  to authenticate every piece before handing it back, and to compare the build and the model it
+  recorded beside the image before reading back begins. Short of that the session refuses what
+  it can tell: an image that does not begin as one of this layout, or was written for a model
+  of another shape; sizes that do not add up; more tokens than the context holds; a token id
+  outside the vocabulary; a checkpoint that belongs to a length beyond the image's tokens, or
+  is larger than a checkpoint of the whole restored memory; a state that asks for more bytes
+  than the image says it has, or leaves some; a memory that does not hold the image's number of
+  tokens afterwards; and anything behind the image. None of these makes up for the guarantee.
+- **NAT-20** While it reads a state back, llama.cpp gathers the cells in lists of its own, and
+  for the models whose state carries the id of every token (Qwen3.5, Boris-2) two of those
+  lists hold the token ids of the whole conversation, in order. The fifth patch (NAT-02)
+  overwrites the two lists before they are freed; unpatched, llama.cpp frees them as they are.
+  That covers every reading of a state: an image read back (NAT-17), and a memory carried into
+  a context of another size (NAT-16). Measured on a desktop: without the patch a scan of the
+  process found the reply's token ids in the freed lists after an image was read back, for
+  Qwen3.5 still after the memory was cleared and the model closed, and for Boris-2 straight
+  after a change of size; with it none, and the test of what is left behind requires that for
+  every model. The positions of the cells, which llama.cpp gathers as well, are freed as they
+  are.
 
 ## 21. What stays in memory (MEM)
 
@@ -2384,7 +2485,11 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   tokenised, and the token ids of the prompt. Measured on the phone that was tested, after the
   clearing a lock makes, copies of the prompt's text were still readable in the process for two
   of the four models and copies of the prompt's token ids for all four, some of them even after
-  the model had been closed. The token ids of replies were not found.
+  the model had been closed. The token ids of replies were not found. Where llama.cpp
+  reads a state back (a memory carried into a context of another size, NAT-16, or a memory
+  image, NAT-17), the lists in which it gathers the token ids of the whole conversation,
+  replies included, are overwritten before they are freed (NAT-20); that was measured on a
+  desktop and not on the phone.
 - **MEM-05** Nor does it reach what the language runtime holds: strings cannot be overwritten at
   all, and chat text passes through strings in the text fields, the Markdown renderer, the
   JSON codec and the engine's prompt formats; the cryptography classes keep copies of keys
@@ -2988,9 +3093,10 @@ This section is exact where the others describe. Each item carries one of three 
   - the budget of an opening = `cap`, whatever `available`, `floor` and `low` are (ENG-36);
   - when a reply needs more than the context has, `needed` = the prompt's tokens plus `reserve`
     (FMT-16), or the limit if that is less. The target is the smallest step not below `needed`. The
-    step taken is the largest step above the present size and not above the target whose bytes are
-    not more than the budget; if there is none, or while the system reports low memory (ENG-32),
-    none is taken.
+    size taken is the largest whole multiple of 256 tokens above the present size and not above
+    the target whose bytes are not more than the budget: the target itself when it fits, and
+    otherwise a size below it that need not be a step, found by halving (ENG-33); if there is
+    none, or while the system reports low memory (ENG-32), none is taken.
 
   The quarter, the fifth, the factor of two, the 120 seconds and the 1,024 are the values of one
   policy that the engine and the settings share. For `byMemory` the engine takes `bytes` from what
@@ -3120,6 +3226,18 @@ without these properties has not reached parity.
   tool's distribution, the model files).
 - **THREAT-24** Anything an outside review would have found: the code has been reviewed for
   security once, within the project, and no outside party has audited it.
+- **THREAT-26** A hardware key that was deleted, on a device whose key store does not promise
+  that it is gone. The app deletes hardware keys: the binding key of an earlier passphrase, the
+  fingerprint key when fingerprint unlock is turned off or replaced, and every key at a reset.
+  Whether a deleted key can come back is the key store's affair. On the phone that was tested
+  (Android 17) the key store offers apps no separate secure element (no StrongBox), and a key
+  that an app generates there does not carry the property by which the platform guarantees
+  that a deleted key is permanently unusable (rollback resistance: it was absent from the
+  attestation of a key generated for the test, and the platform's interface for apps has no way
+  to ask for it). Someone who copied the device's whole storage, the key store's own files
+  included, before a deletion and can write that copy back to the same device may therefore
+  get such a key back; that takes more than access to the app's private storage (compare
+  THREAT-15), and it was not tried.
 
 ### Decisions and their reasons
 
@@ -3306,8 +3424,8 @@ only state a rule, the item says so and states its effect instead of inventing a
   allocates at once for whatever size it is handed, and a device ends the process long before
   such a call returns; and with every candidate ruled out its samplers name an arbitrary token
   or end the process.
-- **DEC-39** *A model gets into a package only as the pinned file, and a release build looks for
-  no other* (BUILD-03, BUILD-10). Reason: a model file from anywhere else would be packaged, or
+- **DEC-39** *A model gets into a package only as the pinned file, and no build of the app looks
+  for any other* (BUILD-03, BUILD-10, MODEL-23). Reason: a model file from anywhere else would be packaged, or
   run, with nothing vouching for it.
 - **DEC-40** *A destroyed key hands out nothing* (KEY-06). Reason: a destroyed key is all zeros,
   and zeros must never be taken for a key: data sealed with them would be readable by anyone,
@@ -3343,6 +3461,36 @@ only state a rule, the item says so and states its effect instead of inventing a
   "Immediately" needs none; a refusal or loss changes nothing else and leaves no session alive
   on false grounds; the lock is still made up for at the return; and after the lock everything
   goes on as before, the end of the process included.
+- **DEC-45** *Messages expire by their age, judged by dates and not by keys* (CHAT-22 to
+  CHAT-24, STORE-21 to STORE-23, SECSET-13). The owner's decision of 2026-11-23: one limit for
+  every chat, 7 days unless the user chooses otherwise, with "Never" among the choices.
+  Reasons: what is no longer on the device cannot be read by whoever gets into it later; and
+  expiry is to happen whenever the app runs, also while it is locked, when only whole files can
+  be judged, by their dates. Giving the messages of every day a hardware key of their own, to
+  be destroyed when the day expires, was considered and set aside: on the phone that was tested
+  the key store does not promise that a deleted key is gone (THREAT-26), so it would have
+  bought only finer deletion while locked, at the price of a new layout for the chats.
+  Preserve: a message goes up to one step early and never late; a date set back keeps nothing
+  alive (CHAT-24); the default is only ever taken from settings that were read (SECSET-13);
+  the readable copy of the limit decides only what is deleted while locked and is corrected at
+  every unlock; and nothing is deleted from under a session that is alive (LOCK-22).
+- **DEC-46** *Opening a model is held to a quarter of the device's memory alone* (ENG-36). The
+  owner's decision of 2026-11-23. Reasons: the system makes room for the app in front by ending
+  others, so memory that is taken at that moment is not memory the opening lacks; and a model
+  refused at opening leaves the user with no model at all, while a refused step of growth only
+  caps the conversation. Preserve: what is available at the moment, the floor and the system's
+  report of low memory bound every step of growth, and none of them the opening.
+- **DEC-47** *An answer that is being finished behind the lock can be stopped without the
+  passphrase* (LEASE-14). Reason: stopping only ever takes away what someone holding the device
+  could otherwise wait for; it opens nothing and shows nothing. Preserve: it does to the
+  session exactly what "Lock now" does (LEASE-08), and does nothing when no session is being
+  finished.
+- **DEC-48** *A development build runs only the models its package carries* (MODEL-23,
+  BUILD-10, APP-16). Stated as a rule: in behaviour a development build is the release build.
+  Its effect: a model file placed in the app's storage is run by no build of the app, so
+  nothing runs that the build did not vouch for (DEC-39), and what is tested is what is
+  released. Preserve: only the device tests of the native binding use a placed file, in the
+  storage of their own test package.
 
 ## 27. Planned tools: design considerations (TOOL)
 
@@ -3499,9 +3647,13 @@ the fixtures under `core/src/test/resources/golden/`.
     closing after them (LEASE-03); a session behind the lock starts nothing
     new, neither a reply nor a model load, so a run that needs a further generation after a tool
     has answered (TOOL-06 is such a run) stops at that step; the keep-alive can only be started
-    while the app is in front, so work that begins in the background has nothing to keep its
-    process alive; and the process ends as soon as the work does, so nothing can wait in the
-    background for a later moment.
+    while the app is in front or at the moment it leaves the screen (BG-02), so work that begins
+    in the background has nothing to keep its process alive; and the process ends as soon as the
+    work does, so nothing that needs the key can wait in the background for a later moment. The
+    one thing that starts the app later by itself is the background maintenance job (BG-12),
+    which runs while the app is locked, never has a key, and holds the process only for its own
+    work (BG-14): a place for further chores that need no key, not a way for work that needs
+    one to wait.
   - Open: whether any of these limits is to be widened for tools, and what the user is told
     when it is. Each widening keeps the data key in memory for longer while the app looks
     locked (THREAT-09).
