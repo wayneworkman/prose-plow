@@ -1,5 +1,6 @@
 package us.theworkmans.proseplow.security
 
+import java.nio.ByteBuffer
 import java.security.KeyStoreException
 import java.security.SecureRandom
 import javax.crypto.Cipher
@@ -239,3 +240,45 @@ fun testConfig(
     lastFailureElapsedMillis = lastFailureElapsedMillis,
     highestKeyGeneration = bindingGeneration,
 )
+
+/**
+ * Randomness that was written down in advance, for the tests that pin the exact bytes of what is
+ * stored: every draw returns the next of [draws], and a draw that was not written down, or of
+ * another length, fails the test.
+ */
+class ScriptedRandom(vararg draws: ByteArray) : SecureRandom() {
+    private val draws = ArrayDeque(draws.toList())
+
+    /** How many of the draws have not been made. */
+    val left: Int
+        @Synchronized get() = draws.size
+
+    @Synchronized
+    override fun nextBytes(bytes: ByteArray) {
+        val next = draws.removeFirstOrNull() ?: throw AssertionError("a draw of ${bytes.size} bytes that was not written down")
+        if (next.size != bytes.size) throw AssertionError("a draw of ${bytes.size} bytes where one of ${next.size} was written down")
+        next.copyInto(bytes)
+    }
+}
+
+/** A direct buffer that holds [bytes] and is ready to be read from its start. */
+fun directBuffer(bytes: ByteArray): ByteBuffer {
+    val buffer = ByteBuffer.allocateDirect(bytes.size)
+    buffer.put(bytes)
+    buffer.flip()
+    return buffer
+}
+
+/** The bytes of this buffer from its position to its limit; the buffer is left as it is. */
+fun ByteBuffer.contents(): ByteArray {
+    val bytes = ByteArray(remaining())
+    duplicate().get(bytes)
+    return bytes
+}
+
+/** Every byte this buffer has room for, whatever its position and limit; the buffer is left as it is. */
+fun ByteBuffer.everything(): ByteArray {
+    val view = duplicate()
+    view.clear()
+    return view.contents()
+}

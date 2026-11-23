@@ -995,6 +995,106 @@ class SourceRulesTest {
         assertEquals(listOf("val key = live?.key", "val key = live?.key ?: return@op false"), uses)
     }
 
+    /**
+     * A sealed stream is the form for content too large to be held in memory, and three things
+     * about it are true only as long as the code keeps its shape:
+     *
+     * 1. Every chunk is sealed and opened by the data key's own class, inside the exclusion its
+     *    destruction waits for and after the question whether the key is still there; and the
+     *    chunks of a stream are only ever counted by the two classes that hold a stream to its
+     *    form. So no stream goes on after a lock, and none is written out of order.
+     * 2. The chunk size is the format's own: nothing in the app names another, so every stream
+     *    has the chunks of its version.
+     * 3. A chunk never passes through an array of the collected heap in the app's own code, and
+     *    a stream is never flushed to the disk when it is written (which would take the seconds
+     *    the app does not have when it leaves the screen), while its deletion is.
+     */
+    @Test
+    fun aStreamIsSealedUnderTheKeysExclusionInChunksOfItsVersionAndBetweenDirectBuffers() {
+        val all = sources(main)
+        val format = code(File(module, "$main/security/SealedStream.kt"))
+        val file = code(File(module, "$main/data/SealedStreamFile.kt"))
+
+        // 1.
+        assertEquals(listOf("Envelope.kt"), users(all, "SealedStream.sealChunk("))
+        assertEquals(listOf("Envelope.kt"), users(all, "SealedStream.openChunk("))
+        val crypto = code(File(module, "$main/security/Envelope.kt")).joinToString("\n")
+        for (operation in listOf(
+            "override fun newStream(oldestMessageMillis: Long): StreamHeader = lock.read {\n" +
+                "if (destroyed) throw KeyDestroyedException()\n" +
+                "SealedStream.newHeader(oldestMessageMillis, random)\n}",
+            "override fun sealChunk(header: StreamHeader, purpose: String, index: Long, last: Boolean, plaintext: ByteBuffer, sealed: ByteBuffer) = lock.read {\n" +
+                "if (destroyed) throw KeyDestroyedException()\n" +
+                "SealedStream.sealChunk(key.bytes, header, purpose, index, last, plaintext, sealed, random)\n}",
+            "override fun openChunk(header: StreamHeader, purpose: String, index: Long, last: Boolean, sealed: ByteBuffer, plaintext: ByteBuffer): Int = lock.read {\n" +
+                "if (destroyed) throw KeyDestroyedException()\n" +
+                "SealedStream.openChunk(key.bytes, header, purpose, index, last, sealed, plaintext)\n}",
+        )) {
+            assertTrue("the data key's class no longer has: $operation", crypto.contains(operation))
+        }
+        assertEquals("the key is destroyed under the exclusion the chunks are sealed in", 1, Regex("fun destroy\\(\\) = lock\\.write \\{").findAll(crypto).count())
+        assertEquals("only the sealer and the opener of a stream ask for a chunk", listOf("SealedStream.kt"), users(all, "cipher.sealChunk("))
+        assertEquals(listOf("SealedStream.kt"), users(all, "cipher.openChunk("))
+        assertEquals(listOf("Envelope.kt", "SealedStream.kt"), users(all, ".sealChunk("))
+        assertEquals(listOf("Envelope.kt", "SealedStream.kt"), users(all, ".openChunk("))
+
+        // 2.
+        assertEquals(listOf("const val CHUNK_SIZE = 4 * 1024 * 1024"), format.filter { it.contains("const val CHUNK_SIZE") })
+        assertEquals("a chunk size is named by the format and its file only", listOf("SealedStream.kt", "SealedStreamFile.kt"), users(all, "chunkSize"))
+        assertEquals(listOf("SealedStream.kt", "SealedStreamFile.kt"), users(all, "SealedStream.CHUNK_SIZE"))
+        assertEquals(
+            "and every way in from outside the module takes the format's",
+            listOf(
+                "constructor(cipher: ChunkCipher, purpose: String, oldestMessageMillis: Long) : this(cipher, purpose, oldestMessageMillis, SealedStream.CHUNK_SIZE)",
+                "constructor(cipher: ChunkCipher, purpose: String, header: StreamHeader) : this(cipher, purpose, header, SealedStream.CHUNK_SIZE)",
+                "constructor(file: File, purpose: String, cipher: ChunkCipher) : this(file, purpose, cipher, SealedStream.CHUNK_SIZE)",
+            ),
+            (format + file).filter { it.startsWith("constructor(") },
+        )
+        assertEquals(
+            "whatever takes a chunk size is not reachable from outside the module",
+            listOf(
+                "class StreamHeader internal constructor(encoded: ByteArray) {",
+                "class StreamSealer internal constructor(",
+                "class StreamOpener internal constructor(",
+                "class SealedStreamFile internal constructor(",
+                "class SealedStreamWriter internal constructor(",
+                "class SealedStreamReader private constructor(",
+            ),
+            (format + file).filter { it.startsWith("class Stream") || it.startsWith("class SealedStream") },
+        )
+
+        // 3.
+        for ((name, lines) in listOf("SealedStream.kt" to format, "SealedStreamFile.kt" to file)) {
+            for (word in listOf("ByteBuffer.wrap(", "ByteBuffer.allocate(", ".array()", "hasArray()")) {
+                assertTrue("$name: $word puts a chunk into an array of the heap, or takes it from one", lines.none { it.contains(word) })
+            }
+        }
+        assertEquals(
+            "the buffers of a stream are made in three places, each direct: the header on its way out, one sealed chunk, one chunk of plaintext",
+            listOf(
+                "val bytes = ByteBuffer.allocateDirect(SealedStream.HEADER_SIZE)",
+                "val sealed = buffer ?: ByteBuffer.allocateDirect(sealedChunkSize).also { buffer = it }",
+                "private val plain: ByteBuffer = ByteBuffer.allocateDirect(chunkSize + SealedStream.TAG_SIZE)",
+                "val sealed = ByteBuffer.allocateDirect(chunkSize + SealedStream.CHUNK_OVERHEAD + 1)",
+            ),
+            (format + file).filter { it.contains("allocate") },
+        )
+        for (word in listOf(".force(", ".sync()", "syncExisting(", "writeAtomically(")) {
+            assertTrue("$word would flush a stream that is being written", file.none { it.contains(word) })
+        }
+        assertEquals(
+            "only a deletion is flushed",
+            listOf("import us.theworkmans.proseplow.security.syncDirectory", "file.absoluteFile.parentFile?.let(::syncDirectory)"),
+            file.filter { it.contains("syncDirectory") },
+        )
+        val delete = File(module, "$main/data/SealedStreamFile.kt").readText().substringAfter("    fun delete() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(
+            listOf("writer?.cancel()", "deleteOrThrow(tempFileFor(file))", "deleteOrThrow(file)", "file.absoluteFile.parentFile?.let(::syncDirectory)"),
+            delete,
+        )
+    }
+
     @Test
     fun aDebugBuildIsAnotherAppSoThatTestsNeverRunInsideARealInstallation() {
         val build = File(module, "build.gradle.kts").readText()

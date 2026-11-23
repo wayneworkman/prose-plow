@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.security
 
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -81,6 +82,9 @@ class DataKey(bytes: ByteArray) {
  * `proseplow:<purpose>`, where the purpose names what the blob is (for example `session:<id>`),
  * so a blob moved to another file or purpose fails to decrypt. The magic, the version byte and
  * the prefix are permanent: changing any of them makes everything stored before unreadable.
+ *
+ * A blob is one message, held in memory whole. Content too large for that has a second form,
+ * [SealedStream], with a magic of its own.
  */
 object Envelope {
     const val VERSION: Byte = 1
@@ -142,11 +146,15 @@ interface BlobCipher {
 }
 
 /**
- * The [BlobCipher] of an unlocked session, using the data key. [destroy] waits for operations in
- * progress, zeroes the key, and makes every later operation fail with [KeyDestroyedException], so
- * nothing can be written with a cleared (all-zero) key.
+ * The [BlobCipher] and the [ChunkCipher] of an unlocked session, using the data key. [destroy]
+ * waits for operations in progress, zeroes the key, and makes every later operation fail with
+ * [KeyDestroyedException], so nothing can be written with a cleared (all-zero) key.
+ *
+ * An operation is one blob or one chunk of a stream, never a stream: [destroy] waits for the
+ * chunk that is being sealed or opened, which is then complete, and the stream it belongs to
+ * gets no further chunk.
  */
-class DataCrypto(private val key: DataKey, private val random: SecureRandom = SecureRandom()) : BlobCipher {
+class DataCrypto(private val key: DataKey, private val random: SecureRandom = SecureRandom()) : BlobCipher, ChunkCipher {
     private val lock = ReentrantReadWriteLock()
     private var destroyed = false
 
@@ -158,6 +166,21 @@ class DataCrypto(private val key: DataKey, private val random: SecureRandom = Se
     override fun open(purpose: String, blob: ByteArray): ByteArray = lock.read {
         if (destroyed) throw KeyDestroyedException()
         Envelope.open(key.bytes, purpose, blob)
+    }
+
+    override fun newStream(oldestMessageMillis: Long): StreamHeader = lock.read {
+        if (destroyed) throw KeyDestroyedException()
+        SealedStream.newHeader(oldestMessageMillis, random)
+    }
+
+    override fun sealChunk(header: StreamHeader, purpose: String, index: Long, last: Boolean, plaintext: ByteBuffer, sealed: ByteBuffer) = lock.read {
+        if (destroyed) throw KeyDestroyedException()
+        SealedStream.sealChunk(key.bytes, header, purpose, index, last, plaintext, sealed, random)
+    }
+
+    override fun openChunk(header: StreamHeader, purpose: String, index: Long, last: Boolean, sealed: ByteBuffer, plaintext: ByteBuffer): Int = lock.read {
+        if (destroyed) throw KeyDestroyedException()
+        SealedStream.openChunk(key.bytes, header, purpose, index, last, sealed, plaintext)
     }
 
     fun destroy() = lock.write {

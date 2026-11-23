@@ -834,8 +834,9 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 ## 10. Storage (STORE)
 
 **Source:** `AppSession.kt` (`DataLayout`), `security/AppFiles.kt`, `security/AtomicFiles.kt`,
-`data/SealedFile.kt`, `data/CoalescingWriter.kt`, `data/SessionStore.kt`,
-`data/SettingsStore.kt`, `data/ExpiredFiles.kt`, `app/src/main/res/xml/data_extraction_rules.xml`; tests in
+`data/SealedFile.kt`, `data/SealedStreamFile.kt`, `data/CoalescingWriter.kt`,
+`data/SessionStore.kt`, `data/SettingsStore.kt`, `data/ExpiredFiles.kt`,
+`app/src/main/res/xml/data_extraction_rules.xml`; tests in
 `app/src/test/java/us/theworkmans/proseplow/data/`, `security/AppFilesTest.kt`,
 `security/DurabilityTest.kt`.
 
@@ -927,7 +928,8 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
     rules that exclude every domain from cloud backup and from device transfer.
 - **STORE-20** Nothing in the storage layer is specific to chats: an encrypted file is a blob
   sealed with a namespaced purpose, written atomically and protected by the rule of STORE-09
-  (TOOL-07).
+  (TOOL-07). The storage layer can also write and read the second form of an encrypted file,
+  the stream of FMT-21, which is as little specific to chats; no store uses it yet.
 - **STORE-21** Every time a chat is written, its file's last-modified time is set to the date of
   its newest message (CHAT-24). When that cannot be done, or no message has a date, the file
   keeps the time it was written, which is later: a deletion by the date (STORE-22) then comes
@@ -2709,13 +2711,15 @@ its own means for each of them.
 
 ## 25. Exact formats and rules (FMT)
 
-**Source:** `security/Envelope.kt`, `security/LockConfig.kt`, `security/LockManager.kt`,
-`security/KeyVault.kt`, `security/Passphrase.kt`, `security/AppFiles.kt`, `AppSession.kt`,
-`data/SealedFile.kt`, `data/SessionStore.kt`, `data/SettingsStore.kt`,
+**Source:** `security/Envelope.kt`, `security/SealedStream.kt`, `security/LockConfig.kt`,
+`security/LockManager.kt`, `security/KeyVault.kt`, `security/Passphrase.kt`,
+`security/AppFiles.kt`, `AppSession.kt`, `data/SealedFile.kt`, `data/SealedStreamFile.kt`,
+`data/SessionStore.kt`, `data/SettingsStore.kt`,
 `core/.../core/chat/SessionCodec.kt`, `core/.../core/chat/PromptHistory.kt`,
 `core/.../core/prompt/`, `core/.../core/model/ModelCatalog.kt`, `core/.../core/engine/`,
 `core/src/test/resources/golden/`, `models/manifest.json`; tests
-`security/EnvelopeTest.kt`, `security/MandatoryLockTest.kt`,
+`security/EnvelopeTest.kt`, `security/SealedStreamTest.kt`, `data/SealedStreamFileTest.kt`,
+`security/MandatoryLockTest.kt`,
 `core/.../core/chat/SessionCodecTest.kt`, `core/.../core/prompt/GoldenPromptTest.kt`,
 `native/session/tests/test_penalties.cpp`.
 
@@ -2733,8 +2737,10 @@ This section is exact where the others describe. Each item carries one of three 
 
 ### Encryption
 
-- **FMT-01** *(Adopt)* Every encrypted blob has this layout, and nothing else is ever written
-  into an encrypted file:
+- **FMT-01** *(Adopt)* An encrypted file holds one of two forms, and nothing else is ever
+  written into one: a blob, which is one encrypted message, or a sealed stream (FMT-21), which
+  is for content too large to be held in memory at once and which no file of the app has yet.
+  Every encrypted blob has this layout:
 
   | Bytes | Content |
   | --- | --- |
@@ -2748,19 +2754,22 @@ This section is exact where the others describe. Each item carries one of three 
   `proseplow:` and the purpose (FMT-02). A blob shorter than 32 bytes, without the magic, with
   another version, or that does not authenticate is "not decryptable"; none of these is ever
   repaired or guessed at. The magic, the version byte and the prefix `proseplow:` are
-  permanent.
-- **FMT-02** *(Adopt)* Purposes. A purpose names what a blob is and is authenticated with it. It
-  is a name space, or a name space, a colon and an id; a name space is a lower-case letter
-  followed by lower-case letters, digits and hyphens, and contains no colon. In use:
-  `settings`; `session-index`; `session:` followed by the chat's id. The name space `dek` is
-  reserved for the lock (`dek:passphrase`, FMT-04) and refused to every store. A purpose is
-  permanent once data has been sealed with it.
+  permanent. A stream begins with a magic of its own, so it is never opened as a blob.
+- **FMT-02** *(Adopt)* Purposes. A purpose names what a blob or a stream is and is authenticated
+  with it. It is a name space, or a name space, a colon and an id; a name space is a lower-case
+  letter followed by lower-case letters, digits and hyphens, and contains no colon. In use:
+  `settings`; `session-index`; `session:` followed by the chat's id. Set aside for the memory of
+  a model kept as a stream (FMT-21), with nothing sealed for it yet: `model-memory:` followed by
+  a chat's id. The name space `dek` is reserved for the lock (`dek:passphrase`, FMT-04) and
+  refused to every store. A purpose is permanent once data has been sealed with it.
 - **FMT-03** *(Adopt)* Names of files. A chat is `sessions/<id>.enc`, where the id is the text
   form of a random (version 4) UUID; an id is valid as a file name if it matches
   `[A-Za-z0-9_-]{1,64}`. A kept copy (STORE-09) is `kept/<name>.<digest>.enc`, where the name is
   `settings`, `session-index` or `session-` followed by the id, and the digest is the first 8
   bytes of the SHA-256 of the copied bytes as 16 lower-case hexadecimal digits. The temporary
-  file of a write is the file's name with `.tmp` appended.
+  file of a write is the file's name with `.tmp` appended. A stream (FMT-21) is named as a
+  blob is: its file's name ends in `.enc`, and the temporary file of its write is that name with
+  `.tmp` appended.
 - **FMT-04** *(Adopt; the last step is device-specific, see KEY-03)* The passphrase key and its
   wrap:
   1. The passphrase is normalised to Unicode Normalisation Form C and encoded as UTF-8 (text
@@ -2879,6 +2888,63 @@ This section is exact where the others describe. Each item carries one of three 
     left out and counted; anything counted, or a higher
     schema version, makes the settings "partly read" (STORE-16); text that is not such an object is
     "unreadable".
+- **FMT-21** *(Adopt)* The sealed stream, the second form of an encrypted file (FMT-01), for
+  content too large to be held in memory at once. A blob is one message, which can only be
+  encrypted and decrypted whole; a stream is a header followed by chunks, each a message of its
+  own under the same data key, so that it is written and read one chunk at a time. Nothing the
+  app stores has this form yet: it is the form in which the memory of a model is to be kept.
+
+  | Bytes | Content |
+  | --- | --- |
+  | 3 | The magic `50 50 53` (the ASCII letters `PPS`) |
+  | 1 | The format version, `01` |
+  | 16 | The stream id, from the system's random generator, new for every writing |
+  | 8 | A date in milliseconds since 1970, as a signed number: for the memory of a conversation, the date of the oldest message it was made from |
+  | the rest | Chunk 0, chunk 1 and so on, to the last chunk |
+
+  The first 28 bytes are the header. Each chunk is:
+
+  | Bytes | Content |
+  | --- | --- |
+  | 12 | The nonce, from the system's random generator, new for every chunk |
+  | the length of the chunk's plaintext | The AES-256-GCM ciphertext |
+  | 16 | The GCM authentication tag (128 bits) |
+
+  - Every chunk but the last holds exactly 4,194,304 bytes (4 MiB) of plaintext. The last holds
+    from 1 byte up to that, and none only when it is the only chunk, which is the stream of an
+    empty content. A content therefore has exactly one form as a stream, a stream has at least
+    one chunk, and a stream takes 28 bytes for its header and 28 for every chunk beyond its
+    content.
+  - The chunk size belongs to version 1 and is not stored. A reader has to know where a chunk
+    ends before it can check the chunk's tag, so a stored size would have to be believed, and
+    memory of that size set aside, before anything had been authenticated. Another chunk size is
+    another version.
+  - The additional authenticated data of chunk `i`, counted from 0, is in this order: the 28
+    bytes of the header; the UTF-8 bytes of `proseplow:` and the purpose (FMT-02); `i` as 8
+    bytes; and one byte that is `01` for the last chunk and `00` for every other. All numbers
+    have their most significant byte first.
+  - Where a stream ends is taken from where its data ends: the chunk that nothing follows is
+    opened as the last, every other as not the last, and the chunk's tag proves or refutes it.
+  - Nothing of a chunk is given out before its tag has been checked, and a stream counts as read
+    only once its last chunk has opened. "Not decryptable", and never repaired or guessed at,
+    are: data shorter than a header, without the magic or with another version; a chunk that
+    does not authenticate where it stands, which is what a changed byte anywhere (the date
+    included), a stream cut off at any point (also exactly between two chunks), a chunk left
+    out, repeated, moved or added, a chunk of another stream, another purpose and another key
+    all come to; and a chunk of a size that no chunk can have where it stands, even when it
+    authenticates.
+  - Which writing of a content a whole stream is, is not authenticated: an older complete stream
+    in the place of a newer one opens, as an older blob does (KEY-08).
+  - No chunk opens as a blob and no blob as a chunk, whatever their purposes are: the additional
+    authenticated data of each form begins with its own magic, and the two differ in their third
+    byte.
+  - Every chunk is one use of the data key with a random nonce, as every blob is. Random nonces
+    are safe for 2^32 uses of one key, which in chunks alone is 2^54 bytes of streams.
+
+  The magic, the version byte, the prefix `proseplow:`, the order of the additional
+  authenticated data and the chunk size of version 1 are permanent. `security/SealedStreamTest.kt`
+  and `data/SealedStreamFileTest.kt` hold the test vectors: a stream of one chunk byte for byte,
+  and a stream of three chunks by its digest.
 
 ### Prompts
 

@@ -16,7 +16,7 @@ import java.nio.file.attribute.BasicFileAttributes
  * - A file encrypted with the data key has a name ending in [ENCRYPTED_SUFFIX] and lives under
  *   [filesDir], outside [securityDir]. That is how [encryptedDataExists] finds data it has never
  *   heard of, so a store added later is covered without touching this class.
- * - Every blob is sealed with a purpose from [Purposes].
+ * - Every blob, and every stream, is sealed with a purpose from [Purposes].
  * - A reset deletes everything in [filesDir] and [cacheDir] ([DataReset]); nothing a store keeps
  *   there survives it.
  */
@@ -62,12 +62,12 @@ class AppFiles(val filesDir: File, val cacheDir: File) {
 }
 
 /**
- * The purposes blobs are sealed with ([BlobCipher]). A purpose names what a blob is, and is part
- * of what is authenticated: a blob moved to another file, or handed to another store, does not
- * open. Purposes are namespaced so that stores cannot collide: `<namespace>` for the one blob of
- * a kind (`settings`), `<namespace>:<id>` for one of many (`session:<id>`). A namespace is
- * lower-case letters, digits and hyphens and has no colon, so the first colon always ends it. A
- * purpose is permanent once data has been sealed with it.
+ * The purposes blobs are sealed with ([BlobCipher]), and streams ([ChunkCipher]). A purpose names
+ * what a blob is, and is part of what is authenticated: a blob moved to another file, or handed
+ * to another store, does not open. Purposes are namespaced so that stores cannot collide:
+ * `<namespace>` for the one blob of a kind (`settings`), `<namespace>:<id>` for one of many
+ * (`session:<id>`). A namespace is lower-case letters, digits and hyphens and has no colon, so
+ * the first colon always ends it. A purpose is permanent once data has been sealed with it.
  */
 object Purposes {
     private val NAMESPACE = Regex("[a-z][a-z0-9-]*")
