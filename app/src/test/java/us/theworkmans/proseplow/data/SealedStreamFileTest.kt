@@ -61,6 +61,9 @@ class SealedStreamFileTest {
 
     private fun bytes(size: Int, from: Int = 0) = ByteArray(size) { (from + it).toByte() }
 
+    /** The names of the temporary files in the directory, in order. */
+    private fun temporaries(): List<String> = directory.list().orEmpty().filter { it.endsWith(".tmp") }.sorted()
+
     /** Writes [plaintext] as one stream, piece by piece through one direct buffer, as an export hands its pieces over. */
     private fun SealedStreamFile.writeAll(plaintext: ByteArray, millis: Long = time) {
         write(millis).use { writer ->
@@ -125,7 +128,7 @@ class SealedStreamFileTest {
         assertTrue(SealedStream.looksSealed(stored))
         assertEquals(SealedStream.sealedSize(text.size.toLong(), SMALL), stored.size.toLong())
         assertFalse(String(stored, Charsets.ISO_8859_1).contains("quick"))
-        assertFalse("no temp file is left behind", File(directory, "$id.enc.tmp").exists())
+        assertEquals("no temp file is left behind", emptyList<String>(), temporaries())
         assertArrayEquals(text, file.readAll())
         assertEquals(time, SealedStreamFile.readHeader(file.file)!!.oldestMessageMillis)
     }
@@ -439,9 +442,9 @@ class SealedStreamFileTest {
         val file = streamFile()
         file.writeAll(plaintext)
         val before = file.file.readBytes()
-        val temporary = File(directory, "$id.enc.tmp")
 
         val writer = file.write(time)
+        val temporary = writer.temp
         writer.write(directBuffer(bytes(SMALL)), false)
         cipher.destroy()
 
@@ -454,7 +457,7 @@ class SealedStreamFileTest {
         assertArrayEquals(before, file.file.readBytes())
 
         assertThrows(KeyDestroyedException::class.java) { file.write(time) }
-        assertFalse("nothing is created for a write that cannot happen", temporary.exists())
+        assertEquals("nothing is created for a write that cannot happen", emptyList<String>(), temporaries())
     }
 
     // --- The plaintext buffer ---
@@ -571,10 +574,11 @@ class SealedStreamFileTest {
     fun untilItIsCommittedAStreamIsATemporaryFileAndTheOneBeforeItStays() {
         val lock = AppFiles(files, temp.newFolder("cache"))
         val file = streamFile()
-        val temporary = File(directory, "$id.enc.tmp")
 
         val writer = file.write(time)
+        val temporary = writer.temp
         assertTrue(temporary.exists())
+        assertEquals("the write's temporary file is the only one", listOf(temporary.name), temporaries())
         writer.write(directBuffer(bytes(SMALL)), false)
         assertFalse("an unfinished write is not data to the lock", lock.encryptedDataExists())
         assertNull(file.read())
@@ -614,27 +618,28 @@ class SealedStreamFileTest {
         val file = streamFile()
         file.writeAll(plaintext)
         val before = file.file.readBytes()
-        val temporary = File(directory, "$id.enc.tmp")
 
         // Closed without a commit, as `use` does when anything is thrown.
         file.write(time).use { writer -> writer.write(directBuffer(bytes(SMALL)), false) }
-        assertFalse(temporary.exists())
+        assertEquals(emptyList<String>(), temporaries())
         assertArrayEquals(before, file.file.readBytes())
 
         // The store says no at the last moment.
         val refused = file.write(time)
         refused.write(directBuffer(bytes(3)), true)
         assertThrows(IOException::class.java) { refused.commit { throw IOException("the date could not be set") } }
-        assertFalse(temporary.exists())
+        assertEquals(emptyList<String>(), temporaries())
         assertArrayEquals(before, file.file.readBytes())
         assertThrows("the write is over", IOException::class.java) { refused.write(directBuffer(bytes(3)), true) }
 
-        // Left behind by a process that ended: not read, and written over by the next write.
-        temporary.writeBytes(bytes(500))
+        // Left behind by a process that ended: not read, and not touched by the next write, which
+        // has a temporary name of its own; a deletion (or the clean-up of every `*.tmp`) removes it.
+        val leftBehind = File(directory, "$id.enc.0123456789abcdef.tmp").apply { writeBytes(bytes(500)) }
         assertArrayEquals(plaintext, file.readAll())
         file.writeAll(bytes(5))
-        assertFalse(temporary.exists())
         assertArrayEquals(bytes(5), file.readAll())
+        assertEquals(listOf(leftBehind.name), temporaries())
+        assertArrayEquals(bytes(500), leftBehind.readBytes())
     }
 
     @Test
@@ -642,12 +647,11 @@ class SealedStreamFileTest {
         val file = streamFile()
         file.writeAll(plaintext)
         val before = file.file.readBytes()
-        val temporary = File(directory, "$id.enc.tmp")
 
         val withoutItsLast = file.write(time)
         withoutItsLast.write(directBuffer(bytes(SMALL)), false)
         assertThrows(IllegalStateException::class.java) { withoutItsLast.commit() }
-        assertFalse(temporary.exists())
+        assertFalse(withoutItsLast.temp.exists())
 
         val empty = file.write(time)
         assertThrows("not even an empty stream is no chunk", IllegalStateException::class.java) { empty.commit() }
@@ -661,7 +665,7 @@ class SealedStreamFileTest {
         sealed.clear()
         lost.seal(directBuffer(bytes(2)), true, sealed)
         assertThrows(IllegalStateException::class.java) { lost.commit() }
-        assertFalse(temporary.exists())
+        assertEquals(emptyList<String>(), temporaries())
         assertArrayEquals(before, file.file.readBytes())
 
         // And nothing is appended that was not sealed, or that is no chunk.
@@ -732,8 +736,9 @@ class SealedStreamFileTest {
         val file = streamFile()
         val first = file.write(time)
         first.write(directBuffer(bytes(SMALL)), false)
-        assertThrows("the temporary name is taken", IOException::class.java) { file.write(time) }
-        assertEquals("and what the first has written is untouched", (HEADER + SEALED).toLong(), File(directory, "$id.enc.tmp").length())
+        assertThrows("a write of this object is open", IOException::class.java) { file.write(time) }
+        assertEquals("and what the first has written is untouched", (HEADER + SEALED).toLong(), first.temp.length())
+        assertEquals("the refused write created nothing", listOf(first.temp.name), temporaries())
         first.write(directBuffer(bytes(1)), true)
         first.commit()
 
@@ -759,9 +764,9 @@ class SealedStreamFileTest {
         assertThrows(IOException::class.java) { writer.write(directBuffer(bytes(1)), true) }
         assertThrows(IOException::class.java) { writer.append(sealed) }
         assertThrows(IOException::class.java) { writer.commit() }
-        assertThrows("until it is closed the temporary name is its own", IOException::class.java) { file.write(time) }
+        assertThrows("until it is closed no other write of this object begins", IOException::class.java) { file.write(time) }
         writer.close()
-        assertFalse(File(directory, "$id.enc.tmp").exists())
+        assertEquals(emptyList<String>(), temporaries())
         assertArrayEquals(before, file.file.readBytes())
         file.writeAll(bytes(3))
         assertArrayEquals(bytes(3), file.readAll())
@@ -776,10 +781,12 @@ class SealedStreamFileTest {
         val other = streamFile(name = "another.enc", purpose = Purposes.of("model-memory", "another"))
         other.writeAll(plaintext)
         File(directory, "$id.enc.tmp").writeBytes(bytes(40))
+        File(directory, "$id.enc.0123456789abcdef.tmp").writeBytes(bytes(40))
+        File(directory, "another.enc.fedcba9876543210.tmp").writeBytes(bytes(40))
 
         file.delete()
 
-        assertEquals(listOf("another.enc"), directory.list()!!.sorted())
+        assertEquals("every temporary file of this name goes, and nothing of another", listOf("another.enc", "another.enc.fedcba9876543210.tmp"), directory.list()!!.sorted())
         assertNull(file.read())
         file.delete() // Deleting what is not there is not an error.
         file.writeAll(bytes(3))

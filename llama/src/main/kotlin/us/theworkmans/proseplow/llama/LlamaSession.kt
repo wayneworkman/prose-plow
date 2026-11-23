@@ -34,8 +34,9 @@ import java.nio.ByteBuffer
  *   caller derives from the memory the system has free, is what protects against that.
  * - [exportMemory] and [importMemory] hand the native session the memory of the caller's direct
  *   buffer as it is: the state goes between llama.cpp's buffers and that memory and through
- *   nothing else, neither an array of the Java heap nor a copy in the binding, and the session
- *   overwrites the whole buffer before it returns. A buffer that is not direct, is read-only, is
+ *   nothing else, neither another array nor a copy in the binding, and the session overwrites
+ *   the whole buffer before it returns. (On Android the direct buffer is a non-movable array of
+ *   the runtime: it is never moved, so it is overwritten where it lies.) A buffer that is not direct, is read-only, is
  *   below the smallest piece or does not contain the offset is refused here, before native code
  *   is reached. An exception thrown by the sink or the source stops the native call; the
  *   binding keeps it while the session winds down (an import then leaves an empty memory) and

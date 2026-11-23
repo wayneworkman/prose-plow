@@ -235,14 +235,15 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         files = files,
         clock = clock,
         // The models offered are the ones whose files this build really carries, asked at every unlock.
-        openSession = { cipher, lockedMessageLifetimeDays ->
+        openSession = { cipher, copies ->
             AppSession(
                 cipher, layout, engine, NativeEngine.availableModels(app),
                 clock = MessageClock { trustedClock.nowMillis() },
                 answerEvents = answerWork,
                 contextLimits = contextLimits,
                 expiryIntervalMillis = ChatController.EXPIRY_INTERVAL_MILLIS,
-                lockedMessageLifetimeDays = lockedMessageLifetimeDays,
+                lockedMessageLifetimeDays = copies.messageLifetimeDays,
+                lockedKeepModelMemory = copies.keepModelMemory,
                 memoryFiles = modelMemory,
                 memoryPlatform = modelMemoryPlatform(),
             )
@@ -280,8 +281,14 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         // that the lock's timer runs on time. Collected on the main thread at once, inside the
         // activity's onStop, which is when Android still lets the service be started.
         CoroutineScope(Dispatchers.Main.immediate).launch { appLock.lockPending.collect(answerWork::onLockPending) }
+        // And for the close of a session that locked by itself the moment the app left the screen
+        // ("Immediately"): asked for inside the activity's onStop, while Android still lets the
+        // service be started, and held through sessionEnding until the key is gone.
+        CoroutineScope(Dispatchers.Main.immediate).launch { appLock.keepAliveForClose.collect(answerWork::onKeepAliveForClose) }
         // And a session left alive behind the lock does not outlive the keep-alive: its end, told
-        // by the service on the main thread, ends the lease at once.
+        // by the service on the main thread, ends the lease at once. Its end and its start also
+        // answer a close that waits to hear whether it runs.
         answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)
+        answerWork.whenKeepAliveStarts(appLock::onKeepAliveStarted)
     }
 }

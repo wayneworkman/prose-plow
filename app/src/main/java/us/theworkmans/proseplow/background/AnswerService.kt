@@ -29,8 +29,9 @@ import kotlinx.coroutines.launch
  * sentence ([KeepAliveSource.keepAliveNotice]) and no more, and holds a partial wake lock for the
  * same time, so that neither the answer nor the timer stops while the phone sleeps.
  *
- * It is started when an answer begins while the app is in front, or when the app leaves the
- * screen unlocked with its lock pending, and it stops itself the moment
+ * It is started when an answer begins while the app is in front, when the app leaves the screen
+ * unlocked with its lock pending, or when the app locks as it leaves the screen and the close of
+ * its session waits for it ("Immediately"), and it stops itself the moment
  * [KeepAliveSource.keepAliveWanted] turns false. It is started as an ordinary service
  * (`startService`), which Android allows while the app is in front and in the seconds after its
  * screen was left, and puts itself in the foreground at once when it is created. Not with

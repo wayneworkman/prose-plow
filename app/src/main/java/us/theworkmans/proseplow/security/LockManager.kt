@@ -606,6 +606,16 @@ class LockManager(
         if (current.messageLifetimeDays != days) save(current.copy(messageLifetimeDays = days))
     }
 
+    /** The readable copy of the switch that keeps the model's memory ([LockConfig.keepModelMemory]); on while there is no configuration. */
+    val keepModelMemory: Boolean get() = config?.keepModelMemory ?: true
+
+    /** Stores [LockConfig.keepModelMemory]. Nothing is written when it already is [keep]. */
+    @Throws(IOException::class)
+    fun setKeepModelMemory(keep: Boolean) {
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (current.keepModelMemory != keep) save(current.copy(keepModelMemory = keep))
+    }
+
     /** Stores [LockConfig.backgroundMaintenance]. Nothing is written when it already is [enabled]. */
     @Throws(IOException::class)
     fun setBackgroundMaintenance(enabled: Boolean) {

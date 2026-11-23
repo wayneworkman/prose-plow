@@ -27,6 +27,9 @@ class AnswerWorkTest {
     /** How often the keep-alive's end was told onward (to the lock, in the app). */
     private var endsTold = 0
 
+    /** How often its start was told onward (to the lock, in the app). */
+    private var startsTold = 0
+
     private val work = AnswerWork(
         keepAlive = {
             starts++
@@ -46,7 +49,10 @@ class AnswerWorkTest {
 
             override fun serviceInForeground() = inForeground
         },
-    ).apply { whenKeepAliveEnds { endsTold++ } }
+    ).apply {
+        whenKeepAliveEnds { endsTold++ }
+        whenKeepAliveStarts { startsTold++ }
+    }
 
     private val wanted get() = work.keepAliveWanted.value
 
@@ -363,12 +369,59 @@ class AnswerWorkTest {
         assertEquals(KeepAliveNotice.LOCK_PENDING, work.notice.value)
 
         work.onSessionEnding(true)
+        assertEquals("still pending until the lock has handed its session on", KeepAliveNotice.LOCK_PENDING, work.notice.value)
         work.onLockPending(false)
         assertTrue(wanted)
-        assertEquals("the closing changes the sentence no more", KeepAliveNotice.LOCK_PENDING, work.notice.value)
+        assertEquals("only the closing is waited for now: the app is locking", KeepAliveNotice.LOCKING, work.notice.value)
         work.onSessionEnding(false)
         assertFalse(wanted)
         assertEquals(1, starts)
+    }
+
+    /**
+     * The lock by itself at the moment of leaving ("Immediately"): the close of its session asks
+     * for the keep-alive, which is started then, says that the app is locking, is told onward to
+     * the lock once the service confirms it, and is held until the session has ended; a start
+     * refused at once is told onward as an end. Catches a close that waits for a keep-alive that
+     * is never started, a lock never told, and a keep-alive let go before the key is gone.
+     */
+    @Test
+    fun aCloseThatAsksForTheKeepAliveStartsItAndHoldsItUntilTheSessionHasEnded() {
+        work.onInFront(true)
+        work.onInFront(false)
+        work.onSessionEnding(true)
+        work.onKeepAliveForClose(true)
+        assertEquals(1, starts)
+        assertTrue(wanted)
+        assertEquals("it says what is true now", KeepAliveNotice.LOCKING, work.notice.value)
+        assertEquals("not told before the service confirms it", 0, startsTold)
+
+        KeepAliveEntry.enter(source, { true }) { }
+        assertEquals(1, startsTold)
+        assertTrue(work.canFinishOutOfSight())
+        work.onKeepAliveForClose(false) // The lock has its answer.
+        assertTrue("held while the session is closing", wanted)
+        work.onSessionEnding(false)
+        assertFalse("let go once the session has ended", wanted)
+
+        // The service still says that it runs (it has not yet seen that it is no longer wanted):
+        // a close that asks again is told at once, and nothing is started twice.
+        work.onSessionEnding(true)
+        work.onKeepAliveForClose(true)
+        assertEquals(1, starts)
+        assertEquals(2, startsTold)
+        work.onKeepAliveForClose(false)
+        work.onSessionEnding(false)
+        work.onKeepAlive(false)
+
+        // Refused at once (the app has been out of sight too long): told as an end, nothing wanted.
+        startWorks = false
+        val ends = endsTold
+        work.onSessionEnding(true)
+        work.onKeepAliveForClose(true)
+        assertEquals(2, starts)
+        assertEquals(ends + 1, endsTold)
+        assertFalse(wanted)
     }
 
     /** The lock fires during an answer: the keep-alive goes on for the lease, and says an answer is being written. */
@@ -384,7 +437,7 @@ class AnswerWorkTest {
         assertEquals(KeepAliveNotice.WRITING, work.notice.value)
         work.onWriting(false)
         assertTrue("until the key is gone", wanted)
-        assertEquals(KeepAliveNotice.WRITING, work.notice.value)
+        assertEquals("the answer has ended, and the lease's closing is waited for", KeepAliveNotice.LOCKING, work.notice.value)
         work.onSessionEnding(false)
         assertFalse(wanted)
         assertEquals(1, starts)
@@ -403,6 +456,7 @@ class AnswerWorkTest {
         work.onLockPending(true)
         assertEquals(1, starts)
         assertFalse(wanted)
+        assertEquals("a start refused at once is told onward as an end", 1, endsTold)
         work.onSessionEnding(false)
         work.onWriting(false)
         assertEquals("never again from the background", 1, starts)
@@ -419,7 +473,7 @@ class AnswerWorkTest {
         assertTrue(work.canFinishOutOfSight())
         work.onKeepAlive(false) // Stopped from outside.
         assertFalse(wanted)
-        assertEquals(1, endsTold)
+        assertEquals(2, endsTold)
         assertFalse(work.canFinishOutOfSight())
         work.onWriting(false)
         work.onSessionEnding(false)
@@ -434,7 +488,7 @@ class AnswerWorkTest {
         assertNull(KeepAliveEntry.enter(source, { false }) { })
         assertFalse(wanted)
         assertFalse(work.keepAliveRunning)
-        assertEquals(2, endsTold)
+        assertEquals(3, endsTold)
     }
 
     @Test

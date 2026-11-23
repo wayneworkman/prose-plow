@@ -81,6 +81,9 @@ class FakeMemoryVault(
     /** Runs before each piece of a restore with its index. */
     var beforeRead: (piece: Int) -> Unit = {}
 
+    /** Runs at every [delete], before anything is deleted: for a test of what the engine has done by then. */
+    var onDelete: () -> Unit = {}
+
     // --- What happened ---
 
     var deletes: Int = 0
@@ -111,6 +114,7 @@ class FakeMemoryVault(
     }
 
     override fun delete() {
+        onDelete()
         deletes++
         if (deleteFails) throw IllegalStateException("the image could not be deleted")
         image = null
@@ -118,9 +122,14 @@ class FakeMemoryVault(
         note = null
     }
 
-    override fun beginSave(memory: SavedMemory): MemoryWriter {
+    /** The engine's stop condition of the latest save begun ([MemoryVault.beginSave]); for asking it from a test. */
+    var lastStopCondition: (() -> Boolean)? = null
+        private set
+
+    override fun beginSave(memory: SavedMemory, stopped: () -> Boolean): MemoryWriter {
         savesBegun++
         headers += memory
+        lastStopCondition = stopped
         return Writer(memory)
     }
 

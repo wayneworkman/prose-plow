@@ -33,6 +33,7 @@ import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -708,6 +709,119 @@ class MemoryStoreTest {
             assertTrue(writer.firstPieceOffset in 1 until writer.buffer.capacity())
         }
         assertTrue(MemoryHeader.MAX_SIZE < NativeLlama.MEMORY_PIECE_BYTES_MIN)
+    }
+
+    /**
+     * A save whose engine thread waits for the disk (every
+     * sealed buffer queued behind a chunk the disk does not take) hears the engine's own stop
+     * condition (a request, a forgetting that is queued, the caller), not only the store's cancel:
+     * the engine's thread is let go within a chunk of it, and the close does not wait for the
+     * writer that is still in the disk. Catches a save that holds the engine, and with it a
+     * queued forgetting and "Lock now", for as long as the disk does not answer.
+     */
+    @Test(timeout = 60_000)
+    fun theEnginesOwnStopConditionEndsEveryWaitOnTheEnginesThread() {
+        chat()
+        val disk = CountDownLatch(1)
+        val inTheDisk = CountDownLatch(1)
+        beforeAppend = {
+            inTheDisk.countDown()
+            disk.await(30, TimeUnit.SECONDS)
+        }
+        val stop = AtomicBoolean(false)
+        val image = image(6 * SMALL)
+        val store = store()
+        val writer = store.beginSave(memoryOf(image), stopped = { stop.get() })
+        val exported = AtomicReference<Boolean>()
+        val engine = thread {
+            try {
+                exported.set(export(writer, image))
+            } finally {
+                writer.close()
+            }
+        }
+        try {
+            assertTrue("the first chunk reached the disk, which does not answer", inTheDisk.await(20, TimeUnit.SECONDS))
+            engine.join(300)
+            assertTrue("the engine's thread waits for a free buffer", engine.isAlive)
+
+            stop.set(true)
+            engine.join(5_000)
+            assertFalse("let go by the engine's own condition, with the disk still stuck", engine.isAlive)
+            assertEquals(false, exported.get())
+        } finally {
+            disk.countDown()
+        }
+        assertTrue(store.awaitStopped(10_000))
+        assertFalse(memoryFile().exists())
+        noTemporaryFile()
+    }
+
+    /**
+     * A writer thread left in the disk by the store of a session
+     * that has ended, which finally gives up after the next session's store began a save of the
+     * same chat, removes only its own temporary file, and the later save is kept. Catches a
+     * temporary name shared by every save of a chat.
+     */
+    @Test(timeout = 60_000)
+    fun aWriterLeftByAnEarlierStoreCannotTakeALaterSavesTemporaryFile() {
+        chat()
+        val stuck = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val firstAppend = AtomicBoolean(true)
+        beforeAppend = {
+            if (firstAppend.compareAndSet(true, false)) {
+                stuck.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+        }
+        val old = store()
+        val first = image(SMALL + 100, seed = 1)
+        val oldWriter = old.beginSave(memoryOf(first))
+        assertTrue(export(oldWriter, first))
+        val oldEngine = thread {
+            try {
+                oldWriter.commit()
+            } catch (_: IOException) {
+                // Given up: the session closed.
+            } finally {
+                oldWriter.close()
+            }
+        }
+        try {
+            assertTrue(stuck.await(20, TimeUnit.SECONDS))
+            // The session closes: its save is cancelled, and its writer thread stays in the disk.
+            old.cancelSave()
+            oldEngine.join(5_000)
+            assertFalse(oldEngine.isAlive)
+            assertFalse(old.awaitStopped(0))
+
+            // The next session saves the same chat; the old writer returns before the commit.
+            val later = image(2 * SMALL + 7, seed = 2)
+            val store = store()
+            store.beginSave(memoryOf(later)).use { writer ->
+                assertTrue(export(writer, later))
+                release.countDown()
+                assertTrue("the old writer has returned and removed what was its own", old.awaitStopped(10_000))
+                writer.commit()
+            }
+            assertArrayEquals("the later save was kept", later, store.restored())
+            noTemporaryFile()
+        } finally {
+            release.countDown()
+        }
+    }
+
+    /** The bytes of every text are overwritten once the digest has read them. */
+    @Test
+    fun theDigestOverwritesTheBytesOfEveryTextItRead() {
+        val messages = messagesOf("c1")
+        val seen = ArrayList<ByteArray>()
+        val digest = MemoryStore.digestOf(messages) { seen += it }
+        assertEquals(messages.size, seen.size)
+        assertEquals(messages.map { it.text.toByteArray(Charsets.UTF_8).size }, seen.map { it.size })
+        assertTrue("every array is zeros", seen.all { bytes -> bytes.all { it == 0.toByte() } })
+        assertArrayEquals("and the digest is as before", digest, MemoryStore.digestOf(messages))
     }
 
     private companion object {

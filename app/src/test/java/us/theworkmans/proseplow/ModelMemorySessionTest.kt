@@ -2,17 +2,21 @@ package us.theworkmans.proseplow
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -30,11 +34,17 @@ import us.theworkmans.proseplow.core.engine.MemoryRestoreState
 import us.theworkmans.proseplow.core.engine.MemorySaveResult
 import us.theworkmans.proseplow.core.engine.MemoryVault
 import us.theworkmans.proseplow.core.engine.SaveTrigger
+import us.theworkmans.proseplow.core.engine.SavedMemory
 import us.theworkmans.proseplow.core.model.ModelCatalog
+import us.theworkmans.proseplow.data.ModelMemoryPlatform
 import us.theworkmans.proseplow.data.ModelMemorySupport
 import us.theworkmans.proseplow.security.SessionClose
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The model's saved memory as the session drives it, through the real session, chats, stores
@@ -494,6 +504,243 @@ class ModelMemorySessionTest {
             thrown = e
         }
         assertNotNull(thrown)
+        session.close()
+    }
+
+    // --- The switch when the settings cannot say ---
+
+    /**
+     * A settings file that is missing or cannot be read, with
+     * the lock's copy of the switch saying off, deletes the memory file at the opening, and
+     * nothing is saved or restored. Catches a switch that falls back to on.
+     */
+    @Test
+    fun settingsThatCannotBeReadWithACopyThatSaysOffKeepNoMemory() = runTest {
+        for (case in listOf("missing", "unreadable")) {
+            val first = unlocked()
+            exchange(first, "Hello")
+            val id = first.id
+            first.close()
+            when (case) {
+                "missing" -> app.layout.settings.delete()
+                "unreadable" -> app.layout.settings.writeBytes(byteArrayOf(1, 2, 3, 4))
+            }
+            plantMemory(id)
+            app.engine.saves.clear()
+            app.engine.restores.clear()
+            app.engine.saveResult = MemorySaveResult.Saved(500, 1_000)
+            fixture.lockedKeepModelMemory = false
+
+            val session = unlocked()
+            assertEquals("$case: the memory found is deleted at the opening", emptyList<String>(), memoryFiles())
+            assertFalse(case, session.keepModelMemory)
+            exchange(session, "Again")
+            session.leftScreen()
+            runCurrent()
+            session.close(SessionClose.UNATTENDED)
+            assertEquals(case, emptyList<String>(), app.engine.restores)
+            assertEquals(case, emptyList<Pair<String, SaveTrigger>>(), app.engine.saves)
+            fixture.lockedKeepModelMemory = null
+            app.layout.kept.deleteRecursively()
+        }
+    }
+
+    // --- "Lock now" and the keeper ---
+
+    /**
+     * "Lock now" stops a save under way before the chats are
+     * shut down, so that their shutdown (which waits for a forgetting queued for the engine,
+     * which a save stuck on the disk would hold) never waits behind it. Seen here by the order:
+     * the save is let go before the reply being written is. Catches a close that stops the save
+     * only after the chats.
+     */
+    @Test
+    fun lockNowStopsASaveBeforeTheChatsAreShutDown() = runTest {
+        val session = unlocked()
+        exchange(session, "Hello")
+        var generationsStoppedWhenTheSaveWas = -1
+        app.engine.onSave = { _, _, _ ->
+            try {
+                awaitCancellation()
+            } finally {
+                generationsStoppedWhenTheSaveWas = app.engine.cancelledGenerations
+            }
+        }
+        session.leftScreen()
+        runCurrent()
+        session.cameOnScreen()
+        app.engine.enqueue(listOf(Step.Hang))
+        assertTrue(session.chat.send(session.id, "Write for ever"))
+        runCurrent()
+        assertEquals(1, app.engine.activeGenerations)
+
+        session.close(SessionClose.IMMEDIATE)
+        assertEquals("the save was let go before the reply was", 0, generationsStoppedWhenTheSaveWas)
+        assertEquals(1, app.engine.cancelledGenerations)
+    }
+
+    /**
+     * Not written twice for nothing: a memory that a save on leaving put on disk, with no request
+     * made since, is not saved again when the session closes by itself; after a request it is.
+     * Catches a keeper that writes hundreds of megabytes again for nothing, and one that skips
+     * the lock's save when something is new.
+     */
+    @Test
+    fun aMemoryOnDiskAsItIsInTheEngineIsNotSavedAgainAtTheLockButOneWithSomethingNewIs() = runTest {
+        fixture.engine.saveResult = MemorySaveResult.Saved(500, 1_000)
+        val unchanged = unlocked()
+        exchange(unchanged, "Hello")
+        unchanged.leftScreen()
+        runCurrent()
+        unchanged.close(SessionClose.UNATTENDED)
+        assertEquals("only the save on leaving", listOf(SaveTrigger.LEFT_SCREEN), app.engine.saves.map { it.second })
+
+        app.engine.saves.clear()
+        val changed = unlocked()
+        exchange(changed, "Hello")
+        changed.leftScreen()
+        runCurrent()
+        changed.cameOnScreen()
+        exchange(changed, "Something new")
+        changed.close(SessionClose.UNATTENDED)
+        assertEquals("the lock saves what is new", listOf(SaveTrigger.LEFT_SCREEN, SaveTrigger.LOCK), app.engine.saves.map { it.second })
+
+        // A save that did not leave the memory on disk does not count either.
+        app.engine.saves.clear()
+        app.engine.saveResult = MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.LITTLE_NEW)
+        val notSaved = unlocked()
+        exchange(notSaved, "Hello")
+        notSaved.leftScreen()
+        runCurrent()
+        notSaved.close(SessionClose.UNATTENDED)
+        assertEquals(listOf(SaveTrigger.LEFT_SCREEN, SaveTrigger.LOCK), app.engine.saves.map { it.second })
+    }
+
+    /**
+     * The vault the engine was given refuses a save begun after the session closed, or after the
+     * switch was turned off, before the store starts anything for it. Catches a late save (an
+     * engine thread that got to it only now) that would write after the close.
+     */
+    @Test
+    fun theVaultRefusesASaveBegunAfterTheCloseOrTheSwitchOff() = runTest {
+        for (case in listOf("closed", "switched off")) {
+            val session = unlocked()
+            exchange(session, "Hello")
+            var given: MemoryVault? = null
+            app.engine.onSave = { vault, _, _ ->
+                given = vault
+                MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.NOT_WORTH_IT)
+            }
+            session.leftScreen()
+            runCurrent()
+            val vault = checkNotNull(given)
+            when (case) {
+                "closed" -> session.close(SessionClose.IMMEDIATE)
+                "switched off" -> session.changeKeepModelMemory(false)
+            }
+            runCurrent()
+            val memory = SavedMemory(ChatController.conversationKeyOf(session.id), ModelCatalog.default.id, 4_096, 500, 60.0, 1_000)
+            assertThrows(case, IOException::class.java) { vault.beginSave(memory) }
+            assertEquals(case, emptyList<String>(), memoryFiles())
+            if (case != "closed") session.close()
+            app.engine.onSave = null
+        }
+    }
+
+    /**
+     * A save that is being begun on the engine's thread when the session closes is waited for by
+     * [AppSession.awaitStopped] until it has ended, so that a reset never deletes the files
+     * beside it. Catches a keeper that counts only the writer threads already started.
+     */
+    @Test(timeout = 60_000)
+    fun awaitStoppedWaitsForASaveThatIsBeingBegun() = runTest {
+        val inside = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val armed = AtomicBoolean(false)
+        val engineThread = Executors.newSingleThreadExecutor()
+        try {
+            val standard = testMemoryPlatform()
+            fixture.memoryPlatform = ModelMemoryPlatform(
+                build = standard.build,
+                modelFileLength = { id ->
+                    if (armed.compareAndSet(true, false)) {
+                        inside.countDown()
+                        release.await(30, TimeUnit.SECONDS)
+                    }
+                    standard.modelFileLength(id)
+                },
+                freeSpace = standard.freeSpace,
+            )
+            val session = unlocked()
+            exchange(session, "Hello")
+            app.engine.onSave = { vault, key, _ ->
+                // On a thread of its own, as the engine's native thread is.
+                withContext(engineThread.asCoroutineDispatcher()) {
+                    try {
+                        vault.beginSave(SavedMemory(key, ModelCatalog.default.id, 4_096, 500, 60.0, 1_000)).close()
+                    } catch (_: IOException) {
+                        // Refused: the session closed while it was being begun.
+                    }
+                }
+                MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.FAILED)
+            }
+            armed.set(true)
+            session.leftScreen()
+            runCurrent()
+            assertTrue("the save is being begun", inside.await(20, TimeUnit.SECONDS))
+
+            session.close(SessionClose.IMMEDIATE)
+            val stopped = launch { session.awaitStopped() }
+            repeat(20) {
+                advanceTimeBy(20)
+                runCurrent()
+            }
+            assertFalse("not stopped while the save is still being begun", stopped.isCompleted)
+
+            release.countDown()
+            repeat(1_000) {
+                if (!stopped.isCompleted) {
+                    Thread.sleep(5)
+                    advanceTimeBy(20)
+                    runCurrent()
+                }
+            }
+            assertTrue("stopped once it has ended", stopped.isCompleted)
+            assertEquals("and it left nothing", emptyList<String>(), memoryFiles())
+        } finally {
+            release.countDown()
+            engineThread.shutdownNow()
+        }
+    }
+
+    /**
+     * A prune of the chat whose saved memory is being read back marks the engine at once and has
+     * it forget, as for the chat it holds. Catches a prune during a restore that leaves the
+     * restored memory, with the expired text, in the engine.
+     */
+    @Test
+    fun aPruneWhileTheChatsMemoryIsReadBackMarksAndForgets() = runTest {
+        val first = unlocked()
+        exchange(first, "Old question")
+        val id = first.id
+        first.close()
+
+        val released = CompletableDeferred<Unit>()
+        app.engine.onRestore = { _, _, _ ->
+            released.await()
+            MemoryRestoreResult.Restored(300)
+        }
+        val session = unlocked()
+        assertEquals("the restore is under way", listOf(ChatController.conversationKeyOf(id)), app.engine.restores.takeLast(1))
+        val marks = app.engine.notToBeSavedMarks
+        val forgets = app.engine.forgetCount
+
+        app.clock.advance(7 * DAY_MILLIS + 1)
+        session.chat.expireMessages()
+        assertEquals("marked at once", marks + 1, app.engine.notToBeSavedMarks)
+        released.complete(Unit)
+        runCurrent()
+        assertEquals("and made to forget", forgets + 1, app.engine.forgetCount)
         session.close()
     }
 }

@@ -119,6 +119,10 @@ class DataLayout(files: AppFiles) {
  *   holds it when it opens the session. It is the limit whenever the settings do not say one
  *   that could be read ([SettingsStore.open]), so that a settings file that cannot be read never
  *   makes the default delete what the user chose to keep.
+ * @param lockedKeepModelMemory the readable copy of the switch "Keep the model's memory after
+ *   locking", as the lock holds it when it opens the session. It is the setting whenever the
+ *   settings do not say one that could be read ([SettingsStore.open]), so that a settings file
+ *   that is missing or cannot be read never turns on again what the user switched off.
  * @param answerEvents told, on the main dispatcher, when an answer begins and ends being
  *   written and when one is finished: what keeps the process alive out of sight goes by it.
  * @param memoryFiles the files of the model's saved memory: one object for the whole process
@@ -148,6 +152,7 @@ class AppSession(
     val contextLimits: DeviceContextLimits = DeviceContextLimits(),
     expiryIntervalMillis: Long? = null,
     lockedMessageLifetimeDays: Int? = null,
+    lockedKeepModelMemory: Boolean? = null,
     val memoryFiles: ModelMemoryFiles = ModelMemoryFiles(layout.modelMemory, layout.sessions),
     memoryPlatform: ModelMemoryPlatform? = null,
     memorySaveBoundMillis: Long = MEMORY_SAVE_BOUND_MILLIS,
@@ -191,6 +196,7 @@ class AppSession(
                 SealedFile(layout.settings, DataLayout.SETTINGS_PURPOSE, cipher, layout.kept, "settings"),
                 writer,
                 knownMessageLifetime = lockedMessageLifetimeDays?.let(MessageLifetime::fromStoredDays),
+                knownKeepModelMemory = lockedKeepModelMemory,
             )
             val sessionStore = SessionStore(
                 sessions = SealedDirectory(layout.sessions, DataLayout::sessionPurpose, cipher, layout.kept, "session"),
@@ -231,7 +237,11 @@ class AppSession(
                 memoryVault = { keeper?.vault() },
                 onTurnEnded = ::onTurnEnded,
                 onMemoryRestored = { keeper?.noteRestored() },
+                deleteSavedMemory = memoryFiles::deleteAll,
             )
+            // A system prompt that is replaced or cleared stays neither in the saved memory nor
+            // in what the store may save next.
+            settingsStore.whenSystemPromptChanges(chats::systemPromptChanged)
             keeper = memoryPlatform?.let { platform ->
                 val store = MemoryStore(
                     files = memoryFiles,
@@ -313,6 +323,9 @@ class AppSession(
 
     override val keepModelMemory: Boolean get() = memoryKeeper != null && settings.settings.value.keepModelMemory
 
+    /** The switch as the settings hold it, whatever the platform; the lock copies it at every unlock. */
+    override val keepModelMemorySetting: Boolean get() = settings.settings.value.keepModelMemory
+
     /**
      * The switch "Keep the model's memory after locking". Main thread. Off deletes the saved
      * memory at once and stops a save that is running; nothing is then saved or restored until
@@ -390,7 +403,8 @@ class AppSession(
     }
 
     /**
-     * Ends the session, in this order:
+     * Ends the session, in this order (for "Lock now" and a reset, [SessionClose.IMMEDIATE], a
+     * save of the model's memory under way is stopped first of all, as in step 2):
      * 1. The reply in flight is stopped, and a restore of the model's memory in progress with
      *    it. What was written of the reply is kept, marked as stopped, and handed to the writer
      *    with everything else that changed.
@@ -419,6 +433,10 @@ class AppSession(
      */
     override suspend fun close(how: SessionClose) {
         withContext(NonCancellable + mainDispatcher) { finishingOnly = true }
+        // "Lock now" and a reset keep nothing: a save under way is stopped before anything else,
+        // so that the chats' shutdown below never waits behind it (a forgetting that is queued
+        // for the engine waits for the engine, which a save stuck on the disk would hold).
+        if (how == SessionClose.IMMEDIATE) memoryKeeper?.close(SessionClose.IMMEDIATE)
         try {
             chat.shutdown()
         } finally {
@@ -443,7 +461,10 @@ class AppSession(
     /**
      * Returns when the writer has really ended (the write that [close] may have left behind has
      * returned), and every writer thread of a save of the model's memory with it, however long
-     * that takes. Nothing of this session touches a file after that.
+     * that takes. Nothing of this session writes a file after that. A deletion may still come:
+     * the engine may delete the saved memory late (its thread was stuck and gets to a
+     * forgetting only now), and turning the switch off deletes it on a thread of its own. Both
+     * only ever delete, needing no key, which can do no harm to what follows.
      */
     override suspend fun awaitStopped() {
         writerScope.coroutineContext.job.join()

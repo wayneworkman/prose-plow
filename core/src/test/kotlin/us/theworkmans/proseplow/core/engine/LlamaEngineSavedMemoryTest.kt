@@ -709,6 +709,79 @@ class LlamaEngineSavedMemoryTest {
         }
     }
 
+    /**
+     * Forgetting, freeing the model and a restore that failed
+     * once it had filled the memory clear the memory first and delete the image second, so that
+     * the conversation never waits in memory for the disk. Catches a deletion made while the
+     * memory still holds the conversation.
+     */
+    @Test
+    fun `the memory is cleared before the image is deleted`() = runTest {
+        val test = engine()
+        // The most the memory held at any deletion since the last reset of this note.
+        var heldAtDelete: Int? = null
+        vault.onDelete = { heldAtDelete = maxOf(heldAtDelete ?: 0, if (test.fake.closed) 0 else test.fake.memory.size) }
+
+        test.ask(*first)
+        test.save()
+        test.engine.forget()
+        assertEquals("forget", 0, heldAtDelete)
+        assertDeleted("forget")
+
+        heldAtDelete = null
+        test.ask(*first)
+        test.save()
+        val held = test.fake.memory.size
+        test.engine.forgetKeepingSavedMemory()
+        // The image says one token less than it holds: the restore reads it all, and then refuses it.
+        vault.reportAs = { it.copy(tokenCount = held - 1) }
+        assertEquals(NotRestored(NotRestored.Reason.FAILED), test.restore())
+        vault.reportAs = null
+        assertEquals("a restore read again", 0, heldAtDelete)
+        assertDeleted("a restore read again")
+
+        heldAtDelete = null
+        test.ask(*first)
+        test.save()
+        test.engine.unload()
+        assertEquals("freeing the model", 0, heldAtDelete)
+        assertDeleted("freeing the model")
+        vault.onDelete = {}
+    }
+
+    /**
+     * The vault is handed the engine's own stop condition, which
+     * a forgetting and a request turn true the moment they are asked for (before they get the
+     * engine), so that a vault waiting for its storage lets the engine go for them. Catches a
+     * condition that is not handed over, or that only the caller's cancellation turns true.
+     */
+    @Test
+    fun `the vault is given the engine's own stop condition, which a forgetting or a request turns true at once`() = runTest {
+        for (what in listOf("forget", "request")) {
+            val test = engine()
+            test.ask(*first)
+            var before: Boolean? = null
+            var after: Boolean? = null
+            vault.beforeWrite = { piece ->
+                if (piece == 0) {
+                    val stopped = checkNotNull(vault.lastStopCondition)
+                    before = stopped()
+                    if (what == "forget") {
+                        launch(start = CoroutineStart.UNDISPATCHED) { test.engine.forget() }
+                    } else {
+                        launch(start = CoroutineStart.UNDISPATCHED) { test.ask(*second) }
+                    }
+                    after = stopped()
+                }
+            }
+            test.save()
+            runCurrent()
+            vault.beforeWrite = {}
+            assertEquals(what, false, before)
+            assertEquals(what, true, after)
+        }
+    }
+
     private companion object {
         const val A = "conversation-a"
         const val B = "conversation-b"

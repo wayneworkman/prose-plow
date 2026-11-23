@@ -368,8 +368,10 @@ class MainActivity : FragmentActivity() {
             // finds that save running and waits for it (within its bound) instead of starting one.
             (container.appLock.state.value as? LockState.Unlocked)?.session?.leftScreen()
             // Starts the lock's timer and, within this call, the keep-alive that lets it run on
-            // time (AppLock.lockPending): Android still allows a foreground service to be started
-            // in the first seconds after the screen was left, and no later.
+            // time (AppLock.lockPending), or, with "Immediately", locks and starts the keep-alive
+            // that the close of the session waits for (AppLock.keepAliveForClose): Android still
+            // allows a foreground service to be started in the first seconds after the screen
+            // was left, and no later.
             container.appLock.onBackground(this)
         }
     }

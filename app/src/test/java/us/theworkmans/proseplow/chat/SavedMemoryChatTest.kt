@@ -6,6 +6,8 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -18,6 +20,7 @@ import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.MessageLifetime.Companion.DAY_MILLIS
 import us.theworkmans.proseplow.core.chat.MessageStatus
 import us.theworkmans.proseplow.core.chat.Role
+import us.theworkmans.proseplow.core.engine.FakeInferenceEngine.Step
 import us.theworkmans.proseplow.core.engine.FinishReason
 import us.theworkmans.proseplow.openSession
 import java.io.File
@@ -136,6 +139,101 @@ class SavedMemoryChatTest {
         session.chat.setDraft(id, "Something being typed")
         runCurrent()
         assertFalse(memoryOf(id).exists())
+        session.close()
+    }
+
+    /**
+     * A system prompt that is changed or cleared stays neither in the saved memory nor in what
+     * the store may save next: the memory file goes at once, and the chat the engine holds has no
+     * conversation to save until the engine has read a request with the new prompt. Catches a
+     * replaced system prompt kept in the memory file.
+     */
+    @Test
+    fun aChangedOrClearedSystemPromptDeletesTheMemoryAndHidesTheHeldChat() = runTest {
+        val session = unlocked()
+        val model = session.openSession.modelId
+        session.settings.update(urgent = true) { it.withSystemPrompt(model, "First prompt") }
+        exchange(session, "A question")
+        val id = session.id
+        val key = ChatController.conversationKeyOf(id)
+        plantMemory(id)
+        assertNotNull(session.chat.conversation(key))
+
+        session.settings.update { it.withSystemPrompt(model, "Second prompt") }
+        assertNull("hidden at once, inside the change", session.chat.conversation(key))
+        runCurrent()
+        assertFalse("deleted at once, not with the next answer", memoryOf(id).exists())
+
+        exchange(session, "Another question")
+        assertNotNull("known again once the engine has read a request with the new prompt", session.chat.conversation(key))
+        assertEquals("Second prompt", app.engine.requests.last().systemPrompt)
+
+        plantMemory(id)
+        session.settings.update { it.withSystemPrompt(model, "") }
+        assertNull("cleared counts as changed", session.chat.conversation(key))
+        runCurrent()
+        assertFalse(memoryOf(id).exists())
+
+        // Anything else of the settings leaves both alone.
+        exchange(session, "And a third")
+        plantMemory(id)
+        session.settings.update(urgent = true) { it.withTemperature(model, 0.3f) }
+        runCurrent()
+        assertTrue(memoryOf(id).exists())
+        assertNotNull(session.chat.conversation(key))
+        session.close()
+    }
+
+    /**
+     * A deleted chat does not stay in the model's memory: deleting the chat the engine holds
+     * makes the engine forget, and deleting another does not. Catches a deletion
+     * that left the deleted chat's text in the engine until the lock.
+     */
+    @Test
+    fun deletingTheChatTheEngineHoldsMakesTheEngineForgetIt() = runTest {
+        val session = unlocked()
+        exchange(session, "Not held for long")
+        val other = session.id
+        session.chat.newChat()
+        exchange(session, "Held")
+        val held = session.id
+
+        session.chat.deleteChat(other)
+        runCurrent()
+        assertEquals("another chat: nothing to forget", 0, app.engine.forgetCount)
+
+        session.chat.deleteChat(held)
+        assertEquals("marked at once", 1, app.engine.notToBeSavedMarks)
+        runCurrent()
+        assertEquals(1, app.engine.forgetCount)
+        session.close()
+    }
+
+    /**
+     * A request that is given up before the engine has read any of it leaves the engine holding
+     * what it held: a prune of that chat still makes the engine forget. Catches a chat
+     * the engine was last given that is taken for what the engine holds.
+     */
+    @Test
+    fun aRequestGivenUpBeforeTheEngineReadItLeavesThePreviousChatForgettable() = runTest {
+        val session = unlocked()
+        exchange(session, "Old question")
+        val held = session.id
+        app.clock.advance(2 * DAY_MILLIS)
+        session.chat.newChat()
+        // Given up before the engine shows that it read anything of it.
+        app.engine.enqueue(listOf(Step.Hang))
+        assertTrue(session.chat.send(session.id, "Stopped at once"))
+        runCurrent()
+        session.chat.stop(session.id)
+        runCurrent()
+
+        app.clock.advance(5 * DAY_MILLIS + 1)
+        session.chat.expireMessages()
+        assertEquals("the chat the engine really holds is marked", 1, app.engine.notToBeSavedMarks)
+        runCurrent()
+        assertEquals("and forgotten", 1, app.engine.forgetCount)
+        assertNull(app.stored(held))
         session.close()
     }
 

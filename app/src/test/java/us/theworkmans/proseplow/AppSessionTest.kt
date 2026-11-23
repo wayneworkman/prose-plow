@@ -7,6 +7,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -350,6 +351,9 @@ class AppSessionTest {
         /** Whether Android puts the answer service in the foreground when it is created (false: `startForeground` throws). */
         var foregroundAllowed = true
 
+        /** How long after `startService` the instance is created; normally at once, on the next turn of the main thread. */
+        var serviceCreationDelayMillis = 0L
+
         /** Whether a `startForeground` that returns has any effect (false: it returns, and the service is not in the foreground). */
         var foregroundTakesEffect = true
 
@@ -395,6 +399,7 @@ class AppSessionTest {
             keepAliveStarts++
             if (serviceInstance?.isActive == true) return true
             serviceInstance = CoroutineScope(dispatcher).launch {
+                delay(serviceCreationDelayMillis)
                 serviceCreations++
                 val wanted = KeepAliveEntry.enter(service, { serviceInForeground }) {
                     if (!foregroundAllowed) throw IllegalStateException("not allowed from the background")
@@ -533,8 +538,16 @@ class AppSessionTest {
                     noteKeepAlive()
                 }
             }
-            // And the end of the keep-alive ends a lease.
+            // And for the close of a lock by itself at the moment of leaving ("Immediately").
+            CoroutineScope(dispatcher).launch {
+                lock.keepAliveForClose.collect {
+                    answers.onKeepAliveForClose(it)
+                    noteKeepAlive()
+                }
+            }
+            // And the end of the keep-alive ends a lease; its end and its start answer such a close.
             answers.whenKeepAliveEnds(lock::onKeepAliveEnded)
+            answers.whenKeepAliveStarts(lock::onKeepAliveStarted)
         }
 
         /** The app's one activity reaches the screen. */
@@ -875,6 +888,7 @@ class AppSessionTest {
         app.lock.lock()
         runCurrent()
 
+        assertEquals("no keep-alive is asked for", 0, app.keepAliveStarts)
         assertEquals("no time was spent waiting", startedAt, currentTime)
         assertFalse("the key is gone at once", app.keyAlive(app.cipher))
         assertTrue(app.log.contains("close IMMEDIATE"))
@@ -1206,6 +1220,8 @@ class AppSessionTest {
         runCurrent()
         assertEquals("stopped, not finished", 0, app.fake.completedGenerations)
         assertEquals(1, app.fake.cancelledGenerations)
+        assertTrue("nothing keeps the phone awake now: no save, no wait", app.log.contains("close IMMEDIATE"))
+        assertEquals(emptyList<Pair<String, SaveTrigger>>(), app.fake.saves)
         assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
         assertFalse(app.lock.sessionEnding.value)
         assertEquals(1, app.processEnds)
@@ -1237,6 +1253,7 @@ class AppSessionTest {
         app.lock.stopAnswerBehindLock()
         runCurrent()
         assertFalse(app.lock.leaseRunning.value)
+        assertTrue("closed as every other end of a lease, not as \"Lock now\"", app.log.contains("close UNATTENDED"))
         assertEquals("stopped, not finished", 0, app.fake.completedGenerations)
         assertEquals(1, app.fake.cancelledGenerations)
         assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
@@ -1492,18 +1509,86 @@ class AppSessionTest {
         session.close()
     }
 
+    /**
+     * With "Immediately" the app locks inside the call that says it left the screen, and the
+     * close of the session, which saves the model's memory, waits to hear whether the keep-alive
+     * runs: it is started at that moment, its notification says that the app is locking, the
+     * save is made while it runs, and it is let go only after the key is gone. Refused, the close
+     * saves nothing and the key goes at once; with no answer within the bound, the same at the
+     * bound. Catches a lock by itself that saves with nothing keeping the phone awake, a
+     * keep-alive let go before the key, and a close that waits
+     * for ever for a service that never answers.
+     */
     @Test
-    fun withImmediatelyNothingIsKeptAliveForTheLock() = runTest {
-        val app = LockedApp(temp.root, testScheduler)
-        unlockedInFront(app)
-        app.lock.setLockTimeout(0)
-        app.leave()
-        runCurrent()
-        assertTrue(app.lock.state.value is LockState.Locked)
-        assertEquals(0, app.keepAliveStarts)
-        assertEquals(0, app.serviceCreations)
-        assertFalse(app.answers.keepAliveWanted.value)
-        assertEquals(1, app.processEnds)
+    fun withImmediatelyTheKeepAliveRunsForTheLocksSaveUntilTheKeyIsGone() = runTest {
+        for (case in listOf("started", "refused", "no answer")) {
+            val app = LockedApp(temp.newFolder(case), testScheduler)
+            val session = unlockedInFront(app)
+            app.lock.setLockTimeout(0)
+            app.fake.enqueueReply(listOf("Hi."))
+            session.chat.send(session.openSession.id, "Hello")
+            runCurrent()
+            val id = session.openSession.id
+            when (case) {
+                "refused" -> app.foregroundAllowed = false
+                "no answer" -> app.serviceCreationDelayMillis = AppLock.KEEP_ALIVE_ANSWER_MILLIS + 1_000
+            }
+            app.fake.onSave = { vault, key, trigger ->
+                app.log += "save $trigger, the keep-alive ${if (app.answers.canFinishOutOfSight()) "running" else "not running"}, saying ${app.answers.notice.value}"
+                writeImage(vault, key)
+            }
+            assertFalse("the answer's own keep-alive has ended", app.answers.keepAliveWanted.value)
+            val startsBefore = app.keepAliveStarts
+            val creationsBefore = app.serviceCreations
+            app.log.clear()
+            val leftAt = currentTime
+
+            app.leave()
+            assertTrue("$case: locked for whoever looks", app.lock.state.value is LockState.Locked)
+            runCurrent()
+            assertEquals("$case: asked for at the moment of leaving", startsBefore + 1, app.keepAliveStarts)
+            val steps = app.log.filter { it.startsWith("close") || it.startsWith("save") || it.startsWith("keep-alive") || it.startsWith("closed") }
+            when (case) {
+                "started" -> {
+                    assertEquals(
+                        listOf(
+                            "close UNATTENDED",
+                            "save LOCK, the keep-alive running, saying LOCKING",
+                            "closed, the key still works",
+                            "keep-alive let go, the key destroyed",
+                        ),
+                        steps,
+                    )
+                    assertTrue("the memory is on disk for the next unlock", memoryFile(app, id).exists())
+                    assertEquals(creationsBefore + 1, app.serviceCreations)
+                }
+                "refused" -> {
+                    // Refused when the service was created, which was before the close began.
+                    assertEquals(listOf("keep-alive let go, the key still alive", "close IMMEDIATE", "closed, the key still works"), steps)
+                    assertFalse("nothing is saved without the keep-alive", memoryFile(app, id).exists())
+                    assertEquals("no time was spent waiting", leftAt, currentTime)
+                }
+                "no answer" -> {
+                    assertEquals("$case: the close waits for the answer", emptyList<String>(), steps)
+                    assertTrue(app.keyAlive(app.cipher))
+                    advanceTimeBy(AppLock.KEEP_ALIVE_ANSWER_MILLIS - 1)
+                    runCurrent()
+                    assertTrue("$case: within the bound", app.keyAlive(app.cipher))
+                    advanceTimeBy(1)
+                    runCurrent()
+                    assertEquals(listOf("close IMMEDIATE", "closed, the key still works"), app.log.filter { it.startsWith("close") })
+                    assertFalse(memoryFile(app, id).exists())
+                    // The service that comes late finds nothing wanted and ends.
+                    advanceTimeBy(2_000)
+                    runCurrent()
+                    assertFalse(app.answers.keepAliveRunning)
+                }
+            }
+            assertFalse(case, app.keyAlive(app.cipher))
+            assertFalse(case, app.answers.keepAliveWanted.value)
+            assertFalse(case, app.lock.keepAliveForClose.value)
+            assertEquals(case, 1, app.processEnds)
+        }
     }
 
     /**

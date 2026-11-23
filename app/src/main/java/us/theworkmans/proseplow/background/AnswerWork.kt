@@ -43,6 +43,12 @@ enum class KeepAliveNotice {
 
     /** Only the lock that is due is waited for: the app is unlocked, out of sight, and will lock itself. */
     LOCK_PENDING,
+
+    /**
+     * Neither: the app has locked, and only the closing of its session is waited for (the model's
+     * memory being saved, the last writes, the key being overwritten): "Locking the app...".
+     */
+    LOCKING,
 }
 
 /** Where the answer service finds out whether it is still wanted, and says whether it runs, without making anything exist that does not yet. */
@@ -122,10 +128,12 @@ object KeepAliveEntry {
  * decides is carried out by the answer service and the notifications. Main thread only.
  *
  * - **Kept alive exactly while there is something to finish or to wait for.** [keepAliveWanted]
- *   turns true when an answer begins to be written while the app is in front, and when the app
- *   leaves the screen unlocked with a lock by itself pending on its timer ([onLockPending]).
- *   Android lets a foreground service be started only from those moments: while the app is in
- *   front, and in the seconds after its screen was left. It turns false when no answer is being
+ *   turns true when an answer begins to be written while the app is in front, when the app
+ *   leaves the screen unlocked with a lock by itself pending on its timer ([onLockPending]), and
+ *   when the app locks by itself at the moment it leaves the screen and the close of its session
+ *   asks for it ([onKeepAliveForClose]: "Immediately"). Android lets a foreground service be
+ *   started only from those moments: while the app is in front, and in the seconds after its
+ *   screen was left. It turns false when no answer is being
  *   written any more, no lock is pending, and no session is still ending behind the lock:
  *   between the last word of an answer, or the lock, and the destruction of the data key the
  *   session is saved and closed, and a process that was put to sleep in that moment would keep
@@ -144,9 +152,10 @@ object KeepAliveEntry {
  *   the session. And whoever was told through [whenKeepAliveEnds] hears of every end, so that a
  *   session left alive on the strength of the keep-alive does not outlive it.
  * - **The notification says why.** [notice] is [KeepAliveNotice.WRITING] while an answer is
- *   being written and [KeepAliveNotice.LOCK_PENDING] while only the pending lock is waited for.
- *   While neither holds (a session is closing after the lock) it stays as it was, for those few
- *   seconds.
+ *   being written, [KeepAliveNotice.LOCK_PENDING] while only the pending lock is waited for, and
+ *   [KeepAliveNotice.LOCKING] while only a session that is closing after the lock is (which,
+ *   with the model's memory being saved, can take seconds). While none holds (nothing is kept
+ *   alive) it stays as it was.
  * - **"Your answer is ready" only for someone who is not looking.** It is shown when the model
  *   finished an answer by itself while the app was not in front, and taken away when the app
  *   comes to the front. It never says anything about the answer.
@@ -159,8 +168,10 @@ class AnswerWork(
     private var writing = false
     private var sessionEnding = false
     private var lockPending = false
+    private var closeWaits = false
     private var inFront = false
     private var keepAliveEnded: () -> Unit = {}
+    private var keepAliveStarted: () -> Unit = {}
 
     private val _keepAliveWanted = MutableStateFlow(false)
 
@@ -196,6 +207,17 @@ class AnswerWork(
     }
 
     /**
+     * [action] is called whenever the answer service confirms that it is in the foreground, on
+     * the main thread, at once; and when a close asks for the keep-alive while the service
+     * already says that it runs ([onKeepAliveForClose]). One listener: the lock, whose close of a
+     * session that locked by itself waits for it. Whether the keep-alive really runs is then the
+     * listener's to ask ([canFinishOutOfSight]).
+     */
+    fun whenKeepAliveStarts(action: () -> Unit) {
+        keepAliveStarted = action
+    }
+
+    /**
      * The answer service confirmed the foreground ([running] true), or is leaving it or has ended
      * (false). See [KeepAliveSource.onKeepAlive]. An end while the keep-alive was still wanted
      * means that it was stopped from outside: nothing is wanted any more either, so that the
@@ -206,6 +228,8 @@ class AnswerWork(
         if (!running) {
             _keepAliveWanted.value = false
             keepAliveEnded()
+        } else {
+            keepAliveStarted()
         }
     }
 
@@ -232,18 +256,43 @@ class AnswerWork(
         if (writing && inFront) startKeepAlive()
     }
 
-    /** Starts the keep-alive unless it is wanted already. */
+    /**
+     * Starts the keep-alive unless it is wanted already. A start that Android refuses at once is
+     * an end like any other ([whenKeepAliveEnds]): nothing goes on waiting for it.
+     */
     private fun startKeepAlive() {
         if (_keepAliveWanted.value) return
         // Wanted before it is started: the service looks at this the moment it exists.
         _keepAliveWanted.value = true
-        if (!keepAlive.start()) _keepAliveWanted.value = false
+        if (!keepAlive.start()) {
+            _keepAliveWanted.value = false
+            keepAliveEnded()
+        }
     }
 
     /** A session that has left the screen is still alive ([ending] true), or none is. */
     fun onSessionEnding(ending: Boolean) {
         sessionEnding = ending
+        refreshNotice()
         settle()
+    }
+
+    /**
+     * The close of a session that the app locked by itself at the moment it left the screen waits
+     * to hear whether the keep-alive runs ([waits] true), or no longer. Turning true is the moment
+     * to start it, as Android still allows that; if the service already says that it runs, the
+     * lock is told so at once. Once the answer is known this turns false, and the keep-alive is
+     * held for the session's close by [onSessionEnding], which turned true before.
+     */
+    fun onKeepAliveForClose(waits: Boolean) {
+        if (closeWaits == waits) return
+        closeWaits = waits
+        refreshNotice()
+        when {
+            !waits -> settle()
+            keepAliveRunning -> keepAliveStarted()
+            else -> startKeepAlive()
+        }
     }
 
     /**
@@ -262,14 +311,15 @@ class AnswerWork(
     }
 
     private fun settle() {
-        if (!writing && !sessionEnding && !lockPending) _keepAliveWanted.value = false
+        if (!writing && !sessionEnding && !lockPending && !closeWaits) _keepAliveWanted.value = false
     }
 
     private fun refreshNotice() {
         when {
             writing -> _notice.value = KeepAliveNotice.WRITING
             lockPending -> _notice.value = KeepAliveNotice.LOCK_PENDING
-            // Neither: a session is closing, or nothing is kept alive. The notice stays as it was.
+            sessionEnding || closeWaits -> _notice.value = KeepAliveNotice.LOCKING
+            // None: nothing is kept alive. The notice stays as it was.
         }
     }
 

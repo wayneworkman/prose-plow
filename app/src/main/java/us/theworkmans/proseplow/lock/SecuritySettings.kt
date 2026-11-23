@@ -157,12 +157,25 @@ class SecurityViewModel(
 
     /**
      * The switch "Keep the model's memory after locking". No passphrase is asked for: the app is
-     * unlocked, the choice opens no key, and off only deletes. Off deletes the saved memory at once.
+     * unlocked, the choice opens no key, and off only deletes. Off deletes the saved memory at
+     * once. Then the readable copy in the lock configuration is written
+     * ([AppLock.setKeepModelMemory]), after the setting and not before it, so that off deletes
+     * without waiting for the lock. A copy that cannot be written is left to the next unlock,
+     * which writes it from the setting.
      */
     fun setKeepModelMemory(keep: Boolean) {
         if (!memorySetting.modelMemorySupported) return
         memorySetting.changeKeepModelMemory(keep)
         _keepModelMemory.value = memorySetting.keepModelMemory
+        viewModelScope.launch {
+            try {
+                appLock.setKeepModelMemory(keep)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // See above: the next unlock writes the copy again.
+            }
+        }
     }
 
     private val _messageLifetimeDays = MutableStateFlow(lifetimeSetting.messageLifetimeDays)

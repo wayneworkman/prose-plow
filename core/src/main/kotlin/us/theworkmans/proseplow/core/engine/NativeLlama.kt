@@ -311,7 +311,9 @@ interface NativeLlama {
      *
      * **The buffer.** [buffer] is the caller's and must be a direct, writable [ByteBuffer] of at
      * least [MEMORY_PIECE_BYTES_MIN] bytes: its memory is handed to the native session as it is,
-     * so that no byte of the state is ever copied into an array of the Java heap. The whole
+     * so that no byte of the state is ever copied into another array. (On Android a direct
+     * buffer is itself an array of the runtime, but one that is never moved, so the bytes are
+     * overwritten where they lie and no copy is left behind by the garbage collector.) The whole
      * capacity is used, from index 0, whatever the buffer's position and limit, and these are
      * neither read nor changed. A piece is the capacity, except the last, which has from 1 byte
      * up to it.

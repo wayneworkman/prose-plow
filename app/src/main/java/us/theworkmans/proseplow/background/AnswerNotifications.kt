@@ -13,14 +13,14 @@ import androidx.core.content.ContextCompat
 import us.theworkmans.proseplow.R
 
 /**
- * The app's two notifications: the ongoing one of the keep-alive, which says one of two fixed
+ * The app's two notifications: the ongoing one of the keep-alive, which says one of three fixed
  * sentences ([KeepAliveNotice]), and the one that an answer is ready. Each is one fixed sentence
  * and nothing else: no word of an answer, no title of a chat, no name of a model ever goes into
  * a notification, because a notification is shown outside the app, on the lock screen of the
  * phone and to whatever reads notifications there. A test that reads this file holds it to that.
  *
- * Both sentences of the keep-alive use one channel: it is one notification whose sentence
- * changes while it is shown, and a user who silences it means both. The channel's identifier is
+ * Every sentence of the keep-alive uses one channel: it is one notification whose sentence
+ * changes while it is shown, and a user who silences it means all of them. The channel's identifier is
  * the one it always had, so that what the user has set for it stays.
  */
 object AnswerNotifications {
@@ -53,6 +53,7 @@ object AnswerNotifications {
         val title = when (notice) {
             KeepAliveNotice.WRITING -> context.getString(R.string.answer_writing)
             KeepAliveNotice.LOCK_PENDING -> context.getString(R.string.keep_alive_lock_pending)
+            KeepAliveNotice.LOCKING -> context.getString(R.string.keep_alive_locking)
         }
         return NotificationCompat.Builder(context, WRITING_CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)

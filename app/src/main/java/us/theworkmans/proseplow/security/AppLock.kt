@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.security
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -17,6 +18,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -39,6 +41,13 @@ sealed interface LockState<out S : UnlockedSession> {
     /** Nothing is known to be lost, but the lock or the data could not be opened (for example the disk is full). */
     data class Failed(val detail: String) : LockState<Nothing>
 }
+
+/**
+ * The readable copies that the lock configuration keeps of settings which live, encrypted, in
+ * the session: handed to a session when it is opened, which uses them whenever its own settings
+ * cannot say ([LockConfig.messageLifetimeDays], [LockConfig.keepModelMemory]).
+ */
+data class ReadableCopies(val messageLifetimeDays: Int, val keepModelMemory: Boolean)
 
 /** The security settings, readable while locked. */
 data class SecurityStatus(
@@ -246,6 +255,19 @@ sealed interface PassphraseCheck {
  * to run; where it cannot, the lock is made up for when the app comes back ([onForeground]).
  * This class only publishes the wish; it neither starts nor knows the keep-alive.
  *
+ * Closing out of sight. A session that the app locked by itself is closed as
+ * [SessionClose.UNATTENDED] (the close that saves the model's memory, and may take seconds for
+ * it) only while something keeps the process alive and awake ([canFinishOutOfSight], asked at
+ * that moment); otherwise it is closed as [SessionClose.IMMEDIATE], which saves nothing and
+ * destroys the key at once. That holds for the end of a lease too, also when the keep-alive was
+ * lost. When the lock is due at the very moment the app leaves the screen ("Immediately", or an
+ * unlock that completes after the screen was left) and no keep-alive runs yet, the session's close
+ * waits, for at most [KEEP_ALIVE_ANSWER_MILLIS], to hear whether one does: [keepAliveForClose]
+ * asks for it, at the moment Android still allows it to be started, and [onKeepAliveStarted] or
+ * [onKeepAliveEnded] answer. Started and running, the close is unattended; refused, lost, or no
+ * answer in time, it is immediate. The keep-alive is then held, as for every session that is
+ * ending ([sessionEnding]), until the close has returned and the key is gone.
+ *
  * Making way for the key derivation. Every time a passphrase is put through the key derivation
  * (an unlock, a check or a change in Settings, the first set-up), whatever else loads the
  * processor is asked to stand aside for just that long ([MakesWay]), so that the wait at the
@@ -263,12 +285,11 @@ class AppLock<S : UnlockedSession>(
     private val files: AppFiles,
     private val clock: Clock,
     /**
-     * Makes the session of an unlock, from its cipher and the readable copy of how long messages
-     * are kept ([LockConfig.messageLifetimeDays]), which the session falls back on when its own
-     * setting cannot be read. Called off the main thread, under the mutex; may read the stores
-     * and may fail.
+     * Makes the session of an unlock, from its cipher and the readable copies of settings that
+     * the session falls back on when its own cannot be read ([ReadableCopies]). Called off the
+     * main thread, under the mutex; may read the stores and may fail.
      */
-    private val openSession: (DataCipher, Int) -> S,
+    private val openSession: (DataCipher, ReadableCopies) -> S,
     private val biometricStatus: () -> BiometricStatus,
     /**
      * The temporary permission to take screenshots. It is not part of the lock (locking leaves
@@ -405,8 +426,28 @@ class AppLock<S : UnlockedSession>(
      */
     val lockPending: StateFlow<Boolean> = _lockPending.asStateFlow()
 
-    /** A session that has ended, and how [closeRetired] is to close it ([UnlockedSession.close]). */
-    private class Retired<S>(val live: Live<S>, val how: SessionClose)
+    private val _keepAliveForClose = MutableStateFlow(false)
+
+    /**
+     * True while a session that the app locked by itself, at the moment it left the screen, waits
+     * to hear whether the keep-alive runs before it is closed (see the class comment). Whatever
+     * keeps the process alive and awake out of sight (the answer service) is to be started when
+     * this turns true, which happens inside the call that tells this class that the app left the
+     * screen ([onBackground]), when Android still allows that; its start is told through
+     * [onKeepAliveStarted], its refusal or end through [onKeepAliveEnded]. It turns false once
+     * the answer is known; the keep-alive is then held through [sessionEnding], which turned true
+     * before this did.
+     */
+    val keepAliveForClose: StateFlow<Boolean> = _keepAliveForClose.asStateFlow()
+
+    /** The closes that wait to hear whether the keep-alive runs ([keepAliveForClose]). Main thread only. */
+    private val awaitingKeepAlive = ArrayList<CompletableDeferred<SessionClose>>()
+
+    /**
+     * A session that has ended, and how [closeRetired] is to close it ([UnlockedSession.close]):
+     * known when it is retired, or, for one that waits for the keep-alive, once that is known.
+     */
+    private class Retired<S>(val live: Live<S>, val how: CompletableDeferred<SessionClose>)
 
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
     private val retired = ConcurrentLinkedQueue<Retired<S>>()
@@ -546,20 +587,31 @@ class AppLock<S : UnlockedSession>(
     }
 
     /**
-     * Under the mutex, at an unlock: writes the readable copy of how long messages are kept from
-     * [session]'s own setting, which is the truth. Best effort: a copy that cannot be written
-     * stays as it was until the next unlock, and only what is deleted while locked follows it.
+     * Under the mutex, at an unlock: writes the readable copies of how long messages are kept and
+     * of whether the model's memory is kept from [session]'s own settings, which are the truth.
+     * Best effort: a copy that cannot be written stays as it was until the next unlock; only what
+     * is deleted while locked, and a session whose settings cannot be read, follow it.
      */
-    private fun copyMessageLifetime(m: LockManager, session: S) {
-        val days = session.messageLifetimeDays ?: return
-        try {
-            m.setMessageLifetimeDays(days)
-        } catch (_: IOException) {
-            // See above.
-        } catch (_: IllegalStateException) {
-            // No configuration (a reset began meanwhile): nothing to copy into.
-        } catch (_: IllegalArgumentException) {
-            // Not one of the choices: the copy keeps what it had.
+    private fun copySettings(m: LockManager, session: S) {
+        session.messageLifetimeDays?.let { days ->
+            try {
+                m.setMessageLifetimeDays(days)
+            } catch (_: IOException) {
+                // See above.
+            } catch (_: IllegalStateException) {
+                // No configuration (a reset began meanwhile): nothing to copy into.
+            } catch (_: IllegalArgumentException) {
+                // Not one of the choices: the copy keeps what it had.
+            }
+        }
+        session.keepModelMemorySetting?.let { keep ->
+            try {
+                m.setKeepModelMemory(keep)
+            } catch (_: IOException) {
+                // See above.
+            } catch (_: IllegalStateException) {
+                // No configuration (a reset began meanwhile): nothing to copy into.
+            }
         }
     }
 
@@ -627,26 +679,66 @@ class AppLock<S : UnlockedSession>(
      * working on decrypted data. "Lock now" always ends it, and so does a reset, which deletes
      * the files under it.
      *
-     * How it is closed is decided here too: a lock by itself closes it as [SessionClose.UNATTENDED]
-     * (it may take one more bounded wait to keep what it can for the next unlock); "Lock now", a
-     * reset and a session that was never shown close it as [SessionClose.IMMEDIATE].
+     * How it is closed is decided here too. A lock by itself closes it as
+     * [SessionClose.UNATTENDED] (it may take one more bounded wait to keep what it can for the
+     * next unlock) only while the keep-alive really runs ([canFinishOutOfSight]): that wait must
+     * not happen in a process that may be put to sleep in the middle of it with the key in
+     * memory. When it does not run yet and [askForKeepAlive] is true (the lock is due at the
+     * moment the app leaves the screen, when the keep-alive can still be started), the close
+     * waits to hear whether it does ([retireAwaitingKeepAlive]); otherwise the lock by itself
+     * closes as [SessionClose.IMMEDIATE]. "Lock now", a reset and a session that was never shown
+     * always close as [SessionClose.IMMEDIATE].
      */
-    private fun endSession(session: Live<S>, reason: SessionEnd, lockedAt: Long) {
+    private fun endSession(session: Live<S>, reason: SessionEnd, lockedAt: Long, askForKeepAlive: Boolean = false) {
         session.session.clearScreens()
-        val finishBehindTheLock = reason == SessionEnd.LOCK_BY_ITSELF && _status.value.finishAnswerAfterLocking &&
-            session.session.hasUnfinishedWork() && canFinishOutOfSight()
-        if (finishBehindTheLock) {
-            startLease(session, lockedAt)
-        } else {
-            retire(session, if (reason == SessionEnd.LOCK_BY_ITSELF) SessionClose.UNATTENDED else SessionClose.IMMEDIATE)
+        val byItself = reason == SessionEnd.LOCK_BY_ITSELF
+        val keptAlive = byItself && canFinishOutOfSight()
+        val finishBehindTheLock = keptAlive && _status.value.finishAnswerAfterLocking && session.session.hasUnfinishedWork()
+        when {
+            finishBehindTheLock -> startLease(session, lockedAt)
+            keptAlive -> retire(session, SessionClose.UNATTENDED)
+            byItself && askForKeepAlive -> retireAwaitingKeepAlive(session)
+            else -> retire(session, SessionClose.IMMEDIATE)
         }
     }
 
     /** Main thread: [session] has ended, to be closed as [how]. It waits for [closeRetired], which whoever called this arranges. */
     private fun retire(session: Live<S>, how: SessionClose) {
         unfinished++
+        retired.add(Retired(session, CompletableDeferred(how)))
+        refreshSessionEnding()
+    }
+
+    /**
+     * Main thread: [session] has ended by a lock by itself at the moment the app left the screen,
+     * with no keep-alive running yet. It is closed once it is known whether one runs (see the
+     * class comment), and is ending from now on ([sessionEnding] before [keepAliveForClose], so
+     * that the keep-alive, once started, is held until the key is gone).
+     */
+    private fun retireAwaitingKeepAlive(session: Live<S>) {
+        val how = CompletableDeferred<SessionClose>()
+        awaitingKeepAlive += how
+        unfinished++
         retired.add(Retired(session, how))
         refreshSessionEnding()
+        _keepAliveForClose.value = true
+    }
+
+    /** Main thread: every close that waits for the keep-alive is to be [how]; none waits any more. */
+    private fun answerKeepAliveQuestion(how: SessionClose) {
+        for (waiting in awaitingKeepAlive) waiting.complete(how)
+        awaitingKeepAlive.clear()
+        _keepAliveForClose.value = false
+    }
+
+    /**
+     * The keep-alive has started: the answer service says that it is in the foreground (main
+     * thread). A close that waits for it ([keepAliveForClose]) is unattended if the keep-alive
+     * really runs now, as [canFinishOutOfSight] says, and immediate if not.
+     */
+    fun onKeepAliveStarted() {
+        if (awaitingKeepAlive.isEmpty()) return
+        answerKeepAliveQuestion(if (canFinishOutOfSight()) SessionClose.UNATTENDED else SessionClose.IMMEDIATE)
     }
 
     private fun refreshSessionEnding() {
@@ -687,12 +779,15 @@ class AppLock<S : UnlockedSession>(
 
     /**
      * What kept the process alive and awake out of sight has ended (main thread): the answer
-     * service was refused, left the foreground or was stopped. A lease that is running depends
-     * on it (without it the process may be frozen and none of its timers run), so it ends now,
-     * by the same path as the ceiling: the work is stopped, the session closed and its key
-     * destroyed. Without a lease this changes nothing.
+     * service was refused, could not be started, left the foreground or was stopped. A lease that
+     * is running depends on it (without it the process may be frozen and none of its timers run),
+     * so it ends now, by the same path as the ceiling: the work is stopped, the session closed and
+     * its key destroyed; and, with nothing keeping the process awake, closed as
+     * [SessionClose.IMMEDIATE] ([endLease]). A close that waits to hear whether the keep-alive
+     * runs is immediate too. Otherwise this changes nothing.
      */
     fun onKeepAliveEnded() {
+        if (awaitingKeepAlive.isNotEmpty()) answerKeepAliveQuestion(SessionClose.IMMEDIATE)
         lease?.let { endLease(it) }
     }
 
@@ -705,11 +800,12 @@ class AppLock<S : UnlockedSession>(
      * must not count as recent use. See [Lease.latestPeriodStart] for a lease that began late.
      *
      * The session is closed as [how]: [SessionClose.UNATTENDED] for every end but "Lock now",
-     * which passes [SessionClose.IMMEDIATE].
+     * which passes [SessionClose.IMMEDIATE]; and as [SessionClose.IMMEDIATE] in any case when no
+     * keep-alive runs at this moment ([canFinishOutOfSight]), as when it was lost.
      */
     private fun endLease(parked: Lease<S>, how: SessionClose = SessionClose.UNATTENDED) {
         if (!release(parked)) return
-        retire(parked.live, how)
+        retire(parked.live, if (how == SessionClose.UNATTENDED && canFinishOutOfSight()) SessionClose.UNATTENDED else SessionClose.IMMEDIATE)
         val endedAt = minOf(clock.elapsedMillis(), parked.untilElapsed, parked.latestPeriodStart)
         launchWork {
             withManager { m ->
@@ -782,7 +878,7 @@ class AppLock<S : UnlockedSession>(
             val next = retired.poll() ?: return
             val ended = next.live
             try {
-                ended.session.close(next.how)
+                ended.session.close(howToClose(next))
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -810,6 +906,20 @@ class AppLock<S : UnlockedSession>(
     }
 
     /**
+     * How [next] is to be closed: as it was retired, or, for a close that waits to hear whether
+     * the keep-alive runs, as that answer says, and [SessionClose.IMMEDIATE] when no answer has
+     * come within [KEEP_ALIVE_ANSWER_MILLIS]. The key stays in memory for that wait, which is
+     * normally a fraction of a second (the answer service is created right after it was asked
+     * for); bounding it means that a service that never answers cannot keep the key.
+     */
+    private suspend fun howToClose(next: Retired<S>): SessionClose {
+        val answered = withTimeoutOrNull(KEEP_ALIVE_ANSWER_MILLIS) { next.how.await() }
+        if (answered != null) return answered
+        withContext(NonCancellable + mainDispatcher) { answerKeepAliveQuestion(SessionClose.IMMEDIATE) }
+        return next.how.await()
+    }
+
+    /**
      * Under the mutex: returns only when no closed session can touch a file any more, however
      * long that takes. A lock does not wait for this (it must not: the key is to go); a reset
      * does, because it deletes the files, and a write that landed afterwards would put one back.
@@ -830,7 +940,7 @@ class AppLock<S : UnlockedSession>(
         closeRetired()
         val crypto = DataCrypto(key)
         val session = try {
-            openSession(crypto, m.messageLifetimeDays)
+            openSession(crypto, ReadableCopies(m.messageLifetimeDays, m.keepModelMemory))
         } catch (e: CancellationException) {
             crypto.destroy()
             throw e
@@ -841,7 +951,7 @@ class AppLock<S : UnlockedSession>(
             }
             return
         }
-        copyMessageLifetime(m, session)
+        copySettings(m, session)
         val opened = Live(session, crypto, key)
         withContext(mainDispatcher) {
             if (_state.value != from) {
@@ -894,7 +1004,7 @@ class AppLock<S : UnlockedSession>(
         }
         if (reattached != null) {
             key.destroy()
-            copyMessageLifetime(m, reattached)
+            copySettings(m, reattached)
         } else {
             open(m, key, from, offer)
         }
@@ -910,15 +1020,18 @@ class AppLock<S : UnlockedSession>(
      * answer that is being written is stopped, and a lease that is running ends here too.
      */
     fun lock() {
+        // A session of a lock by itself that waits to hear about the keep-alive saves nothing either.
+        if (awaitingKeepAlive.isNotEmpty()) answerKeepAliveQuestion(SessionClose.IMMEDIATE)
         if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW, lockedAt = clock.elapsedMillis()) else lease?.let { endLease(it, SessionClose.IMMEDIATE) }
     }
 
     /**
-     * "Stop the answer" on the lock screen (main thread): ends a running lease at once, exactly
-     * as [lock] ends one. The answer written so far is kept as a stopped answer, the session is
-     * closed and its key destroyed. It asks for no passphrase, because it only ever takes away
-     * what an attacker could otherwise wait for. Only while the app is locked: it never locks an
-     * app that an unlock has opened in the meantime, and without a lease it does nothing.
+     * "Stop the answer" on the lock screen (main thread): ends a running lease at once. The
+     * answer written so far is kept as a stopped answer, and the session is closed as every other
+     * end of a lease closes it ([endLease]): unattended while the keep-alive runs, so the model's
+     * memory is saved first, unlike "Lock now". It asks for no passphrase, because it only ever
+     * takes away what an attacker could otherwise wait for. Only while the app is locked: it never
+     * locks an app that an unlock has opened in the meantime, and without a lease it does nothing.
      */
     fun stopAnswerBehindLock() {
         if (_state.value is LockState.Locked) lease?.let { endLease(it) }
@@ -929,14 +1042,14 @@ class AppLock<S : UnlockedSession>(
      * to the foreground. As [lock], except that [endSession] may leave the session alive to
      * finish its work. No-op unless unlocked.
      */
-    private fun lockByItself(dueAt: Long? = backgroundPolicy.dueAt()) {
+    private fun lockByItself(dueAt: Long? = backgroundPolicy.dueAt(), askForKeepAlive: Boolean = false) {
         if (_state.value !is LockState.Unlocked) return
         val now = clock.elapsedMillis()
         // A lock by itself is due when the app left the screen plus the timeout; it may run
         // later (a timer that could not run while the process was frozen or the phone slept),
         // and then it counts as having happened when it was due. Without a due moment (none is
         // expected) it is now.
-        lockAs(SessionEnd.LOCK_BY_ITSELF, lockedAt = dueAt?.let { minOf(it, now) } ?: now)
+        lockAs(SessionEnd.LOCK_BY_ITSELF, lockedAt = dueAt?.let { minOf(it, now) } ?: now, askForKeepAlive = askForKeepAlive)
     }
 
     /**
@@ -949,8 +1062,8 @@ class AppLock<S : UnlockedSession>(
      * the mutex inside [launchWork], and the process is only ended when nothing holds the mutex
      * ([considerEndingProcess]), so the write is finished before the process can be ended.
      */
-    private fun lockAs(reason: SessionEnd, lockedAt: Long) {
-        leaveUnlocked(reason, lockedAt)
+    private fun lockAs(reason: SessionEnd, lockedAt: Long, askForKeepAlive: Boolean = false) {
+        leaveUnlocked(reason, lockedAt, askForKeepAlive)
         enterLocked(waitMillis = 0)
         launchWork {
             withManager { m ->
@@ -968,7 +1081,7 @@ class AppLock<S : UnlockedSession>(
     }
 
     /** Main thread: everything that belongs to the unlocked state goes, whatever the state is now. */
-    private fun leaveUnlocked(reason: SessionEnd, lockedAt: Long = clock.elapsedMillis()) {
+    private fun leaveUnlocked(reason: SessionEnd, lockedAt: Long = clock.elapsedMillis(), askForKeepAlive: Boolean = false) {
         // Cancelled here, but said only at the end, once the session has been handed on: see [lockPending].
         lockTimer?.cancel()
         lockTimer = null
@@ -988,7 +1101,7 @@ class AppLock<S : UnlockedSession>(
         // order the work that follows runs in.
         val ending = live
         live = null
-        ending?.let { endSession(it, reason, lockedAt) }
+        ending?.let { endSession(it, reason, lockedAt, askForKeepAlive) }
         _sessionGeneration.update { it + 1 }
         refreshLockPending()
     }
@@ -1022,7 +1135,9 @@ class AppLock<S : UnlockedSession>(
     }
 
     /**
-     * Main thread. The timer runs on the main dispatcher's clock, which may stand still while the
+     * Main thread. A lock that is due now (a timeout of zero, "Immediately") is taken at once,
+     * and when nothing of the app is on screen its close asks for the keep-alive (see the class
+     * comment). The timer runs on the main dispatcher's clock, which may stand still while the
      * phone sleeps or the process is frozen. While it waits, [lockPending] is true, and that is
      * what asks for the keep-alive that lets it run on time; where the keep-alive is refused or
      * lost, [onForeground] makes up for the timer before anything of the session can be seen
@@ -1032,7 +1147,8 @@ class AppLock<S : UnlockedSession>(
         lockTimer?.cancel()
         lockTimer = null
         if (delayMillis <= 0L) {
-            lockByItself()
+            // Due now, out of sight: the moment the keep-alive for its close can still be started.
+            lockByItself(askForKeepAlive = onScreen.isEmpty() && arriving.isEmpty() && successors == 0)
         } else {
             lockTimer = main.launch {
                 delay(delayMillis)
@@ -1454,6 +1570,13 @@ class AppLock<S : UnlockedSession>(
     suspend fun setMessageLifetimeDays(days: Int) = op { m -> m.setMessageLifetimeDays(days) }
 
     /**
+     * The readable copy of the switch that keeps the model's memory, written when the user
+     * changes the switch (the setting itself is the session's). @throws IOException when it
+     * could not be written.
+     */
+    suspend fun setKeepModelMemory(keep: Boolean) = op { m -> m.setKeepModelMemory(keep) }
+
+    /**
      * "Background maintenance": stores the setting, then schedules the job or cancels it.
      * @throws IOException when the setting could not be stored; nothing is scheduled or cancelled then.
      */
@@ -1560,6 +1683,8 @@ class AppLock<S : UnlockedSession>(
         if (_state.value == LockState.Starting) return
         // After a reset the app is as it was when first installed: nothing may be captured.
         screenshots.end()
+        // A close that waits to hear about the keep-alive keeps nothing either: the files are about to go.
+        if (awaitingKeepAlive.isNotEmpty()) answerKeepAliveQuestion(SessionClose.IMMEDIATE)
         leaveUnlocked(SessionEnd.RESET)
         // A session that was being finished behind the lock ends with the rest: its files are about to go.
         lease?.let { if (release(it)) retire(it.live, SessionClose.IMMEDIATE) }
@@ -1613,6 +1738,13 @@ class AppLock<S : UnlockedSession>(
         /** The longest a session is left alive behind the lock to finish its work. */
         const val LEASE_MINUTES = 10
         const val LEASE_MILLIS = LEASE_MINUTES * 60_000L
+
+        /**
+         * The longest the close of a lock by itself waits to hear whether the keep-alive it asked
+         * for runs ([keepAliveForClose]); without an answer by then it closes as
+         * [SessionClose.IMMEDIATE].
+         */
+        const val KEEP_ALIVE_ANSWER_MILLIS = 5_000L
 
         // androidx.biometric.BiometricPrompt error codes (kept here so this file needs no Android UI library).
         const val ERROR_HW_UNAVAILABLE = 1

@@ -22,14 +22,15 @@ import java.nio.file.Files
 import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.security.SecureRandom
 
 /**
  * One file of the app's data in the form of a sealed stream ([SealedStream]): content too large
  * to be held in memory at once, sealed for a purpose (see `Purposes`) one chunk at a time. What
  * [SealedFile] is for a blob, this is for a stream, with these differences:
  *
- * - **Nothing is flushed when it is written.** A stream is written to `<name>.tmp` and renamed,
- *   as every file of the app is, but neither the temporary file nor the directory is flushed to
+ * - **Nothing is flushed when it is written.** A stream is written to a temporary file beside
+ *   it and renamed, as every file of the app is, but neither the temporary file nor the directory is flushed to
  *   the disk: flushing hundreds of megabytes takes seconds that the app does not have when it
  *   leaves the screen. A power loss can therefore leave the old file, no file, or a file with
  *   holes in it under the name. That is safe because a stream is never the only copy of
@@ -41,8 +42,11 @@ import java.nio.file.StandardOpenOption
  * - **It carries a date in the clear**, the header's ([StreamHeader.oldestMessageMillis]), which
  *   can be read without the key ([readHeader]) and is authenticated with every chunk.
  *
- * One write at a time: the temporary name is one. A stream is read through the file's own name
- * only, so a write that never ended is never read.
+ * One write at a time per object. Each write has a temporary name of its own,
+ * `<name>.<16 random hexadecimal digits>.tmp`, so that a write that another object of the same
+ * file began (a session that has ended, whose writer thread is still in the disk) can never
+ * remove or replace a later write's temporary file when it finally gives up. A stream is read
+ * through the file's own name only, so a write that never ended is never read.
  *
  * [write], [delete] and the last step of a write exclude each other; reading needs no exclusion,
  * because a reader keeps the file it opened whatever takes its name afterwards.
@@ -71,11 +75,11 @@ class SealedStreamFile internal constructor(
      */
     val chunkBytes: Int get() = chunkSize
 
-    /** The write begun last. While it is open, the temporary name is its own. */
+    /** The write begun last. While it is open, no other write of this object begins. */
     private var writer: SealedStreamWriter? = null
 
     /**
-     * Begins a new stream in `<name>.tmp`, with a header that carries [oldestMessageMillis]. The
+     * Begins a new stream in a temporary file of its own ([temporaryFileFor]), with a header that carries [oldestMessageMillis]. The
      * file under the real name is untouched until [SealedStreamWriter.commit]; whatever happens
      * before that, [SealedStreamWriter.close] removes the temporary file again.
      *
@@ -94,8 +98,8 @@ class SealedStreamFile internal constructor(
         if (!directory.isDirectory && !directory.mkdirs() && !directory.isDirectory) {
             throw IOException("Could not create the directory ${directory.name}")
         }
-        val temp = tempFileFor(file)
-        val channel = FileChannel.open(temp.toPath(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)
+        val temp = temporaryFileFor(file)
+        val channel = FileChannel.open(temp.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
         val begun = SealedStreamWriter(this, temp, channel, sealer, chunkSize)
         writer = begun
         try {
@@ -134,13 +138,15 @@ class SealedStreamFile internal constructor(
     }
 
     /**
-     * Deletes the file and what a write may have left beside it, and flushes the directory, so
-     * that a power loss cannot bring the stream back. A write of this file that is still open is
-     * cancelled first: its [SealedStreamWriter.commit] fails, so what was deleted here is not put
-     * back by a write that began before.
+     * Deletes the file and every temporary file a write of it may have left beside it (whichever
+     * object began that write), and flushes the directory, so that a power loss cannot bring the
+     * stream back. A write of this object that is still open is cancelled first: its
+     * [SealedStreamWriter.commit] fails, so what was deleted here is not put back by a write that
+     * began before. A write of another object whose temporary file was deleted here can no longer
+     * be renamed either, since its file is gone.
      *
-     * That covers this object's own writes only. A file that is deleted in another way (by its
-     * name, while the app is locked) needs its store to make sure that no write is under way.
+     * A file that is deleted in another way (by its name, while the app is locked) needs its
+     * store to make sure that no write is under way.
      *
      * @throws IOException when something could not be deleted.
      */
@@ -148,7 +154,7 @@ class SealedStreamFile internal constructor(
     @Throws(IOException::class)
     fun delete() {
         writer?.cancel()
-        deleteOrThrow(tempFileFor(file))
+        for (temporary in temporaryFilesOf(file)) deleteOrThrow(temporary)
         deleteOrThrow(file)
         file.absoluteFile.parentFile?.let(::syncDirectory)
     }
@@ -170,6 +176,32 @@ class SealedStreamFile internal constructor(
     }
 
     companion object {
+        private const val TEMPORARY_SUFFIX = ".tmp"
+        private val random = SecureRandom()
+
+        /**
+         * A new temporary name for a write of [file]: `<name>.<16 random hexadecimal digits>.tmp`
+         * beside it. It ends in `.tmp` like every temporary file of the app, which is what the
+         * clean-ups go by, and never in [AppFiles.ENCRYPTED_SUFFIX], so the lock does not count
+         * an unfinished write as data.
+         */
+        internal fun temporaryFileFor(file: File): File {
+            val digits = ByteArray(8).also(random::nextBytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            return File(file.absoluteFile.parentFile, "${file.name}.$digits$TEMPORARY_SUFFIX")
+        }
+
+        /**
+         * Every temporary file a write of [file] may have left: those named as [temporaryFileFor]
+         * names them, and `<name>.tmp`, the one name that earlier builds used for every write.
+         */
+        internal fun temporaryFilesOf(file: File): List<File> {
+            val prefix = file.name + "."
+            val named = file.absoluteFile.parentFile?.listFiles { candidate ->
+                candidate.name.startsWith(prefix) && candidate.name.endsWith(TEMPORARY_SUFFIX) && candidate.isFile
+            }?.toList().orEmpty()
+            return (named + tempFileFor(file)).distinct()
+        }
+
         /**
          * The header of the stream in [file], read without the key: for the app while it is
          * locked, which may delete by the date in it.
@@ -221,7 +253,8 @@ class SealedStreamFile internal constructor(
  */
 class SealedStreamWriter internal constructor(
     private val streamFile: SealedStreamFile,
-    private val temp: File,
+    /** The temporary file of this write, its own for as long as the write lasts ([SealedStreamFile.temporaryFileFor]). */
+    internal val temp: File,
     private val channel: FileChannel,
     private val sealer: StreamSealer,
     chunkSize: Int,
@@ -355,7 +388,7 @@ class SealedStreamWriter internal constructor(
                 closeQuietly(channel)
                 temp.delete()
             }
-            // Last, because it frees the temporary name for the next write.
+            // Last, because it lets the next write of the same object begin.
             open = false
         }
     }
@@ -376,7 +409,7 @@ class SealedStreamWriter internal constructor(
         if (!open) return
         closeQuietly(channel)
         temp.delete()
-        // Last, because it frees the temporary name for the next write.
+        // Last, because it lets the next write of the same object begin.
         open = false
     }
 

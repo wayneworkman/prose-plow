@@ -50,6 +50,9 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
      */
     var memoryPlatform: ModelMemoryPlatform? = testMemoryPlatform()
 
+    /** The lock's readable copy of the memory switch that the next session is handed; null for none. */
+    var lockedKeepModelMemory: Boolean? = null
+
     private var unlocks = 0
 
     /**
@@ -60,6 +63,7 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
         AppSession(
             cipher, layout, engine, models, dispatcher, dispatcher, clock, SequentialIds("u${++unlocks}-"),
             answerEvents = answerEvents, contextLimits = contextLimits, memoryPlatform = memoryPlatform,
+            lockedKeepModelMemory = lockedKeepModelMemory,
         )
 
     /** The session [id] as it is on disk right now, or null when it has no file. */

@@ -269,7 +269,12 @@ is about things that are **not** built and is kept apart from everything else.
   restricted the app's background use) or stops it on the way, nothing else changes: the
   elapsed time is looked at again whenever the app comes back to the screen, before anything
   of the session is drawn, and the app locks first if the time is up. Until then the key and
-  the decrypted chats stay in the memory of the frozen process (MEM-11).
+  the decrypted chats stay in the memory of the frozen process (MEM-11). The closing of a lock
+  by itself has the same need: it saves the model's memory (LOCK-17, step 4), which takes
+  seconds, and every wait of LOCK-17 is counted on clocks that stand still while the device
+  sleeps. So that closing is unattended only while the process is kept running and awake at
+  that moment (BG-16); otherwise it is the immediate closing of "Lock now", which saves
+  nothing.
   - **On Android:** measured on the phone that was tested (Android 17): the process is counted
     as cached within 1 to 2 seconds of leaving the screen and frozen about 60 seconds later.
 - **LOCK-14** With "Immediately", the app locks at the moment LOCK-12 describes.
@@ -281,25 +286,30 @@ is about things that are **not** built and is kept apart from everything else.
   chat screen and in the security settings. It is the strongest way to lock: a reply that is
   being written is stopped, and nothing is left alive behind the lock whatever the settings say
   (LEASE-08). It never waits for the model's memory to be saved and never begins a save; a save
-  that is under way is stopped (LOCK-17, step 4). A memory that an earlier save completed stays
-  on disk and is used at the next unlock as far as it goes (STORE-31).
+  that is under way is stopped before anything else of the closing (LOCK-17, steps 3 and 4), so
+  that a save stuck on a storage that does not answer cannot make the lock wait. It needs
+  nothing kept running for its closing, and asks for nothing (BG-16). A memory that an earlier
+  save completed stays on disk and is used at the next unlock as far as it goes (STORE-31).
 - **LOCK-17** What a lock does, in this order:
   1. The state changes and every unlocked screen is torn down within the same call, not at the
      next frame, so that nothing of a chat or a setting stays referenced by the interface. The
      state of every screen (input text, open dialogs, which message was being edited) is
      dropped.
   2. Changes that were waiting to be written are sent to the disk without further delay.
-  3. Away from the interface thread: a reply that is being written is stopped and kept as a
-     stopped message (MSG-07); a model load that is under way is abandoned, and so is a restore
-     of the model's memory (STORE-31), whose saved memory stays. The lock waits at most 10
-     seconds for the engine to let go.
-  4. The model's memory (STORE-28). For a lock by itself and at the end of a lease, a save that
-     is under way is waited for, or one is begun (with the lock's own rules, ENG-38) when the
-     memory on disk is not already the memory in the engine; then whatever is still saving is
-     stopped. All of this takes at most 10 seconds. For "Lock now" and a reset nothing is waited
-     for and nothing begun, and a save that is under way is stopped at once. A memory that a
-     save completed before stays on disk either way. Nothing is saved with SECSET-15 off, or
-     below Android 12 (STORE-30).
+  3. Away from the interface thread: for "Lock now" and a reset, a save of the model's memory
+     that is under way is stopped first (as in step 4). Then a reply that is being written is
+     stopped and kept as a stopped message (MSG-07); a model load that is under way is
+     abandoned, and so is a restore of the model's memory (STORE-31), whose saved memory stays.
+     The lock waits at most 10 seconds for the engine to let go.
+  4. The model's memory (STORE-28). For an unattended closing (a lock by itself, and the end of
+     a lease, while something keeps the process running and awake out of sight, BG-16), a save
+     that is under way is waited for, or one is begun (with the lock's own rules, ENG-38) when
+     the memory on disk is not already the memory in the engine; then whatever is still saving
+     is stopped. All of this takes at most 10 seconds. For an immediate closing ("Lock now", a
+     reset, and a lock by itself or the end of a lease with nothing keeping the process awake)
+     nothing is waited for and nothing begun, and a save that is under way is stopped at once.
+     A memory that a save completed before stays on disk either way. Nothing is saved with
+     SECSET-15 off, or below Android 12 (STORE-30).
   5. The engine forgets the conversation and keeps what was saved of it (ENG-21); the model
      itself stays loaded. This too is waited for at most 10 seconds; if forgetting fails, the
      model is unloaded instead.
@@ -321,10 +331,14 @@ is about things that are **not** built and is kept apart from everything else.
      the latest at the end of its 10 minutes, and at the latest 10 minutes after the lock that
      began it was due, however late it is noticed.
 
-  Steps 3 to 7 therefore take at most four waits of 10 seconds each for a lock by itself and
-  the end of a lease, and at most three for "Lock now" and a reset, which skip the wait of step
-  4. They begin once a passphrase check that is running at that moment has returned (the two
-  never overlap). LEASE-01 is the one case in which steps 3 to 7 are put off.
+  Steps 3 to 7 therefore take at most four waits of 10 seconds each for an unattended closing,
+  and at most three for an immediate one, which skips the wait of step 4. These waits are
+  counted on clocks that stand still while the device sleeps, which is why the unattended
+  closing happens only while the process is kept awake (BG-16): with "Immediately" the closing
+  first waits, for at most 5 seconds, to hear whether that keep-alive could be started, and is
+  immediate if it could not. They begin once a passphrase check that is running at that moment
+  has returned (the two never overlap). LEASE-01 is the one case in which steps 3 to 7 are put
+  off.
 - **LOCK-18** A write that the storage does not complete within its time is not waited for, so
   that it cannot keep the key in memory. Its bytes were encrypted before the key went, so it may
   still reach the disk later. Until it has, an unlock that follows may already be writing the
@@ -620,10 +634,13 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   stopped it, or took it out of the foreground), whichever comes first. At the limit, and when
   the keep-alive is lost, an answer that is still being written is stopped and kept as a
   stopped message. Then the session is closed in the order of
-  LOCK-17 (steps 3 to 7), the model's memory of the conversation saved on the way (step 4), and
-  the key is overwritten. The key is therefore in memory for at most 10 minutes and then the
-  closing, which is bounded by four waits of up to 10 seconds each (LOCK-17); when the lease is
-  ended by "Lock now", by three.
+  LOCK-17 (steps 3 to 7), and the key is overwritten. The model's memory of the conversation is
+  saved on the way (step 4) only while the keep-alive still runs at that moment; when the lease
+  ends because the keep-alive was lost, or it no longer runs, the closing is immediate and
+  saves nothing, since nothing would keep the device awake during the save. The key is
+  therefore in memory for at most 10 minutes and then the closing, which is bounded by four
+  waits of up to 10 seconds each (LOCK-17); when the closing is immediate ("Lock now", or no
+  keep-alive), by three.
 - **LEASE-04** The limit is counted on the device clock. Because a timer can be late, the
   deadline itself is checked when the app comes to the front and before a session is handed back
   (LEASE-05); a session whose time is up is ended, not resumed.
@@ -668,10 +685,11 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   be read back after the unlock is not read again: only what is new since is read.
 - **LEASE-14** For as long as a session is being finished behind the lock, the lock screen
   (LOCK-04) shows the line "An answer is being finished behind the lock." and an outlined
-  button "Stop the answer". The button ends it exactly as "Lock now" does (LEASE-08): the
-  answer written so far is kept as a stopped message, the session is closed and its key
-  overwritten (LOCK-17, steps 3 to 7, and step 8), and, like every end of a lease other than
-  "Lock now", it saves the model's memory on the way (step 4). It asks for no passphrase, because stopping
+  button "Stop the answer". The button ends it at once, as "Lock now" does (LEASE-08), but is
+  closed as every other end of a lease is: the answer written so far is kept as a stopped
+  message, the session is closed and its key overwritten (LOCK-17, steps 3 to 7, and step 8),
+  and, unlike "Lock now", it saves the model's memory on the way (step 4) while the keep-alive
+  runs (LEASE-03). It asks for no passphrase, because stopping
   only ever takes away what an attacker could otherwise wait for. Line and button go when the
   session is no longer being finished, however that came about. The lock screen learns that a
   session is being finished from the lock's own state, never from the session; the button does
@@ -699,9 +717,9 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
 - **END-03** What follows from END-01:
   - after the app has locked in the background and its session is closed, the process ends;
     what kept it running until then (BG-16) is let go at that moment, never before the key has
-    been overwritten. A lock by itself first saves the model's memory (LOCK-17, step 4), so
-    the process lives up to 10 seconds longer, and a save that was stopped at that bound keeps
-    it alive until its writing thread has returned;
+    been overwritten. A lock by itself first saves the model's memory (LOCK-17, step 4) while
+    that keep-alive runs, so the process lives up to 10 seconds longer, and a save that was
+    stopped at that bound keeps it alive until its writing thread has returned;
   - leaving the lock screen without unlocking ends the process;
   - leaving the first-run set-up screen does not (nothing was ever decrypted in that process);
   - the app stays in the list of recent apps, and opening it is a fresh start at the lock
@@ -876,7 +894,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); whether the question about notifications has been asked; and how long messages are kept (SECSET-13) | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
   | `model-memory/<chat id>.enc` | The model's saved memory of one conversation, at most one such file (STORE-24), written as STORE-28 describes. The file's last-modified time is the date of the oldest message it was made from | A sealed stream (FMT-21) for the purpose `model-memory:<chat id>`, with the store's header (FMT-22) |
-  | `security/lock.json` | The lock configuration (FMT-06), with a readable copy of how long messages are kept and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
+  | `security/lock.json` | The lock configuration (FMT-06), with readable copies of how long messages are kept and of SECSET-15, and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
 
   The model files are part of the installed app and are not encrypted: they are public files.
 - **STORE-02** Every file that is encrypted with the data key has a name ending in `.enc` and
@@ -1048,13 +1066,19 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   there is room only without it, the old one is deleted first; when there is not room even then,
   the old one is deleted and nothing is saved. The engine's thread seals each piece as a chunk
   where the native export left it, and a thread of the save writes the chunks out through a
-  queue of 3, so the engine's thread never waits in a write to the disk; cancelling the save lets
-  it go within one chunk, and a disk that does not answer holds only ciphertext. The file is
+  queue of 3, so the engine's thread never waits in a write to the disk; cancelling the save, and
+  every reason the engine itself has to stop it (a request, forgetting, unloading or loading,
+  its caller), let it go within one chunk, and a disk that does not answer holds only
+  ciphertext. Every save writes to a temporary file of its own name
+  (`<chat id>.enc.<16 random hexadecimal digits>.tmp`), so that the writing thread of an earlier
+  session's save that finally gives up cannot remove a later save's file. The file is
   dated by the oldest message it was made from (the earlier of the date the chat's entry records
   and the messages' own); a memory whose date cannot be set, or does not hold, is not kept.
   Deleting wins over saving: every deletion counts up a number shared by the whole process, and
   the last step of a save checks that number and renames the file under the same lock, so a save
-  that ends after a deletion keeps nothing. A save that is given up leaves no temporary file.
+  that ends after a deletion keeps nothing. A save that is given up leaves no temporary file. The
+  text of the messages is read only to make the digest of STORE-25, and the bytes it is read
+  into are overwritten as soon as the digest has them.
 - **STORE-27** A saved memory never outlives a message it was made from. Without the key, by
   STORE-22. At every unlock, before any chat is shown or any memory read back, the same rules by
   name and date run under the user's own limit. And wherever the stored messages of a chat are
@@ -1064,7 +1088,12 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   chat that takes the place of that write before it runs carries the deletion over. A change
   that only adds (a new message or reply, an answer that is carried on, a draft, another model)
   keeps the memory. A memory that cannot be deleted then does not stop the change: STORE-25 and
-  STORE-22 catch it before it could be used.
+  STORE-22 catch it before it could be used. The system prompt is part of the memory too (the
+  memory holds the whole prompt the model read): when the system prompt of a model is changed
+  or cleared (MSET-04), the saved memory is deleted at once, whichever chat and model it is of
+  (which model it was made with is only known by opening it), and the conversation the model may
+  hold is treated as changed (STORE-29). The other settings of a model (temperature, the longest
+  reply, the size of the context) are not part of what the model read, and change nothing here.
 - **STORE-28** When the model's memory is saved. Always of the conversation the model last
   worked on, as the engine's rules allow (ENG-38), and only while SECSET-15 is on and on
   Android 12 or later (STORE-30):
@@ -1074,7 +1103,8 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   - when an answer ends, however it ends, while the app is out of sight and still unlocked: the
     same save. Until that save has ended the answer counts as still being written, so the
     keep-alive that ran for it (BG-01) covers the save too;
-  - when the session closes for a lock by itself or at the end of a lease (LOCK-17, step 4): a
+  - when the session closes for a lock by itself or at the end of a lease, unattended because
+    the keep-alive runs at that moment (LOCK-17, step 4; BG-16): a
     save that is under way is joined; then, unless that save left the memory on disk as it is in
     the engine, the lock's own save is begun, which saves whenever the memory is worth keeping
     at all. Both together take at most 10 seconds; then the save is stopped both ways (the
@@ -1082,14 +1112,16 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
     and nothing of it is kept. A memory that is on disk as it is in the engine, because it was
     saved or read back and no request was made since, is not written again.
 
-  "Lock now" and a reset never save (LOCK-16). No save is asked for while an answer is being
-  written; one that is running is stopped by the next request (ENG-38).
+  "Lock now" and a reset never save (LOCK-16), and neither does a lock by itself or the end of a
+  lease while nothing keeps the process awake (LOCK-13, BG-16). No save is asked for while an
+  answer is being written; one that is running is stopped by the next request (ENG-38).
 - **STORE-29** What the store is told of a conversation, which it binds a memory to (STORE-25):
   the chat whose conversation key names it (every request names its chat by `chat:` followed by
   the chat's id, the same at every unlock and never the same for two chats), with its messages
   as they are now. There is none for a chat that was deleted, and none for a chat whose stored
-  messages were removed or changed (pruned, edited, asked for again, retried) until the engine
-  has read a request of it made after that change: so a save at a lock that comes between the
+  messages were removed or changed (pruned, edited, asked for again, retried), or whose
+  conversation the model may hold while the system prompt of its model is changed or cleared
+  (STORE-27), until the engine has read a request of it made after that change: so a save at a lock that comes between the
   change and the next answer keeps nothing, rather than a memory of text that is gone. A chat
   that was not opened since the unlock is read from its file; one whose file cannot be read
   cannot be told now, which deletes nothing (STORE-25).
@@ -1830,7 +1862,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   screen, for at most 10 minutes."
 - **SECSET-15** Right after it, the switch "Keep the model's memory after locking" (STORE-28),
   on by default and stored with the encrypted settings (FMT-08), where a file without the field
-  means on and a value that cannot be read means off. No passphrase is asked for. The line under
+  means on. The lock configuration keeps a readable copy of it (FMT-06), written from the setting
+  at every unlock and whenever the switch is changed; when the settings cannot say (their file is
+  missing or cannot be read, or the value in it is not a boolean) the copy is the setting, so a
+  damaged or deleted settings file never turns the switch on again: with the copy saying off,
+  the saved memory is deleted at the unlock and nothing is saved. No passphrase is asked for. The line under
   it says, when on: "On: what the model has read of the conversation it worked on last is saved
   when you leave the app and when it locks by itself, encrypted like the chats, so that after
   unlocking the next answer need not read it all again. It takes storage, up to about 1.5 GB,
@@ -1997,8 +2033,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     Each time it renews its wake lock it asks the system whether it is still in the
     foreground, and ends if it is not.
 - **BG-02** The keep-alive begins when an answer begins to be written while the app is in front,
-  or when the app leaves the screen unlocked with its lock pending (BG-16); the platform lets it
-  be started from nowhere else. It ends by itself at the moment no answer is being written any
+  when the app leaves the screen unlocked with its lock pending, or when it locks by itself at
+  the moment it leaves the screen ("Immediately", BG-16); the platform lets it be started from
+  nowhere else. It ends by itself at the moment no answer is being written any
   more, no lock is pending and no session is still ending behind the lock: it is held until the
   data key has been overwritten, so that the process cannot be put to sleep on its way there.
   An answer that ends while the app is out of sight and still unlocked therefore leaves it
@@ -2010,12 +2047,13 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   app's own lock stops it (LEASE-01, LEASE-09). A refusal is recorded at once, so nothing goes on
   counting on a keep-alive. A keep-alive that the platform stops while an answer is being
   finished behind the lock ends that session at once (LEASE-03).
-- **BG-04** While the keep-alive runs, a notification says why, in one of two fixed sentences
+- **BG-04** While the keep-alive runs, a notification says why, in one of three fixed sentences
   and nothing else: "Writing an answer…" while an answer is being written (in front, out of
-  sight or behind the lock), and "Unlocked; it locks itself when its time is up." while only the
-  pending lock of BG-16 is waited for. The sentence changes in place when the reason does (an
-  answer ends while the lock is pending; the lock happens during an answer), and stays as it was
-  for the moment a session takes to close after the lock. It is silent, is marked as ongoing and
+  sight or behind the lock), "Unlocked; it locks itself when its time is up." while only the
+  pending lock of BG-16 is waited for, and "Locking the app…" while only a session that is
+  closing after the lock is (which, with the model's memory being saved, can take seconds). The
+  sentence changes in place when the reason does (an answer ends while the lock is pending; the
+  lock happens during an answer; the lock has happened and its session is closing). It is silent, is marked as ongoing and
   carries no badge. In the system's settings for the app's notifications its kind is named
   "Running in the background". It is gone with the keep-alive.
 - **BG-05** The keep-alive does nothing itself: the answer is written by the unlocked session.
@@ -2099,20 +2137,27 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   the process is not ended while the app is on screen.
 - **BG-16** The keep-alive of BG-01 also runs while the app is unlocked and out of sight with
   its lock pending (LOCK-11, LOCK-13): from the moment the app leaves the screen with a time
-  other than "Immediately" ("Immediately" needs none) until that lock has happened or the app
-  is back on screen. It is the same keep-alive, with the same wake lock and the same
-  notification (BG-04); one that is already running for an answer simply goes on. When the lock
-  happens, the keep-alive is held until the session it ended is closed and its key overwritten,
-  or, while an answer is still being written, for the session finished behind the lock on the
-  usual grounds (LEASE-01), and then the process ends (END-01). If the platform refuses it, or
-  later stops it or takes it out of the foreground, nothing else changes and nothing asks for it
-  again until the app next leaves the screen: no session is left alive behind the lock on its
-  strength, and the lock is made up for as LOCK-13 describes. "Lock now" and a reset end the
+  other than "Immediately" until that lock has happened or the app is back on screen. With
+  "Immediately" the app locks at the moment it leaves the screen, and the keep-alive is started
+  at that same moment for the closing of the session, which saves the model's memory and can
+  take seconds (LOCK-17, step 4); that closing waits, for at most 5 seconds, to hear whether
+  the keep-alive runs, and is unattended (it saves) only if it does, immediate (it saves
+  nothing, and the key goes at once) if the platform refuses it or does not answer in time. So
+  with "Immediately" the notification shows "Locking the app…" for the seconds the closing
+  takes. It is the same keep-alive, with the same wake lock and the same notification (BG-04);
+  one that is already running for an answer simply goes on. When the lock happens, the
+  keep-alive is held until the session it ended is closed and its key overwritten, or, while an
+  answer is still being written, for the session finished behind the lock on the usual grounds
+  (LEASE-01), and then the process ends (END-01). If the platform refuses it, or later stops it
+  or takes it out of the foreground, nothing else changes and nothing asks for it again until the
+  app next leaves the screen: no session is left alive behind the lock on its strength, the lock
+  by itself closes as "Lock now" does and saves nothing (LOCK-13), and the lock is made up for
+  as LOCK-13 describes. "Lock now" needs no keep-alive and asks for none; it and a reset end the
   pending lock as they end the session, and the keep-alive goes with it once the key is gone.
   The setting of SECSET-05 and the permission to show notifications (BG-09) change nothing
   about it.
   - **On Android:** the service is started from within the activity's `onStop`, in the same
-    call that starts the lock's timer. The platform allows a foreground service to be started
+    call that starts the lock's timer, or, with "Immediately", that locks. The platform allows a foreground service to be started
     while the app has a visible screen and, from Android 12, for a grace period after its last
     one was hidden (5 seconds by default); on Android 9 to 11 for as long as the app has not
     become idle in the background, about a minute. A start the platform refuses is a refusal
@@ -2713,8 +2758,9 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   after a change of size; with it none, and the test of what is left behind requires that for
   every model. The positions of the cells, which llama.cpp gathers as well, are freed as they
   are.
-- **NAT-21** The Android binding moves a memory image without a copy on the Java heap. The
-  caller owns the buffer, a direct buffer of at least 4,096 bytes, and the binding hands the
+- **NAT-21** The Android binding moves a memory image without a copy of its own. The
+  caller owns the buffer, a direct buffer of at least 4,096 bytes (on Android a non-movable
+  array of the runtime, which is never moved and is overwritten in place), and the binding hands the
   native session its memory as it is: the image goes between the model's buffers and that
   memory and through nothing else, and the session overwrites the whole buffer, the caller's
   own first bytes included, before the call returns, whatever the outcome. A piece is always at
@@ -2771,12 +2817,17 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   replies included, are overwritten before they are freed (NAT-20); that was measured on a
   desktop and not on the phone.
 - **MEM-12** Saving and reading back the model's memory (STORE-28, STORE-31) hands it to the
-  platform's cipher a chunk at a time, from a direct buffer that is overwritten after every chunk;
-  nothing of it passes through an array of the runtime. What the cipher itself keeps of the
-  chunk it last worked on is not the app's to overwrite: on Android 9 to 11 that is a copy of
-  every chunk, which is why the feature exists only from Android 12 (STORE-30); from Android 12
-  on it is assumed to be no more than the cipher's own working state, which was not verified in
-  the platform's source.
+  platform's cipher a chunk at a time, from a direct buffer that is overwritten after every chunk,
+  and through no other array. On Android a direct buffer is itself an array of the runtime, but a
+  non-movable one (libcore's `DirectByteBuffer`): it is never moved, so overwriting it in place
+  leaves no older copy behind. What the cipher itself keeps of the chunk it last worked on is not
+  the app's to overwrite: on Android 9 to 11 that is a copy of every chunk, which is why the
+  feature exists only from Android 12 (STORE-30). From Android 12 on, as read in the platform's
+  source (Conscrypt's `OpenSSLAeadCipher` of Android 11 to 16 and its main branch, its
+  `native_crypto.cc` of Android 12, and libcore's `DirectByteBuffer` and `Cipher` of Android 12),
+  the cipher seals and opens direct buffers in place and copies its input only when the input and
+  the output overlap or touch, which two separate allocations cannot; Android 11 has no such
+  path. Each version from 12 on was read in the source, not measured on a phone.
 - **MEM-05** Nor does it reach what the language runtime holds: strings cannot be overwritten at
   all, and chat text passes through strings in the text fields, the Markdown renderer, the
   JSON codec and the engine's prompt formats; the cryptography classes keep copies of keys
@@ -3083,6 +3134,7 @@ This section is exact where the others describe. Each item carries one of three 
   | `trustedTime.elapsedMillis` | number | That moment on the device clock | not negative |
   | `trustedTime.bootCount` | number or null | The device's count of starts at that moment; null when it could not be read | when not null, not negative |
   | `backgroundMaintenance` | boolean, default true | SECSET-14; a file without the field means on | |
+  | `keepModelMemory` | boolean, default true | The readable copy of SECSET-15, written from the setting at every unlock and when the switch is changed, and used when the settings cannot say (SECSET-15); a file without the field means on | |
 
   The hardware keys are named `proseplow.passphrase.binding.` and `proseplow.dek.biometric.`
   followed by the generation in decimal without leading zeros. Every key of the app begins with
@@ -3148,7 +3200,7 @@ This section is exact where the others describe. Each item carries one of three 
     (SECSET-15). A value that is not set is not written, a model with nothing set has no entry,
     `notificationsAsked` is written only once it is true, `messageLifetimeDays` only when it is
     not 7, and `keepModelMemory` only when it is false; a `keepModelMemory` that is not a boolean
-    is counted and read as false. On reading, unknown fields are ignored; a system prompt that is not text, a
+    is counted and read as the readable copy of FMT-06 says (false without one). On reading, unknown fields are ignored; a system prompt that is not text, a
     temperature that is not a number from 0 to 2, a longest reply that is not a whole number of at
     least 16 written as one, a context size that is not a whole number of at least 1,024 written as
     one, a flag that is not a boolean and a limit for messages that is not one of the choices are
@@ -3592,7 +3644,7 @@ without these properties has not reached parity.
   the lock configuration (whether fingerprint unlock is on, whether an answer is finished after
   locking, how many wrong attempts were made and when).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
-  one, or is unlocked and waiting to lock itself (BG-04), and when. Nothing else.
+  one, or is unlocked and waiting to lock itself, or is locking (BG-04), and when. Nothing else.
 - **THREAT-25** What the expiry of messages (CHAT-22) does not do. Deleting is not erasing:
   the medium may keep the encrypted bytes of an expired message (THREAT-20), and text that
   was decrypted stays in the memory of the process until it ends (MEM-04, MEM-05). Nothing
@@ -3852,10 +3904,11 @@ only state a rule, the item says so and states its effect instead of inventing a
   it leaves the screen, so that a lock of 5 or 15 minutes never happened while the app was away
   and the key stayed in memory until it was opened again. Reasons: the lock is to happen when
   the user chose; the keep-alive that finishes an answer exists already and needs no new
-  permission. Preserve: the same keep-alive and notification as an answer, no second one;
-  "Immediately" needs none; a refusal or loss changes nothing else and leaves no session alive
-  on false grounds; the lock is still made up for at the return; and after the lock everything
-  goes on as before, the end of the process included.
+  permission. Preserve: the same keep-alive and notification as an answer, no second one; a
+  refusal or loss changes nothing else and leaves no session alive on false grounds; the lock is
+  still made up for at the return; and after the lock everything goes on as before, the end of
+  the process included. "Immediately" needed none until the lock began to save the model's
+  memory; it now has it for the closing of the session (DEC-55).
 - **DEC-45** *Messages expire by their age, judged by dates and not by keys* (CHAT-22 to
   CHAT-24, STORE-21 to STORE-23, SECSET-13). The owner's decision of 2026-11-23: one limit for
   every chat, 7 days unless the user chooses otherwise, with "Never" among the choices.
@@ -3877,9 +3930,10 @@ only state a rule, the item says so and states its effect instead of inventing a
   report of low memory bound every step of growth, and none of them the opening.
 - **DEC-47** *An answer that is being finished behind the lock can be stopped without the
   passphrase* (LEASE-14). Reason: stopping only ever takes away what someone holding the device
-  could otherwise wait for; it opens nothing and shows nothing. Preserve: it does to the
-  session exactly what "Lock now" does (LEASE-08), and does nothing when no session is being
-  finished.
+  could otherwise wait for; it opens nothing and shows nothing. Preserve: it ends the session at
+  once, as "Lock now" does (LEASE-08), but closes it as every other end of a lease closes it,
+  saving the model's memory while the keep-alive runs (LEASE-03, LEASE-14); and it does nothing
+  when no session is being finished.
 - **DEC-48** *A development build runs only the models its package carries* (MODEL-23,
   BUILD-10, APP-16). Stated as a rule: in behaviour a development build is the release build.
   Its effect: a model file placed in the app's storage is run by no build of the app, so
@@ -3892,7 +3946,7 @@ only state a rule, the item says so and states its effect instead of inventing a
   about a minute after it leaves the screen, so a save made only at the lock would often run
   late or never; a save begun on leaving the screen was measured to finish in about 2 seconds
   for 600 MB out of sight. Preserve: the lock still saves when nothing was saved before it, and
-  only within its bound.
+  only within its bound, and only while something keeps the device awake (DEC-55).
 - **DEC-50** *"Lock now" never saves the model's memory* (LOCK-16). The owner's decision of
   2026-11-23. Reason: the strongest lock stays as fast as it was and leaves nothing alive a
   moment longer; the price is that after "Lock now" a conversation is read again from where the
@@ -3916,6 +3970,19 @@ only state a rule, the item says so and states its effect instead of inventing a
   Reason: on Android 9 to 11 the platform's cipher would leave a copy of every chunk of the
   model's memory in memory that cannot be wiped. Preserve: the check is made in one place, and
   where it fails nothing is saved or read back and any memory file is deleted.
+- **DEC-55** *A lock by itself saves the model's memory only while something keeps the device
+  awake* (LOCK-13, LOCK-17, BG-16). The owner's decision of 2026-11-23, after it was found
+  that a lock by itself with "Immediately", or one whose keep-alive was lost, did
+  seconds of saving with nothing keeping the device awake, so that the device could sleep in the
+  middle of it with the key and the conversation in memory. A session is closed unattended (the
+  closing that saves and may wait) only when the keep-alive really runs at that moment, by the
+  same test a lease uses; otherwise immediately, saving nothing, the key overwritten at once. So
+  that "Immediately" still saves, the keep-alive (the same service, wake lock and notification)
+  is started when the app locks as it leaves the screen, the moment the platform still allows
+  it, and held until that session's key is gone; with it the notification says "Locking the
+  app…" for the seconds the lock takes. Preserve: no saving or waiting without the keep-alive;
+  a refusal, or no answer within 5 seconds, makes the closing immediate; "Lock now" never saves
+  and needs no keep-alive.
 
 ## 27. Planned tools: design considerations (TOOL)
 

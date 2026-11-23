@@ -104,11 +104,14 @@ class StreamHeader internal constructor(encoded: ByteArray) {
  * streams, or 16 PiB.
  *
  * **Buffers.** Chunks are sealed and opened between direct buffers only, so that nothing here
- * copies a chunk of plaintext into an array of the collected heap, and neither the plaintext nor
- * the ciphertext of a whole stream is ever in memory. What the cipher itself does with a chunk
- * is the platform's: from Android 12 on it reads and writes direct buffers where they lie; the
- * versions before that copy each chunk they are given into an array of their own, which nothing
- * can overwrite. The plaintext and the sealed buffer of one operation must be separate
+ * copies a chunk of plaintext into another array, and neither the plaintext nor the ciphertext
+ * of a whole stream is ever in memory. On Android a direct buffer is itself an array of the
+ * runtime, but a non-movable one (libcore's `DirectByteBuffer`): it is never moved, so what is
+ * overwritten in place leaves no older copy behind. What the cipher itself does with a chunk is
+ * the platform's: as read in Conscrypt's source (`OpenSSLAeadCipher` of Android 12 to 16), from
+ * Android 12 on it seals and opens direct buffers where they lie; the versions before that
+ * (Android 11's has no such path) copy each chunk they are given into an array of their own,
+ * which nothing can overwrite. The plaintext and the sealed buffer of one operation must be separate
  * allocations: where the two overlap or touch, also the newer cipher copies its input.
  */
 object SealedStream {

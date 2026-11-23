@@ -595,7 +595,7 @@ class SourceRulesTest {
     /**
      * A notification is shown outside the app: on the phone's lock screen, and to whatever is
      * allowed to read notifications. So each of the app's two says one fixed sentence from the
-     * resources (the ongoing one, one of two, by why it is shown), without a placeholder, and nothing that could carry a word of an answer, the
+     * resources (the ongoing one, one of three, by why it is shown), without a placeholder, and nothing that could carry a word of an answer, the
      * title of a chat or the name of a model is ever set on one. The code that builds them
      * cannot even reach a chat: it imports nothing of the chats, the stores or the models.
      */
@@ -609,18 +609,22 @@ class SourceRulesTest {
             listOf(".setContentTitle(title)", ".setContentTitle(context.getString(R.string.answer_ready))"),
             notifications.filter { it.contains("setContentTitle(") },
         )
-        // The ongoing notification's title is one of two fixed sentences, one for each reason it is shown.
+        // The ongoing notification's title is one of three fixed sentences, one for each reason it is shown.
         assertEquals(
             listOf(
                 "KeepAliveNotice.WRITING -> context.getString(R.string.answer_writing)",
                 "KeepAliveNotice.LOCK_PENDING -> context.getString(R.string.keep_alive_lock_pending)",
+                "KeepAliveNotice.LOCKING -> context.getString(R.string.keep_alive_locking)",
             ),
             notifications.filter { it.contains("KeepAliveNotice.") && it.contains("->") },
         )
         assertEquals(listOf("val title = when (notice) {"), notifications.filter { it.contains("val title") })
         assertEquals(
             "every text a notification can show",
-            listOf("R.string.channel_answer_writing", "R.string.channel_answer_ready", "R.string.answer_writing", "R.string.keep_alive_lock_pending", "R.string.answer_ready"),
+            listOf(
+                "R.string.channel_answer_writing", "R.string.channel_answer_ready", "R.string.answer_writing", "R.string.keep_alive_lock_pending",
+                "R.string.keep_alive_locking", "R.string.answer_ready",
+            ),
             notifications.flatMap { line -> Regex("""R\.string\.[a-z_]+""").findAll(line).map { it.value }.toList() },
         )
         for (word in listOf("setContentText(", "setSubText(", "setTicker(", "setStyle(", "setContentInfo(", "setLargeIcon(", "addAction(", "setExtras(", "addExtras(", "setRemoteInputHistory(")) {
@@ -636,10 +640,11 @@ class SourceRulesTest {
         fun text(name: String) = Regex("""<string name="$name">([^<]*)</string>""").find(strings)?.groupValues?.get(1)
         assertEquals("Writing an answer\u2026", text("answer_writing"))
         assertEquals("Unlocked; it locks itself when its time is up.", text("keep_alive_lock_pending"))
+        assertEquals("Locking the app\u2026", text("keep_alive_locking"))
         assertEquals("Your answer is ready.", text("answer_ready"))
         assertEquals("Running in the background", text("channel_answer_writing"))
         assertEquals("Answer ready", text("channel_answer_ready"))
-        for (name in listOf("answer_writing", "keep_alive_lock_pending", "answer_ready", "channel_answer_writing", "channel_answer_ready")) {
+        for (name in listOf("answer_writing", "keep_alive_lock_pending", "keep_alive_locking", "answer_ready", "channel_answer_writing", "channel_answer_ready")) {
             assertTrue("$name takes an argument", !text(name)!!.contains("%"))
         }
     }
@@ -1097,7 +1102,7 @@ class SourceRulesTest {
         )
         val delete = File(module, "$main/data/SealedStreamFile.kt").readText().substringAfter("    fun delete() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
         assertEquals(
-            listOf("writer?.cancel()", "deleteOrThrow(tempFileFor(file))", "deleteOrThrow(file)", "file.absoluteFile.parentFile?.let(::syncDirectory)"),
+            listOf("writer?.cancel()", "for (temporary in temporaryFilesOf(file)) deleteOrThrow(temporary)", "deleteOrThrow(file)", "file.absoluteFile.parentFile?.let(::syncDirectory)"),
             delete,
         )
     }

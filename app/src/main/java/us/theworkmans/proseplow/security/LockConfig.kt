@@ -82,6 +82,15 @@ data class LockConfig(
      * written before this field existed does not have it, which means on.
      */
     val backgroundMaintenance: Boolean = true,
+    /**
+     * A readable copy of the switch "Keep the model's memory after locking". The setting itself
+     * is in the encrypted settings, and every unlock writes this copy from it again; the session
+     * uses the copy only when its settings cannot say ([us.theworkmans.proseplow.data.SettingsStore.open]),
+     * so that a settings file that is missing or damaged never turns the switch on again. A file
+     * written before this field existed does not have it, which means on, the setting's default.
+     * Its type is its validation: a value that is not a boolean makes the configuration unreadable.
+     */
+    val keepModelMemory: Boolean = true,
 ) {
     /**
      * Every field is in range and every wrap well formed, so nothing read from the file can make

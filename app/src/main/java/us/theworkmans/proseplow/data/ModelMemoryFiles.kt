@@ -5,7 +5,6 @@ import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.deleteOrThrow
 import us.theworkmans.proseplow.security.syncDirectory
-import us.theworkmans.proseplow.security.tempFileFor
 import java.io.File
 import java.io.IOException
 
@@ -36,7 +35,7 @@ fun interface SavedMemoryDeletion {
 /**
  * The files of the model's saved memory, as far as they can be handled without the data key:
  * `<directory>/<chat id>.enc`, at most one of them, and what an interrupted write left beside it
- * (`<chat id>.enc.tmp`).
+ * (`<chat id>.enc.<random>.tmp`, a name of its own for every write; see [SealedStreamFile]).
  *
  * The directory follows the three rules of [AppFiles]: it lies under the private files
  * directory and outside `security/`, every file in it that holds data ends in
@@ -88,9 +87,9 @@ class ModelMemoryFiles(val directory: File, private val sessionsDir: File) : Sav
             count++
             if (!SealedDirectory.isValidId(chatId)) return
             val file = fileFor(chatId)
-            val temp = tempFileFor(file)
-            if (!file.exists() && !temp.exists()) return
-            deleteOrThrow(temp)
+            val temporaries = SealedStreamFile.temporaryFilesOf(file).filter { it.exists() }
+            if (!file.exists() && temporaries.isEmpty()) return
+            for (temporary in temporaries) deleteOrThrow(temporary)
             deleteOrThrow(file)
             syncDirectory(directory)
         }
@@ -136,7 +135,11 @@ class ModelMemoryFiles(val directory: File, private val sessionsDir: File) : Sav
      * The rules by which a saved memory goes without the key, by the names and the dates of the
      * files alone; for the lock's clean-up ([ExpiredFiles]) and for every unlock, before any
      * restore:
-     * - every `*.tmp` goes, whatever its date: no write is under way when this runs;
+     * - every `*.tmp` goes, whatever its date. No write of this session is under way when this
+     *   runs; a writer thread left by a session that has ended may still be, and then loses its
+     *   temporary file, which only makes its save fail (it was given up already, and the
+     *   generation counted up here keeps it from being installed). No later save is touched by
+     *   that writer when it finally returns, because every save has a temporary name of its own;
      * - a memory goes when no chat file of the same id is there (`sessions/<id>.enc`), and when
      *   its name is not that of a chat;
      * - under a [lifetime] with a limit, a memory goes when its file's date (the date of the

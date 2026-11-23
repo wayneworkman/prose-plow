@@ -136,9 +136,11 @@ class MandatoryLockTest {
                 "messageLifetimeDays",
                 "trustedTime",
                 "backgroundMaintenance",
+                "keepModelMemory",
             ),
             stored.keys,
         )
+        assertEquals("the copy of the memory switch is on until a session says otherwise", "true", stored.getValue("keepModelMemory").toString())
         assertEquals("1", stored.getValue("version").toString())
         assertEquals(setOf("kdf", "salt", "iterations", "wrappedKey", "bindingGeneration"), stored.getValue("passphrase").jsonObject.keys)
         assertEquals("\"PBKDF2-HMAC-SHA256+keystore-HMAC-SHA256\"", stored.getValue("passphrase").jsonObject.getValue("kdf").toString())

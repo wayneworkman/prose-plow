@@ -22,7 +22,8 @@ import java.nio.ByteBuffer
  *   a byte array, never a string (see `NativeLlama.tokenize` for the reason).
  * - A failure is thrown as `NativeLlamaException` with the native status as its code.
  * - The model's state (a memory image) crosses only through the memory of a direct
- *   [ByteBuffer] that the caller owns, never through an array of the Java heap.
+ *   [ByteBuffer] that the caller owns, never through another array. On Android that memory is
+ *   a non-movable array of the runtime, which is never moved and is overwritten in place.
  * - Nothing is called from another thread: the callbacks [LoadProgress],
  *   [EvaluationObserver], [MemorySink] and [MemorySource] run on the calling thread before the
  *   call returns.

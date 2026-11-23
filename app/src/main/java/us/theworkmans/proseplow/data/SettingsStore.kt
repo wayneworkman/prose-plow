@@ -180,7 +180,8 @@ data class AppSettings(
  * `keepModelMemory` is only written when it is false (the default is true), and was added
  * without a new schema version: a file without it means the default. A value that is not a
  * boolean is left out and counted, and then reads as false: what the user may have switched off
- * is not switched on again by a value that cannot be read.
+ * is not switched on again by a value that cannot be read. [SettingsStore.open] then takes the
+ * readable copy the lock keeps instead, when there is one.
  *
  * `messageLifetimeDays` is how long messages are kept, in days, 0 for Never
  * ([MessageLifetime.storedDays]); it is only written when it is not the default (7), and was
@@ -218,12 +219,17 @@ object SettingsCodec {
          *   be used: [AppSettings.messageLifetime] is then the default only because nothing
          *   better was known, and must not be acted on (see [SettingsStore.open]). True when it
          *   was read, and when none was stored, which means the default.
+         * @property keepModelMemoryRead false when `keepModelMemory` was stored but is not a
+         *   boolean: [AppSettings.keepModelMemory] is then false only because nothing better was
+         *   known (see [SettingsStore.open]). True when it was read, and when none was stored,
+         *   which means on.
          */
         data class Readable(
             val settings: AppSettings,
             val schemaVersion: Int,
             val skippedEntries: Int = 0,
             val messageLifetimeRead: Boolean = true,
+            val keepModelMemoryRead: Boolean = true,
         ) : Decoded {
             /** True when [settings] is everything that was stored. */
             val complete: Boolean get() = skippedEntries == 0 && schemaVersion <= SCHEMA_VERSION
@@ -331,12 +337,14 @@ object SettingsCodec {
             }
         }
         var keepMemory = true
+        var keepMemoryRead = true
         val storedKeepMemory = stored["keepModelMemory"]
         if (storedKeepMemory != null) {
             val value = (storedKeepMemory as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
             if (value == null) {
                 skipped++
                 keepMemory = false
+                keepMemoryRead = false
             } else {
                 keepMemory = value
             }
@@ -346,6 +354,7 @@ object SettingsCodec {
             version,
             skipped,
             messageLifetimeRead = lifetimeRead,
+            keepModelMemoryRead = keepMemoryRead,
         )
     }
 }
@@ -399,6 +408,24 @@ class SettingsStore private constructor(
         if (updated == current) return
         _settings.value = updated
         writer.submit(WRITER_KEY, urgent) { file.write(SettingsCodec.encode(updated).toByteArray(Charsets.UTF_8)) }
+        if (updated.systemPrompts != current.systemPrompts) {
+            val changed = (current.systemPrompts.keys + updated.systemPrompts.keys).filter { current.systemPrompt(it) != updated.systemPrompt(it) }
+            for (modelId in changed) systemPromptChanged(modelId)
+        }
+    }
+
+    /** Told of every change of a model's system prompt; see [whenSystemPromptChanges]. */
+    private var systemPromptChanged: (modelId: String) -> Unit = {}
+
+    /**
+     * [action] is called, on the thread of the [update] and before it returns, with the id of
+     * every model whose system prompt that update changed or cleared. One listener: the session,
+     * which makes sure that no saved memory of the model keeps the text of the prompt that was
+     * replaced (a memory holds the whole prompt, the system prompt included).
+     */
+    @Synchronized
+    fun whenSystemPromptChanges(action: (modelId: String) -> Unit) {
+        systemPromptChanged = action
     }
 
     companion object {
@@ -415,13 +442,29 @@ class SettingsStore private constructor(
          * keeps, which follows the setting. It is then written into the settings with their next
          * change, so that the two agree again. Without one either, the default applies.
          *
+         * Whether the model's memory is kept is treated the same way, so that the switch never
+         * falls back to on when the user may have turned it off: when the settings cannot say
+         * (there is no settings file, it cannot be read, or the stored value is not a boolean),
+         * [knownKeepModelMemory] is used, the readable copy the lock keeps (the app always has
+         * one). Without one, a file that is missing or cannot be read means the defaults, as
+         * before, and a value that is not a boolean means off.
+         *
          * @throws IOException when the file is there but could not be read from the disk.
          */
         @Throws(IOException::class)
-        fun open(file: SealedFile, writer: CoalescingWriter, knownMessageLifetime: MessageLifetime? = null): SettingsStore {
+        fun open(
+            file: SealedFile,
+            writer: CoalescingWriter,
+            knownMessageLifetime: MessageLifetime? = null,
+            knownKeepModelMemory: Boolean? = null,
+        ): SettingsStore {
             val fallback = knownMessageLifetime ?: MessageLifetime.DEFAULT
             val decoded = when (val read = file.read()) {
-                SealedRead.Missing -> return SettingsStore(file, writer, AppSettings(messageLifetime = fallback), issue = null)
+                SealedRead.Missing -> return SettingsStore(
+                    file, writer,
+                    AppSettings(messageLifetime = fallback, keepModelMemory = knownKeepModelMemory ?: AppSettings().keepModelMemory),
+                    issue = null,
+                )
                 SealedRead.Undecryptable -> SettingsCodec.Decoded.Unreadable
                 is SealedRead.Opened -> SettingsCodec.decode(read.plaintext.toString(Charsets.UTF_8))
             }
@@ -430,7 +473,10 @@ class SettingsStore private constructor(
                 return SettingsStore(file, writer, decoded.settings, issue = null)
             }
             val usable = (decoded as? SettingsCodec.Decoded.Readable)?.let { readable ->
-                if (readable.messageLifetimeRead) readable.settings else readable.settings.copy(messageLifetime = fallback)
+                var settings = readable.settings
+                if (!readable.messageLifetimeRead) settings = settings.copy(messageLifetime = fallback)
+                if (!readable.keepModelMemoryRead) settings = settings.copy(keepModelMemory = knownKeepModelMemory ?: false)
+                settings
             }
             try {
                 file.keepCopy()
@@ -442,7 +488,11 @@ class SettingsStore private constructor(
             }
             return when (decoded) {
                 is SettingsCodec.Decoded.Readable -> SettingsStore(file, writer, checkNotNull(usable), LoadIssue.PARTLY_READ)
-                SettingsCodec.Decoded.Unreadable -> SettingsStore(file, writer, AppSettings(messageLifetime = fallback), LoadIssue.UNREADABLE)
+                SettingsCodec.Decoded.Unreadable -> SettingsStore(
+                    file, writer,
+                    AppSettings(messageLifetime = fallback, keepModelMemory = knownKeepModelMemory ?: AppSettings().keepModelMemory),
+                    LoadIssue.UNREADABLE,
+                )
             }
         }
     }

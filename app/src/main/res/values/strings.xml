@@ -134,6 +134,7 @@
     <string name="channel_answer_ready">Answer ready</string>
     <string name="answer_writing">Writing an answer…</string>
     <string name="keep_alive_lock_pending">Unlocked; it locks itself when its time is up.</string>
+    <string name="keep_alive_locking">Locking the app…</string>
     <string name="answer_ready">Your answer is ready.</string>
     <plurals name="security_screenshots">
         <item quantity="one">Allow screenshots for %1$d minute</item>

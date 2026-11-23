@@ -196,7 +196,9 @@ enum class ChatNotice {
  *   [MemoryConversations]: it tells the store what a conversation is now, and answers "no such
  *   conversation" for a chat whose stored messages were removed or changed (an edit, an answer
  *   asked for again, a retry, an expiry) until the engine has read a request built after that
- *   change. So a save at a lock that comes before that request cannot keep the old text.
+ *   change. So a save at a lock that comes before that request cannot keep the old text. A
+ *   change of a system prompt is such a change too ([systemPromptChanged]): the prompt is part
+ *   of what the engine holds.
  *
  * Threading: everything except the constructor, [shutdown], [conversation], [requestsBuilt] and
  * [heldConversationKey] is called on the main dispatcher and all state is confined to it. The
@@ -222,6 +224,9 @@ enum class ChatNotice {
  *   and no other reply has begun in its place.
  * @param onMemoryRestored called on the main dispatcher when the engine's memory was read back
  *   from the saved one, or already was it.
+ * @param deleteSavedMemory deletes whatever saved memory there is, of whichever chat, without
+ *   the key; blocking, run by the writer. For a change of a system prompt
+ *   ([systemPromptChanged]).
  */
 class ChatController(
     private val store: SessionStore,
@@ -240,6 +245,7 @@ class ChatController(
     private val memoryVault: () -> MemoryVault? = { null },
     private val onTurnEnded: () -> Unit = {},
     private val onMemoryRestored: () -> Unit = {},
+    private val deleteSavedMemory: () -> Unit = {},
 ) : MemoryConversations {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
@@ -267,6 +273,16 @@ class ChatController(
      * main thread only.
      */
     @Volatile private var engineHolds: String? = null
+
+    /**
+     * Every chat whose conversation the engine may hold in its memory now, as far as can be told
+     * from here: [engineHolds] says which chat the engine was last given, but a request can be
+     * given up before the engine has read any of it (stopped while it waited for the engine), and
+     * the engine then still holds what it held before. So a chat leaves this set only once the
+     * engine has shown that it read another chat's request ([showsPromptRead]) or a restore has
+     * filled its memory with another chat, or when the engine is made to forget. Main thread only.
+     */
+    private val mayHold = HashSet<String>()
 
     /** The chat whose saved memory the engine is reading back right now, if any. Main thread only. */
     private var restoring: String? = null
@@ -403,7 +419,8 @@ class ChatController(
     /**
      * Deletes the chat [id] for good, readable or not: its file, every kept copy of it and its
      * entry in the list. A reply being written in it is abandoned. When it was the chat on
-     * screen, a new empty chat takes its place.
+     * screen, a new empty chat takes its place. When the engine may hold its conversation, the
+     * engine is made to forget it, as for a pruned chat ([forgetIfHeld]).
      */
     fun deleteChat(id: String) {
         if (closed) return
@@ -428,6 +445,8 @@ class ChatController(
                 contextNotes = state.contextNotes - id,
             )
         }
+        // A chat the user deleted does not stay in the model's memory either.
+        forgetIfHeld(id)
         saveIndex(urgent = true)
     }
 
@@ -792,17 +811,18 @@ class ChatController(
     }
 
     /**
-     * Main thread: when the engine may still hold the conversation of the chat [id], whose
-     * messages have just been removed, it is made to forget it, so that no expired text stays
-     * in its memory. Done in turn with the replies: the next one waits for it, as it waits for
-     * the one before.
+     * Main thread: when the engine may still hold the conversation of the chat [id] ([mayHold]),
+     * whose messages have just been removed or which was deleted, it is made to forget it, so
+     * that no text that is gone stays in its memory. Done in turn with the replies: the next one
+     * waits for it, as it waits for the one before.
      */
     private fun forgetIfHeld(id: String) {
-        if ((engineHolds != id && restoring != id) || closed) return
+        if ((id !in mayHold && engineHolds != id && restoring != id) || closed) return
         // At once, before any request can be built without the removed messages: no save of
         // what the engine holds now, and no restore, until its memory has been emptied.
         engine.markNotToBeSaved()
         engineHolds = null
+        mayHold.clear()
         val previous = lastTurn
         lastTurn = scope.launch {
             previous?.join()
@@ -921,7 +941,14 @@ class ChatController(
             val builtAfter = changes.get()
             builtRequests.incrementAndGet()
             engineHolds = reply.sessionId
+            mayHold += reply.sessionId
             engine.generate(request).collect { event ->
+                if (event.showsPromptRead() && !closed) {
+                    // The engine has read this request into its memory, which now holds this chat
+                    // and no other (it keeps only what this request's prompt begins with).
+                    mayHold.retainAll(setOf(reply.sessionId))
+                    mayHold += reply.sessionId
+                }
                 if (running === reply) {
                     // The engine has read this request: what it holds no longer has the text of a change made before it.
                     if (event.showsPromptRead()) staleSince.computeIfPresent(reply.sessionId) { _, since -> since.takeIf { it > builtAfter } }
@@ -983,6 +1010,9 @@ class ChatController(
             val result = engine.restoreMemory(vault, conversationKeyOf(id), requestSettings(spec).maxContextTokens)
             if (result is MemoryRestoreResult.Restored || result == MemoryRestoreResult.AlreadyHeld) {
                 engineHolds = id
+                // A restore empties the memory before it fills it with this chat's.
+                if (result is MemoryRestoreResult.Restored) mayHold.clear()
+                mayHold += id
                 onMemoryRestored()
             }
         } catch (e: CancellationException) {
@@ -991,6 +1021,39 @@ class ChatController(
             // The engine promises not to throw; the request reads the conversation as it is.
         } finally {
             restoring = null
+        }
+    }
+
+    /**
+     * Main thread: the system prompt of the model [modelId] was changed or cleared in the
+     * settings. The engine's memory, and a memory saved of it, hold the whole prompt the engine
+     * was given, the old system prompt included; neither may keep that text now that the user has
+     * replaced it. So, as for an edit:
+     * - every chat the engine may hold now ([mayHold], and the one being restored) is treated as
+     *   changed, hidden from the store ([conversation]) until the engine has read a request built
+     *   after this change, unless the engine has another model loaded, whose memory the prompt
+     *   of [modelId] cannot be in;
+     * - the saved memory is deleted at once (handed to the writer, as every deletion of a chat's
+     *   memory is), which also stops a save under way. It is deleted whichever chat and model it
+     *   is of: which model a memory was made with is only known by opening it, and a chat's
+     *   model can have changed since. The cost is one reading of a conversation.
+     */
+    fun systemPromptChanged(modelId: String) {
+        if (closed) return
+        val loaded = (engine.state.value as? EngineState.Ready)?.modelId
+        if (loaded == null || loaded == modelId) {
+            val held = mayHold + listOfNotNull(engineHolds, restoring)
+            if (held.isNotEmpty()) {
+                val change = changes.incrementAndGet()
+                for (id in held) staleSince[id] = change
+            }
+        }
+        writer.submit(MEMORY_KEY, urgent = true) {
+            try {
+                deleteSavedMemory()
+            } catch (_: IOException) {
+                // The store's checks refuse the memory of a hidden chat, and delete it, before it could be used.
+            }
         }
     }
 
@@ -1067,6 +1130,9 @@ class ChatController(
 
         /** The key of the index in the [CoalescingWriter]. */
         const val INDEX_KEY: String = "session-index"
+
+        /** The key in the [CoalescingWriter] of a deletion of the saved memory for a changed system prompt. */
+        const val MEMORY_KEY: String = "model-memory"
 
         /** How often expired messages are looked for while a session lives: hourly. */
         const val EXPIRY_INTERVAL_MILLIS: Long = 60 * 60 * 1000L

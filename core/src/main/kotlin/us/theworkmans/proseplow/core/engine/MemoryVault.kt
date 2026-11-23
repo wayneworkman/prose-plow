@@ -69,8 +69,15 @@ interface MemoryVault {
      * the first [MemoryWriter.firstPieceOffset] bytes of [MemoryWriter.buffer] when this returns.
      * The image it holds, if any, stays until [MemoryWriter.commit]; whether it survives a save
      * that is abandoned is the vault's decision (it may have had to make room).
+     *
+     * [stopped] is the engine's own condition for giving the save up (a request, forgetting,
+     * unloading or loading, the caller). The engine also asks it between pieces, but a vault
+     * whose storage stops answering may keep the engine's thread waiting inside a call of this
+     * save ([MemoryWriter.write], [MemoryWriter.commit], [MemoryWriter.close], or this one); a
+     * vault that waits there asks [stopped] as it waits, and stops waiting, giving the save up,
+     * once it is true. It may be asked from the thread that waits only.
      */
-    fun beginSave(memory: SavedMemory): MemoryWriter
+    fun beginSave(memory: SavedMemory, stopped: () -> Boolean = { false }): MemoryWriter
 
     /**
      * Begins reading the image that [saved] reported. [MemoryReader.memory] is its header as

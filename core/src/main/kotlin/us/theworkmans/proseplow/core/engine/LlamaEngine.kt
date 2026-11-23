@@ -374,9 +374,10 @@ class LlamaEngine(
     override suspend fun forgetKeepingSavedMemory() = forget(keepSaved = true)
 
     /**
-     * Empties the memory. With [keepSaved] the engine lets go of a saved image without deleting
-     * it, before anything else, so that no failure on the way can delete it either; otherwise the
-     * image goes with the memory.
+     * Empties the memory. The engine lets go of a saved image before anything else. With
+     * [keepSaved] it is not deleted, so that no failure on the way can delete it either;
+     * otherwise it is deleted once the memory has been cleared (or the model freed), never
+     * before: the conversation does not wait in memory for the disk.
      */
     private suspend fun forget(keepSaved: Boolean) {
         epoch.incrementAndGet()
@@ -386,18 +387,24 @@ class LlamaEngine(
             mutex.withLock {
                 withContext(nativeDispatcher) {
                     marksBeforeOperation = marksBefore
-                    if (keepSaved) savedImage = null else dropSavedImage()
+                    // The memory is cleared first and the image deleted second: deleting is work
+                    // on the disk, which may be slow, and the conversation is not to wait in memory
+                    // for it. The image is let go of here and deleted below, however the clearing went.
+                    val image = savedImage
+                    savedImage = null
                     _memoryRestore.value = MemoryRestoreState.Idle
-                    val current = native
-                    if (current == null) {
-                        // No model, so no memory: nothing is left that a mark could concern.
-                        liftMarks()
-                        return@withContext
-                    }
-                    if (!clearMemory(current)) {
-                        // The memory could not be cleared; freeing the model clears it for certain.
-                        closeNative()
-                        _state.value = EngineState.Unloaded
+                    try {
+                        val current = native
+                        if (current == null) {
+                            // No model, so no memory: nothing is left that a mark could concern.
+                            liftMarks()
+                        } else if (!clearMemory(current)) {
+                            // The memory could not be cleared; freeing the model clears it for certain.
+                            closeNative()
+                            _state.value = EngineState.Unloaded
+                        }
+                    } finally {
+                        if (!keepSaved && image != null) deleteQuietly(image.vault)
                     }
                 }
             }
@@ -460,13 +467,15 @@ class LlamaEngine(
         memory.wipe()
         checkpoints.clear()
         memoryKey = null
-        dropSavedImage()
         liftMarks()
         _memoryRestore.value = MemoryRestoreState.Idle
         try {
             current?.close()
         } catch (_: RuntimeException) {
             // Nothing more can be done for it; the engine no longer refers to it either way.
+        } finally {
+            // After the model's memory is freed: deleting is work on the disk (see forget).
+            dropSavedImage()
         }
     }
 
@@ -479,16 +488,18 @@ class LlamaEngine(
     private fun clearMemory(native: NativeLlama): Boolean {
         memory.wipe()
         checkpoints.clear()
-        // The key stays: a request clears and then rebuilds the memory as its own conversation's.
-        // An empty memory is never saved, whatever key it has.
-        dropSavedIfBeyondMemory()
         liftMarks()
-        return try {
+        val cleared = try {
             native.clearMemory()
             true
         } catch (_: RuntimeException) {
             false
         }
+        // The key stays: a request clears and then rebuilds the memory as its own conversation's.
+        // An empty memory is never saved, whatever key it has. The image goes only now, after the
+        // native memory: deleting is work on the disk (see forget).
+        dropSavedIfBeyondMemory()
+        return cleared
     }
 
     // --- What was saved, and what may be ---
@@ -589,6 +600,10 @@ class LlamaEngine(
         val handles = checkpoints.sortedBy { it.position }.takeLast(NativeLlama.MAX_MEMORY_CHECKPOINTS).map { it.handle }.toIntArray()
         // An image the engine knows of in another vault is not the one this save replaces.
         if (savedImage?.vault !== vault) dropSavedImage()
+        // Stops at the next piece for a request, for forgetting, unloading or loading, and for the
+        // caller; and the vault is given the same condition, so that a wait of its own for its
+        // storage ends for them too.
+        val stopped = { epoch.get() != startEpoch || requests.get() != startRequests || !job.isActive }
         val writer: MemoryWriter
         val bytes: Long
         try {
@@ -602,12 +617,11 @@ class LlamaEngine(
                     readingSeconds = times.seconds(tokens),
                     imageBytes = bytes,
                 ),
+                stopped,
             )
         } catch (_: Exception) {
             return notSaved(MemorySaveResult.NotSaved.Reason.FAILED)
         }
-        // Stops at the next piece for a request, for forgetting, unloading or loading, and for the caller.
-        val stopped = { epoch.get() != startEpoch || requests.get() != startRequests || !job.isActive }
         try {
             val written = writer.use {
                 val written = native.exportMemory(handles, writer.buffer, writer.firstPieceOffset) { piece, last ->
@@ -779,10 +793,14 @@ class LlamaEngine(
     private fun readAgain(vault: MemoryVault, native: NativeLlama, reason: MemoryRestoreResult.NotRestored.Reason): MemoryRestoreResult {
         val modelId = loaded?.id
         savedImage = null
-        deleteQuietly(vault)
-        if (!clearMemory(native)) {
-            closeNative()
-            _state.value = EngineState.Unloaded
+        try {
+            if (!clearMemory(native)) {
+                closeNative()
+                _state.value = EngineState.Unloaded
+            }
+        } finally {
+            // After the memory: deleting is work on the disk (see forget).
+            deleteQuietly(vault)
         }
         if (modelId != null) _memoryRestore.value = MemoryRestoreState.ReadAgain(modelId)
         return MemoryRestoreResult.NotRestored(reason)

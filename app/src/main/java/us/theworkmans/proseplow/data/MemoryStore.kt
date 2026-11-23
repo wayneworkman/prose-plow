@@ -14,7 +14,6 @@ import us.theworkmans.proseplow.security.ChunkCipher
 import us.theworkmans.proseplow.security.Purposes
 import us.theworkmans.proseplow.security.SealedStream
 import us.theworkmans.proseplow.security.UndecryptableException
-import us.theworkmans.proseplow.security.tempFileFor
 import us.theworkmans.proseplow.security.wipe
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -106,8 +105,9 @@ data class FreeSpace(val usableBytes: Long, val totalBytes: Long)
  * [QUEUE_CHUNKS] chunks; every step that touches the disk (making room, creating the file,
  * appending, the rename) is that thread's. The engine's thread therefore never waits in a disk
  * write: it waits only for a free buffer, or for a step of the writer, and every such wait ends
- * when the save is cancelled ([cancelSave]) or the memory deleted, within one chunk. A disk that
- * does not answer holds only ciphertext. Nothing of a save is flushed to the disk (see
+ * when the save is cancelled ([cancelSave]), the memory deleted, or the engine's own stop
+ * condition holds (the one it hands to [beginSave]: a request, forgetting, the caller), within
+ * one chunk. A disk that does not answer holds only ciphertext. Nothing of a save is flushed to the disk (see
  * [SealedStreamFile]); a deletion is.
  *
  * **Free space.** A save needs its stream's size plus a reserve free: the larger of 1 GiB and 5%
@@ -214,7 +214,7 @@ class MemoryStore internal constructor(
      * build does not carry, and when the key has gone.
      */
     @Throws(IOException::class)
-    override fun beginSave(memory: SavedMemory): MemoryWriter {
+    override fun beginSave(memory: SavedMemory, stopped: () -> Boolean): MemoryWriter {
         check(active == null) { "A save of the memory is under way" }
         val startGeneration = files.generation
         val conversation = conversations.conversation(memory.conversationKey) ?: throw IOException("The conversation is not known")
@@ -235,7 +235,7 @@ class MemoryStore internal constructor(
         }
         val stream = streamOf(chatId)
         if (header.size >= stream.chunkBytes) throw IOException("The header of the memory does not fit its first chunk")
-        val save = Save(stream, header, header.size + memory.imageBytes, oldest, startGeneration)
+        val save = Save(stream, header, header.size + memory.imageBytes, oldest, startGeneration, stopped)
         synchronized(writers) {
             writers.removeAll { !it.isAlive }
             writers += save.thread
@@ -470,6 +470,8 @@ class MemoryStore internal constructor(
         private val expected: Long,
         private val oldestMillis: Long,
         private val startGeneration: Long,
+        /** The engine's own stop condition ([MemoryVault.beginSave]); asked on the engine's thread only. */
+        private val engineStopped: () -> Boolean,
     ) : MemoryWriter {
         override val buffer: ByteBuffer = ByteBuffer.allocateDirect(stream.chunkBytes)
         override val firstPieceOffset: Int = header.size
@@ -583,7 +585,10 @@ class MemoryStore internal constructor(
                 ),
             )
             tasks.add(SaveTask.End)
-            while (thread.isAlive && !cancelRequested && files.generation == startGeneration) thread.join(POLL_MILLIS)
+            // Waits for that, unless the save was stopped from outside or by the engine's own
+            // condition: the writer thread then removes the file when the disk lets it, and
+            // awaitStopped waits for it.
+            while (thread.isAlive && !cancelRequested && files.generation == startGeneration && !engineStopped()) thread.join(POLL_MILLIS)
             buffer.wipe()
             if (active === this) active = null
         }
@@ -594,7 +599,11 @@ class MemoryStore internal constructor(
             abandon()
         }
 
-        private fun stopped(): Boolean = cancelRequested || abandoned || files.generation != startGeneration
+        /**
+         * Whether the save is to be given up: cancelled from outside, abandoned, the memory deleted,
+         * or the engine's own condition holds. On the engine's thread only, which is where it is asked.
+         */
+        private fun stopped(): Boolean = cancelRequested || abandoned || files.generation != startGeneration || engineStopped()
 
         /** Gives the save up: nothing more is sealed, appended or renamed, and [close] removes what was written. */
         private fun abandon() {
@@ -639,7 +648,8 @@ class MemoryStore internal constructor(
             val space = freeSpace(directory)
             val needed = SealedStream.sealedSize(expected) + maxOf(RESERVE_MIN_BYTES, space.totalBytes / RESERVE_SHARE)
             if (space.usableBytes >= needed) return
-            val old = files.storedFiles().sumOf { it.length() } + tempFileFor(stream.file).length()
+            // Everything the deletion below removes: the memory kept, and what writes left beside it.
+            val old = directory.listFiles().orEmpty().filter { it.isFile }.sumOf { it.length() }
             files.exclusive { files.deleteOthersLocked() }
             if (space.usableBytes + old < needed) throw IOException("Too little free space for the memory")
         }
@@ -694,8 +704,13 @@ class MemoryStore internal constructor(
          * The digest a memory's header carries of the messages it was made from: SHA-256 over a
          * fixed label and, for every message in order, the length and UTF-8 bytes of its id, its
          * date, and the length and UTF-8 bytes of its text.
+         *
+         * The bytes of each text are a copy of the conversation that the runtime would otherwise
+         * keep until it is collected; they are overwritten with zeros as soon as the digest has
+         * read them ([textBytesSeen] sees each array just before that, for the tests). The
+         * strings themselves cannot be overwritten (MEM-05).
          */
-        internal fun digestOf(messages: List<ChatMessage>): ByteArray {
+        internal fun digestOf(messages: List<ChatMessage>, textBytesSeen: (ByteArray) -> Unit = {}): ByteArray {
             val digest = MessageDigest.getInstance("SHA-256")
             digest.update(DIGEST_LABEL.toByteArray(Charsets.UTF_8))
             val number = ByteArray(8)
@@ -709,8 +724,13 @@ class MemoryStore internal constructor(
                 digest.update(id)
                 put(message.createdAtMillis, 8)
                 val text = message.text.toByteArray(Charsets.UTF_8)
-                put(text.size.toLong(), 4)
-                digest.update(text)
+                try {
+                    put(text.size.toLong(), 4)
+                    digest.update(text)
+                } finally {
+                    text.fill(0)
+                    textBytesSeen(text)
+                }
             }
             return digest.digest()
         }

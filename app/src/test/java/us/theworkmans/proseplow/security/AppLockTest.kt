@@ -70,6 +70,12 @@ class AppLockTest {
     /** What the sessions opened from now on say their setting of how long messages are kept is. */
     private var sessionLifetime: Int? = null
 
+    /** The readable copy of the switch that keeps the model's memory that the lock handed to each session it opened. */
+    private val keepCopiesHandedIn = mutableListOf<Boolean>()
+
+    /** What the sessions opened from now on say their switch that keeps the model's memory is. */
+    private var sessionKeep: Boolean? = null
+
     /** Whether the keep-alive (the answer service in the foreground) is running, as the lock is told. */
     private var keepAliveRunning = true
 
@@ -109,6 +115,7 @@ class AppLockTest {
         val cipher: BlobCipher,
         private val log: MutableList<String>,
         override val messageLifetimeDays: Int? = null,
+        override val keepModelMemorySetting: Boolean? = null,
     ) : UnlockedSession {
         var screensCleared = 0
         var closeStarted = false
@@ -228,10 +235,11 @@ class AppLockTest {
             manager = manager,
             files = files,
             clock = clock,
-            openSession = { cipher, lockedDays ->
+            openSession = { cipher, copies ->
                 openFails?.let { throw it }
-                copiesHandedIn += lockedDays
-                FakeSession(cipher, log, sessionLifetime).also { sessions += it }
+                copiesHandedIn += copies.messageLifetimeDays
+                keepCopiesHandedIn += copies.keepModelMemory
+                FakeSession(cipher, log, sessionLifetime, sessionKeep).also { sessions += it }
             },
             biometricStatus = { biometric },
             screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
@@ -3013,6 +3021,40 @@ class AppLockTest {
         enter(passphrase)
         assertEquals("the session was handed the copy as it stood, to fall back on", 90, copiesHandedIn.last())
         assertEquals(0, LockConfigStore(files.lockConfig).read()!!.messageLifetimeDays)
+    }
+
+    /**
+     * The readable copy of the switch that keeps the model's memory: on in a configuration
+     * without it, handed to every session it opens, and written at every unlock from the
+     * session's own setting, whatever it said before. Catches a session handed no copy (it would
+     * fall back on "on" with settings it cannot read) and an unlock that leaves a stale copy.
+     */
+    @Test
+    fun everyUnlockOverwritesTheCopyOfTheMemorySwitchFromTheRealSetting() = runTest(dispatcher) {
+        startApp()
+        sessionKeep = false
+        createPassphrase()
+        assertEquals("the first session was handed the default", listOf(true), keepCopiesHandedIn)
+        assertEquals(false, LockConfigStore(files.lockConfig).read()!!.keepModelMemory)
+
+        lock.lock()
+        runCurrent()
+        sessionKeep = null
+        enter(passphrase)
+        assertEquals("handed the copy as it stood", false, keepCopiesHandedIn.last())
+        assertEquals("a session without the setting leaves the copy as it is", false, LockConfigStore(files.lockConfig).read()!!.keepModelMemory)
+
+        lock.lock()
+        runCurrent()
+        sessionKeep = true
+        enter(passphrase)
+        assertEquals(true, LockConfigStore(files.lockConfig).read()!!.keepModelMemory)
+
+        // A configuration written before the copy existed has no such field, which means on.
+        val text = files.lockConfig.readText()
+        assertTrue(text.contains("\"keepModelMemory\":true"))
+        files.lockConfig.writeText(text.replace(",\"keepModelMemory\":true", ""))
+        assertEquals(true, LockConfigStore(files.lockConfig).read()!!.keepModelMemory)
     }
 
     // --- Background maintenance ---------------------------------------------------------------

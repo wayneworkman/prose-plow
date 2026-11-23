@@ -49,10 +49,13 @@ class SettingsStoreTest {
         override fun open(purpose: String, blob: ByteArray): ByteArray = cipher.open(purpose, blob)
     }
 
-    private fun TestScope.open(): SettingsStore {
+    private fun TestScope.open(knownKeepModelMemory: Boolean? = null): SettingsStore {
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
         val writer = CoalescingWriter(scope, lazyMillis = 1_000) { key, failure -> failures += "$key: ${failure.javaClass.simpleName}" }
-        return SettingsStore.open(SealedFile(layout.settings, DataLayout.SETTINGS_PURPOSE, countingCipher, layout.kept, "settings"), writer)
+        return SettingsStore.open(
+            SealedFile(layout.settings, DataLayout.SETTINGS_PURPOSE, countingCipher, layout.kept, "settings"), writer,
+            knownKeepModelMemory = knownKeepModelMemory,
+        )
     }
 
     private fun plant(json: String) = layout.settings.writeBytes(cipher.seal(DataLayout.SETTINGS_PURPOSE, json.toByteArray()))
@@ -489,6 +492,47 @@ class SettingsStoreTest {
 
         store.loadIssueShown()
         assertNull(store.loadIssue.value)
+    }
+
+    /**
+     * The switch that keeps the model's memory never falls back to on when the settings cannot
+     * say what it is: a file that is missing, one that cannot be decrypted, and a value that is
+     * not a boolean all take the readable copy the lock keeps. A file that says it plainly is
+     * believed over the copy. Catches a switch that fails open.
+     */
+    @Test
+    fun theMemorySwitchTakesTheLocksCopyWheneverTheSettingsCannotSay() = runTest {
+        assertFalse("no file", open(knownKeepModelMemory = false).settings.value.keepModelMemory)
+        assertTrue("no file, a copy that says on", open(knownKeepModelMemory = true).settings.value.keepModelMemory)
+
+        layout.settings.writeBytes(byteArrayOf(1, 2, 3, 4))
+        assertFalse("a file that cannot be decrypted", open(knownKeepModelMemory = false).settings.value.keepModelMemory)
+        layout.settings.delete()
+        layout.kept.deleteRecursively()
+
+        plant("""{"schemaVersion":1,"settings":{"keepModelMemory":"yes"}}""")
+        assertFalse("a value that is not a boolean, a copy that says off", open(knownKeepModelMemory = false).settings.value.keepModelMemory)
+        assertTrue("a value that is not a boolean, a copy that says on", open(knownKeepModelMemory = true).settings.value.keepModelMemory)
+        assertFalse("a value that is not a boolean and no copy", open().settings.value.keepModelMemory)
+
+        plant("""{"schemaVersion":1,"settings":{"keepModelMemory":false}}""")
+        assertFalse("a file that says off", open(knownKeepModelMemory = true).settings.value.keepModelMemory)
+        plant("""{"schemaVersion":1,"settings":{}}""")
+        assertTrue("a file without the field means on, whatever the copy", open(knownKeepModelMemory = false).settings.value.keepModelMemory)
+    }
+
+    /** Catches a change of a system prompt (or its removal) that the session is not told of, and a change of anything else that it is. */
+    @Test
+    fun everyChangeOfASystemPromptIsToldAndNothingElse() = runTest {
+        val store = open()
+        val told = ArrayList<String>()
+        store.whenSystemPromptChanges { told += it }
+        store.update { it.withSystemPrompt("a", "One") }
+        store.update { it.withSystemPrompt("a", "One") }
+        store.update { it.withSystemPrompt("a", "Two").withSystemPrompt("b", "Other") }
+        store.update { it.withTemperature("a", 0.5f) }
+        store.update { it.withSystemPrompt("a", "") }
+        assertEquals(listOf("a", "a", "b", "a"), told)
     }
 
     @Test

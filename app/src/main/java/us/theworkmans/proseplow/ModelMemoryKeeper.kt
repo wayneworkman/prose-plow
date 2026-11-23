@@ -175,6 +175,9 @@ internal class ModelMemoryKeeper(
      * running, then, unless that left the memory on disk as it is, one with [SaveTrigger.LOCK].
      * Then, and at once for [SessionClose.IMMEDIATE], nothing more may be begun and whatever is
      * still saving is stopped. Returns within the bound whatever the engine or the disk do.
+     * Calling it again does nothing more: after the first call nothing can be saved, so a later
+     * [SessionClose.UNATTENDED] waits for nothing either (the session calls it early for "Lock
+     * now", before its chats are shut down, and again in its usual place).
      */
     suspend fun close(how: SessionClose) {
         try {
@@ -222,11 +225,11 @@ internal class ModelMemoryKeeper(
     private inner class Vault : MemoryVault {
         override fun saved(): SavedMemory? = store.saved()
 
-        override fun beginSave(memory: SavedMemory): MemoryWriter {
+        override fun beginSave(memory: SavedMemory, stopped: () -> Boolean): MemoryWriter {
             beginning.incrementAndGet()
             try {
                 if (closed || current !== this) throw IOException("The session has closed, or saving was switched off")
-                val writer = store.beginSave(memory)
+                val writer = store.beginSave(memory, stopped)
                 if (closed || current !== this) {
                     store.cancelSave()
                     writer.close()

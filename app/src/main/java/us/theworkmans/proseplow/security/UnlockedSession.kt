@@ -59,6 +59,14 @@ interface UnlockedSession {
     val messageLifetimeDays: Int? get() = null
 
     /**
+     * Whether the model's memory is kept across a lock, as the session's own (encrypted)
+     * settings say ([LockConfig.keepModelMemory] is its readable copy). Read under the lock's
+     * mutex at every unlock, which writes the copy from it. Null for a session that has no such
+     * setting, whose unlock then leaves the copy as it is.
+     */
+    val keepModelMemorySetting: Boolean? get() = null
+
+    /**
      * Stops all work of the session, gives the writes that are queued their time to reach the
      * disk, and lets go of everything decrypted. Called once, off the main thread, after
      * [clearScreens]. [how] says what kind of end it is: whether the session may take one more
@@ -88,16 +96,18 @@ interface UnlockedSession {
 enum class SessionClose {
     /**
      * The user's own "Lock now" (also when it ends an answer being finished behind the lock), a
-     * reset, or a session that was never shown: the strongest end. Nothing is waited for that can
-     * be dropped, and nothing new is begun.
+     * reset, a session that was never shown, and any end of the kinds below while nothing keeps
+     * the process alive and awake: the strongest end. Nothing is waited for that can be dropped,
+     * and nothing new is begun.
      */
     IMMEDIATE,
 
     /**
      * The app locked by itself, or an answer that was being finished behind the lock ended (by
-     * itself, at its time limit, with the keep-alive, or by "Stop the answer"). Nobody is waiting
-     * at that moment, and the session may take one more bounded wait to keep for the next unlock
-     * what it can, for at most [KEEPING_WAIT_SECONDS].
+     * itself, at its time limit, or by "Stop the answer"), while something keeps the process
+     * alive and awake out of sight at that moment, so that the device cannot sleep in the middle
+     * of the close. Nobody is waiting at that moment, and the session may take one more bounded
+     * wait to keep for the next unlock what it can, for at most [KEEPING_WAIT_SECONDS].
      */
     UNATTENDED,
     ;
