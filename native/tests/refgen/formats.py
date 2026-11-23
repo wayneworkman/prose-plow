@@ -51,6 +51,31 @@ with the reference's tokenisation of the rendered conversation and its greedy re
 The requests are in the order an application would send them, each a whole conversation: a new
 turn appended, the same conversation again (regenerate), an earlier message changed, another
 beginning. A request's expected reply never depends on what was sent before it.
+
+Penalty reference ("PPPENAL1"): chat requests against a plain-text ChatML model, each with the
+greedy reply the reference library generates with a repetition penalty.
+
+    magic            8 bytes  "PPPENAL1"
+    tokenizer sha    64 bytes hex SHA-256 of the tokenizer file
+    penalty          f32      the repetition penalty the replies were generated with
+    max_new_tokens   u32      the length limit they were generated with
+    top_k            u32      how many tokens of the first reply position are described
+    n_request        u32
+    n_request times:
+        n_messages   u32, per message role and content (u32 length + UTF-8 bytes each)
+        prompt       u32 count + i32 each   the conversation with the generation prompt, tokenised
+        plain        u32 count + i32 each   the greedy reply without the penalty
+        reply        u32 count + i32 each   the greedy reply with it; both end with the tokens
+                                            that complete the end marker in the text
+        margin       f32[count of reply]    how far the score of each reply token was ahead of
+                                            the next best one, after the penalty
+        first_idx    i32[top_k]   the tokens with the highest scores at the first position of
+                                  the reply after the penalty, best first
+        first_logit  f32[top_k]   their logits, before the penalty
+        first_score  f32[top_k]   their scores, after it
+
+The requests are again whole conversations in the order an application would send them, and
+each reply was generated from scratch.
 """
 from __future__ import annotations
 
@@ -64,6 +89,7 @@ import numpy as np
 TOKEN_MAGIC = b"PPTOKV01"
 LOGIT_MAGIC = b"PPLOGIT1"
 CHAT_MAGIC = b"PPCHAT01"
+PENALTY_MAGIC = b"PPPENAL1"
 
 
 @dataclass
@@ -232,3 +258,36 @@ def read_chat_reference(path: Path) -> tuple[str, int, list[ChatRequest]]:
         requests.append(ChatRequest(messages, prompt, reply, ended, take_bytes().decode("utf-8")))
     assert pos == len(data), f"{path} has trailing bytes"
     return sha, max_new_tokens, requests
+
+
+@dataclass
+class PenaltyRequest:
+    messages: list[tuple[str, str]]  # (role, content)
+    prompt: list[int]
+    plain: list[int]
+    reply: list[int]
+    margins: list[float]       # one per reply token
+    first_idx: list[int]       # top_k each
+    first_logit: list[float]
+    first_score: list[float]
+
+
+def write_penalty_reference(path: Path, tokenizer_sha256: str, penalty: float, max_new_tokens: int, top_k: int,
+                            requests: list[PenaltyRequest]) -> None:
+    assert len(tokenizer_sha256) == 64
+    out = bytearray(PENALTY_MAGIC + tokenizer_sha256.encode("ascii"))
+    out += struct.pack("<fIII", penalty, max_new_tokens, top_k, len(requests))
+    for r in requests:
+        assert len(r.margins) == len(r.reply) and len(r.first_idx) == len(r.first_logit) == len(r.first_score) == top_k
+        out += struct.pack("<I", len(r.messages))
+        for role, content in r.messages:
+            _put_bytes(out, role.encode("utf-8"))
+            _put_bytes(out, content.encode("utf-8"))
+        for ids in (r.prompt, r.plain, r.reply):
+            out += struct.pack("<I", len(ids)) + np.asarray(ids, dtype="<i4").tobytes()
+        out += np.asarray(r.margins, dtype="<f4").tobytes()
+        out += np.asarray(r.first_idx, dtype="<i4").tobytes()
+        out += np.asarray(r.first_logit, dtype="<f4").tobytes()
+        out += np.asarray(r.first_score, dtype="<f4").tobytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))

@@ -15,7 +15,9 @@ import kotlinx.serialization.Serializable
  * @property topP keep the smallest set of most likely tokens whose probabilities reach this sum;
  *   1 keeps all.
  * @property minP drop tokens less likely than this fraction of the most likely one; 0 drops none.
- * @property repetitionPenalty divides the score of tokens already written in this reply; 1 is off.
+ * @property repetitionPenalty lowers the score of every token that is in the conversation so far,
+ *   the prompt as much as this reply: a positive score is divided by it, a negative one
+ *   multiplied. 1 is off.
  * @property presencePenalty subtracted once from the score of every token already written in
  *   this reply; 0 is off.
  * @property frequencyPenalty subtracted from a token's score once per time it was already written

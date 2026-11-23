@@ -761,9 +761,10 @@ int main(int argc, char ** argv) {
         r.check(bad_window == PP_STATUS_INVALID_ARGUMENT && bad_top_k == PP_STATUS_INVALID_ARGUMENT && bad_ban == PP_STATUS_INVALID_ARGUMENT,
                 "a penalty window of 0, a negative top_k, a banned token outside the vocabulary: INVALID_ARGUMENT");
 
-        // A penalty window that no machine can serve: llama.cpp allocates the whole window when
-        // the sampler is created. More than the context holds is taken as the context, so it
-        // must cost next to nothing; see address_space_limit for why this runs inside one.
+        // A penalty window that no machine can serve, which llama.cpp's own penalties would
+        // allocate in full when the sampler is created. The session's penalties look at its
+        // record of the memory and allocate nothing for a window, so it must cost next to
+        // nothing; see address_space_limit for why this runs inside one.
         const int32_t n_vocab = pp_session_vocab_size(s);
         {
             const address_space_limit limit((uint64_t) 1 << 30);
@@ -778,7 +779,7 @@ int main(int argc, char ** argv) {
                 const pp_sampler_config crowded = greedy_config(too_many);
                 const int32_t crowded_status = pp_session_configure_sampler(s, &crowded);
                 r.check(wide_status == PP_STATUS_OK && after.total < before.total + 16.0 && crowded_status == PP_STATUS_INVALID_ARGUMENT,
-                        "a penalty window of %d tokens is taken as the context size: OK (%d), resident memory %.0f MiB before and %.0f MiB after; "
+                        "a penalty window of %d tokens is no window and costs nothing: OK (%d), resident memory %.0f MiB before and %.0f MiB after; "
                         "more banned tokens than the vocabulary has: INVALID_ARGUMENT (%d)",
                         wide.penalty_window, wide_status, before.total, after.total, crowded_status);
             } else {
@@ -1132,8 +1133,9 @@ int main(int argc, char ** argv) {
         llama_token none = LLAMA_TOKEN_NULL;
         r.check(pp_session_sample_next(s, &none) == PP_STATUS_SAMPLING_FAILED, "no prediction survives a clear: SAMPLING_FAILED");
 
-        // Not reconfigured: the sampler must still be there, and must have forgotten the first run
-        // (its penalties' history and its random state), or the second run would differ.
+        // Not reconfigured: the sampler must still be there, and the first run must be forgotten
+        // (the tokens its penalties were computed from, and its random state), or the second run
+        // would differ.
         must_evaluate(s, a);
         const std::vector<llama_token> second = continue_reply(s, k_tail, stop);
         r.check(!first.empty() && first == second, "the sampler stays configured across a clear and starts afresh: the same %zu sampled tokens again", first.size());

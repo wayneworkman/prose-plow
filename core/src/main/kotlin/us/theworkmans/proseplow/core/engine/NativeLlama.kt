@@ -183,17 +183,26 @@ interface NativeLlama {
     fun clearMemory()
 
     /**
-     * Replaces the sampler with a new chain built from [config]
-     * (`llama_sampler_chain_init(llama_sampler_chain_default_params())`, then
-     * `llama_sampler_chain_add` in exactly this order; free the previous chain):
+     * Replaces the sampler with a new one built from [config]. A token is then sampled in exactly
+     * this order; steps 2 to 4 are a chain (`llama_sampler_chain_init(
+     * llama_sampler_chain_default_params())`, then `llama_sampler_chain_add`; free the previous
+     * chain):
      *
-     * 1. `llama_sampler_init_logit_bias(n_vocab, count, biases)` giving every id in
-     *    [SamplerConfig.bannedTokenIds] a bias of negative infinity. Skip when the list is empty.
-     * 2. `llama_sampler_init_penalties(n_vocab, penalty_last_n, penalty_repeat, penalty_freq,
-     *    penalty_present)` with [SamplerConfig.penaltyWindow], [SamplerConfig.repetitionPenalty],
-     *    [SamplerConfig.frequencyPenalty] and [SamplerConfig.presencePenalty] in that order.
-     *    Skip when all three penalties are at their neutral values (1, 0, 0). In both calls
-     *    `n_vocab` is `llama_vocab_n_tokens(vocab)`.
+     * 1. The penalties, computed by the implementation itself from the tokens in memory and not
+     *    by `llama_sampler_init_penalties`, which would give all three the same tokens to look at.
+     *    [SamplerConfig.repetitionPenalty] covers every token in memory, the prompt as much as
+     *    the reply, and a token once however often it occurs: a score below zero is multiplied
+     *    by it, any other divided by it. [SamplerConfig.frequencyPenalty] and
+     *    [SamplerConfig.presencePenalty] cover the tokens of the reply and no token of the
+     *    prompt: the score less the frequency penalty times the number of times the token occurs
+     *    in the reply, less the presence penalty when that number is not zero. The reply is what
+     *    the memory holds from the length it had when the first token was sampled after this
+     *    call. [SamplerConfig.penaltyWindow], when it is shorter than the memory, limits all
+     *    three to the latest tokens. Nothing is done when all three penalties are at their
+     *    neutral values (1, 0, 0).
+     * 2. `llama_sampler_init_logit_bias(n_vocab, count, biases)` giving every id in
+     *    [SamplerConfig.bannedTokenIds] a bias of negative infinity, with
+     *    `llama_vocab_n_tokens(vocab)` for `n_vocab`. Skip when the list is empty.
      * 3. If [SamplerConfig.temperature] is greater than 0:
      *    `llama_sampler_init_temp(temperature)`; then `llama_sampler_init_top_k(topK)` unless
      *    topK is 0; then `llama_sampler_init_top_p(topP, 1)` unless topP is 1 or more; then
@@ -202,19 +211,28 @@ interface NativeLlama {
      *    value.
      * 4. Otherwise `llama_sampler_init_greedy()` and none of step 3.
      *
-     * The order is the one the models' reference implementations use: banned tokens and
-     * penalties act on the raw scores, the temperature comes next, and the truncations see the
+     * The order is the one the models' reference implementations use: penalties and banned
+     * tokens act on the raw scores, the temperature comes next, and the truncations see the
      * distribution after the temperature. llama.cpp's own default order applies the temperature
      * last, which gives a different nucleus; do not use it.
      *
-     * The new chain has seen no tokens. The engine calls this once at the start of every reply.
+     * What each penalty covers is likewise what it covers where the models' settings come from.
+     * A repetition penalty in a `generation_config.json` is the transformers library's, which
+     * penalises the whole sequence it is shown, prompt included; a presence penalty in a model
+     * card is the OpenAI API's, which the servers that implement it compute over the generated
+     * tokens. The penalties follow the memory: a token is covered from the moment it is
+     * evaluated, and no longer once [rewindTo], [restoreCheckpoint] or [clearMemory] has removed
+     * it.
+     *
+     * The engine calls this once at the start of every reply, which is where a reply begins for
+     * the penalties.
      */
     fun configureSampler(config: SamplerConfig)
 
     /**
-     * Chooses the next token from the prediction left by the last complete [evaluate]:
-     * `llama_sampler_sample(chain, ctx, -1)`, which also records the token in the sampler (it
-     * calls `llama_sampler_accept`), so the penalties see it from the next call on.
+     * Chooses the next token from the prediction left by the last complete [evaluate]: the
+     * penalties of [configureSampler], then what `llama_sampler_sample(chain, ctx, -1)` does. The
+     * penalties see the token once it has been evaluated, like every other token in memory.
      *
      * The token is not evaluated: the engine passes it to [evaluate] itself if the reply goes on,
      * and does not if the token ends the reply. The engine calls this only directly after a
@@ -260,8 +278,9 @@ interface EvaluationObserver {
  * @property repetitionPenalty 1 is neutral.
  * @property presencePenalty 0 is neutral.
  * @property frequencyPenalty 0 is neutral.
- * @property penaltyWindow how many of the most recently sampled tokens the penalties look at;
- *   always positive. The engine passes the context size, so that the whole reply counts.
+ * @property penaltyWindow how many of the latest tokens in memory the penalties look at; always
+ *   positive. The engine passes the context size, which is no window: the whole conversation
+ *   counts.
  * @property seed the seed of the random choice; its 32 bits are read as unsigned.
  * @property bannedTokenIds tokens that must never be returned by [NativeLlama.sampleNext].
  */

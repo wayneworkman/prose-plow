@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Runs the session conformance test (test_session) for one model of models/manifest.json.
 
-    run_session.py --bin-dir DIR --work-dir DIR --llama-src DIR [--residue] MODEL_ID
+    run_session.py --bin-dir DIR --work-dir DIR --llama-src DIR [--residue | --penalties] MODEL_ID
 
 ctest calls this (see CMakeLists.txt next to it). Finding the model follows the rules of
 native/tests/run.py, whose Runner is reused: the GGUF is located from PROSEPLOW_MODEL_OUT,
 converted on demand when the checkpoint is under PROSEPLOW_MODEL_SRC, and a model whose weights
 are not on this machine makes the test exit with 77, which ctest reports as skipped.
 
-With --residue it runs test_residue on the model file instead, which needs nothing else.
+With --residue it runs test_residue on the model file instead, which needs nothing else. With
+--penalties it runs test_penalties, which gets the committed logit reference for its prompts
+where the model has one, and the committed penalty reference where the model has one.
 
 Besides the model file the test gets:
 - for an architecture ported by this project (peacebell, boris2, shard2), the committed logit
@@ -105,6 +107,8 @@ def main() -> int:
     parser.add_argument("--llama-src", type=Path, required=True)
     parser.add_argument("--residue", action="store_true",
                         help="run test_residue (what a forgotten conversation leaves in memory) instead of test_session")
+    parser.add_argument("--penalties", action="store_true",
+                        help="run test_penalties (what the sampling penalties cover) instead of test_session")
     parser.add_argument("model")
     args = parser.parse_args()
 
@@ -115,6 +119,14 @@ def main() -> int:
         gguf = runner.gguf(entry, entry["ftype"])  # exits with 77 when the weights are not here
         if args.residue:
             return runner.binary("test_residue", "--gguf", gguf)
+        if args.penalties:
+            command = ["--gguf", gguf]
+            if models.CONVERTERS[entry["converter"]].validation_f32:
+                command += ["--ref", harness.DATA / f"{entry['id']}-logits.bin"]
+            penalty_reference = harness.DATA / f"{entry['id']}-penalty.bin"
+            if penalty_reference.is_file():
+                command += ["--penalty-ref", penalty_reference]
+            return runner.binary("test_penalties", *command)
         size = gguf.stat().st_size
 
         command = ["--gguf", gguf]

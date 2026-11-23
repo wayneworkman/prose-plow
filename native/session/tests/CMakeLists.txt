@@ -27,6 +27,34 @@ target_include_directories(test_residue PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../
 target_link_libraries(test_residue PRIVATE proseplow_session)
 target_compile_options(test_residue PRIVATE -Wall -Wextra -Wpedantic)
 
+# What the sampling penalties cover: the session's choices against a second context on the same
+# file and the penalties' definitions, and for Boris-2 against replies of its reference library.
+add_executable(test_penalties test_penalties.cpp)
+target_include_directories(test_penalties PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
+target_link_libraries(test_penalties PRIVATE proseplow_session)
+target_compile_options(test_penalties PRIVATE -Wall -Wextra -Wpedantic)
+
+# One penalties entry per bundled model, and one for Shard-2: the kinds of memory go back in
+# different ways, and what the penalties cover has to survive each of them.
+function(proseplow_add_penalties_test model)
+    add_test(NAME ${model}.penalties
+        COMMAND "${PROSEPLOW_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/run_session.py"
+                --bin-dir "$<TARGET_FILE_DIR:test_penalties>"
+                --work-dir "${CMAKE_BINARY_DIR}/test-work"
+                --llama-src "${PROSEPLOW_LLAMA_SRC}"
+                --penalties
+                ${model})
+    set_tests_properties(${model}.penalties PROPERTIES
+        SKIP_RETURN_CODE 77
+        RESOURCE_LOCK proseplow_cpu
+        TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;CUDA_VISIBLE_DEVICES=")
+endfunction()
+proseplow_add_penalties_test(peacebell-v1-291m)
+proseplow_add_penalties_test(boris-2-instruct)
+proseplow_add_penalties_test(qwen3.5-0.8b)
+proseplow_add_penalties_test(shard-2)
+
 # One residue entry per bundled model: they are what the app forgets.
 function(proseplow_add_residue_test model)
     add_test(NAME ${model}.residue

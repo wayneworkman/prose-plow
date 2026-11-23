@@ -353,8 +353,10 @@ int32_t pp_session_save_checkpoint(struct pp_session * session);
 // Brings the memory back to the length it had when the checkpoint was saved:
 // llama_state_seq_set_data_ext with the same flag, then llama_memory_seq_rm from that length.
 // The caller guarantees that the memory still begins with the tokens it held then and is at
-// least as long. Returns true when the memory now has the saved length; false for an unknown
-// handle or when either call failed (clear the memory then). The checkpoint stays valid.
+// least as long: the restored state belongs to those tokens, and they are the tokens the
+// penalties then take the memory to hold (see pp_session_configure_sampler). Returns true when
+// the memory now has the saved length; false for an unknown handle or when either call failed
+// (clear the memory then). The checkpoint stays valid.
 bool pp_session_restore_checkpoint(struct pp_session * session, int32_t checkpoint);
 
 // Zeroes and frees a checkpoint. An unknown handle is ignored.
@@ -365,15 +367,18 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
 
 // Forgets the conversation: this is what runs when the app locks. Afterwards the memory is
 // empty, every checkpoint handle is unknown, no prediction is ready, the model is still loaded
-// and the sampler is still configured as it was, having seen no tokens.
+// and the sampler is still configured as it was: its random numbers start where they started,
+// and no reply has begun.
 //
 // What is done, in this order:
 // - every checkpoint is overwritten with zeros and freed;
 // - the scores of the last prediction and the session's own copy of them are overwritten;
-// - the sampler chain's record of the sampled tokens is overwritten, and the chain is freed;
+// - the sampler chain is freed (it holds no token of a conversation);
 // - the token buffer of the batch is overwritten, and the batch is freed;
 // - llama_memory_clear(mem, true) overwrites the key-value and state buffers of the context,
 //   and the context is freed with everything it owns;
+// - the session's record of the tokens in memory, which the penalties are computed from, is
+//   overwritten and emptied;
 // - a new context, a new batch and a new sampler chain are created from the parameters the old
 //   ones were created with (the thread pool is kept: it holds nothing of a conversation);
 // - the allocator is asked to give its free pages back to the system (malloc_trim with glibc,
@@ -408,11 +413,11 @@ struct pp_sampler_config {
     int32_t  top_k;               // 0 disables it
     float    top_p;               // 1 or more disables it
     float    min_p;               // 0 or less disables it
-    float    repetition_penalty;  // 1 is neutral
-    float    presence_penalty;    // 0 is neutral
-    float    frequency_penalty;   // 0 is neutral
-    int32_t  penalty_window;      // how many of the latest sampled tokens the penalties see; at least 1. More than
-                                  // the context holds is taken as the context size: there are no more tokens to see
+    float    repetition_penalty;  // 1 is neutral; covers every token in memory
+    float    presence_penalty;    // 0 is neutral; covers the tokens of the reply
+    float    frequency_penalty;   // 0 is neutral; covers the tokens of the reply
+    int32_t  penalty_window;      // how many of the latest tokens in memory the penalties look at; at least 1. The
+                                  // context size or more is no window, which is what the definitions below have
     uint32_t seed;
     const llama_token * banned_tokens; // tokens that must never be sampled; may be NULL when n_banned_tokens is 0
     int32_t  n_banned_tokens;     // at most the size of the vocabulary
@@ -424,16 +429,39 @@ struct pp_sampler_config {
 // denormal). Greedy decoding is what such a temperature means, so it is what it gets.
 #define PP_TEMPERATURE_MIN 1e-6f
 
-// Replaces the sampler with a new chain, in exactly this order:
-//   1. llama_sampler_init_logit_bias with minus infinity for every banned token (skipped when
+// Replaces the sampler. A token is then sampled in exactly this order:
+//   1. the penalties, computed by the session (nothing is done when all three are neutral);
+//   2. llama_sampler_init_logit_bias with minus infinity for every banned token (skipped when
 //      there is none);
-//   2. llama_sampler_init_penalties (skipped when all three penalties are neutral);
 //   3. for a temperature of PP_TEMPERATURE_MIN or more: llama_sampler_init_temp, then top_k,
 //      top_p and min_p (each skipped when disabled), then llama_sampler_init_dist(seed);
 //   4. otherwise llama_sampler_init_greedy alone.
-// Banned tokens and penalties act on the raw scores, the temperature comes next and the
+// Penalties and banned tokens act on the raw scores, the temperature comes next and the
 // truncations see the distribution after it: the order of the models' reference
-// implementations, not llama.cpp's default order. The new chain has seen no tokens.
+// implementations, not llama.cpp's default order.
+//
+// What the penalties cover. Each covers what it covers where the settings of the models come
+// from, and those are two different things:
+// - The repetition penalty covers every token in memory, the prompt as much as the reply, and a
+//   token once however often it occurs: a score below zero is multiplied by the penalty, any
+//   other divided by it. This is the repetition_penalty of the transformers library
+//   (RepetitionPenaltyLogitsProcessor, which is shown the whole sequence), the meaning of that
+//   name in a model's generation_config.json; vLLM computes the same over prompt and output.
+// - The presence and frequency penalties cover the tokens of the reply and no token of the
+//   prompt: the score less frequency_penalty times the number of times the token occurs in the
+//   reply, less presence_penalty when that number is not zero. This is the definition of the
+//   OpenAI API, which vLLM and SGLang, the servers Qwen3.5's model card names, implement by
+//   counting the tokens of the output.
+// llama.cpp's own penalties do neither: they are computed from the tokens its sampler was told
+// of, which in this library were the sampled ones, so a repetition penalty did not reach the
+// prompt; in llama.cpp's server they are prompt and reply for all three alike.
+//
+// The session computes them from its own record of the tokens in memory, so they follow the
+// memory: a token is covered from the moment it is evaluated, whoever chose it, and no longer
+// once it is removed (pp_session_rewind_to, pp_session_restore_checkpoint,
+// pp_session_clear_memory). The reply is what the memory holds from the length it had when the
+// first token was sampled after this call; pp_session_clear_memory ends it as this call does.
+// Configure the sampler once for every reply, before its first token is sampled.
 //
 // Returns PP_STATUS_INVALID_ARGUMENT for a value outside the ranges above, a number that is not
 // finite, more banned tokens than the vocabulary has, or a banned token outside the
@@ -442,11 +470,13 @@ int32_t pp_session_configure_sampler(struct pp_session * session, const struct p
 
 // Chooses the next token from the prediction left by the last complete pp_session_evaluate:
 // what llama_sampler_sample(chain, ctx, -1) does, step by step (the scores into a candidate
-// list, llama_sampler_apply, llama_sampler_accept), so that the candidate list is the
-// session's own and is overwritten before the function returns, as are the scores themselves.
-// The last sampler of the chain, the one that chooses, is applied on its own after the others,
-// and only when there is something to choose from. The chosen token is recorded in the
-// sampler. It is not evaluated. Valid once per complete evaluation.
+// list, the penalties, llama_sampler_apply, llama_sampler_accept), so that the candidate list
+// is the session's own and is overwritten before the function returns, as are the scores
+// themselves. The last sampler of the chain, the one that chooses, is applied on its own after
+// the others, and only when there is something to choose from. The chosen token is not
+// evaluated, and it counts for the penalties only once it is: pass it to pp_session_evaluate
+// before the next token is sampled, as a reply needs anyway. Valid once per complete
+// evaluation.
 //
 // Returns PP_STATUS_SAMPLING_FAILED when no sampler is configured, when no fresh prediction is
 // ready, and when nothing is left to choose from after the bans, penalties, temperature and

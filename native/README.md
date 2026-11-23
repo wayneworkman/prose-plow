@@ -187,6 +187,7 @@ reported by ctest as skipped, never as failed.
 | `boris-2-instruct.chat-f32`, `.chat-f16` | A session of eight chat requests served from one context whose memory is kept between them (a turn appended, the same request again, an earlier message changed, another beginning): the encoder gives the reference's prompt tokens; every rewind goes through a checkpoint (the cut is refused before the restore and succeeds after it) or starts over when none fits; each reply, ended by the stop string, equals the reply the reference generated from scratch, as tokens and as text (F16: reported) |
 | `boris-2-instruct.no-ngram-lookup` | The F32 file with its four lookup arrays removed, against the reference with the lookup switched off: all the checks of `logits-f32`. It separates Canon and the hybrid memory from the n-gram input |
 | `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
+| `<model>.penalties` | For each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2, what the sampling penalties cover. A second context on the same file, which the session does not know, scores the same memory, and the penalties' definitions are applied to its scores as the test writes them out: the session's greedy choice must be the token that comes out on top, step by step, for a repetition penalty over the whole memory (1.1 and 1.6), for presence and frequency penalties over the reply alone (Qwen3.5's 2.0 among them), after going back to the end of the prompt and into the middle of a reply without configuring the sampler again (by removing the end of the memory where the model allows it, and through a checkpoint), with every checkpoint dropped, after a clear, after a prompt whose evaluation was cancelled and finished by a second call, and with a window. Each check names the mistake it is there to catch (a penalty over the reply alone, one that counts the prompt too, a record that still holds tokens which left the memory or lacks tokens that are in it) and fails when no step would have exposed it. Boris-2 further, against `boris-2-instruct-penalty.bin`: six requests of a conversation served from one memory, greedy with the model's repetition penalty of 1.1, choose the tokens that transformers' `generate()` chooses (128 reply tokens; a reference choice with a lead below 0.1 is reported, not required); at the first position of each reply, where only the prompt can be penalised, the logits and the scores after the penalty are the reference's to within 0.05 and the session's first choices in order are the reference's; with the penalty off the first token is the reference's without a penalty |
 | `<model>.residue` | For the three bundled models and shard-2: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
@@ -282,9 +283,13 @@ The reference is always the PyTorch model, fp32 on the CPU.
   `<model>-logits.bin` (five conversations, for Shard-2 five prompts, with the reference's
   greedy reply; the top 20 logits at every position and the whole logit vector at the last
   prompt position); `boris-2-instruct-chat.bin` (the chat session with the reference's
-  replies); and `shard-2-long-logits.bin` (the sequences longer than its attention window: 300,
-  600 and 1,500 tokens sampled by the reference, and one that feeds every special id). These
-  pin the expected behaviour independently of what is installed.
+  replies); `boris-2-instruct-penalty.bin` (6,098 bytes: six requests of a conversation with
+  the replies that transformers' `generate()` gives with the model's repetition penalty of
+  1.1 and without it, the lead of every chosen token, and the 16 highest scores of each
+  reply's first position before and after the penalty); and `shard-2-long-logits.bin` (the
+  sequences longer than its attention window: 300, 600 and 1,500 tokens sampled by the
+  reference, and one that feeds every special id). These pin the expected behaviour
+  independently of what is installed.
 - Generated on demand into the build tree, because they are too large to commit: the logits of
   the whole vocabulary at every position (the KL test needs them; for Shard-2 both precisions
   are judged against them, and one more file covers a sequence of 8,192 tokens, 186 MB in
@@ -296,7 +301,7 @@ The reference is always the PyTorch model, fp32 on the CPU.
   bit on another machine could choose another token. Sampling and greedy choices are made
   once, when a committed file is written.
 
-The generators are in `tests/refgen/`; the three binary formats are described in
+The generators are in `tests/refgen/`; the four binary formats are described in
 `tests/refgen/formats.py`. To regenerate the committed files after a checkpoint or tokenizer
 changes (with exactly the package versions of `requirements.txt`):
 
@@ -305,12 +310,14 @@ python3 native/tests/refgen/gen_logit_ref.py --model-dir /path/to/checkpoint --o
 python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/peacebell --out native/tests/data/peacebell-v1-tokens.bin
 python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/boris-2 --out native/tests/data/boris-2-instruct-tokens.bin
 python3 native/tests/refgen/gen_chat_ref.py --model-dir /path/to/boris-2 --out native/tests/data/boris-2-instruct-chat.bin
+python3 native/tests/refgen/gen_penalty_ref.py --model-dir /path/to/boris-2 --out native/tests/data/boris-2-instruct-penalty.bin
 python3 native/tests/refgen/gen_logit_ref.py --model-dir /path/to/shard-2 --long --out native/tests/data/shard-2-long-logits.bin
 python3 native/tests/refgen/gen_token_vectors.py --model-dir /path/to/shard-2 --out native/tests/data/shard-2-tokens.bin
 ```
 
 The Boris-2 reference has no cache, so its replies are made by a forward pass over the whole
-prefix for every token: generating the three files takes about a minute with 6 threads. The
+prefix for every token: generating the first three files takes about a minute with 6 threads
+and the penalty reference a little over two minutes. The
 three Shard-2 files take about a minute as well. Run these with `python3 -I` when the
 checkpoint directory is not your own work: `-I` keeps the current directory and the user's
 site packages off the module search path.
@@ -681,8 +688,8 @@ phone runs. The header is the reference for every function; this is the outline:
 | `pp_session_evaluate` | Chunks through `llama_batch_ext` and `llama_process` with explicit positions and output for the last token only; a progress and a cancel callback |
 | `pp_session_rewind_to` | `llama_memory_seq_rm(mem, 0, n, -1)` and its own answer, which is "no" for a model with recurrent state. For a model with windowed layers the session answers "no" itself when those layers no longer hold the window before the cut (see below). Nothing ever calls `llama_memory_seq_add` or `llama_memory_seq_div` |
 | `pp_session_save_checkpoint`, `..._restore_checkpoint`, `..._drop_checkpoint` | The partial sequence state (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) kept in native memory with the token count it belongs to; restoring is the state, then the cut, in that order (see "Checkpoints" above) |
-| `pp_session_clear_memory` | Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens, the sampler's record of the reply); the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
-| `pp_session_configure_sampler`, `pp_session_sample_next` | A chain in a fixed order: banned tokens (logit bias of minus infinity), penalties, then for a temperature of a millionth or more temperature, top-k, top-p, min-p and the random choice, otherwise greedy; then what `llama_sampler_sample` does (`llama_sampler_apply` on the scores, `llama_sampler_accept`), once per complete evaluation, on a candidate list of the session's own, with the sampler that chooses applied after the others and only when there is something to choose from |
+| `pp_session_clear_memory` | Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens) and the session's own record of the tokens in memory; the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
+| `pp_session_configure_sampler`, `pp_session_sample_next` | A fixed order: the penalties, which the session computes itself from its record of the tokens in memory (see "Penalties that cover what their definitions cover" below), then a chain of banned tokens (logit bias of minus infinity) and, for a temperature of a millionth or more, temperature, top-k, top-p, min-p and the random choice, otherwise greedy; this is what `llama_sampler_sample` does (`llama_sampler_apply` on the scores, `llama_sampler_accept`), once per complete evaluation, on a candidate list of the session's own, with the sampler that chooses applied after the others and only when there is something to choose from |
 | `pp_session_close` | Everything freed, after the same overwriting as a clear |
 
 A failure is a status code, and the codes are the ones of the Kotlin `NativeLlamaException`,
@@ -740,7 +747,7 @@ wrong on a phone or for one of the models:
   | Model embedded in a file | The header and every tensor end within offset + length | `PP_STATUS_LOAD_FAILED`, before anything is loaded |
   | Text to tokenise | 262144 bytes (`PP_TOKENIZE_BYTES_MAX`) | `PP_ERROR` (`PP_STATUS_TOKENIZE_FAILED`) |
   | Checkpoints held at once | 8 (`PP_CHECKPOINTS_MAX`) | -1, until one is dropped |
-  | Penalty window | The context size | Taken as the context size: there are no more tokens to see |
+  | Penalty window | None | The context size or more is no window: the penalties look at the whole memory |
   | Banned tokens | The size of the vocabulary | `PP_STATUS_INVALID_ARGUMENT` |
 
   The ceiling of 32768 is the largest context any model of the kind this app bundles was
@@ -762,14 +769,40 @@ wrong on a phone or for one of the models:
   instance, would divide the scores into infinities; it selects greedy decoding, which is what
   it means.
 
+- **Penalties that cover what their definitions cover.** The settings a model comes with name
+  penalties, and what a name means is decided where the settings come from. `repetition_penalty`
+  in a `generation_config.json` (Boris-2-Instruct: 1.1) is the transformers library's: its
+  processor is shown the whole sequence, so it penalises every token of the prompt and of the
+  reply so far, each once, with no window. `presence_penalty` in Qwen3.5's model card (2.0) is
+  the OpenAI API's, and the servers that card names for it count the tokens of the output only
+  (vLLM's `apply_penalties` in `vllm/model_executor/layers/utils.py` subtracts frequency and
+  presence over the output tokens and applies the repetition penalty over prompt and output;
+  SGLang's `sampling/penalties.py` keeps "output-token counts" for all three). llama.cpp's
+  penalties are one sampler for all three, computed from whatever tokens it was told of: in
+  its own server that is prompt and reply within a window of 64, and in this library it was
+  the sampled tokens, so the repetition penalty never reached the prompt and Boris-2 did not
+  generate what its reference generates. The session therefore computes the penalties itself,
+  with llama.cpp's arithmetic, from a record it keeps of the tokens in memory: the repetition
+  penalty over all of it, presence and frequency over the part from where the reply began
+  (the length of the memory when the first token is sampled after the sampler was configured).
+  The record is one id per position, written when tokens are evaluated and cut when the end of
+  the memory is removed, a checkpoint restored or the conversation forgotten, so a token is
+  covered exactly while it is in the memory, whoever chose it; a checkpoint holds none of it.
+  It is the session's own allocation, sized for a full context when the context is created
+  and overwritten wherever it is cut, which the sampler's ring buffer and table were not
+  entirely. Nothing changes for a caller: `pp_sampler_config` is what it was, and a window of
+  the context size, which the engine passes, is no window.
+
 What a caller must know beyond the header is little: one thread should make all the calls of a
 session, a prediction exists only between a complete evaluation and the next call that changes
 the memory (sampling at any other time is an error, not stale output), and after a restore at
 least one token has to be evaluated before sampling, because a checkpoint holds state, not
 scores.
 
-The tests are `session/tests/test_session.cpp`, registered as `<model>.session` and run with
-the rest by `ctest` and `tools/host-check.sh` (`ctest -R session` for these alone). Each takes
+The tests are `session/tests/test_session.cpp`, registered as `<model>.session`, and
+`session/tests/test_penalties.cpp`, registered as `<model>.penalties` (a few seconds to half a
+minute each), run with the rest by `ctest` and `tools/host-check.sh` (`ctest -R session` for
+the first alone, `ctest -R penalties` for the second). Each session test takes
 between ten seconds and two minutes, depending on the model and on what else the machine is
 doing, and writes up to 2.2 GB into the build directory while it runs, the file that holds the
 model next to another model, and deletes it afterwards. The checks that hand the session a
@@ -785,9 +818,8 @@ model stays loaded and the thread pool is kept. Before each is freed, what it ho
 conversation and can be reached is overwritten: every checkpoint, the scores of the last
 prediction (which are also overwritten as soon as a token has been sampled from them, and when
 the next evaluation begins), the session's candidate list, the tokens in the batch, the
-sampler's record of the sampled tokens (by accepting token 0 once for every place of its ring
-buffer, which `llama_sampler_reset` leaves as it is), and the key-value and state buffers of
-the memory. The front-end overwrites its normalised copy of a text and the token ids it
+session's record of the tokens in memory, from which its penalties are computed (the sampler
+chain itself holds no token), and the key-value and state buffers of the memory. The front-end overwrites its normalised copy of a text and the token ids it
 produced before it frees them, and the JNI binding its copies of the arrays it was handed.
 Then the allocator is asked to give its free pages back.
 

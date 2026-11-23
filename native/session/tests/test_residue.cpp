@@ -18,7 +18,8 @@
 // What it requires and what it only reports follows what the session promises (see
 // pp_session_clear_memory in the header):
 //   - required: no token ids of the reply after forgetting. The only place that holds them in
-//     order is the sampler's record, which the session overwrites.
+//     order is the session's record of the tokens in memory, from which its penalties are
+//     computed, and the session overwrites it.
 //   - reported, not required: the text and the prompt's token ids. llama.cpp copies both into
 //     allocations of its own and frees them as they are, so what a scan finds depends on what
 //     the allocator did with those blocks since. The numbers are the measurement to quote; a
@@ -27,7 +28,7 @@
 // A model can repeat its prompt, and Qwen3.5 does with this text: ten of its twelve reply
 // tokens are a stretch of the prompt. Windows of the reply that also occur in the prompt are
 // therefore not counted as the reply's: finding one says where the prompt is, which is the
-// second point, and nothing about the sampler. (This was learnt on a phone, where such windows
+// second point, and nothing about that record. (This was learnt on a phone, where such windows
 // were found after forgetting, in the copy llama.cpp makes of each micro-batch's tokens.)
 //
 // Where a process cannot read itself through /proc/self/mem (anything but Linux) the program
@@ -338,7 +339,8 @@ int main(int argc, char ** argv) {
     found after_tokenize;
     scan(p, after_tokenize);
 
-    // --- Evaluate it, sample a reply with penalties (which is what keeps a record of it) ---
+    // --- Evaluate it, sample a reply with a penalty (the session keeps a record of the tokens in
+    // memory for its penalties whether one is set or not; this makes it read the record too) ---
     pp_sampler_config config = {};
     config.top_p = 1.0f;
     config.repetition_penalty = 1.1f;
