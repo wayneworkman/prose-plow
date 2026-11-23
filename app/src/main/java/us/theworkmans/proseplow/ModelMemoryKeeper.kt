@@ -1,11 +1,13 @@
 package us.theworkmans.proseplow
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,7 +37,11 @@ import java.util.concurrent.atomic.AtomicInteger
  *   running is joined, and when that did not leave the memory on disk one is started with
  *   [SaveTrigger.LOCK], all within [saveBoundMillis]. "Lock now" ([SessionClose.IMMEDIATE])
  *   waits for nothing and starts nothing.
- * - **The bound.** When it is reached, or at once for "Lock now", the save is stopped both ways:
+ * - **Hurrying.** When what keeps the process awake ends during an unattended close, or before
+ *   it, [hurry] stops the save at once and ends the wait of [close] for it: a wait that the
+ *   phone may sleep through must not keep the key in memory.
+ * - **The bound.** When it is reached, at once for "Lock now", and when the close is told to
+ *   hurry, the save is stopped both ways:
  *   its coroutine is cancelled (the engine stops at its next piece) and [MemoryStore.cancelSave]
  *   lets the engine's thread go within one chunk, whatever it waits for. Neither is waited for:
  *   the session goes on to forget and the lock destroys the key, after which no further chunk
@@ -79,6 +85,9 @@ internal class ModelMemoryKeeper(
     /** Set when the session closes: no save is begun from then on. */
     @Volatile private var closed = false
 
+    /** Completed by [hurry]: the close waits for no save from then on. */
+    private val hurried = CompletableDeferred<Unit>()
+
     /** Calls of [MemoryVault.beginSave] that are under way; see [awaitStopped]. */
     private val beginning = AtomicInteger(0)
 
@@ -115,6 +124,30 @@ internal class ModelMemoryKeeper(
         if (closed || saving?.isActive == true) return
         val key = heldConversation() ?: return
         start(vault, key, SaveTrigger.LEFT_SCREEN, outOfSight)
+    }
+
+    /**
+     * Whether a close as [SessionClose.UNATTENDED] could save anything now: the switch is on, the
+     * close has not happened and has not been told to hurry, and either a save is running (which
+     * that close would join) or the memory on disk is not known to be the one in the engine. It
+     * says nothing of whether the engine holds a conversation worth saving; the session asks
+     * that. Main thread; reads only fields, never waits for the engine or the disk.
+     */
+    fun closeCouldSave(): Boolean {
+        if (closed || current == null || hurried.isCompleted) return false
+        if (saving?.isActive == true) return true
+        return !(onDiskAt >= 0 && onDiskAt == requestsBuilt())
+    }
+
+    /**
+     * What keeps the process alive and awake has ended during the session's unattended close, or
+     * before it (main thread, from the lock). A save that is running is stopped both ways at once,
+     * and [close] waits for none from now on, whatever kind of close it is asked for. Returns at
+     * once; calling it again does nothing more.
+     */
+    fun hurry() {
+        hurried.complete(Unit)
+        stopSaving()
     }
 
     /** The memory in the engine was just read back from the one on disk ([InferenceEngine.restoreMemory]). */
@@ -173,8 +206,9 @@ internal class ModelMemoryKeeper(
      * The session closes; see the class comment. With [SessionClose.UNATTENDED] and the switch on,
      * waits at most [saveBoundMillis] for a save of the conversation the engine holds: the one
      * running, then, unless that left the memory on disk as it is, one with [SaveTrigger.LOCK].
-     * Then, and at once for [SessionClose.IMMEDIATE], nothing more may be begun and whatever is
-     * still saving is stopped. Returns within the bound whatever the engine or the disk do.
+     * Then, and at once for [SessionClose.IMMEDIATE] or once the close has been told to [hurry],
+     * nothing more may be begun and whatever is still saving is stopped. A [hurry] during the
+     * wait ends it at once. Returns within the bound whatever the engine or the disk do.
      * Calling it again does nothing more: after the first call nothing can be saved, so a later
      * [SessionClose.UNATTENDED] waits for nothing either (the session calls it early for "Lock
      * now", before its chats are shut down, and again in its usual place).
@@ -182,8 +216,18 @@ internal class ModelMemoryKeeper(
     suspend fun close(how: SessionClose) {
         try {
             val vault = current
-            if (how == SessionClose.UNATTENDED && vault != null) {
-                withTimeoutOrNull(saveBoundMillis) { saveForLock(vault) }
+            if (how == SessionClose.UNATTENDED && vault != null && !hurried.isCompleted) {
+                withTimeoutOrNull(saveBoundMillis) {
+                    coroutineScope {
+                        val save = launch { saveForLock(vault) }
+                        val hurry = launch {
+                            hurried.await()
+                            save.cancel()
+                        }
+                        save.join()
+                        hurry.cancel()
+                    }
+                }
             }
         } finally {
             closed = true
@@ -203,7 +247,7 @@ internal class ModelMemoryKeeper(
                 if (!running.isCancelled) throw e
             }
         }
-        if (onDiskAt >= 0 && onDiskAt == requestsBuilt()) return
+        if (hurried.isCompleted || (onDiskAt >= 0 && onDiskAt == requestsBuilt())) return
         val key = heldConversation() ?: return
         start(vault, key, SaveTrigger.LOCK, outOfSight = false).await()
     }

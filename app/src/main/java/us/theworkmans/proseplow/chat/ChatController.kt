@@ -45,6 +45,7 @@ import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import us.theworkmans.proseplow.data.CoalescingWriter
 import us.theworkmans.proseplow.data.MemoryConversation
 import us.theworkmans.proseplow.data.MemoryConversations
+import us.theworkmans.proseplow.data.RequestText
 import us.theworkmans.proseplow.data.SessionIndex
 import us.theworkmans.proseplow.data.SessionStore
 import java.io.IOException
@@ -198,10 +199,12 @@ enum class ChatNotice {
  *   asked for again, a retry, an expiry) until the engine has read a request built after that
  *   change. So a save at a lock that comes before that request cannot keep the old text. A
  *   change of a system prompt is such a change too ([systemPromptChanged]): the prompt is part
- *   of what the engine holds.
+ *   of what the engine holds. And it tells the store the system prompt a request of the
+ *   conversation would carry now, which the store binds a memory to, so that a memory made with
+ *   another prompt is refused at the next unlock even where its deletion never happened.
  *
- * Threading: everything except the constructor, [shutdown], [conversation], [requestsBuilt] and
- * [heldConversationKey] is called on the main dispatcher and all state is confined to it. The
+ * Threading: everything except the constructor, [shutdown], [conversation], [requestsBuilt],
+ * [heldConversationKey] and [holdsSavableConversation] is called on the main dispatcher and all state is confined to it. The
  * constructor reads the chat that was on screen last from the disk, so it is called off the
  * main thread, when the session is opened.
  *
@@ -1061,16 +1064,29 @@ class ChatController(
     fun heldConversationKey(): String? = engineHolds?.let(::conversationKeyOf)
 
     /**
-     * The conversation [conversationKey] names, for the store of the saved memory; see
-     * [MemoryConversations.conversation]. Null for a key that is not a chat's, for a chat that
-     * was deleted, and for one whose stored messages were changed since the engine last read a
-     * request of it (see the class comment). A chat that was not opened since the unlock is read
-     * from the disk. From any thread.
+     * True when the engine holds a chat's conversation, as far as this class knows, and no change
+     * since the engine last read it hides that chat from the store ([conversation]): there is a
+     * conversation the store could save now. Reads only what is in memory and takes no lock, so
+     * that the lock can ask it on the main thread at the moment it decides how to close.
+     */
+    fun holdsSavableConversation(): Boolean = engineHolds?.let { !staleSince.containsKey(it) } == true
+
+    /**
+     * The conversation [conversationKey] names as it would be asked of the model [modelId] now,
+     * for the store of the saved memory; see [MemoryConversations.conversation]. Null for a key
+     * that is not a chat's, for a model this build does not offer, for a chat that was deleted,
+     * and for one whose stored messages were changed since the engine last read a request of it
+     * (see the class comment). A chat that was not opened since the unlock is read from the disk.
+     * Its [MemoryConversation.requestText] is what a request to that model carries besides the
+     * messages now: the system prompt the settings hold for it, taken from [requestSettings] as a
+     * reply's request takes it, and no other system text, because nothing sets any yet. From any
+     * thread.
      *
      * @throws IOException when the chat's file exists and cannot be read.
      */
-    override fun conversation(conversationKey: String): MemoryConversation? {
+    override fun conversation(conversationKey: String, modelId: String): MemoryConversation? {
         val id = chatIdOf(conversationKey) ?: return null
+        val spec = models.firstOrNull { it.id == modelId } ?: return null
         if (staleSince.containsKey(id)) return null
         val listed = _state.value.chats.firstOrNull { it.id == id }
         val session = sessions[id] ?: run {
@@ -1082,8 +1098,17 @@ class ChatController(
             }
         }
         val oldest = listOfNotNull(listed?.oldestMessageAtMillis, session.messages.minOfOrNull { it.createdAtMillis }).minOrNull() ?: return null
-        return MemoryConversation(id, session.messages, oldest)
+        return MemoryConversation(id, session.messages, oldest, requestTextFor(spec))
     }
+
+    /**
+     * What a request to [spec] carries into the prompt besides the messages, as [run] builds one
+     * now: the system prompt from [requestSettings], and no other system text
+     * ([us.theworkmans.proseplow.core.engine.GenerationRequest.extraSystemText]), which nothing
+     * sets yet. When tools add such text, it is to be taken from the same place as the request
+     * takes it, here as there, so that a memory made with other tool text is not restored.
+     */
+    private fun requestTextFor(spec: ModelSpec): RequestText = RequestText(requestSettings(spec).systemPrompt, extraSystemText = null)
 
     private fun onEvent(reply: Running, event: GenerationEvent) {
         val session = sessions[reply.sessionId] ?: return

@@ -75,9 +75,15 @@ class MemoryStoreTest {
     /** The conversations the session knows, by conversation key. */
     private val chats = HashMap<String, MemoryConversation>()
     private var conversationsFail = false
-    private val conversations = MemoryConversations { key ->
+    /** What a request to each model carries besides the messages now, by model id; none for a model not named. */
+    private val requestTexts = mutableMapOf("model-a" to RequestText("Answer briefly.", null))
+
+    /** The models the store asked about, in order. */
+    private val modelsAsked = ArrayList<String>()
+    private val conversations = MemoryConversations { key, modelId ->
         if (conversationsFail) throw IOException("The chats cannot be read now")
-        chats[key]
+        modelsAsked += modelId
+        chats[key]?.copy(requestText = requestTexts[modelId] ?: RequestText(null, null))
     }
 
     private fun store(cipher: ChunkCipher = this.cipher) = MemoryStore(
@@ -100,7 +106,7 @@ class MemoryStoreTest {
     /** A chat the session knows under the key `k-<id>`, with a file. */
     private fun chat(id: String = "c1", messages: List<ChatMessage> = messagesOf(id), oldest: Long = messages.minOf { it.createdAtMillis }): MemoryConversation {
         File(sessions, "$id.enc").writeText("a chat")
-        return MemoryConversation(id, messages, oldest).also { chats["k-$id"] = it }
+        return MemoryConversation(id, messages, oldest, RequestText(null, null)).also { chats["k-$id"] = it }
     }
 
     private fun changeMessages(id: String = "c1", change: (List<ChatMessage>) -> List<ChatMessage>) {
@@ -224,7 +230,7 @@ class MemoryStoreTest {
     @Test
     fun imagesOfEverySizeAroundAChunkComeBack() {
         chat()
-        val header = MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), memoryOf(ByteArray(0))).size
+        val header = MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), MemoryStore.requestDigestOf(RequestText(null, null)), memoryOf(ByteArray(0))).size
         for (size in listOf(0, 1, SMALL - header - 1, SMALL - header, SMALL - header + 1, 2 * SMALL - header, 2 * SMALL)) {
             val image = image(size, seed = size)
             assertTrue("size $size", store().save(memoryOf(image), image))
@@ -244,7 +250,7 @@ class MemoryStoreTest {
     }
 
     private fun memoryOfHeaderSize(image: ByteArray) =
-        MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), memoryOf(image)).size.toLong()
+        MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), MemoryStore.requestDigestOf(RequestText(null, null)), memoryOf(image)).size.toLong()
 
     /** Catches a store that keeps two memories, or the old one of another chat after a new one. */
     @Test
@@ -271,6 +277,8 @@ class MemoryStoreTest {
         build = BuildIdentity(versionCode = 10203, lastUpdateMillis = 1_690_000_000_000L)
         modelLengths.clear()
         modelLengths["model-a"] = 600_000_000L
+        requestTexts.clear()
+        requestTexts["model-a"] = RequestText("Answer briefly.", null)
     }
 
     /**
@@ -309,6 +317,10 @@ class MemoryStoreTest {
             "a second memory file" to { memoryFile().copyTo(memoryFile("c2")) },
             "a memory file whose name no chat has" to { assertTrue(memoryFile().renameTo(File(memoryDir, "not a chat.enc"))) },
             "an empty file" to { rewrite(memoryFile()) { ByteArray(0) } },
+            "the system prompt replaced" to { requestTexts["model-a"] = RequestText("Answer at length.", null) },
+            "the system prompt cleared" to { requestTexts["model-a"] = RequestText(null, null) },
+            "the system prompt made empty" to { requestTexts["model-a"] = RequestText("", null) },
+            "further system text added" to { requestTexts["model-a"] = RequestText("Answer briefly.", "A tool.") },
         )
         for ((case, change) in cases) {
             resetWorld()
@@ -327,7 +339,7 @@ class MemoryStoreTest {
     fun aHeaderOfAnotherFormatVersionIsDeleted() {
         chat()
         val image = image(100)
-        val header = MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), memoryOf(image)).encode()
+        val header = MemoryHeader(build, 600_000_000L, "c1", "c1-u1", 4, MemoryStore.digestOf(messagesOf("c1")), MemoryStore.requestDigestOf(RequestText(null, null)), memoryOf(image)).encode()
         header[1] = 2
         memoryDir.mkdirs()
         SealedStreamFile(memoryFile(), MemoryStore.purposeOf("c1"), cipher, SMALL).write(t0).use { writer ->
@@ -354,6 +366,10 @@ class MemoryStoreTest {
 
         memoryFile().setLastModified(t0 - DAY_MILLIS)
         assertEquals("an earlier file date only deletes it earlier while locked", memory, store().saved())
+
+        requestTexts["model-b"] = RequestText("Another model's prompt", null)
+        assertEquals("the prompt of another model does not concern it", memory, store().saved())
+        assertEquals("the store asks for the request text of the memory's own model", setOf("model-a"), modelsAsked.toSet())
 
         lifetime = MessageLifetime.NEVER
         clock.now = t0 + 400 * DAY_MILLIS
@@ -822,6 +838,67 @@ class MemoryStoreTest {
         assertEquals(messages.map { it.text.toByteArray(Charsets.UTF_8).size }, seen.map { it.size })
         assertTrue("every array is zeros", seen.all { bytes -> bytes.all { it == 0.toByte() } })
         assertArrayEquals("and the digest is as before", digest, MemoryStore.digestOf(messages))
+    }
+
+    /**
+     * A memory made with one system prompt is refused, and deleted, by a restore begun once the
+     * conversation would be asked with another: the binding beside the messages' digest. Catches
+     * a replaced prompt whose deletion did not happen being read back into the engine.
+     */
+    @Test
+    fun aRestoreOfAMemoryMadeWithAnotherSystemPromptIsRefusedAndDeletes() {
+        chat()
+        val image = image(SMALL + 9)
+        assertTrue(store().save(memoryOf(image), image))
+        assertArrayEquals("with the same prompt it comes back", image, store().restored())
+
+        requestTexts["model-a"] = RequestText("Answer at length.", null)
+        val refused = assertThrows(IOException::class.java) { store().beginRestore() }
+        assertFalse("a refusal, not a memory that cannot be told now", refused is MemoryVaultUnavailableException)
+        assertEquals(emptyList<String>(), leftInDirectory())
+    }
+
+    /**
+     * The digest of the request text: none and empty differ, so do the system prompt and the
+     * further text holding the same words, and the bytes of every text are overwritten once read.
+     */
+    @Test
+    fun theRequestDigestTellsItsTextsApartAndOverwritesTheirBytes() {
+        val digests = listOf(
+            RequestText(null, null),
+            RequestText("", null),
+            RequestText(null, ""),
+            RequestText("Words", null),
+            RequestText(null, "Words"),
+            RequestText("Words", "Words"),
+            RequestText("Word", "sWords"),
+        ).map { MemoryStore.requestDigestOf(it).toList() }
+        assertEquals("every one differs", digests.size, digests.toSet().size)
+
+        val seen = ArrayList<ByteArray>()
+        val text = RequestText("A private system prompt", "Some tool text")
+        val digest = MemoryStore.requestDigestOf(text) { seen += it }
+        assertEquals(listOf(23, 14), seen.map { it.size })
+        assertTrue("every array is zeros", seen.all { bytes -> bytes.all { it == 0.toByte() } })
+        assertArrayEquals("and the digest is as before", digest, MemoryStore.requestDigestOf(text))
+    }
+
+    /**
+     * The close of a save overwrites the buffer the engine was handed, committed or not: the
+     * plaintext of the last piece must not stay in it. Catches a close that leaves it.
+     */
+    @Test
+    fun theCloseOfASaveOverwritesItsBuffer() {
+        chat()
+        for (commit in listOf(true, false)) {
+            val image = image(SMALL + 300, seed = if (commit) 3 else 4)
+            val writer = store().beginSave(memoryOf(image))
+            assertTrue(export(writer, image, zeroAtEnd = false))
+            assertTrue("the last piece is in the buffer before the close", (0 until writer.buffer.capacity()).any { writer.buffer.get(it) != 0.toByte() })
+            if (commit) writer.commit()
+            writer.close()
+            assertTrue("commit $commit: every byte is zero", (0 until writer.buffer.capacity()).all { writer.buffer.get(it) == 0.toByte() })
+        }
     }
 
     private companion object {

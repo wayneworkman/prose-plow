@@ -157,20 +157,20 @@ class SavedMemoryChatTest {
         val id = session.id
         val key = ChatController.conversationKeyOf(id)
         plantMemory(id)
-        assertNotNull(session.chat.conversation(key))
+        assertNotNull(session.chat.conversation(key, model))
 
         session.settings.update { it.withSystemPrompt(model, "Second prompt") }
-        assertNull("hidden at once, inside the change", session.chat.conversation(key))
+        assertNull("hidden at once, inside the change", session.chat.conversation(key, model))
         runCurrent()
         assertFalse("deleted at once, not with the next answer", memoryOf(id).exists())
 
         exchange(session, "Another question")
-        assertNotNull("known again once the engine has read a request with the new prompt", session.chat.conversation(key))
+        assertNotNull("known again once the engine has read a request with the new prompt", session.chat.conversation(key, model))
         assertEquals("Second prompt", app.engine.requests.last().systemPrompt)
 
         plantMemory(id)
         session.settings.update { it.withSystemPrompt(model, "") }
-        assertNull("cleared counts as changed", session.chat.conversation(key))
+        assertNull("cleared counts as changed", session.chat.conversation(key, model))
         runCurrent()
         assertFalse(memoryOf(id).exists())
 
@@ -180,7 +180,7 @@ class SavedMemoryChatTest {
         session.settings.update(urgent = true) { it.withTemperature(model, 0.3f) }
         runCurrent()
         assertTrue(memoryOf(id).exists())
-        assertNotNull(session.chat.conversation(key))
+        assertNotNull(session.chat.conversation(key, model))
         session.close()
     }
 

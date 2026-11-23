@@ -67,6 +67,30 @@ interface UnlockedSession {
     val keepModelMemorySetting: Boolean? get() = null
 
     /**
+     * Main thread: whether a close as [SessionClose.UNATTENDED] would keep anything at all for
+     * the next unlock that a close as [SessionClose.IMMEDIATE] does not. Asked by the lock before
+     * it asks for the keep-alive for a close (the lock by itself at the moment the app leaves the
+     * screen): when this is false, the session is closed as [SessionClose.IMMEDIATE] at once,
+     * without the keep-alive, its notification or the wait to hear of it, which would only keep
+     * the key in memory longer for nothing. It answers at once from what the session knows, and
+     * never waits for anything (a thread, a lock, the disk). False, the default, for a session
+     * that keeps nothing more in an unattended close.
+     */
+    fun unattendedCloseKeeps(): Boolean = false
+
+    /**
+     * Main thread: what kept the process alive and awake out of sight has ended while this
+     * session is being closed as [SessionClose.UNATTENDED], or before that close has begun. From
+     * now on the close keeps nothing more: whatever it waits for only to keep something for the
+     * next unlock is stopped at once, and the rest of it proceeds as a close as
+     * [SessionClose.IMMEDIATE] would, so that the key is not kept in memory by a wait that the
+     * phone may sleep through. Returns at once. May come more than once, and after the close has
+     * returned, when it changes nothing. The default does nothing, for a session whose close
+     * keeps nothing more either way.
+     */
+    fun hurryClose() {}
+
+    /**
      * Stops all work of the session, gives the writes that are queued their time to reach the
      * disk, and lets go of everything decrypted. Called once, off the main thread, after
      * [clearScreens]. [how] says what kind of end it is: whether the session may take one more
@@ -96,8 +120,10 @@ interface UnlockedSession {
 enum class SessionClose {
     /**
      * The user's own "Lock now" (also when it ends an answer being finished behind the lock), a
-     * reset, a session that was never shown, and any end of the kinds below while nothing keeps
-     * the process alive and awake: the strongest end. Nothing is waited for that can be dropped,
+     * reset, a session that was never shown, any end of the kinds below while nothing keeps the
+     * process alive and awake, and a lock by itself at the moment the app leaves the screen whose
+     * session says that an unattended close would keep nothing more
+     * ([UnlockedSession.unattendedCloseKeeps]): the strongest end. Nothing is waited for that can be dropped,
      * and nothing new is begun.
      */
     IMMEDIATE,
@@ -107,7 +133,9 @@ enum class SessionClose {
      * itself, at its time limit, or by "Stop the answer"), while something keeps the process
      * alive and awake out of sight at that moment, so that the device cannot sleep in the middle
      * of the close. Nobody is waiting at that moment, and the session may take one more bounded
-     * wait to keep for the next unlock what it can, for at most [KEEPING_WAIT_SECONDS].
+     * wait to keep for the next unlock what it can, for at most [KEEPING_WAIT_SECONDS]. Should
+     * the keep-alive end during the close, the lock says so ([UnlockedSession.hurryClose]) and
+     * that wait ends at once.
      */
     UNATTENDED,
     ;

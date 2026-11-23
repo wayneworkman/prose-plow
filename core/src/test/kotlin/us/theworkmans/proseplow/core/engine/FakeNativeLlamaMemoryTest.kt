@@ -114,6 +114,39 @@ class FakeNativeLlamaMemoryTest {
         evaluate(10, first = 50)
     }
 
+    /**
+     * The native session reaches the buffer through its address and capacity and never looks at
+     * its position or limit, so neither does the fake: a source that leaves the limit at the end
+     * of what it read (as the store's reader of a sealed stream leaves its buffer) still has its
+     * image read, and the whole buffer overwritten, beyond the limit too. Catches a fake that
+     * fails where the binding does not.
+     */
+    @Test
+    fun `the buffer's position and limit decide nothing an image reaches`() {
+        val checkpoints = conversation()
+        val tokens = fake.memoryTokens()
+        val image = joined(export(checkpoints))
+        fake.clearMemory()
+        val buffer = ByteBuffer.allocateDirect(PIECE)
+        val feed = object : MemorySource {
+            var at = 0
+
+            override fun read(): Int {
+                val n = minOf(1000, image.size - at)
+                val all = buffer.duplicate().also { it.clear() }
+                for (index in 0 until n) all.put(index, image[at + index])
+                at += n
+                // Left as a reader of a stream leaves it: the limit at the end of the piece.
+                buffer.clear()
+                buffer.limit(n)
+                return n
+            }
+        }
+        fake.importMemory(buffer, HEADER_BYTES, feed)
+        assertArrayEquals(tokens, fake.memoryTokens())
+        assertTrue("the whole buffer is overwritten, beyond its limit too", buffer.duplicate().also { it.clear() }.isZero())
+    }
+
     @Test
     fun `an image with no checkpoints and no caller's bytes, of exactly one piece's multiple`() {
         fake.stateBytesPerToken = 0

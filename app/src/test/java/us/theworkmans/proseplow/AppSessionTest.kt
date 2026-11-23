@@ -49,6 +49,7 @@ import us.theworkmans.proseplow.core.engine.FakeInferenceEngine.Step
 import us.theworkmans.proseplow.core.engine.GenerationEvent
 import us.theworkmans.proseplow.core.engine.GenerationRequest
 import us.theworkmans.proseplow.core.engine.InferenceEngine
+import us.theworkmans.proseplow.core.engine.MemoryRestoreResult
 import us.theworkmans.proseplow.core.engine.MemoryRestoreState
 import us.theworkmans.proseplow.core.engine.MemoryVault
 import us.theworkmans.proseplow.core.engine.SaveTrigger
@@ -298,6 +299,13 @@ class AppSessionTest {
         override fun resume() {
             log += "resumed"
             real.resume()
+        }
+
+        override fun unattendedCloseKeeps(): Boolean = real.unattendedCloseKeeps()
+
+        override fun hurryClose() {
+            log += "hurried"
+            real.hurryClose()
         }
     }
 
@@ -1589,6 +1597,154 @@ class AppSessionTest {
             assertFalse(case, app.lock.keepAliveForClose.value)
             assertEquals(case, 1, app.processEnds)
         }
+    }
+
+    /** One message and its answer in the chat on screen, so that the engine holds a conversation. */
+    private fun TestScope.exchange(app: LockedApp, session: AppSession) {
+        app.fake.enqueueReply(listOf("Hi."))
+        session.chat.send(session.openSession.id, "Hello")
+        runCurrent()
+    }
+
+    /**
+     * With "Immediately", a close that would keep nothing (the switch off, no conversation held,
+     * or the memory on disk already as it is in the engine) asks for no keep-alive and waits for
+     * nothing: the key goes at once. Catches the service, its "locking" notification and up to
+     * five seconds of waiting with the key in memory, for a close with nothing to keep.
+     */
+    @Test
+    fun withImmediatelyACloseThatWouldKeepNothingStartsNoKeepAliveAndWaitsForNothing() = runTest {
+        for (case in listOf("switch off", "nothing held", "already on disk")) {
+            val app = LockedApp(temp.newFolder(case), testScheduler)
+            val session = unlockedInFront(app)
+            app.lock.setLockTimeout(0)
+            app.fake.onSave = { vault, key, _ -> writeImage(vault, key) }
+            when (case) {
+                "switch off" -> {
+                    exchange(app, session)
+                    session.changeKeepModelMemory(false)
+                    runCurrent()
+                }
+                "nothing held" -> Unit
+                "already on disk" -> {
+                    exchange(app, session)
+                    session.leftScreen()
+                    runCurrent()
+                    session.cameOnScreen()
+                    assertTrue(memoryFile(app, session.openSession.id).exists())
+                }
+            }
+            assertFalse(case, session.unattendedCloseKeeps())
+            assertFalse("$case: the answer's own keep-alive has ended", app.answers.keepAliveWanted.value)
+            val startsBefore = app.keepAliveStarts
+            app.log.clear()
+            val leftAt = currentTime
+
+            app.leave()
+            runCurrent()
+            assertEquals("$case: no keep-alive is asked for", startsBefore, app.keepAliveStarts)
+            assertEquals(case, listOf("close IMMEDIATE", "closed, the key still works"), app.log.filter { it.startsWith("close") })
+            assertEquals("$case: nothing was waited for", leftAt, currentTime)
+            assertFalse(case, app.keyAlive(app.cipher))
+            assertFalse(case, app.lock.keepAliveForClose.value)
+            assertEquals(case, 1, app.processEnds)
+        }
+    }
+
+    /**
+     * The keep-alive is lost (the service stopped from outside) while the close of "Immediately"
+     * is saving the model's memory: the save is stopped at that moment, the close goes on as an
+     * immediate one, and the key goes without waiting for the save's bound. Catches a save that
+     * goes on, with the key in memory, after nothing keeps the phone awake any more.
+     */
+    @Test
+    fun aKeepAliveLostDuringTheLocksSaveStopsTheSaveAndTheKeyGoesAtOnce() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        exchange(app, session)
+        val id = session.openSession.id
+        var saveStopped = false
+        app.fake.onSave = { vault, key, trigger ->
+            app.log += "save $trigger"
+            try {
+                writeImage(vault, key, pieces = 3) { piece -> if (piece == 1) awaitCancellation() }
+            } finally {
+                saveStopped = true
+            }
+        }
+
+        app.leave()
+        runCurrent()
+        assertTrue(app.answers.keepAliveRunning)
+        assertEquals(listOf("close UNATTENDED", "save LOCK"), app.log.filter { it.startsWith("close") || it.startsWith("save") })
+        assertTrue("the key lives while the save runs", app.keyAlive(app.cipher))
+        val lostAt = currentTime
+
+        app.destroyServiceFromOutside()
+        runCurrent()
+        assertTrue(app.log.contains("hurried"))
+        assertTrue("the save was stopped", saveStopped)
+        assertFalse("the key is gone", app.keyAlive(app.cipher))
+        assertEquals("without waiting for the save's bound", lostAt, currentTime)
+        assertEquals(1, app.fake.forgetKeepingSavedCount)
+        repeat(500) {
+            if (app.processEnds == 0) {
+                Thread.sleep(10)
+                advanceTimeBy(20)
+                runCurrent()
+            }
+        }
+        assertEquals(1, app.processEnds)
+        assertFalse("nothing of the stopped save was kept", memoryFile(app, id).exists())
+    }
+
+    /**
+     * A memory made with one system prompt, whose deletion when the prompt was replaced did not
+     * happen (here it is put back afterwards), is refused and deleted by the next unlock's
+     * restore, because it is bound to the prompt it was made with. Catches the old prompt read
+     * back into the engine at every unlock.
+     */
+    @Test
+    fun aMemoryMadeWithAReplacedSystemPromptIsRefusedEvenWhereItsDeletionNeverHappened() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        var session = setUp(app)
+        app.lock.setLockTimeout(0)
+        val model = session.openSession.modelId
+        session.settings.update(urgent = true) { it.withSystemPrompt(model, "First prompt") }
+        exchange(app, session)
+        val id = session.openSession.id
+        app.fake.onSave = { vault, key, _ -> writeImage(vault, key) }
+        app.leave()
+        runCurrent()
+        val file = memoryFile(app, id)
+        assertTrue(file.exists())
+        val bytes = file.readBytes()
+        val date = file.lastModified()
+        app.fake.onRestore = { vault, _, _ ->
+            app.log += "kept: ${vault.saved() != null}"
+            MemoryRestoreResult.NothingSaved
+        }
+
+        app.comeToFront()
+        session = unlock(app)
+        runCurrent()
+        assertEquals("with the same prompt the memory is usable", listOf("kept: true"), app.log.filter { it.startsWith("kept") })
+        session.settings.update { it.withSystemPrompt(model, "Second prompt") }
+        runCurrent()
+        assertFalse("deleted at the change", file.exists())
+        app.lock.lock()
+        runCurrent()
+
+        // As if that deletion had never happened.
+        file.parentFile!!.mkdirs()
+        file.writeBytes(bytes)
+        file.setLastModified(date)
+        app.log.clear()
+        unlock(app)
+        runCurrent()
+        assertEquals(listOf("kept: false"), app.log.filter { it.startsWith("kept") })
+        assertFalse("refused and deleted", file.exists())
     }
 
     /**

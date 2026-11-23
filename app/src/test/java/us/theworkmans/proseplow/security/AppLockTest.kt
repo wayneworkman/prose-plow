@@ -76,6 +76,9 @@ class AppLockTest {
     /** What the sessions opened from now on say their switch that keeps the model's memory is. */
     private var sessionKeep: Boolean? = null
 
+    /** What the sessions opened from now on answer when asked whether an unattended close would keep anything. */
+    private var sessionKeepsWhenUnattended = true
+
     /** Whether the keep-alive (the answer service in the foreground) is running, as the lock is told. */
     private var keepAliveRunning = true
 
@@ -137,6 +140,19 @@ class AppLockTest {
         var answer: CompletableDeferred<Unit>? = null
         var finishOnly = 0
         var resumed = 0
+
+        /** What the session answers when the lock asks whether an unattended close would keep anything ([unattendedCloseKeeps]). */
+        var keepsWhenUnattended = true
+
+        /** How often the lock told the session to hurry its close, and whether its close had begun each time. */
+        val hurried = ArrayList<Boolean>()
+
+        override fun unattendedCloseKeeps(): Boolean = keepsWhenUnattended
+
+        override fun hurryClose() {
+            hurried += closeStarted
+            log += "hurried"
+        }
 
         override fun hasUnfinishedWork(): Boolean = answer?.isActive == true
 
@@ -239,7 +255,10 @@ class AppLockTest {
                 openFails?.let { throw it }
                 copiesHandedIn += copies.messageLifetimeDays
                 keepCopiesHandedIn += copies.keepModelMemory
-                FakeSession(cipher, log, sessionLifetime, sessionKeep).also { sessions += it }
+                FakeSession(cipher, log, sessionLifetime, sessionKeep).also {
+                    it.keepsWhenUnattended = sessionKeepsWhenUnattended
+                    sessions += it
+                }
             },
             biometricStatus = { biometric },
             screenshots = ScreenshotAllowance(clock, screenWatch, dispatcher),
@@ -1777,9 +1796,10 @@ class AppLockTest {
     /**
      * How each kind of end has its session closed ([SessionClose]), decided in one place: a lock
      * by itself and every end of a lease but "Lock now" leave the session its one more bounded
-     * wait (UNATTENDED); "Lock now", also over a lease, and a reset never do (IMMEDIATE). Catches
-     * a "Lock now" that would wait for a save, and a lock by itself or a lease end that would
-     * not keep the model's memory.
+     * wait (UNATTENDED) while the keep-alive runs; a lease whose keep-alive has ended, "Lock now",
+     * also over a lease, and a reset never do (IMMEDIATE). Catches a "Lock now" that would wait
+     * for a save, a lock by itself or a lease end that would not keep the model's memory, and a
+     * lease that would save after what kept the phone awake was gone.
      */
     @Test
     fun everyKindOfEndClosesItsSessionAsItShould() = runTest(dispatcher) {
@@ -1821,9 +1841,12 @@ class AppLockTest {
         enter(passphrase)
         session = session()
         lockItselfDuringAnAnswer(session)
+        // Ended as the answer service ends it: it no longer runs when the lock hears of it.
+        keepAliveRunning = false
         lock.onKeepAliveEnded()
         runCurrent()
-        assertEquals("a lease whose keep-alive ended", SessionClose.UNATTENDED, session.closedAs)
+        assertEquals("a lease whose keep-alive ended", SessionClose.IMMEDIATE, session.closedAs)
+        keepAliveRunning = true
 
         lock.onForeground()
         enter(passphrase)
@@ -1852,6 +1875,220 @@ class AppLockTest {
         assertTrue(session.closed)
         assertDestroyed(session.cipher)
         assertFalse(lock.sessionEnding.value)
+    }
+
+    // --- Closing out of sight with and without the keep-alive ----------------------------------------
+
+    /** Every value [AppLock.keepAliveForClose] takes from now on, as it is published. */
+    private fun TestScope.recordKeepAliveForClose(): MutableList<Boolean> {
+        val values = mutableListOf<Boolean>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { lock.keepAliveForClose.collect { values += it } }
+        values.clear()
+        return values
+    }
+
+    /** Catches a timed lock that, firing with nothing keeping the phone awake, would still close its session to save. */
+    @Test
+    fun aTimedLockThatFiresWithoutTheKeepAliveClosesImmediate() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        keepAliveRunning = false
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(SessionClose.IMMEDIATE, session.closedAs)
+        assertDestroyed(session.cipher)
+    }
+
+    /**
+     * With "Immediately" the lock asks the session, before it asks for the keep-alive, whether an
+     * unattended close would keep anything; when not, the session is closed as immediate at once:
+     * no keep-alive is asked for and nothing is waited for. When it would, the keep-alive is
+     * asked for as before. Catches a lock that starts the service, its notification and a wait of
+     * up to five seconds with the key in memory, for a close that has nothing to keep.
+     */
+    @Test
+    fun withImmediatelyASessionThatWouldKeepNothingIsClosedAtOnceWithoutTheKeepAlive() = runTest(dispatcher) {
+        startApp(visible = true)
+        var session = createPassphrase()
+        lock.setLockTimeout(0)
+        keepAliveRunning = false
+        session.keepsWhenUnattended = false
+        val asked = recordKeepAliveForClose()
+
+        lock.onBackground()
+        runCurrent()
+        assertEquals("the keep-alive was never asked for", emptyList<Boolean>(), asked)
+        assertEquals(SessionClose.IMMEDIATE, session.closedAs)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+
+        // The same with something to keep: the keep-alive is asked for, and the close waits for it.
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lock.onBackground()
+        runCurrent()
+        assertEquals(listOf(true), asked)
+        assertFalse("waiting to hear of the keep-alive", session.closeStarted)
+        keepAliveRunning = true
+        lock.onKeepAliveStarted()
+        runCurrent()
+        assertEquals(SessionClose.UNATTENDED, session.closedAs)
+        assertDestroyed(session.cipher)
+        assertEquals(listOf(true, false), asked)
+    }
+
+    /** Catches a reset during the wait for the keep-alive that would wait for it, or close its session to save. */
+    @Test
+    fun aResetDuringTheWaitForTheKeepAliveClosesImmediateAtOnce() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        lock.setLockTimeout(0)
+        keepAliveRunning = false
+        lock.onBackground()
+        runCurrent()
+        assertTrue(lock.keepAliveForClose.value)
+        assertFalse(session.closeStarted)
+
+        lock.reset()
+        runCurrent()
+        assertFalse(lock.keepAliveForClose.value)
+        assertEquals(SessionClose.IMMEDIATE, session.closedAs)
+        assertDestroyed(session.cipher)
+        assertEquals(LockState.SetupRequired, lock.state.value)
+    }
+
+    /**
+     * An unlock during the wait for the keep-alive waits for the close before it (the lock's
+     * mutex), and opens the new session only once that close has ended and its key is gone.
+     * Catches a new session opened beside a close that still holds a key.
+     */
+    @Test
+    fun anUnlockDuringTheWaitForTheKeepAliveOpensOnlyAfterTheCloseBefore() = runTest(dispatcher) {
+        startApp(visible = true)
+        val first = createPassphrase()
+        lock.setLockTimeout(0)
+        keepAliveRunning = false
+        lock.onBackground()
+        runCurrent()
+        assertTrue(lock.keepAliveForClose.value)
+
+        lock.onForeground()
+        enter(passphrase)
+        assertTrue("still locked: the close before holds the lock", lock.state.value is LockState.Locked)
+        assertFalse(first.closeStarted)
+
+        keepAliveRunning = true
+        lock.onKeepAliveStarted()
+        runCurrent()
+        assertEquals(SessionClose.UNATTENDED, first.closedAs)
+        assertDestroyed(first.cipher)
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertEquals(2, sessions.size)
+        assertEquals(listOf("screens cleared", "session closed", "session stopped"), log)
+    }
+
+    /**
+     * An unlock that completes after the app left the screen, with "Immediately": its session
+     * locks again at once, and its close asks for the keep-alive as at the moment of leaving,
+     * or, when it would keep nothing, closes at once without it. Catches such a session closed to
+     * save without the keep-alive, or left waiting for one it did not need.
+     */
+    @Test
+    fun anUnlockThatCompletesAfterTheScreenWasLeftClosesAsAtTheMomentOfLeaving() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.setLockTimeout(0)
+        keepAliveRunning = false
+        lock.lock()
+        runCurrent()
+        val asked = recordKeepAliveForClose()
+
+        lock.unlockWithPassphrase(passphrase.toCharArray())
+        lock.onBackground()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        val second = sessions.last()
+        assertEquals(listOf(true), asked)
+        assertFalse(second.closeStarted)
+        lock.onKeepAliveEnded()
+        runCurrent()
+        assertEquals("refused: nothing is saved", SessionClose.IMMEDIATE, second.closedAs)
+        assertDestroyed(second.cipher)
+
+        // Once more, with nothing to keep: closed at once.
+        lock.onForeground()
+        lock.unlockWithPassphrase(passphrase.toCharArray())
+        lock.onBackground()
+        // The session is made by the unlock below; it says it has nothing to keep from the start.
+        sessionKeepsWhenUnattended = false
+        runCurrent()
+        val third = sessions.last()
+        assertEquals(listOf(true, false), asked)
+        assertEquals(SessionClose.IMMEDIATE, third.closedAs)
+        assertDestroyed(third.cipher)
+    }
+
+    /**
+     * The keep-alive ends while an unattended close is running: the session is told to hurry,
+     * once, and its close goes on. Catches a close that would go on keeping, with nothing keeping
+     * the phone awake, until its own bound.
+     */
+    @Test
+    fun theEndOfTheKeepAliveHurriesAnUnattendedCloseThatIsRunning() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        val write = CompletableDeferred<Unit>()
+        session.pendingWrite = write
+        lock.onBackground()
+        pass(60_000)
+        assertEquals(SessionClose.UNATTENDED, session.closedAs)
+        assertTrue(session.closeStarted)
+        assertFalse(session.closed)
+
+        keepAliveRunning = false
+        lock.onKeepAliveEnded()
+        assertEquals("told at once, while its close runs", listOf(true), session.hurried)
+        lock.onKeepAliveEnded()
+        assertEquals("and only once", listOf(true), session.hurried)
+        write.complete(Unit)
+        runCurrent()
+        assertTrue(session.closed)
+        assertDestroyed(session.cipher)
+
+        // After the close has returned there is nothing to hurry.
+        keepAliveRunning = true
+        lock.onForeground()
+        enter(passphrase)
+        val next = session()
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(next.closed)
+        keepAliveRunning = false
+        lock.onKeepAliveEnded()
+        assertEquals(emptyList<Boolean>(), next.hurried)
+    }
+
+    /**
+     * The keep-alive ends after a session was retired to be closed unattended and before its
+     * close begins: it is closed as immediate, because whether the keep-alive runs is asked again
+     * when the close begins. Catches a close that goes by what was true when the session was
+     * retired.
+     */
+    @Test
+    fun aKeepAliveLostBeforeAnUnattendedCloseBeginsMakesItImmediate() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        // Lost the moment the session has been retired, before its close can run.
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            lock.sessionEnding.collect { if (it) keepAliveRunning = false }
+        }
+        lock.onBackground()
+        pass(60_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(SessionClose.IMMEDIATE, session.closedAs)
+        assertDestroyed(session.cipher)
     }
 
     // --- The timed lock on time, and stopping a lease from the lock screen ----------------------------

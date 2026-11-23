@@ -28,6 +28,7 @@ import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.RandomIds
 import us.theworkmans.proseplow.core.chat.SystemClock
 import us.theworkmans.proseplow.core.engine.DeviceContextLimits
+import us.theworkmans.proseplow.core.engine.EngineState
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.CoalescingWriter
@@ -383,6 +384,25 @@ class AppSession(
         writer.flush()
     }
 
+    /**
+     * Whether a close as [SessionClose.UNATTENDED] could keep the model's memory for the next
+     * unlock: the platform keeps one and the switch is on, a model is loaded, the engine holds the
+     * conversation of a chat whose text the store may save now ([ChatController.holdsSavableConversation]),
+     * and that memory is not known to be on disk already, or a save of it is running
+     * ([ModelMemoryKeeper.closeCouldSave]). Whether the engine finds it worth saving is the
+     * engine's to say and is not asked: that would wait for the engine. Main thread; reads only
+     * what is in memory.
+     */
+    override fun unattendedCloseKeeps(): Boolean {
+        val keeper = memoryKeeper ?: return false
+        return keeper.closeCouldSave() && engine.state.value is EngineState.Ready && chat.holdsSavableConversation()
+    }
+
+    /** The keep-alive has ended during the unattended close, or before it: the save is stopped and waited for no more ([ModelMemoryKeeper.hurry]). */
+    override fun hurryClose() {
+        memoryKeeper?.hurry()
+    }
+
     /** An answer is being written, in whichever chat. */
     override fun hasUnfinishedWork(): Boolean = chat.state.value.turn != null
 
@@ -412,7 +432,10 @@ class AppSession(
      *    locked by itself, or an answer finished behind the lock has ended) a save that is
      *    running is joined, or one is started, and waited for at most the save bound (ten
      *    seconds). Then, and at once for "Lock now" and a reset ([SessionClose.IMMEDIATE]),
-     *    whatever is still saving is stopped. A memory saved before stays on disk either way.
+     *    whatever is still saving is stopped. Should the keep-alive end in the meantime, the lock
+     *    says so ([hurryClose]): the save is stopped at that moment, wherever the close is, and the
+     *    rest of it goes on as for [SessionClose.IMMEDIATE]. A memory saved before stays on disk
+     *    either way.
      * 3. The engine forgets the conversation without deleting what was saved of it
      *    ([InferenceEngine.forgetKeepingSavedMemory]); the model stays loaded.
      * 4. The writer accepts nothing more and gets [writeTimeoutMillis] to finish what it was

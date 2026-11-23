@@ -38,14 +38,15 @@ fun interface MemoryConversations {
 
     /**
      * The chat that [conversationKey] names ([SavedMemory.conversationKey]), with its messages as
-     * they are now (as stored, after any pruning), or null when there is no such chat any more.
-     * Called on the engine's thread; may block on the disk.
+     * they are now (as stored, after any pruning) and the text besides them that a request of it
+     * to the model [modelId] ([SavedMemory.modelId]) would carry now; or null when there is no
+     * such chat any more, or no such model. Called on the engine's thread; may block on the disk.
      *
      * @throws IOException when it cannot be told now. That says nothing about the memory, which
      *   is then not deleted by the store.
      */
     @Throws(IOException::class)
-    fun conversation(conversationKey: String): MemoryConversation?
+    fun conversation(conversationKey: String, modelId: String): MemoryConversation?
 }
 
 /**
@@ -55,8 +56,21 @@ fun interface MemoryConversations {
  * @property messages its messages in order, as they are now.
  * @property oldestMessageMillis the date of its oldest message (the chat's entry in the list
  *   records it). A memory is dated by the earlier of this and the dates of [messages].
+ * @property requestText what a request of the conversation to the model asked about carries into
+ *   the prompt besides the messages, as the settings are now.
  */
-data class MemoryConversation(val chatId: String, val messages: List<ChatMessage>, val oldestMessageMillis: Long)
+data class MemoryConversation(val chatId: String, val messages: List<ChatMessage>, val oldestMessageMillis: Long, val requestText: RequestText)
+
+/**
+ * The text a request carries into the model's prompt besides the messages: what a memory was
+ * made from beside them, and what it is bound to (see [MemoryStore]). The prompt format is the
+ * model's, which the memory is bound to by its model id.
+ *
+ * @property systemPrompt the system prompt as the request carries it, or null for none.
+ * @property extraSystemText the further system text of the request
+ *   ([us.theworkmans.proseplow.core.engine.GenerationRequest.extraSystemText]), or null for none.
+ */
+data class RequestText(val systemPrompt: String?, val extraSystemText: String?)
 
 /**
  * Which build of the app wrote a memory. A memory is only ever read back by the build that wrote
@@ -83,16 +97,19 @@ data class FreeSpace(val usableBytes: Long, val totalBytes: Long)
  * **The store's header.** The first piece the engine hands over begins with the store's own
  * header ([MemoryWriter.firstPieceOffset]), so it sits in the first chunk of the stream and is
  * authenticated with it: the format version, the build ([BuildIdentity]), the model and the
- * length of its packaged file, the chat, the id of the chat's first message and a digest of the
- * messages the memory was made from (their ids, dates and text), and the fields of
- * [SavedMemory]. The date of the oldest of those messages is in the stream's own header
+ * length of its packaged file, the chat, the id of the chat's first message, a digest of the
+ * messages the memory was made from (their ids, dates and text), a digest of the text the
+ * request carried besides them ([RequestText]: the system prompt, and any further system text),
+ * and the fields of [SavedMemory]. The date of the oldest of those messages is in the stream's own header
  * ([us.theworkmans.proseplow.security.StreamHeader.oldestMessageMillis]), and is the file's date.
  *
  * **What makes a memory usable** ([saved], [beginRestore]): its first chunk authenticates and
  * holds a header of this format; the build, the model and the length of the model's file are
  * the ones of now; the chat's file exists; the chat as it is now begins with the very messages
  * the memory was made from (a chat may have more messages since, which the engine reads on top);
- * the oldest of them has not expired under the limit at the trusted time, judged by the
+ * a request of the chat to the memory's model would carry the very text besides the messages that
+ * the memory was made with (a system prompt that was changed or cleared since makes it unusable,
+ * even where the deletion at the moment of the change did not happen); the oldest of them has not expired under the limit at the trusted time, judged by the
  * authenticated date in the header and never by the file's date; and the file's date is not
  * later than that, or the clean-up without the key would keep it too long. A memory that fails
  * any of these is deleted; nothing of it is acted on before its chunk has authenticated.
@@ -217,7 +234,7 @@ class MemoryStore internal constructor(
     override fun beginSave(memory: SavedMemory, stopped: () -> Boolean): MemoryWriter {
         check(active == null) { "A save of the memory is under way" }
         val startGeneration = files.generation
-        val conversation = conversations.conversation(memory.conversationKey) ?: throw IOException("The conversation is not known")
+        val conversation = conversations.conversation(memory.conversationKey, memory.modelId) ?: throw IOException("The conversation is not known")
         val chatId = conversation.chatId
         if (!SealedDirectory.isValidId(chatId)) throw IOException("Not an id that can name a file")
         val messages = conversation.messages
@@ -229,7 +246,7 @@ class MemoryStore internal constructor(
         val modelLength = modelFileLength(memory.modelId) ?: throw IOException("The model is not part of this build")
         if (memory.imageBytes < 0) throw IOException("An image cannot have a negative size")
         val header = try {
-            MemoryHeader(build, modelLength, chatId, messages.first().id, messages.size, digestOf(messages), memory).encode()
+            MemoryHeader(build, modelLength, chatId, messages.first().id, messages.size, digestOf(messages), requestDigestOf(conversation.requestText), memory).encode()
         } catch (e: IllegalArgumentException) {
             throw IOException("The header of the memory is too long", e)
         }
@@ -374,13 +391,14 @@ class MemoryStore internal constructor(
         val modelLength = modelFileLength(header.memory.modelId)
         if (modelLength == null || modelLength != header.modelFileLength) throw RefusedMemory()
         if (!files.chatFileFor(chatId).isFile) throw RefusedMemory()
-        val conversation = conversations.conversation(header.memory.conversationKey) ?: throw RefusedMemory()
+        val conversation = conversations.conversation(header.memory.conversationKey, header.memory.modelId) ?: throw RefusedMemory()
         if (conversation.chatId != chatId) throw RefusedMemory()
         val messages = conversation.messages
         if (header.messageCount < 1 || messages.size < header.messageCount) throw RefusedMemory()
         val builtFrom = messages.subList(0, header.messageCount)
         if (builtFrom.first().id != header.firstMessageId) throw RefusedMemory()
         if (!MessageDigest.isEqual(digestOf(builtFrom), header.digest)) throw RefusedMemory()
+        if (!MessageDigest.isEqual(requestDigestOf(conversation.requestText), header.requestDigest)) throw RefusedMemory()
         // The date that decides is the header's, which the chunk has just proven; the file's
         // date is only what the file says.
         if (oldestMillis <= 0 || builtFrom.any { it.createdAtMillis < oldestMillis }) throw RefusedMemory()
@@ -736,6 +754,38 @@ class MemoryStore internal constructor(
         }
 
         private const val DIGEST_LABEL = "proseplow model memory messages v1"
+
+        /**
+         * The digest a memory's header carries of the text the request carried besides the
+         * messages ([RequestText]): SHA-256 over a fixed label and, for the system prompt and
+         * then the further system text, one byte that is 0 for none and 1 for some, followed for
+         * some by its length and its UTF-8 bytes. None and an empty text therefore differ. The
+         * bytes are overwritten with zeros as soon as the digest has read them ([textBytesSeen]
+         * sees each array just before that, for the tests), as in [digestOf].
+         */
+        internal fun requestDigestOf(text: RequestText, textBytesSeen: (ByteArray) -> Unit = {}): ByteArray {
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.update(REQUEST_DIGEST_LABEL.toByteArray(Charsets.UTF_8))
+            for (part in listOf(text.systemPrompt, text.extraSystemText)) {
+                if (part == null) {
+                    digest.update(0.toByte())
+                    continue
+                }
+                digest.update(1.toByte())
+                val bytes = part.toByteArray(Charsets.UTF_8)
+                try {
+                    val size = bytes.size
+                    digest.update(byteArrayOf((size ushr 24).toByte(), (size ushr 16).toByte(), (size ushr 8).toByte(), size.toByte()))
+                    digest.update(bytes)
+                } finally {
+                    bytes.fill(0)
+                    textBytesSeen(bytes)
+                }
+            }
+            return digest.digest()
+        }
+
+        private const val REQUEST_DIGEST_LABEL = "proseplow model memory request text v1"
     }
 }
 
@@ -760,6 +810,7 @@ private class RefusedMemory : Exception()
  * @property firstMessageId the id of the chat's first message when the memory was made.
  * @property messageCount how many of the chat's messages, from its first, the memory was made from.
  * @property digest [MemoryStore.digestOf] those messages.
+ * @property requestDigest [MemoryStore.requestDigestOf] the text the request carried besides them.
  * @property memory the engine's own description of the memory, its model id included.
  */
 internal class MemoryHeader(
@@ -769,6 +820,7 @@ internal class MemoryHeader(
     val firstMessageId: String,
     val messageCount: Int,
     val digest: ByteArray,
+    val requestDigest: ByteArray,
     val memory: SavedMemory,
 ) {
     /** The length of the encoded header in bytes, which is where the image begins. */
@@ -777,11 +829,11 @@ internal class MemoryHeader(
     /**
      * The header as it is stored.
      *
-     * @throws IllegalArgumentException when a text is longer than [MAX_TEXT_BYTES], or the digest
+     * @throws IllegalArgumentException when a text is longer than [MAX_TEXT_BYTES], or a digest
      *   is not [DIGEST_BYTES] long.
      */
     fun encode(): ByteArray {
-        require(digest.size == DIGEST_BYTES) { "A digest has $DIGEST_BYTES bytes" }
+        require(digest.size == DIGEST_BYTES && requestDigest.size == DIGEST_BYTES) { "A digest has $DIGEST_BYTES bytes" }
         val bytes = ByteArrayOutputStream()
         DataOutputStream(bytes).use { out ->
             out.writeShort(FORMAT_VERSION)
@@ -795,6 +847,7 @@ internal class MemoryHeader(
             out.text(firstMessageId)
             out.writeInt(messageCount)
             out.write(digest)
+            out.write(requestDigest)
             out.text(memory.conversationKey)
             out.writeInt(memory.contextTokens)
             out.writeInt(memory.tokenCount)
@@ -823,7 +876,7 @@ internal class MemoryHeader(
         const val MAX_TEXT_BYTES = 256
 
         /** The longest a header can be: five texts at their longest and the fixed fields. */
-        const val MAX_SIZE = 4 + 8 + 8 + 8 + 4 + DIGEST_BYTES + 4 + 4 + 8 + 8 + 5 * (2 + MAX_TEXT_BYTES)
+        const val MAX_SIZE = 4 + 8 + 8 + 8 + 4 + 2 * DIGEST_BYTES + 4 + 4 + 8 + 8 + 5 * (2 + MAX_TEXT_BYTES)
 
         /**
          * The header at the start of [chunk] (from index 0 to its limit, which are left as they
@@ -848,6 +901,7 @@ internal class MemoryHeader(
                 val firstMessageId = input.text()
                 val messageCount = input.readInt()
                 val digest = ByteArray(DIGEST_BYTES).also(input::readFully)
+                val requestDigest = ByteArray(DIGEST_BYTES).also(input::readFully)
                 val conversationKey = input.text()
                 val memory = SavedMemory(
                     conversationKey = conversationKey,
@@ -858,7 +912,7 @@ internal class MemoryHeader(
                     imageBytes = input.readLong(),
                 )
                 if (input.available() != 0) return null
-                MemoryHeader(build, modelFileLength, chatId, firstMessageId, messageCount, digest, memory)
+                MemoryHeader(build, modelFileLength, chatId, firstMessageId, messageCount, digest, requestDigest, memory)
             } catch (_: IOException) {
                 null
             }

@@ -506,6 +506,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         if (memoryTokens.isEmpty()) throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "an empty memory has no image")
         checkImageCheckpoints(checkpoints)
         val image = imageOf(checkpoints)
+        val whole = whole(buffer)
         try {
             val capacity = buffer.capacity()
             var fill = firstPieceOffset
@@ -513,7 +514,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
             var piece = 0
             while (true) {
                 val n = minOf(capacity - fill, image.size - produced)
-                for (index in 0 until n) buffer.put(fill + index, image[produced + index])
+                for (index in 0 until n) whole.put(fill + index, image[produced + index])
                 fill += n
                 produced += n
                 if (fill == capacity || produced == image.size) {
@@ -546,7 +547,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         // gone whatever the outcome, as in the native session.
         predictionReady = false
         try {
-            val reader = PieceReader(buffer, firstPieceOffset, source)
+            val reader = PieceReader(whole(buffer), firstPieceOffset, source)
             val header = ByteBuffer.wrap(reader.take(IMAGE_FIXED_BYTES))
             val magic = ByteArray(IMAGE_MAGIC.size).also { header.get(it) }
             if (!magic.contentEquals(IMAGE_MAGIC)) failImage("the image does not begin as one of the fake's")
@@ -681,8 +682,16 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
     private fun checkpointStateOf(length: Int, bytes: Int): ByteArray = ByteArray(bytes) { index -> (length * 7 + index).toByte() }
 
+    /**
+     * The whole of [buffer], whatever its position and limit say: the native session reaches it
+     * through its address and its capacity (`GetDirectBufferAddress`, `GetDirectBufferCapacity`)
+     * and never looks at either, so neither may decide what the fake can reach.
+     */
+    private fun whole(buffer: ByteBuffer): ByteBuffer = buffer.duplicate().also { it.clear() }
+
     private fun wipe(buffer: ByteBuffer) {
-        for (index in 0 until buffer.capacity()) buffer.put(index, 0)
+        val whole = whole(buffer)
+        for (index in 0 until whole.capacity()) whole.put(index, 0)
     }
 
     override fun close() {

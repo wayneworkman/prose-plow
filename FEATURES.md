@@ -274,7 +274,8 @@ is about things that are **not** built and is kept apart from everything else.
   seconds, and every wait of LOCK-17 is counted on clocks that stand still while the device
   sleeps. So that closing is unattended only while the process is kept running and awake at
   that moment (BG-16); otherwise it is the immediate closing of "Lock now", which saves
-  nothing.
+  nothing. Should what keeps it awake end while the unattended closing runs, the save is
+  stopped at that moment and the closing goes on as an immediate one (LOCK-17, step 4).
   - **On Android:** measured on the phone that was tested (Android 17): the process is counted
     as cached within 1 to 2 seconds of leaving the screen and frozen about 60 seconds later.
 - **LOCK-14** With "Immediately", the app locks at the moment LOCK-12 describes.
@@ -308,8 +309,13 @@ is about things that are **not** built and is kept apart from everything else.
      is stopped. All of this takes at most 10 seconds. For an immediate closing ("Lock now", a
      reset, and a lock by itself or the end of a lease with nothing keeping the process awake)
      nothing is waited for and nothing begun, and a save that is under way is stopped at once.
-     A memory that a save completed before stays on disk either way. Nothing is saved with
-     SECSET-15 off, or below Android 12 (STORE-30).
+     When what keeps the process awake ends during an unattended closing, the closing is told
+     so at that moment: a save that is under way is stopped then and there (both ways, as at
+     the bound), nothing more is begun, and the rest of the closing goes on as an immediate one.
+     It is asked again when an unattended closing begins, so that one which ended while the
+     closing waited for an earlier one makes it immediate. A memory that a save completed
+     before stays on disk either way. Nothing is saved with SECSET-15 off, or below Android 12
+     (STORE-30).
   5. The engine forgets the conversation and keeps what was saved of it (ENG-21); the model
      itself stays loaded. This too is waited for at most 10 seconds; if forgetting fails, the
      model is unloaded instead.
@@ -333,10 +339,17 @@ is about things that are **not** built and is kept apart from everything else.
 
   Steps 3 to 7 therefore take at most four waits of 10 seconds each for an unattended closing,
   and at most three for an immediate one, which skips the wait of step 4. These waits are
-  counted on clocks that stand still while the device sleeps, which is why the unattended
-  closing happens only while the process is kept awake (BG-16): with "Immediately" the closing
-  first waits, for at most 5 seconds, to hear whether that keep-alive could be started, and is
-  immediate if it could not. They begin once a passphrase check that is running at that moment
+  counted on clocks that stand still while the device sleeps, which is why the wait of step 4,
+  the one an unattended closing adds, happens only while the process is kept awake (BG-16), and
+  ends the moment it is no longer kept awake. With "Immediately" the closing first asks whether
+  an unattended closing would keep anything at all (SECSET-15 on and the platform able to keep
+  a memory, a model loaded, a conversation held whose text may be saved now, and that memory
+  not already on disk as the engine holds it, or a save of it under way); if not, it is
+  immediate at once, and no keep-alive is asked for. If so, it waits, for at most 5 seconds,
+  to hear whether that keep-alive could be started, and is immediate if it could not. That
+  wait, and the three waits of an immediate closing, are not themselves covered by a
+  keep-alive: each is bounded, but one that the device sleeps through ends only when it wakes,
+  with the key in memory until then. Normally each is a fraction of a second. They begin once a passphrase check that is running at that moment
   has returned (the two never overlap). LEASE-01 is the one case in which steps 3 to 7 are put
   off.
 - **LOCK-18** A write that the storage does not complete within its time is not waited for, so
@@ -637,7 +650,8 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   LOCK-17 (steps 3 to 7), and the key is overwritten. The model's memory of the conversation is
   saved on the way (step 4) only while the keep-alive still runs at that moment; when the lease
   ends because the keep-alive was lost, or it no longer runs, the closing is immediate and
-  saves nothing, since nothing would keep the device awake during the save. The key is
+  saves nothing, since nothing would keep the device awake during the save. A keep-alive lost
+  during that save stops it at once (LOCK-17, step 4). The key is
   therefore in memory for at most 10 minutes and then the closing, which is bounded by four
   waits of up to 10 seconds each (LOCK-17); when the closing is immediate ("Lock now", or no
   keep-alive), by three.
@@ -1045,7 +1059,11 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   of another llama.cpp is ever read), the model and the length of the model's packaged file are
   those of now; the chat's file exists; the chat as it is now begins with the very messages the
   memory was made from (the same first message, the same digest of their ids, dates and text;
-  messages added since are allowed, and are read on top); the date of the oldest of them, as the
+  messages added since are allowed, and are read on top); a request of the chat to the
+  memory's model would carry now the very text besides the messages that the memory was made
+  with (the same digest of the system prompt and of any further system text, STORE-29), so that
+  a memory made with a system prompt that has since been changed or cleared is deleted at this
+  check even where its deletion at the moment of the change (STORE-27) did not happen; the date of the oldest of them, as the
   stream's header carries it and the chunk proves it, is within the limit of SECSET-13 at the
   trusted time (CHAT-24), and the file's own date is never what decides this; and the file's
   date is not later than that date, which would keep it from the clean-up of STORE-22. A memory
@@ -1092,8 +1110,12 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   memory holds the whole prompt the model read): when the system prompt of a model is changed
   or cleared (MSET-04), the saved memory is deleted at once, whichever chat and model it is of
   (which model it was made with is only known by opening it), and the conversation the model may
-  hold is treated as changed (STORE-29). The other settings of a model (temperature, the longest
-  reply, the size of the context) are not part of what the model read, and change nothing here.
+  hold is treated as changed (STORE-29). That deletion is the first line; the second is the
+  binding of every memory to the system prompt it was made with (STORE-25), which refuses and
+  deletes, at the next unlock, a memory whose deletion did not happen (it failed, or a restore
+  that had begun before it read the memory back). The other settings of a model (temperature,
+  the longest reply, the size of the context) are not part of what the model read, and change
+  nothing here.
 - **STORE-28** When the model's memory is saved. Always of the conversation the model last
   worked on, as the engine's rules allow (ENG-38), and only while SECSET-15 is on and on
   Android 12 or later (STORE-30):
@@ -1118,7 +1140,13 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 - **STORE-29** What the store is told of a conversation, which it binds a memory to (STORE-25):
   the chat whose conversation key names it (every request names its chat by `chat:` followed by
   the chat's id, the same at every unlock and never the same for two chats), with its messages
-  as they are now. There is none for a chat that was deleted, and none for a chat whose stored
+  as they are now, and the text besides the messages that a request of it to the memory's model
+  would carry now: the system prompt the settings hold for that model, taken where a request
+  takes it, and the further system text of a request (`extraSystemText`), which nothing sets
+  yet and which tools will use (TOOL). Nothing else of a request becomes part of the prompt: the
+  prompt format is the model's, which the memory is bound to by its id, and the sampling, the
+  longest reply and the size of the context are not text the model reads. There is none for a
+  model this build does not offer. There is none for a chat that was deleted, and none for a chat whose stored
   messages were removed or changed (pruned, edited, asked for again, retried), or whose
   conversation the model may hold while the system prompt of its model is changed or cleared
   (STORE-27), until the engine has read a request of it made after that change: so a save at a lock that comes between the
@@ -2140,7 +2168,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   other than "Immediately" until that lock has happened or the app is back on screen. With
   "Immediately" the app locks at the moment it leaves the screen, and the keep-alive is started
   at that same moment for the closing of the session, which saves the model's memory and can
-  take seconds (LOCK-17, step 4); that closing waits, for at most 5 seconds, to hear whether
+  take seconds (LOCK-17, step 4), provided that closing would keep anything at all (LOCK-17):
+  when it would not (SECSET-15 off, below Android 12, no model loaded, no conversation held, or
+  its memory on disk already as the engine holds it), the session is closed as "Lock now"
+  closes it, at once, and no keep-alive, notification or wait comes of it. Otherwise that
+  closing waits, for at most 5 seconds, to hear whether
   the keep-alive runs, and is unattended (it saves) only if it does, immediate (it saves
   nothing, and the key goes at once) if the platform refuses it or does not answer in time. So
   with "Immediately" the notification shows "Locking the app…" for the seconds the closing
@@ -2151,7 +2183,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   (LEASE-01), and then the process ends (END-01). If the platform refuses it, or later stops it
   or takes it out of the foreground, nothing else changes and nothing asks for it again until the
   app next leaves the screen: no session is left alive behind the lock on its strength, the lock
-  by itself closes as "Lock now" does and saves nothing (LOCK-13), and the lock is made up for
+  by itself closes as "Lock now" does and saves nothing (LOCK-13), a save that a closing is
+  making when it ends is stopped at once (LOCK-17, step 4), and the lock is made up for
   as LOCK-13 describes. "Lock now" needs no keep-alive and asks for none; it and a reset end the
   pending lock as they end the session, and the keep-alive goes with it once the key is gone.
   The setting of SECSET-05 and the permission to show notifications (BG-09) change nothing
@@ -3282,6 +3315,7 @@ This section is exact where the others describe. Each item carries one of three 
   | 2 + n | The id of the chat's first message when the memory was made |
   | 4 | How many of the chat's messages, from its first, the memory was made from |
   | 32 | The digest of those messages, below |
+  | 32 | The digest of the text the request carried besides them, below |
   | 2 + n | The conversation's key, as the engine was given it |
   | 4 | The size of the context when the memory was saved, in tokens |
   | 4 | The number of tokens in the memory |
@@ -3291,10 +3325,14 @@ This section is exact where the others describe. Each item carries one of three 
   The digest is SHA-256 over the ASCII bytes of `proseplow model memory messages v1` followed,
   for every message in order, by the length of its id in UTF-8 bytes (4 bytes), those bytes, its
   date in milliseconds since 1970 (8 bytes), the length of its text in UTF-8 bytes (4 bytes) and
-  those bytes. A header is at most 1,378 bytes long. One of another version, longer than that,
+  those bytes. The digest of the request's text is SHA-256 over the ASCII bytes of
+  `proseplow model memory request text v1` followed, for the system prompt and then the further
+  system text of the request (STORE-29), by one byte, `00` for none or `01` for some, and for
+  some by its length in UTF-8 bytes (4 bytes) and those bytes; none and an empty text therefore
+  differ. A header is at most 1,410 bytes long. One of another version, longer than that,
   longer than the chunk, with a text that is not UTF-8, or that does not end exactly where its
   length says is refused, and the memory deleted. The date of the oldest message is not in this
-  header: it is the stream's own (FMT-21). The version and the digest's label are permanent. The
+  header: it is the stream's own (FMT-21). The version and the digests' labels are permanent. The
   build is named by Android's version code and the package's last update time; a port names its
   build by what its platform has, and the memory is only ever read back by the build that wrote
   it (NAT-19), so no two platforms need to agree on those 16 bytes.
@@ -3980,9 +4018,14 @@ only state a rule, the item says so and states its effect instead of inventing a
   that "Immediately" still saves, the keep-alive (the same service, wake lock and notification)
   is started when the app locks as it leaves the screen, the moment the platform still allows
   it, and held until that session's key is gone; with it the notification says "Locking the
-  app…" for the seconds the lock takes. Preserve: no saving or waiting without the keep-alive;
-  a refusal, or no answer within 5 seconds, makes the closing immediate; "Lock now" never saves
-  and needs no keep-alive.
+  app…" for the seconds the lock takes. The keep-alive is asked for only when the closing would
+  keep anything at all; when it would not, the closing is immediate at once. Preserve: no
+  saving without the keep-alive, and a save that is under way stops the moment the keep-alive
+  ends; no keep-alive is asked for a closing that would keep nothing; a refusal, or no answer
+  within 5 seconds, makes the closing immediate; "Lock now" never saves and needs no
+  keep-alive. What the keep-alive does not cover: the wait of up to 5 seconds to hear of it,
+  and the three bounded waits every closing has (LOCK-17), which a device that sleeps through
+  them prolongs.
 
 ## 27. Planned tools: design considerations (TOOL)
 

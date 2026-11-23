@@ -158,11 +158,14 @@ Privacy:
   about 1.5 GB of storage, a lock by itself that can take up to ten seconds longer while the
   save finishes (the key stays in memory for that time), and far more old encrypted data on the
   phone's storage (see [What this does not protect against](#what-this-does-not-protect-against)).
-  A lock by itself saves only while the app's foreground service keeps the phone awake; with
-  "immediately" that service is started as the app leaves the screen, and its notification says
-  "Locking the app…" for the seconds the lock takes. "Lock now" never waits for it and saves
-  nothing; what an earlier save kept is used. Changing or clearing a model's system prompt
-  deletes the saved memory, since the memory holds the prompt too. Turning it off deletes the
+  A lock by itself saves only while the app's foreground service keeps the phone awake, and
+  stops saving the moment that service stops; with "immediately" that service is started as
+  the app leaves the screen when there is something to save, and its notification says
+  "Locking the app…" for the seconds the lock takes (with nothing to save the app locks at
+  once without it). "Lock now" never waits for it and saves nothing; what an earlier save kept
+  is used. Changing or clearing a model's system prompt deletes the saved memory, since the
+  memory holds the prompt too, and a memory is only ever read back with the system prompt it
+  was made with. Turning it off deletes the
   saved memory at once. A copy of this switch is kept in `lock.json` and used whenever the
   encrypted settings cannot be read, so a damaged or deleted settings file never turns it on
   again. On Android 9 to 11 it does not exist (see
@@ -460,7 +463,8 @@ sealed with AES-256-GCM under its own random nonce and bound to the header, the 
 `model-memory:<chat id>`, its place in the stream and whether it is the last. At most one exists,
 and it is deleted whenever a message it was made from is pruned, edited or deleted, and whenever
 a model's system prompt is changed or cleared, since the memory holds the whole prompt the model
-read. It is written to a temporary file of its own name and renamed without the two `fsync`s, because it can always be made again and
+read; and because its first chunk carries a digest of that system prompt, a memory whose
+deletion did not happen is refused and deleted when the next unlock checks it. It is written to a temporary file of its own name and renamed without the two `fsync`s, because it can always be made again and
 a damaged one fails authentication; its deletion is flushed. When it is written and read back is
 described under [The lock](#the-lock) and [What stays in memory](#what-stays-in-memory).
 
@@ -534,7 +538,9 @@ optionally a second time by a fingerprint key.
   lock. With "immediately" the app locks as it leaves the screen, and the service is started in
   that same call for the closing of the session, which saves the model's memory and so takes
   seconds (see below); that closing saves only if the service really runs, and otherwise closes
-  as "Lock now" does. While nothing but the lock is waited for, its notification says
+  as "Lock now" does. When there is nothing to save (the switch off, Android 9 to 11, no model
+  loaded, no conversation held, or its memory already on disk as the model holds it), the
+  service is not started at all and the session is closed at once as "Lock now" closes it. While nothing but the lock is waited for, its notification says
   "Unlocked; it locks itself when its time is up."; while an answer is being written it says
   "Writing an answer..."; and while only the closing of a session after the lock is waited for,
   "Locking the app…". Each is one fixed sentence in the same notification, whose kind is named
@@ -560,15 +566,21 @@ optionally a second time by a fingerprint key.
   stopped. "Lock now", a reset, and a lock by itself with nothing keeping the phone awake skip
   this step: they wait for no save, begin none, and stop one that is under way ("Lock now" and a
   reset before anything else, so that a save stuck on a storage that does not answer cannot hold
-  them up), and a memory an earlier save completed stays on disk. With "immediately" the
-  closing first waits, for at most five seconds, to hear whether the service could be started.
+  them up), and a memory an earlier save completed stays on disk. If the service stops while a
+  save is under way, the save is stopped at that moment and the closing goes on as for "Lock
+  now". With "immediately", when there is something to save, the closing first waits, for at
+  most five seconds, to hear whether the service could be started.
   Then the inference engine is told to forget the conversation and keep what was saved of it
   (again up to ten seconds), the writes that are waiting get up to ten seconds to finish, and
   the data key is overwritten with zeros whether or not any of that did. Closing a session
   therefore takes at most four waits of ten seconds each (three for "Lock now" and a reset),
   plus the moment a passphrase check that is running at the same time needs to return. These
-  waits are counted on clocks that stand still while the phone sleeps, which is why the waits of
-  a lock by itself happen only while the service keeps the phone awake. A write
+  waits are counted on clocks that stand still while the phone sleeps, which is why the save,
+  the wait that a lock by itself adds, happens only while the service keeps the phone awake.
+  The other waits (the five seconds of "immediately", and the three every closing has) are not
+  covered by the service when it does not run: each is bounded and normally takes a fraction of
+  a second, but a phone that sleeps in the middle of one keeps the key in memory until it
+  wakes. A write
   that the storage does not complete in that time is not waited for, so that it cannot keep
   the key in memory; only a reset waits for it, because a reset deletes the files. A save of
   the model's memory that was stopped is the same: its own thread may still write a chunk that
@@ -587,8 +599,8 @@ optionally a second time by a fingerprint key.
   phone a 600 MB save begun when the screen was left took about two seconds. At most one saved
   memory exists. After an unlock it is read back for the chat on screen once its model is
   loaded, before the first answer ("Restoring the conversation…" under a reply that waits for
-  it), and checked first against the build, the model file and the chat's messages as they are
-  now; whenever it does not fit, it is deleted and the conversation is read as before.
+  it), and checked first against the build, the model file, the chat's messages as they are
+  now and the model's system prompt; whenever it does not fit, it is deleted and the conversation is read as before.
 - **An answer can be finished behind the lock.** When the app locks by itself (the timeout, or
   the check on coming back) while an answer is being written, and "Finish the answer after
   locking" is on (the default), everything above happens for the screen: it is torn down, the
@@ -877,7 +889,7 @@ it or losing the phone loses the chats.
   memory after locking" on, a lock by itself keeps the data key and the conversation in memory
   for up to ten seconds more while the save finishes, and does so only while the app's
   foreground service keeps the phone awake, so that the phone cannot fall asleep in the middle
-  of it with the key in memory. "Lock now" does not, and the setting can be turned off.
+  of it with the key in memory; if the service stops on the way, the save stops with it. "Lock now" does not, and the setting can be turned off.
 - **A compromised phone.** Root access, malware with system privileges or an exploited system
   can read the app's memory while it is unlocked, record what is typed and capture the screen
   whatever the window says. The app relies on Android's separation of apps.
@@ -896,8 +908,9 @@ it or losing the phone loses the chats.
   a write to failing storage does not return. And whatever the system moved to compressed
   swap.
 - **What the notifications tell.** Anyone who sees the phone's notifications learns that the
-  app is writing an answer, or has finished one, or is unlocked and waiting to lock itself, and
-  when. They never learn anything else.
+  app is writing an answer, or has finished one, or is unlocked and waiting to lock itself, or
+  is locking (and so, with "Keep the model's memory after locking" on, that it holds a
+  conversation it is saving), and when. They never learn anything else.
 - **The keyboard, the clipboard and accessibility services.** A keyboard sees everything typed
   into it. Text you copy leaves the app and can be read by the keyboard and by the app it is
   pasted into. An accessibility service that you have enabled can read what is on the screen,
@@ -931,8 +944,9 @@ it or losing the phone loses the chats.
   its oldest message and, by when the file last changed, roughly when the app last left the
   screen or locked, and the content of `lock.json` (whether fingerprint
   unlock is on and for how long, whether an answer is finished after locking, how many wrong
-  attempts were made and when, how long messages are kept, the latest trusted time, and when,
-  on the clock since the phone's start, the app last locked or was unlocked).
+  attempts were made and when, how long messages are kept, whether the model's memory is kept
+  after locking, whether background maintenance is on, the latest trusted time, and when, on
+  the clock since the phone's start, the app last locked or was unlocked).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
   debugging can read its private files with `run-as` and attach a debugger to it. It runs
   the same models as a release build, from its own APK and from nowhere else. Use a release
@@ -1562,8 +1576,8 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 473 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 833 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, the switch, and Android below 12; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 474 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 850 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, a save stopped when the keep-alive ends, no keep-alive asked for a closing with nothing to save, the binding to the system prompt, the switch, and Android below 12; the real inference engine joined with that store over real files; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |

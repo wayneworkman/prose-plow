@@ -261,12 +261,18 @@ sealed interface PassphraseCheck {
  * that moment); otherwise it is closed as [SessionClose.IMMEDIATE], which saves nothing and
  * destroys the key at once. That holds for the end of a lease too, also when the keep-alive was
  * lost. When the lock is due at the very moment the app leaves the screen ("Immediately", or an
- * unlock that completes after the screen was left) and no keep-alive runs yet, the session's close
- * waits, for at most [KEEP_ALIVE_ANSWER_MILLIS], to hear whether one does: [keepAliveForClose]
- * asks for it, at the moment Android still allows it to be started, and [onKeepAliveStarted] or
- * [onKeepAliveEnded] answer. Started and running, the close is unattended; refused, lost, or no
- * answer in time, it is immediate. The keep-alive is then held, as for every session that is
- * ending ([sessionEnding]), until the close has returned and the key is gone.
+ * unlock that completes after the screen was left) and no keep-alive runs yet, the session is
+ * first asked whether an unattended close would keep anything more
+ * ([UnlockedSession.unattendedCloseKeeps]); if not, it is closed as [SessionClose.IMMEDIATE] at
+ * once. If so, its close waits, for at most [KEEP_ALIVE_ANSWER_MILLIS], to hear whether one runs:
+ * [keepAliveForClose] asks for it, at the moment Android still allows it to be started, and
+ * [onKeepAliveStarted] or [onKeepAliveEnded] answer. Started and running, the close is
+ * unattended; refused, lost, or no answer in time, it is immediate. The keep-alive is then held,
+ * as for every session that is ending ([sessionEnding]), until the close has returned and the key
+ * is gone. Whether it runs is asked once more at the moment an unattended close begins
+ * ([closeRetired]), and should it end while that close runs, the session is told to hurry
+ * ([UnlockedSession.hurryClose]): the close then keeps nothing more and goes on as an immediate
+ * one.
  *
  * Making way for the key derivation. Every time a passphrase is put through the key derivation
  * (an unlock, a check or a change in Settings, the first set-up), whatever else loads the
@@ -451,6 +457,14 @@ class AppLock<S : UnlockedSession>(
 
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
     private val retired = ConcurrentLinkedQueue<Retired<S>>()
+
+    /**
+     * The session whose close as [SessionClose.UNATTENDED] is running, from the moment it was
+     * found that the keep-alive runs until the close has returned; null otherwise. Closes run one
+     * at a time under the mutex, so there is at most one. [onKeepAliveEnded] tells it to hurry.
+     * Main thread only.
+     */
+    private var closingUnattended: S? = null
 
     /**
      * One job for every closed session, which ends when that session has really stopped
@@ -684,10 +698,12 @@ class AppLock<S : UnlockedSession>(
      * next unlock) only while the keep-alive really runs ([canFinishOutOfSight]): that wait must
      * not happen in a process that may be put to sleep in the middle of it with the key in
      * memory. When it does not run yet and [askForKeepAlive] is true (the lock is due at the
-     * moment the app leaves the screen, when the keep-alive can still be started), the close
-     * waits to hear whether it does ([retireAwaitingKeepAlive]); otherwise the lock by itself
-     * closes as [SessionClose.IMMEDIATE]. "Lock now", a reset and a session that was never shown
-     * always close as [SessionClose.IMMEDIATE].
+     * moment the app leaves the screen, when the keep-alive can still be started), the session is
+     * asked whether an unattended close would keep anything more
+     * ([UnlockedSession.unattendedCloseKeeps]); if so, the close waits to hear whether the
+     * keep-alive runs ([retireAwaitingKeepAlive]). Otherwise the lock by itself closes as
+     * [SessionClose.IMMEDIATE], with nothing asked for and nothing waited for. "Lock now", a reset
+     * and a session that was never shown always close as [SessionClose.IMMEDIATE].
      */
     private fun endSession(session: Live<S>, reason: SessionEnd, lockedAt: Long, askForKeepAlive: Boolean = false) {
         session.session.clearScreens()
@@ -697,7 +713,9 @@ class AppLock<S : UnlockedSession>(
         when {
             finishBehindTheLock -> startLease(session, lockedAt)
             keptAlive -> retire(session, SessionClose.UNATTENDED)
-            byItself && askForKeepAlive -> retireAwaitingKeepAlive(session)
+            // Asked only here, before the keep-alive would be asked for: a close that would keep
+            // nothing more is not worth the service, its notification or the wait for it.
+            byItself && askForKeepAlive && session.session.unattendedCloseKeeps() -> retireAwaitingKeepAlive(session)
             else -> retire(session, SessionClose.IMMEDIATE)
         }
     }
@@ -784,10 +802,18 @@ class AppLock<S : UnlockedSession>(
      * so it ends now, by the same path as the ceiling: the work is stopped, the session closed and
      * its key destroyed; and, with nothing keeping the process awake, closed as
      * [SessionClose.IMMEDIATE] ([endLease]). A close that waits to hear whether the keep-alive
-     * runs is immediate too. Otherwise this changes nothing.
+     * runs is immediate too. An unattended close that is already running is told to hurry
+     * ([UnlockedSession.hurryClose]): it keeps nothing more and goes on as an immediate one.
+     * Sessions retired as unattended whose close has not begun yet are closed as immediate,
+     * because the keep-alive is asked for again when their close begins ([closeRetired]).
+     * Otherwise this changes nothing.
      */
     fun onKeepAliveEnded() {
         if (awaitingKeepAlive.isNotEmpty()) answerKeepAliveQuestion(SessionClose.IMMEDIATE)
+        closingUnattended?.let {
+            closingUnattended = null
+            it.hurryClose()
+        }
         lease?.let { endLease(it) }
     }
 
@@ -885,6 +911,7 @@ class AppLock<S : UnlockedSession>(
                 // A session that fails to close has still lost its key below.
             } finally {
                 ended.crypto.destroy()
+                withContext(NonCancellable + mainDispatcher) { if (closingUnattended === ended.session) closingUnattended = null }
             }
             val session = ended.session
             stopping += work.launch {
@@ -911,12 +938,26 @@ class AppLock<S : UnlockedSession>(
      * come within [KEEP_ALIVE_ANSWER_MILLIS]. The key stays in memory for that wait, which is
      * normally a fraction of a second (the answer service is created right after it was asked
      * for); bounding it means that a service that never answers cannot keep the key.
+     *
+     * An unattended close is unattended only if the keep-alive still runs at the moment it
+     * begins ([canFinishOutOfSight], asked on the main thread): the keep-alive may have ended
+     * since the session was retired, while it waited for an earlier close. In the same step on
+     * the main thread the session becomes [closingUnattended], so that an end of the keep-alive
+     * from then on reaches it ([onKeepAliveEnded]), and one before was seen here.
      */
     private suspend fun howToClose(next: Retired<S>): SessionClose {
         val answered = withTimeoutOrNull(KEEP_ALIVE_ANSWER_MILLIS) { next.how.await() }
-        if (answered != null) return answered
-        withContext(NonCancellable + mainDispatcher) { answerKeepAliveQuestion(SessionClose.IMMEDIATE) }
-        return next.how.await()
+        if (answered == null) withContext(NonCancellable + mainDispatcher) { answerKeepAliveQuestion(SessionClose.IMMEDIATE) }
+        val how = answered ?: next.how.await()
+        if (how != SessionClose.UNATTENDED) return how
+        return withContext(NonCancellable + mainDispatcher) {
+            if (canFinishOutOfSight()) {
+                closingUnattended = next.live.session
+                SessionClose.UNATTENDED
+            } else {
+                SessionClose.IMMEDIATE
+            }
+        }
     }
 
     /**

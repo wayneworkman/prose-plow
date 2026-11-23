@@ -8,6 +8,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -439,19 +440,19 @@ class ModelMemorySessionTest {
         exchange(session, "First question")
         val id = session.id
         val key = ChatController.conversationKeyOf(id)
-        assertNotNull(session.chat.conversation(key))
+        assertNotNull(session.chat.conversation(key, ModelCatalog.default.id))
 
         app.engine.enqueue(listOf(Step.Hang))
         val question = session.openSession.messages.first()
         assertTrue(session.chat.edit(id, question.id, "First question, edited"))
         runCurrent()
-        assertNull("the engine has not read the edited conversation", session.chat.conversation(key))
+        assertNull("the engine has not read the edited conversation", session.chat.conversation(key, ModelCatalog.default.id))
         session.chat.stop(id)
         runCurrent()
-        assertNull("nor after the reply was stopped before it read it", session.chat.conversation(key))
+        assertNull("nor after the reply was stopped before it read it", session.chat.conversation(key, ModelCatalog.default.id))
 
         exchange(session, "And another")
-        assertEquals("known again once a later request was read", "And another", session.chat.conversation(key)?.messages?.dropLast(1)?.last()?.text)
+        assertEquals("known again once a later request was read", "And another", session.chat.conversation(key, ModelCatalog.default.id)?.messages?.dropLast(1)?.last()?.text)
         session.close()
     }
 
@@ -462,8 +463,8 @@ class ModelMemorySessionTest {
         exchange(session, "Soon deleted")
         val id = session.id
         session.chat.deleteChat(id)
-        assertNull(session.chat.conversation(ChatController.conversationKeyOf(id)))
-        assertNull(session.chat.conversation("not a key"))
+        assertNull(session.chat.conversation(ChatController.conversationKeyOf(id), ModelCatalog.default.id))
+        assertNull(session.chat.conversation("not a key", ModelCatalog.default.id))
         session.close()
     }
 
@@ -478,7 +479,7 @@ class ModelMemorySessionTest {
         first.close()
 
         val session = unlocked()
-        val conversation = session.chat.conversation(ChatController.conversationKeyOf(id))
+        val conversation = session.chat.conversation(ChatController.conversationKeyOf(id), ModelCatalog.default.id)
         assertEquals(id, conversation?.chatId)
         assertEquals(2, conversation?.messages?.size)
         assertEquals(conversation?.messages?.minOf { it.createdAtMillis }, conversation?.oldestMessageMillis)
@@ -499,7 +500,7 @@ class ModelMemorySessionTest {
         val session = unlocked()
         var thrown: Throwable? = null
         try {
-            session.chat.conversation(ChatController.conversationKeyOf(id))
+            session.chat.conversation(ChatController.conversationKeyOf(id), ModelCatalog.default.id)
         } catch (e: IOException) {
             thrown = e
         }
@@ -614,6 +615,99 @@ class ModelMemorySessionTest {
         runCurrent()
         notSaved.close(SessionClose.UNATTENDED)
         assertEquals(listOf(SaveTrigger.LEFT_SCREEN, SaveTrigger.LOCK), app.engine.saves.map { it.second })
+    }
+
+    /**
+     * What the session answers when the lock asks, before it asks for the keep-alive, whether an
+     * unattended close would keep anything: only with the switch on, a model loaded, a
+     * conversation held that the store may save, not on disk already as it is in the engine, and
+     * no hurry told; never on a platform that keeps no memory. Catches a session that would have
+     * the lock start the keep-alive and wait for it with nothing to keep, and one that would make
+     * the lock skip a save that is due.
+     */
+    @Test
+    fun anUnattendedCloseIsSaidToKeepSomethingOnlyWhenItCould() = runTest {
+        val session = unlocked()
+        assertFalse("no conversation is held", session.unattendedCloseKeeps())
+        exchange(session, "Hello")
+        assertTrue("a conversation held and never saved", session.unattendedCloseKeeps())
+
+        val model = session.openSession.modelId
+        session.settings.update(urgent = true) { it.withSystemPrompt(model, "A new prompt") }
+        assertFalse("hidden by the change of the system prompt", session.unattendedCloseKeeps())
+        exchange(session, "Again")
+        assertTrue("read again with the new prompt", session.unattendedCloseKeeps())
+
+        app.engine.saveResult = MemorySaveResult.Saved(500, 1_000)
+        session.leftScreen()
+        runCurrent()
+        session.cameOnScreen()
+        assertFalse("on disk as it is in the engine", session.unattendedCloseKeeps())
+        exchange(session, "Something new")
+        assertTrue("something new since", session.unattendedCloseKeeps())
+
+        session.changeKeepModelMemory(false)
+        assertFalse("the switch off", session.unattendedCloseKeeps())
+        session.changeKeepModelMemory(true)
+        assertTrue("the switch on again", session.unattendedCloseKeeps())
+
+        session.hurryClose()
+        assertFalse("told to hurry", session.unattendedCloseKeeps())
+        session.close()
+
+        val unloaded = unlocked()
+        exchange(unloaded, "Hello")
+        assertTrue(unloaded.unattendedCloseKeeps())
+        app.engine.unload()
+        assertFalse("no model loaded", unloaded.unattendedCloseKeeps())
+        unloaded.close()
+
+        fixture.memoryPlatform = null
+        val below12 = unlocked()
+        exchange(below12, "Hello")
+        assertFalse("a platform that keeps no memory", below12.unattendedCloseKeeps())
+        below12.close()
+    }
+
+    /**
+     * A close told to hurry before it began (the keep-alive ended while it waited for an earlier
+     * close) saves nothing and waits for nothing, though it was asked as unattended; one told
+     * during its wait for the save stops that save and returns at once. Catches a hurry that
+     * only a running wait would hear.
+     */
+    @Test
+    fun aCloseToldToHurryKeepsNothingMoreWhenEverItIsTold() = runTest {
+        val before = unlocked()
+        exchange(before, "Hello")
+        before.hurryClose()
+        before.close(SessionClose.UNATTENDED)
+        assertEquals("no save was asked for", emptyList<Pair<String, SaveTrigger>>(), app.engine.saves)
+
+        val during = unlocked()
+        exchange(during, "Hello")
+        var saveStopped = false
+        app.engine.onSave = { _, _, _ ->
+            try {
+                awaitCancellation()
+            } finally {
+                saveStopped = true
+            }
+        }
+        var closed = false
+        val closing = launch {
+            during.close(SessionClose.UNATTENDED)
+            closed = true
+        }
+        runCurrent()
+        assertEquals(listOf(SaveTrigger.LOCK), app.engine.saves.map { it.second })
+        assertFalse("waiting for the save", closed)
+        val toldAt = currentTime
+        during.hurryClose()
+        runCurrent()
+        assertTrue(saveStopped)
+        assertTrue(closed)
+        assertEquals("at once", toldAt, currentTime)
+        closing.join()
     }
 
     /**
