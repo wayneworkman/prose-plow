@@ -28,7 +28,9 @@ import us.theworkmans.proseplow.core.model.ModelSpec
  * - A cancelled collection ends the generation without a final event.
  *
  * What happened is recorded: [requests], and the counters of generations started, completed and
- * cancelled. Meant for single-threaded tests; nothing here is synchronised.
+ * cancelled. Saving and restoring the memory are recorded and answered from [saveResult] and
+ * [restoreResult]; nothing is written to a vault. Meant for single-threaded tests; nothing here
+ * is synchronised.
  */
 class FakeInferenceEngine : InferenceEngine {
 
@@ -119,6 +121,34 @@ class FakeInferenceEngine : InferenceEngine {
     var forgetCount: Int = 0
         private set
 
+    /** How often [forgetKeepingSavedMemory] was called; it also counts towards nothing else. */
+    var forgetKeepingSavedCount: Int = 0
+        private set
+
+    /** How often [markNotToBeSaved] was called. */
+    var notToBeSavedMarks: Int = 0
+        private set
+
+    /** Every save asked for, as (conversation key, trigger), oldest first. */
+    val saves = ArrayList<Pair<String, SaveTrigger>>()
+
+    /** Every restore asked for, by conversation key, oldest first. */
+    val restores = ArrayList<String>()
+
+    /** What [saveMemory] answers. */
+    var saveResult: MemorySaveResult = MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.NOT_WORTH_IT)
+
+    /** What [restoreMemory] answers. */
+    var restoreResult: MemoryRestoreResult = MemoryRestoreResult.NothingSaved
+
+    private val _memoryRestore = MutableStateFlow<MemoryRestoreState>(MemoryRestoreState.Idle)
+    override val memoryRestore: StateFlow<MemoryRestoreState> = _memoryRestore.asStateFlow()
+
+    /** Sets what [memoryRestore] reports, for a test of whoever shows it. */
+    fun reportRestore(state: MemoryRestoreState) {
+        _memoryRestore.value = state
+    }
+
     // --- InferenceEngine ---
 
     /** Moves on whenever generations in flight must end; see the class comment. */
@@ -150,6 +180,25 @@ class FakeInferenceEngine : InferenceEngine {
     override suspend fun forget() {
         forgetCount++
         epoch.value++
+    }
+
+    override suspend fun forgetKeepingSavedMemory() {
+        forgetKeepingSavedCount++
+        epoch.value++
+    }
+
+    override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult {
+        saves += conversationKey to trigger
+        return saveResult
+    }
+
+    override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
+        restores += conversationKey
+        return restoreResult
+    }
+
+    override fun markNotToBeSaved() {
+        notToBeSavedMarks++
     }
 
     override fun generate(request: GenerationRequest): Flow<GenerationEvent> = flow {

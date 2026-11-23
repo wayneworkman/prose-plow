@@ -47,6 +47,10 @@ sealed interface EngineState {
  *   to for this conversation, or null to leave that to the engine (which then also holds it to
  *   what can be read again in reasonable time). The model's own maximum and the device's
  *   memory bound it either way; see [ContextPolicy].
+ * @property conversationKey which conversation this is, in the caller's own terms; opaque to the
+ *   engine, which only compares it with the key of a saved memory ([InferenceEngine.saveMemory]).
+ *   A request for another key than that of the saved memory, or for none, deletes the saved
+ *   memory.
  */
 data class GenerationRequest(
     val modelId: String,
@@ -58,6 +62,7 @@ data class GenerationRequest(
     val maxNewTokens: Int? = null,
     val stopStrings: List<String> = emptyList(),
     val maxContextTokens: Int? = null,
+    val conversationKey: String? = null,
 )
 
 /**
@@ -100,7 +105,67 @@ interface InferenceEngine {
     /**
      * Drops everything the engine and the native layer remember of any conversation, and returns
      * when that is done. The model stays loaded. A generation in flight ends with
-     * [FinishReason.CANCELLED]. The app calls this when it locks.
+     * [FinishReason.CANCELLED].
+     *
+     * A saved memory the engine knows of ([saveMemory], [restoreMemory]) is deleted as well:
+     * this is the forgetting of a conversation that must not come back, such as one whose
+     * messages expired. To forget at a lock and keep what was saved for the next unlock, use
+     * [forgetKeepingSavedMemory].
      */
     suspend fun forget()
+
+    /**
+     * Everything [forget] does, except that a saved memory stays where it is, for the next
+     * [restoreMemory]. The engine lets go of the vault: after this it neither deletes the image
+     * nor knows of it. The session calls this when it closes, after its own [saveMemory].
+     */
+    suspend fun forgetKeepingSavedMemory()
+
+    /**
+     * How the latest restore went, for whoever shows it: in progress, restored, or read again.
+     * Carries no text of the conversation.
+     */
+    val memoryRestore: StateFlow<MemoryRestoreState>
+
+    /**
+     * Saves what the model's memory holds now into [vault], as the memory of the conversation
+     * [conversationKey], and returns at once with a reason when it should not:
+     * - no model is loaded, or (for [SaveTrigger.LEFT_SCREEN]) the engine is busy with a reply,
+     *   a load or anything else; for [SaveTrigger.LOCK] the save waits its turn instead;
+     * - the memory is empty, or is not that conversation's (the latest request named another);
+     * - the memory was marked with [markNotToBeSaved] and has not been rebuilt from nothing;
+     * - reading it again would take less than the engine's least worth saving (about 20 seconds
+     *   by the model's reading curve on this device), or nobody knows how long;
+     * - for [SaveTrigger.LEFT_SCREEN], reading again what is new since the last save would take
+     *   no more than about 10 seconds.
+     *
+     * Every checkpoint the engine holds goes into the image. The memory itself is only read:
+     * whatever the outcome it is as it was. A request that arrives while a save runs stops the
+     * save at its next piece and then runs; so do [forget], [unload], a [load] and cancelling the
+     * caller. The image becomes the vault's only when every piece was written.
+     */
+    suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult
+
+    /**
+     * Reads back the memory that [vault] holds, when it is the memory of [conversationKey] made
+     * with the loaded model: called after the model is loaded and before the first request of
+     * that conversation. The context is given the size the image needs within the limits it
+     * would have for a request naming [maxContextTokens]. Afterwards the memory is ordinary
+     * memory, and the next request keeps of it what it has in common with its prompt.
+     *
+     * Any failure, at any point, leaves the memory empty and the image deleted, and the
+     * conversation is then read again as it would have been without a saved memory. An image of
+     * another conversation is kept until a request comes (which deletes it) or a restore for its
+     * own conversation. [memoryRestore] says what happened.
+     */
+    suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int? = null): MemoryRestoreResult
+
+    /**
+     * Marks the memory as not to be saved, because part of its conversation must be forgotten
+     * (messages that expired): from the moment this is called, no save is made until the memory
+     * has been emptied by a request made after the mark, or by [forget], [load] or [unload]; and
+     * no saved memory is restored. Returns at once, from any thread, also while a reply runs.
+     * The caller marks before it builds any request without the forgotten messages.
+     */
+    fun markNotToBeSaved()
 }

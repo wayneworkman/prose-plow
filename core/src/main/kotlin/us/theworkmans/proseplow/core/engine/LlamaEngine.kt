@@ -30,6 +30,7 @@ import us.theworkmans.proseplow.core.prompt.PromptRole
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.random.Random
@@ -193,6 +194,13 @@ class LlamaEngine(
      *   used for it. That is the case when another conversation is asked for, which shares
      *   only its beginning with the one in memory. A conversation that merely became shorter
      *   keeps its context, and what was read of it.
+     * @property minSavedReadingSeconds the least time reading a memory again must take, by the
+     *   model's reading curve on this device, for the memory to be saved or restored: below it
+     *   reading again costs less than is worth keeping a large file for. It rules out a model by
+     *   its numbers (Boris-2 reads its whole context in about 7 seconds), never by its name.
+     * @property newReadingSecondsOnLeaving how long reading again what is new since the last save
+     *   must take for a save when the app leaves the screen ([SaveTrigger.LEFT_SCREEN]): more than
+     *   this. Leaving the screen happens often, and a save writes the whole memory.
      */
     data class Settings(
         val maxCheckpoints: Int = 4,
@@ -200,6 +208,8 @@ class LlamaEngine(
         val deepReadTokens: Int = 1024,
         val minReplyTokens: Int = ReplyLength.MIN_TOKENS,
         val giveBackRereadTokens: Int = ContextPolicy.GRANULARITY,
+        val minSavedReadingSeconds: Double = 20.0,
+        val newReadingSecondsOnLeaving: Double = 10.0,
     ) {
         init {
             require(maxCheckpoints >= 0) { "maxCheckpoints must not be negative" }
@@ -207,11 +217,27 @@ class LlamaEngine(
             require(deepReadTokens >= 0) { "deepReadTokens must not be negative" }
             require(minReplyTokens >= 1) { "minReplyTokens must be at least 1" }
             require(giveBackRereadTokens >= 0) { "giveBackRereadTokens must not be negative" }
+            require(minSavedReadingSeconds >= 0 && newReadingSecondsOnLeaving >= 0) { "the reading times of saving must not be negative" }
         }
     }
 
     /** A saved state of the memory when it held exactly the first [position] tokens. */
     private class Checkpoint(val position: Int, val handle: Int)
+
+    /**
+     * The image a vault holds that the engine knows of: of [tokenCount] tokens of the
+     * conversation [conversationKey], made with [modelId].
+     *
+     * While it is not [waiting], its tokens are the first [tokenCount] tokens of the memory: it
+     * was written from this memory or read into it, and since then the memory has only grown,
+     * because every place that makes the memory shorter than [tokenCount] deletes it first
+     * ([dropSavedIfBeyondMemory]). So comparing lengths is comparing tokens.
+     *
+     * A [waiting] image is of another conversation than the memory's, found by a restore for
+     * another one; the first request deletes it, unless a restore for its own conversation
+     * comes first.
+     */
+    private class KnownImage(val vault: MemoryVault, val conversationKey: String, val modelId: String, val tokenCount: Int, val waiting: Boolean)
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
     override val state: StateFlow<EngineState> = _state.asStateFlow()
@@ -250,6 +276,36 @@ class LlamaEngine(
      */
     private var measuredReadSpeed = 0.0
 
+    /** The saved image the engine knows of, if any; see [KnownImage]. */
+    private var savedImage: KnownImage? = null
+
+    /**
+     * Which conversation the memory is of: the key of the request or restore that last made it
+     * agree with a prompt. Meaningful only while the memory is not empty.
+     */
+    private var memoryKey: String? = null
+
+    /**
+     * How many marks of [markNotToBeSaved] have been made, and how many of them the memory has
+     * since been emptied after. The memory is marked while the first is ahead of the second.
+     * Marks are made from any thread; [liftedMarks] is written on the native thread only.
+     */
+    private val marks = AtomicLong(0)
+    @Volatile private var liftedMarks = 0L
+
+    /**
+     * The marks that were made before the operation now holding the engine was asked for: an
+     * emptied memory lifts those, and none made later. Set at the start of every operation; 0
+     * for one that must lift none (a restore, which fills the memory with what was saved).
+     */
+    private var marksBeforeOperation = 0L
+
+    /** Moves on whenever a request is collected, so that a save in progress stops for it. */
+    private val requests = AtomicInteger(0)
+
+    private val _memoryRestore = MutableStateFlow<MemoryRestoreState>(MemoryRestoreState.Idle)
+    override val memoryRestore: StateFlow<MemoryRestoreState> = _memoryRestore.asStateFlow()
+
     /** The limit the collector was last told of, so that the same one is not announced with every answer; null after a growth. */
     private var announcedContextLimit: Int? = null
     private val checkpoints = ArrayList<Checkpoint>()
@@ -260,9 +316,11 @@ class LlamaEngine(
         val current = _state.value
         if (current is EngineState.Ready && current.modelId == model.id) return
         epoch.incrementAndGet()
+        val marksBefore = marks.get()
         mutex.withLock {
             withContext(nativeDispatcher) {
                 if (native != null && loaded?.id == model.id) return@withContext
+                marksBeforeOperation = marksBefore
                 closeNative()
                 _state.value = EngineState.Loading(model.id, 0f)
                 val job = coroutineContext.job
@@ -298,10 +356,12 @@ class LlamaEngine(
 
     override suspend fun unload() {
         epoch.incrementAndGet()
+        val marksBefore = marks.get()
         // Not cancellable: once asked for, the model must really be freed.
         withContext(NonCancellable) {
             mutex.withLock {
                 withContext(nativeDispatcher) {
+                    marksBeforeOperation = marksBefore
                     closeNative()
                     _state.value = EngineState.Unloaded
                 }
@@ -309,13 +369,31 @@ class LlamaEngine(
         }
     }
 
-    override suspend fun forget() {
+    override suspend fun forget() = forget(keepSaved = false)
+
+    override suspend fun forgetKeepingSavedMemory() = forget(keepSaved = true)
+
+    /**
+     * Empties the memory. With [keepSaved] the engine lets go of a saved image without deleting
+     * it, before anything else, so that no failure on the way can delete it either; otherwise the
+     * image goes with the memory.
+     */
+    private suspend fun forget(keepSaved: Boolean) {
         epoch.incrementAndGet()
+        val marksBefore = marks.get()
         // Not cancellable: the app is locking, and the conversation must be gone when this returns.
         withContext(NonCancellable) {
             mutex.withLock {
                 withContext(nativeDispatcher) {
-                    val current = native ?: return@withContext
+                    marksBeforeOperation = marksBefore
+                    if (keepSaved) savedImage = null else dropSavedImage()
+                    _memoryRestore.value = MemoryRestoreState.Idle
+                    val current = native
+                    if (current == null) {
+                        // No model, so no memory: nothing is left that a mark could concern.
+                        liftMarks()
+                        return@withContext
+                    }
                     if (!clearMemory(current)) {
                         // The memory could not be cleared; freeing the model clears it for certain.
                         closeNative()
@@ -366,7 +444,10 @@ class LlamaEngine(
         }
     }
 
-    /** Frees the loaded model, if any, and forgets everything about its memory. */
+    /**
+     * Frees the loaded model, if any, and forgets everything about its memory, a saved image the
+     * engine knows of included: no other model can use it, and this one has nothing it begins.
+     */
     private fun closeNative() {
         val current = native
         native = null
@@ -378,6 +459,10 @@ class LlamaEngine(
         announcedContextLimit = null
         memory.wipe()
         checkpoints.clear()
+        memoryKey = null
+        dropSavedImage()
+        liftMarks()
+        _memoryRestore.value = MemoryRestoreState.Idle
         try {
             current?.close()
         } catch (_: RuntimeException) {
@@ -388,16 +473,303 @@ class LlamaEngine(
     /**
      * Empties the native memory, which also frees every checkpoint, and the engine's copy with
      * it. Returns false when the native side failed; the copy is emptied regardless, so the next
-     * generation notices the mismatch and tries again.
+     * generation notices the mismatch and tries again. A saved image the memory no longer
+     * begins with is deleted, and the marks made before the operation in progress are lifted.
      */
     private fun clearMemory(native: NativeLlama): Boolean {
         memory.wipe()
         checkpoints.clear()
+        // The key stays: a request clears and then rebuilds the memory as its own conversation's.
+        // An empty memory is never saved, whatever key it has.
+        dropSavedIfBeyondMemory()
+        liftMarks()
         return try {
             native.clearMemory()
             true
         } catch (_: RuntimeException) {
             false
+        }
+    }
+
+    // --- What was saved, and what may be ---
+
+    /**
+     * Deletes the saved image the engine knows of, if any, and forgets it. A vault that fails to
+     * delete is not asked again by the engine: the vault's own checks of the conversation catch
+     * an image that outlived its memory before it could be restored.
+     */
+    private fun dropSavedImage() {
+        val image = savedImage ?: return
+        savedImage = null
+        try {
+            image.vault.delete()
+        } catch (_: Exception) {
+            // See above; the engine goes on without it.
+        }
+    }
+
+    /**
+     * Called after everything that makes the memory shorter: a saved image longer than the
+     * memory now is no longer its beginning, so it is deleted at once (see [KnownImage]).
+     */
+    private fun dropSavedIfBeyondMemory() {
+        val image = savedImage ?: return
+        if (!image.waiting && memory.size < image.tokenCount) dropSavedImage()
+    }
+
+    /** The memory is empty: the marks made before the operation in progress no longer apply. */
+    private fun liftMarks() {
+        if (marksBeforeOperation > liftedMarks) liftedMarks = marksBeforeOperation
+    }
+
+    private fun isMarked(): Boolean = marks.get() > liftedMarks
+
+    override fun markNotToBeSaved() {
+        marks.incrementAndGet()
+    }
+
+    /**
+     * How long [model] takes to read a conversation on this device: the catalogue's curve
+     * scaled by the factor last measured (1 until then). A model whose catalogue entry has no
+     * curve gets a flat one from the speed it was last seen to read at, and none at all before
+     * that.
+     */
+    private fun readingTimes(model: ModelSpec): ReadingTimes {
+        val catalogue = model.readingTimes
+        return when {
+            catalogue.isKnown -> if (measuredReadingFactor > 0) catalogue.scaled(measuredReadingFactor) else catalogue
+            measuredReadSpeed > 0 -> ReadingTimes.flat(measuredReadSpeed)
+            else -> ReadingTimes.UNKNOWN
+        }
+    }
+
+    /** Whether reading [tokens] again takes [model] at least the least worth saving; false when nobody knows. */
+    private fun worthSaving(model: ModelSpec, tokens: Int): Boolean {
+        val times = readingTimes(model)
+        return times.isKnown && times.seconds(tokens) >= settings.minSavedReadingSeconds
+    }
+
+    // --- Saving and restoring the memory ---
+
+    override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult {
+        val startEpoch = epoch.get()
+        // On leaving the screen a reply, a load or anything else that holds the engine goes first,
+        // and the save is not made; the lock's save waits its turn (its caller bounds the wait).
+        if (trigger == SaveTrigger.LEFT_SCREEN) {
+            if (!mutex.tryLock()) return MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.BUSY)
+        } else {
+            mutex.lock()
+        }
+        try {
+            return withContext(nativeDispatcher) { save(vault, conversationKey, trigger, startEpoch, coroutineContext.job) }
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    /** [saveMemory] on [nativeDispatcher] with the mutex held. */
+    private fun save(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger, startEpoch: Int, job: Job): MemorySaveResult {
+        val startRequests = requests.get()
+        fun notSaved(reason: MemorySaveResult.NotSaved.Reason) = MemorySaveResult.NotSaved(reason)
+        val native = native ?: return notSaved(MemorySaveResult.NotSaved.Reason.NOT_LOADED)
+        val model = loaded ?: return notSaved(MemorySaveResult.NotSaved.Reason.NOT_LOADED)
+        val tokens = memory.size
+        if (tokens == 0 || native.memoryTokenCount() != tokens) return notSaved(MemorySaveResult.NotSaved.Reason.EMPTY)
+        if (memoryKey != conversationKey) return notSaved(MemorySaveResult.NotSaved.Reason.OTHER_CONVERSATION)
+        if (isMarked()) return notSaved(MemorySaveResult.NotSaved.Reason.MARKED)
+        val times = readingTimes(model)
+        if (!worthSaving(model, tokens)) return notSaved(MemorySaveResult.NotSaved.Reason.NOT_WORTH_IT)
+        if (trigger == SaveTrigger.LEFT_SCREEN) {
+            // What the vault already holds of this memory need not be read again; only what is new.
+            val image = savedImage
+            val since = if (image != null && !image.waiting && image.vault === vault && image.conversationKey == conversationKey) image.tokenCount else 0
+            if (times.secondsBetween(since, tokens) <= settings.newReadingSecondsOnLeaving) return notSaved(MemorySaveResult.NotSaved.Reason.LITTLE_NEW)
+        }
+        // Every checkpoint goes into the image, oldest first, as many as an image carries.
+        val handles = checkpoints.sortedBy { it.position }.takeLast(NativeLlama.MAX_MEMORY_CHECKPOINTS).map { it.handle }.toIntArray()
+        // An image the engine knows of in another vault is not the one this save replaces.
+        if (savedImage?.vault !== vault) dropSavedImage()
+        val writer: MemoryWriter
+        val bytes: Long
+        try {
+            bytes = native.memoryStateBytes(handles)
+            writer = vault.beginSave(
+                SavedMemory(
+                    conversationKey = conversationKey,
+                    modelId = model.id,
+                    contextTokens = native.contextSize(),
+                    tokenCount = tokens,
+                    readingSeconds = times.seconds(tokens),
+                    imageBytes = bytes,
+                ),
+            )
+        } catch (_: Exception) {
+            return notSaved(MemorySaveResult.NotSaved.Reason.FAILED)
+        }
+        // Stops at the next piece for a request, for forgetting, unloading or loading, and for the caller.
+        val stopped = { epoch.get() != startEpoch || requests.get() != startRequests || !job.isActive }
+        try {
+            val written = writer.use {
+                val written = native.exportMemory(handles, writer.buffer, writer.firstPieceOffset) { piece, last ->
+                    !stopped() && writer.write(piece, last)
+                }
+                if (written != bytes) return notSaved(MemorySaveResult.NotSaved.Reason.FAILED)
+                writer.commit()
+                written
+            }
+            savedImage = KnownImage(vault, conversationKey, model.id, tokens, waiting = false)
+            return MemorySaveResult.Saved(tokens, written)
+        } catch (e: NativeLlamaException) {
+            return notSaved(if (e.code == NativeLlamaException.MEMORY_STOPPED) MemorySaveResult.NotSaved.Reason.STOPPED else MemorySaveResult.NotSaved.Reason.FAILED)
+        } catch (_: Exception) {
+            return notSaved(MemorySaveResult.NotSaved.Reason.FAILED)
+        }
+    }
+
+    override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
+        val startEpoch = epoch.get()
+        return mutex.withLock {
+            withContext(nativeDispatcher) { restore(vault, conversationKey, maxContextTokens, startEpoch, coroutineContext.job) }
+        }
+    }
+
+    /** [restoreMemory] on [nativeDispatcher] with the mutex held. */
+    private suspend fun restore(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?, startEpoch: Int, job: Job): MemoryRestoreResult {
+        // Nothing a restore empties is rebuilt from nothing: it is filled with what was saved.
+        marksBeforeOperation = 0
+        val native = native ?: return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.NOT_LOADED)
+        val model = loaded ?: return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.NOT_LOADED)
+        val image = try {
+            vault.saved()
+        } catch (_: Exception) {
+            return refuseImage(vault, MemoryRestoreResult.NotRestored.Reason.FAILED)
+        }
+        if (image == null) {
+            // The vault holds nothing: what the engine knew of it is gone.
+            if (savedImage?.vault === vault) savedImage = null
+            return MemoryRestoreResult.NothingSaved
+        }
+        if (image.modelId != model.id) return refuseImage(vault, MemoryRestoreResult.NotRestored.Reason.OTHER_MODEL)
+        if (image.conversationKey != conversationKey) {
+            // It waits for its own conversation; the next request deletes it.
+            savedImage = KnownImage(vault, image.conversationKey, image.modelId, image.tokenCount, waiting = true)
+            return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.OTHER_CONVERSATION)
+        }
+        if (memory.size > 0 && memoryKey == conversationKey) {
+            // The memory is this conversation already. The image is its beginning only when it
+            // is the very one the engine wrote or read; anything else cannot be placed.
+            val known = savedImage
+            if (known != null && !known.waiting && known.vault === vault && known.conversationKey == conversationKey && known.tokenCount == image.tokenCount) {
+                return MemoryRestoreResult.AlreadyHeld
+            }
+            return refuseImage(vault, MemoryRestoreResult.NotRestored.Reason.MEMORY_IN_USE)
+        }
+
+        _memoryRestore.value = MemoryRestoreState.Restoring(model.id)
+        // Whatever the memory holds is another conversation's, or nothing: it goes. The image is
+        // not the engine's to keep track of until it has been read; one in another vault goes.
+        if (savedImage?.vault === vault) savedImage = null else dropSavedImage()
+        if (memory.size > 0 || native.memoryTokenCount() > 0) {
+            if (!clearMemory(native)) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+        }
+        if (isMarked()) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.MARKED)
+        if (image.tokenCount < 1 || !worthSaving(model, image.tokenCount)) {
+            return readAgain(vault, native, if (image.tokenCount < 1) MemoryRestoreResult.NotRestored.Reason.FAILED else MemoryRestoreResult.NotRestored.Reason.NOT_WORTH_IT)
+        }
+
+        // The size: the saved one, or the smallest step that holds the tokens, by the same
+        // growth and memory checks as for a request, with nothing to carry over.
+        try {
+            val sizing = Sizing(native, model, maxContextTokens, tell = null)
+            val limit = sizing.contextLimit()
+            if (image.tokenCount > limit) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.CONTEXT_TOO_SMALL)
+            val wanted = maxOf(image.tokenCount, minOf(image.contextTokens, limit))
+            if (native.contextSize() < wanted) sizing.growTowards(wanted, limit)
+        } catch (_: NativeLlamaException) {
+            if (native.contextSize() <= 0) {
+                // No context exists any more, of any size: the model is as good as not loaded.
+                closeNative()
+                _state.value = EngineState.Failed(model.id, EngineError.LoadFailed(model.id, TOO_LITTLE_MEMORY))
+                deleteQuietly(vault)
+                _memoryRestore.value = MemoryRestoreState.ReadAgain(model.id)
+                return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.CONTEXT_TOO_SMALL)
+            }
+            return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.CONTEXT_TOO_SMALL)
+        }
+        if (native.contextSize() < image.tokenCount) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.CONTEXT_TOO_SMALL)
+
+        val reader = try {
+            vault.beginRestore()
+        } catch (_: Exception) {
+            return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+        }
+        try {
+            reader.use {
+                if (reader.memory != image) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+                // Stops for forgetting, unloading or loading, and for the caller.
+                val source = MemorySource { if (epoch.get() != startEpoch || !job.isActive) -1 else reader.read() }
+                val restored = native.importMemory(reader.buffer, reader.firstPieceOffset, source)
+                // Restored only when the import returned normally and the memory is as long as the header said.
+                val tokens = native.memoryTokens()
+                try {
+                    val count = native.memoryTokenCount()
+                    val positions = restored.map { it.tokenCount }
+                    val agrees = tokens.size == image.tokenCount && count == image.tokenCount &&
+                        positions.all { it in 1..image.tokenCount } && positions.distinct().size == positions.size
+                    if (!agrees) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+                    memory.wipe()
+                    memory.addAll(tokens)
+                } finally {
+                    tokens.fill(0)
+                }
+                // The latest checkpoints are kept, as many as the engine keeps; the rest are freed.
+                val ordered = restored.sortedBy { it.tokenCount }
+                val surplus = (ordered.size - settings.maxCheckpoints).coerceAtLeast(0)
+                for (checkpoint in ordered.take(surplus)) native.dropCheckpoint(checkpoint.handle)
+                checkpoints.clear()
+                for (checkpoint in ordered.drop(surplus)) checkpoints += Checkpoint(checkpoint.tokenCount, checkpoint.handle)
+            }
+        } catch (e: NativeLlamaException) {
+            return readAgain(vault, native, if (e.code == NativeLlamaException.MEMORY_STOPPED) MemoryRestoreResult.NotRestored.Reason.STOPPED else MemoryRestoreResult.NotRestored.Reason.FAILED)
+        } catch (_: Exception) {
+            return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+        }
+        memoryKey = conversationKey
+        savedImage = KnownImage(vault, conversationKey, model.id, image.tokenCount, waiting = false)
+        _memoryRestore.value = MemoryRestoreState.Restored(model.id, image.tokenCount)
+        return MemoryRestoreResult.Restored(image.tokenCount)
+    }
+
+    /** A restore that did not begin: the image is deleted, and the memory is left as it was. */
+    private fun refuseImage(vault: MemoryVault, reason: MemoryRestoreResult.NotRestored.Reason): MemoryRestoreResult {
+        if (savedImage?.vault === vault) savedImage = null
+        deleteQuietly(vault)
+        return MemoryRestoreResult.NotRestored(reason)
+    }
+
+    /**
+     * A restore that began and failed: the memory is emptied (and the model freed if even that
+     * fails, as [forget] does), the image deleted, and the conversation is read again at the
+     * next request.
+     */
+    private fun readAgain(vault: MemoryVault, native: NativeLlama, reason: MemoryRestoreResult.NotRestored.Reason): MemoryRestoreResult {
+        val modelId = loaded?.id
+        savedImage = null
+        deleteQuietly(vault)
+        if (!clearMemory(native)) {
+            closeNative()
+            _state.value = EngineState.Unloaded
+        }
+        if (modelId != null) _memoryRestore.value = MemoryRestoreState.ReadAgain(modelId)
+        return MemoryRestoreResult.NotRestored(reason)
+    }
+
+    /** Tells [vault] to delete; see [dropSavedImage] for why a failure is let go. */
+    private fun deleteQuietly(vault: MemoryVault) {
+        try {
+            vault.delete()
+        } catch (_: Exception) {
+            // As in dropSavedImage.
         }
     }
 
@@ -415,16 +787,23 @@ class LlamaEngine(
      * caller that is waiting for forget() to return). The buffer cannot grow without bound: a
      * generation emits at most one event per token or per chunk of the prompt.
      */
-    override fun generate(request: GenerationRequest): Flow<GenerationEvent> = flow {
-        val startEpoch = epoch.get()
-        emitAll(
-            channelFlow { mutex.withLock { generate(request, startEpoch) } }
-                .buffer(Channel.UNLIMITED)
-                .flowOn(nativeDispatcher),
-        )
+    override fun generate(request: GenerationRequest): Flow<GenerationEvent> {
+        // Taken when the request is handed over, which is after the caller built it: a mark made
+        // later may concern messages this request still holds, and its emptying must not lift it.
+        val marksBefore = marks.get()
+        return flow {
+            val startEpoch = epoch.get()
+            // A save in progress stops at its next piece and lets this request have the engine.
+            requests.incrementAndGet()
+            emitAll(
+                channelFlow { mutex.withLock { generate(request, startEpoch, marksBefore) } }
+                    .buffer(Channel.UNLIMITED)
+                    .flowOn(nativeDispatcher),
+            )
+        }
     }
 
-    private suspend fun ProducerScope<GenerationEvent>.generate(request: GenerationRequest, startEpoch: Int) {
+    private suspend fun ProducerScope<GenerationEvent>.generate(request: GenerationRequest, startEpoch: Int, marksBefore: Long) {
         val native = native
         val model = loaded
         if (native == null || model == null) {
@@ -435,6 +814,11 @@ class LlamaEngine(
             send(GenerationEvent.Error(EngineError.WrongModel(requested = request.modelId, loaded = model.id)))
             return
         }
+        marksBeforeOperation = marksBefore
+        // A saved image of another conversation, or one still waiting for a restore, is not what
+        // this request will make of the memory.
+        val image = savedImage
+        if (image != null && (image.waiting || image.conversationKey != request.conversationKey)) dropSavedImage()
         val error = try {
             Generation(this, native, model, request, startEpoch, coroutineContext.job).run()
             return
@@ -462,6 +846,186 @@ class LlamaEngine(
     }
 
     /**
+     * The decisions about the size of the loaded model's context ([ContextPolicy]), shared by a
+     * generation and a restore. Runs on [nativeDispatcher] with the mutex held.
+     *
+     * @param chosen the size the user chose as the most the context may grow to, or null for
+     *   automatic ([GenerationRequest.maxContextTokens]).
+     * @param tell receives the events about the size, in a generation; null for a restore, which
+     *   has nobody to tell. A limit found without being told is still this model's limit, and
+     *   the next generation that runs into it says so.
+     */
+    private inner class Sizing(
+        private val native: NativeLlama,
+        private val model: ModelSpec,
+        private val chosen: Int?,
+        private val tell: (suspend (GenerationEvent) -> Unit)?,
+    ) {
+        /**
+         * What a context of [tokens] costs as the native side counts it, or null when it cannot
+         * say: for a size beyond the model's largest, and for a session that could not learn
+         * what its contexts cost. Such a session keeps the size it has; it still answers.
+         */
+        private fun nativeCost(tokens: Int): Long? {
+            if (tokens < 1 || tokens > native.maxContextSize) return null
+            return try {
+                native.contextBytes(tokens)
+            } catch (e: NativeLlamaException) {
+                if (e.code != NativeLlamaException.CONTEXT_REFUSED) throw e
+                null
+            }
+        }
+
+        /** The memory one more token of context costs for the loaded model, as it says itself; the catalogue's figure when it does not. */
+        private fun bytesPerToken(): Long {
+            val low = nativeCost(ContextPolicy.GRANULARITY)
+            val high = nativeCost(2 * ContextPolicy.GRANULARITY)
+            val asked = if (low != null && high != null) (high - low) / ContextPolicy.GRANULARITY else 0
+            return if (asked > 0) asked else model.contextBytesPerToken
+        }
+
+        /**
+         * How large this model's context may become now: what the policy allows for the model
+         * on this device (under the user's choice of size, [chosen], if there is one), and no
+         * more than a limit that was found earlier by running into it.
+         *
+         * Left to itself, a context that has grown is not cut back because the model was since
+         * seen to read more slowly: the speed is measured again with every prompt, and a limit
+         * that followed every measurement down would leave out turns of a conversation that was
+         * already read, and read the rest again. What a conversation was given, it keeps until
+         * it is left; the limit of the moment counts for what is asked for from then on. A size
+         * the user chose is another matter: it is the user's, and holds at once.
+         */
+        fun contextLimit(): Int {
+            val allowed = contextPolicy.limit(
+                start = openedContext,
+                maxContext = minOf(model.maxContextLength, native.maxContextSize),
+                bytesPerToken = bytesPerToken(),
+                totalBytes = memoryGauge.read().totalBytes,
+                chosen = chosen,
+                readingTimes = readingTimes(model),
+            )
+            val limit = minOf(allowed, foundContextLimit ?: Int.MAX_VALUE)
+            return (if (chosen == null) maxOf(limit, native.contextSize()) else limit).coerceAtLeast(1)
+        }
+
+        /**
+         * Makes the context larger, towards [wanted] tokens and never beyond [limit]: to the
+         * smallest step that holds [wanted] if the device's memory allows that now, otherwise
+         * to the largest size it does allow below that step, a step or any whole multiple of
+         * [NATIVE_CONTEXT_STEP] tokens ([largestWithin]). Where it ends below what was wanted,
+         * that size is the model's limit from now on, and the collector is told so once.
+         *
+         * The device's memory is read here, at the moment of the decision. The policy budgets
+         * what the tokens of a context take. The native side counts more: what a session
+         * reserves whatever the size of its context, most of which is never touched. That part
+         * is the same before and after a step, so it is added to the policy's budget, and the
+         * sum is what the native side is given; it keeps the context's memory within it at
+         * every moment, choosing itself whether the model's memory can be carried over.
+         *
+         * The native side counts a size larger than any it has created a little higher than its
+         * own line through the sizes it has (a margin it keeps against costing too low), while
+         * the policy's limit is the token arithmetic alone. At the very largest sizes the step
+         * the policy allows can therefore cost the native side just more than the budget; the
+         * size taken is then the largest below it that the native side costs within the budget,
+         * not the step before, which can be tens of thousands of tokens smaller.
+         */
+        suspend fun growTowards(wanted: Int, limit: Int) {
+            val from = native.contextSize()
+            val device = memoryGauge.read()
+            val cost = nativeCost(from)
+            if (cost == null) {
+                // What a context costs is not known, so none is asked for.
+                limitFound(from, GenerationEvent.ContextLimited.Reason.FAILED)
+                return
+            }
+            val tokenBytes = from.toLong() * bytesPerToken()
+            val reserved = (cost - tokenBytes).coerceAtLeast(0)
+            val allowed = contextPolicy.budgetBytes(device, minOf(tokenBytes, cost))
+            val budget = if (allowed > Long.MAX_VALUE - reserved) Long.MAX_VALUE else allowed + reserved
+            val steps = contextPolicy.steps(start = openedContext, limit = limit)
+            val target = steps.firstOrNull { it >= wanted } ?: limit
+            if (device.low) {
+                // The system says memory is low: nothing is added while it says so. That is a
+                // state of the moment and not a limit of this model, so it is not remembered.
+                announceLimit(from, GenerationEvent.ContextLimited.Reason.MEMORY)
+                return
+            }
+            fun fits(size: Int): Boolean = nativeCost(size).let { it != null && it <= budget }
+            val step = steps.lastOrNull { step -> step > from && step <= target && fits(step) }
+            val affordable = if (step == target) step else largestWithin(above = step ?: from, below = target, fits = ::fits) ?: step
+            if (affordable == null) {
+                limitFound(from, GenerationEvent.ContextLimited.Reason.MEMORY)
+                return
+            }
+            val held = memory.size
+            try {
+                native.resizeContext(affordable, budget)
+            } catch (e: NativeLlamaException) {
+                when (e.code) {
+                    NativeLlamaException.CONTEXT_REFUSED -> limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.MEMORY)
+                    NativeLlamaException.CONTEXT_NOT_CREATED -> {
+                        // Whatever exists now is what there is; a context that does not exist at all ends the generation as a failure of the model.
+                        if (native.contextSize() <= 0) throw e
+                        agreeWithNativeMemory()
+                        limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.FAILED)
+                    }
+                    else -> throw e
+                }
+                return
+            }
+            agreeWithNativeMemory()
+            announcedContextLimit = null
+            tell?.invoke(GenerationEvent.ContextGrown(fromTokens = from, toTokens = native.contextSize(), rereading = held > 0 && memory.size == 0))
+            if (affordable < target) limitFound(affordable, GenerationEvent.ContextLimited.Reason.MEMORY)
+        }
+
+        /**
+         * The largest whole multiple of [NATIVE_CONTEXT_STEP] tokens strictly between [above] and
+         * [below] that [fits], or null when none does. What a context costs rises with its size,
+         * so the multiples are searched by halving: a few questions to the native side, each of
+         * which is arithmetic on figures it already has, and none of which allocates anything.
+         */
+        private fun largestWithin(above: Int, below: Int, fits: (Int) -> Boolean): Int? {
+            var low = above / NATIVE_CONTEXT_STEP + 1
+            var high = (below - 1) / NATIVE_CONTEXT_STEP
+            if (low > high || !fits(low * NATIVE_CONTEXT_STEP)) return null
+            // Invariant: the multiple low fits; every multiple above high does not, or is out of range.
+            while (low < high) {
+                val middle = low + (high - low + 1) / 2
+                if (fits(middle * NATIVE_CONTEXT_STEP)) low = middle else high = middle - 1
+            }
+            return low * NATIVE_CONTEXT_STEP
+        }
+
+        /** After a resize: the engine's copy of the memory is what the native side kept, which is all of it or nothing. */
+        private fun agreeWithNativeMemory() {
+            if (native.memoryTokenCount() == memory.size) return
+            if (native.memoryTokenCount() == 0) {
+                // Not carried over. The checkpoints went with it, and a saved image of it is no longer its beginning.
+                memory.wipe()
+                checkpoints.clear()
+                dropSavedIfBeyondMemory()
+            } else if (!clearMemory(native)) {
+                throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "The memory could not be cleared")
+            }
+        }
+
+        /** [tokens] is this model's limit until it is loaded again; the collector is told once. */
+        private suspend fun limitFound(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
+            foundContextLimit = minOf(tokens, foundContextLimit ?: Int.MAX_VALUE)
+            announceLimit(tokens, reason)
+        }
+
+        private suspend fun announceLimit(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
+            val tell = tell ?: return
+            if (announcedContextLimit == tokens) return
+            announcedContextLimit = tokens
+            tell(GenerationEvent.ContextLimited(tokens, reason))
+        }
+    }
+
+    /**
      * One generation from start to finish. A class only so that the steps can share their state;
      * it runs on [nativeDispatcher] with the mutex held and is used once.
      */
@@ -473,6 +1037,7 @@ class LlamaEngine(
         private val startEpoch: Int,
         private val job: Job,
     ) {
+        private val sizing = Sizing(native, model, request.maxContextTokens) { out.send(it) }
         private val startedAt = nanoTime()
         private var promptReadyAt = startedAt
         private var promptTokens = 0
@@ -533,7 +1098,7 @@ class LlamaEngine(
             // memory agree with the prompt (which may clear it, and with it give a grown context
             // back), and then makes room. A size that cannot be had lowers the limit, and the
             // next round fits to that; so the limit only ever goes down and the rounds end.
-            var limit = contextLimit()
+            var limit = sizing.contextLimit()
             var fitted: ContextBudget.Result.Fits
             var rounds = 0
             while (true) {
@@ -547,11 +1112,13 @@ class LlamaEngine(
                 if (fitted.prompt.tokens.isEmpty()) throw PromptFormatException("The prompt is empty.")
                 // A collector that has gone is noticed before the memory is touched again.
                 job.ensureActive()
+                // From here on the memory is made to agree with this prompt: it is this conversation's.
+                memoryKey = request.conversationKey
                 val wanted = minOf(limit, fitted.prompt.tokens.size + minOf(requestedNewTokens, ReplyLength.maxTokens(limit)))
                 giveBackIfLeft(fitted.prompt.tokens, wanted)
                 reuseMemory(fitted.prompt.tokens)
                 if (native.contextSize() >= wanted) break
-                growTowards(wanted, limit)
+                sizing.growTowards(wanted, limit)
                 if (native.contextSize() >= wanted) break
                 limit = native.contextSize()
                 if (++rounds >= MAX_FITTING_ROUNDS) {
@@ -585,21 +1152,6 @@ class LlamaEngine(
         // --- The size of the context ---
 
         /**
-         * How long this model takes to read a conversation on this device: the catalogue's
-         * curve scaled by the factor last measured (1 until then). A model whose catalogue
-         * entry has no curve gets a flat one from the speed it was last seen to read at, and
-         * none at all before that.
-         */
-        private fun readingTimes(): ReadingTimes {
-            val catalogue = model.readingTimes
-            return when {
-                catalogue.isKnown -> if (measuredReadingFactor > 0) catalogue.scaled(measuredReadingFactor) else catalogue
-                measuredReadSpeed > 0 -> ReadingTimes.flat(measuredReadSpeed)
-                else -> ReadingTimes.UNKNOWN
-            }
-        }
-
-        /**
          * Remembers how fast a prompt was read that took the memory from [from] to [to] tokens
          * in [nanos], when it was long enough to say: as a factor over the catalogue's time
          * for the same stretch, so that a short prompt read deep into a conversation is
@@ -615,143 +1167,6 @@ class LlamaEngine(
             } else {
                 measuredReadSpeed = (to - from) / seconds
             }
-        }
-
-        /**
-         * What a context of [tokens] costs as the native side counts it, or null when it cannot
-         * say: for a size beyond the model's largest, and for a session that could not learn
-         * what its contexts cost. Such a session keeps the size it has; it still answers.
-         */
-        private fun nativeCost(tokens: Int): Long? {
-            if (tokens < 1 || tokens > native.maxContextSize) return null
-            return try {
-                native.contextBytes(tokens)
-            } catch (e: NativeLlamaException) {
-                if (e.code != NativeLlamaException.CONTEXT_REFUSED) throw e
-                null
-            }
-        }
-
-        /** The memory one more token of context costs for the loaded model, as it says itself; the catalogue's figure when it does not. */
-        private fun bytesPerToken(): Long {
-            val low = nativeCost(ContextPolicy.GRANULARITY)
-            val high = nativeCost(2 * ContextPolicy.GRANULARITY)
-            val asked = if (low != null && high != null) (high - low) / ContextPolicy.GRANULARITY else 0
-            return if (asked > 0) asked else model.contextBytesPerToken
-        }
-
-        /**
-         * How large this model's context may become for this request: what the policy allows
-         * for the model on this device (under the request's own choice of size, if it makes
-         * one), and no more than a limit that was found earlier by running into it.
-         *
-         * Left to itself, a context that has grown is not cut back because the model was since
-         * seen to read more slowly: the speed is measured again with every prompt, and a limit
-         * that followed every measurement down would leave out turns of a conversation that was
-         * already read, and read the rest again. What a conversation was given, it keeps until
-         * it is left; the limit of the moment counts for what is asked for from then on. A size
-         * the request names is another matter: it is the user's, and holds at once.
-         */
-        private fun contextLimit(): Int {
-            val allowed = contextPolicy.limit(
-                start = openedContext,
-                maxContext = minOf(model.maxContextLength, native.maxContextSize),
-                bytesPerToken = bytesPerToken(),
-                totalBytes = memoryGauge.read().totalBytes,
-                chosen = request.maxContextTokens,
-                readingTimes = readingTimes(),
-            )
-            val limit = minOf(allowed, foundContextLimit ?: Int.MAX_VALUE)
-            return (if (request.maxContextTokens == null) maxOf(limit, native.contextSize()) else limit).coerceAtLeast(1)
-        }
-
-        /**
-         * Makes the context larger, towards [wanted] tokens and never beyond [limit]: to the
-         * smallest step that holds [wanted] if the device's memory allows that now, otherwise
-         * to the largest size it does allow below that step, a step or any whole multiple of
-         * [NATIVE_CONTEXT_STEP] tokens ([largestWithin]). Where it ends below what was wanted,
-         * that size is the model's limit from now on, and the collector is told so once.
-         *
-         * The device's memory is read here, at the moment of the decision. The policy budgets
-         * what the tokens of a context take. The native side counts more: what a session
-         * reserves whatever the size of its context, most of which is never touched. That part
-         * is the same before and after a step, so it is added to the policy's budget, and the
-         * sum is what the native side is given; it keeps the context's memory within it at
-         * every moment, choosing itself whether the model's memory can be carried over.
-         *
-         * The native side counts a size larger than any it has created a little higher than its
-         * own line through the sizes it has (a margin it keeps against costing too low), while
-         * the policy's limit is the token arithmetic alone. At the very largest sizes the step
-         * the policy allows can therefore cost the native side just more than the budget; the
-         * size taken is then the largest below it that the native side costs within the budget,
-         * not the step before, which can be tens of thousands of tokens smaller.
-         */
-        private suspend fun growTowards(wanted: Int, limit: Int) {
-            val from = native.contextSize()
-            val device = memoryGauge.read()
-            val cost = nativeCost(from)
-            if (cost == null) {
-                // What a context costs is not known, so none is asked for.
-                limitFound(from, GenerationEvent.ContextLimited.Reason.FAILED)
-                return
-            }
-            val tokenBytes = from.toLong() * bytesPerToken()
-            val reserved = (cost - tokenBytes).coerceAtLeast(0)
-            val allowed = contextPolicy.budgetBytes(device, minOf(tokenBytes, cost))
-            val budget = if (allowed > Long.MAX_VALUE - reserved) Long.MAX_VALUE else allowed + reserved
-            val steps = contextPolicy.steps(start = openedContext, limit = limit)
-            val target = steps.firstOrNull { it >= wanted } ?: limit
-            if (device.low) {
-                // The system says memory is low: nothing is added while it says so. That is a
-                // state of the moment and not a limit of this model, so it is not remembered.
-                announceLimit(from, GenerationEvent.ContextLimited.Reason.MEMORY)
-                return
-            }
-            fun fits(size: Int): Boolean = nativeCost(size).let { it != null && it <= budget }
-            val step = steps.lastOrNull { step -> step > from && step <= target && fits(step) }
-            val affordable = if (step == target) step else largestWithin(above = step ?: from, below = target, fits = ::fits) ?: step
-            if (affordable == null) {
-                limitFound(from, GenerationEvent.ContextLimited.Reason.MEMORY)
-                return
-            }
-            val held = memory.size
-            try {
-                native.resizeContext(affordable, budget)
-            } catch (e: NativeLlamaException) {
-                when (e.code) {
-                    NativeLlamaException.CONTEXT_REFUSED -> limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.MEMORY)
-                    NativeLlamaException.CONTEXT_NOT_CREATED -> {
-                        // Whatever exists now is what there is; a context that does not exist at all ends the generation as a failure of the model.
-                        if (native.contextSize() <= 0) throw e
-                        agreeWithNativeMemory()
-                        limitFound(native.contextSize(), GenerationEvent.ContextLimited.Reason.FAILED)
-                    }
-                    else -> throw e
-                }
-                return
-            }
-            agreeWithNativeMemory()
-            announcedContextLimit = null
-            out.send(GenerationEvent.ContextGrown(fromTokens = from, toTokens = native.contextSize(), rereading = held > 0 && memory.size == 0))
-            if (affordable < target) limitFound(affordable, GenerationEvent.ContextLimited.Reason.MEMORY)
-        }
-
-        /**
-         * The largest whole multiple of [NATIVE_CONTEXT_STEP] tokens strictly between [above] and
-         * [below] that [fits], or null when none does. What a context costs rises with its size,
-         * so the multiples are searched by halving: a few questions to the native side, each of
-         * which is arithmetic on figures it already has, and none of which allocates anything.
-         */
-        private fun largestWithin(above: Int, below: Int, fits: (Int) -> Boolean): Int? {
-            var low = above / NATIVE_CONTEXT_STEP + 1
-            var high = (below - 1) / NATIVE_CONTEXT_STEP
-            if (low > high || !fits(low * NATIVE_CONTEXT_STEP)) return null
-            // Invariant: the multiple low fits; every multiple above high does not, or is out of range.
-            while (low < high) {
-                val middle = low + (high - low + 1) / 2
-                if (fits(middle * NATIVE_CONTEXT_STEP)) low = middle else high = middle - 1
-            }
-            return low * NATIVE_CONTEXT_STEP
         }
 
         /**
@@ -771,30 +1186,6 @@ class LlamaEngine(
             if (native.contextSize() <= openedContext || wanted > openedContext) return
             val reusable = minOf(memory.commonPrefixWith(prompt), prompt.size - 1)
             if (reusable <= settings.giveBackRereadTokens) clearMemory()
-        }
-
-        /** After a resize: the engine's copy of the memory is what the native side kept, which is all of it or nothing. */
-        private fun agreeWithNativeMemory() {
-            if (native.memoryTokenCount() == memory.size) return
-            if (native.memoryTokenCount() == 0) {
-                // Not carried over. The checkpoints went with it.
-                memory.wipe()
-                checkpoints.clear()
-            } else {
-                clearMemory()
-            }
-        }
-
-        /** [tokens] is this model's limit until it is loaded again; the collector is told once. */
-        private suspend fun limitFound(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
-            foundContextLimit = minOf(tokens, foundContextLimit ?: Int.MAX_VALUE)
-            announceLimit(tokens, reason)
-        }
-
-        private suspend fun announceLimit(tokens: Int, reason: GenerationEvent.ContextLimited.Reason) {
-            if (announcedContextLimit == tokens) return
-            announcedContextLimit = tokens
-            out.send(GenerationEvent.ContextLimited(tokens, reason))
         }
 
         // --- Step 1: render, tokenise, fit ---
@@ -855,6 +1246,7 @@ class LlamaEngine(
         private fun shortenMemoryTo(keep: Int) {
             if (keep > 0 && native.rewindTo(keep)) {
                 memory.truncate(keep)
+                dropSavedIfBeyondMemory()
                 dropCheckpointsAfter(keep)
                 return
             }
@@ -862,6 +1254,7 @@ class LlamaEngine(
             val checkpoint = checkpoints.filter { it.position in 1..keep }.maxByOrNull { it.position }
             if (checkpoint != null && native.restoreCheckpoint(checkpoint.handle)) {
                 memory.truncate(checkpoint.position)
+                dropSavedIfBeyondMemory()
                 dropCheckpointsAfter(checkpoint.position)
                 return
             }

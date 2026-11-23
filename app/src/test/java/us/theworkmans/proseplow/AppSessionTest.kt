@@ -41,6 +41,9 @@ import us.theworkmans.proseplow.core.engine.FakeInferenceEngine.Step
 import us.theworkmans.proseplow.core.engine.GenerationEvent
 import us.theworkmans.proseplow.core.engine.GenerationRequest
 import us.theworkmans.proseplow.core.engine.InferenceEngine
+import us.theworkmans.proseplow.core.engine.MemoryRestoreState
+import us.theworkmans.proseplow.core.engine.MemoryVault
+import us.theworkmans.proseplow.core.engine.SaveTrigger
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.security.AppFiles
@@ -218,6 +221,17 @@ class AppSessionTest {
         override fun generate(request: GenerationRequest): Flow<GenerationEvent> = delegate.generate(request)
 
         override suspend fun forget(): Unit = awaitCancellation()
+
+        override suspend fun forgetKeepingSavedMemory(): Unit = awaitCancellation()
+
+        override val memoryRestore: StateFlow<MemoryRestoreState> get() = delegate.memoryRestore
+
+        override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger) = delegate.saveMemory(vault, conversationKey, trigger)
+
+        override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?) =
+            delegate.restoreMemory(vault, conversationKey, maxContextTokens)
+
+        override fun markNotToBeSaved() = delegate.markNotToBeSaved()
     }
 
     @Test

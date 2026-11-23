@@ -1954,7 +1954,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 **Source:** `core/src/main/kotlin/us/theworkmans/proseplow/core/engine/` (`LlamaEngine.kt`,
 `InferenceEngine.kt`, `GenerationEvent.kt`, `ContextBudget.kt`, `ContextPolicy.kt`,
 `PromptTokeniser.kt`, `ReplyAssembler.kt`, `StopStringMatcher.kt`, `Utf8Assembler.kt`,
-`EngineError.kt`, `NativeLlama.kt`), `DeviceMemoryGauge.kt`, `background/MemoryPressure.kt`; tests
+`EngineError.kt`, `NativeLlama.kt`, `MemoryVault.kt`), `DeviceMemoryGauge.kt`, `background/MemoryPressure.kt`; tests
 in `core/src/test/kotlin/us/theworkmans/proseplow/core/engine/`,
 `background/MemoryPressureTest.kt`.
 
@@ -1994,7 +1994,9 @@ is what a port has to reproduce, whatever it is written in.
   only the rest is read. So a next turn reads only what is new, answering again goes back to
   just before the reply, an edit goes back to the common beginning, and showing another
   conversation keeps only what the two have in common. At least the last token of the prompt is
-  always read afresh, because the model's prediction only exists after reading.
+  always read afresh, because the model's prediction only exists after reading. A memory read back
+  from a saved image (ENG-39) is memory like any other: the first request after it keeps the common
+  beginning by these same rules.
 - **ENG-08** Removing the end of the memory is not possible for every model (NAT-08). When the
   model refuses, the engine goes back to the nearest saved checkpoint at or before the point it
   needs, and reads on from there; with no such checkpoint it clears the memory and reads the
@@ -2083,6 +2085,10 @@ is what a port has to reproduce, whatever it is written in.
   consumer of events that has stopped listening. If the native memory cannot be cleared, the
   model is freed, which clears it for certain. The app calls this at every lock (LOCK-17).
   A context that had grown is back at the size it was opened with afterwards (ENG-35).
+  "Forget" also deletes a saved image of the memory that the engine knows of (ENG-40), since it is
+  the forgetting of a conversation that must not come back (CHAT-23). A second form, "forget and
+  keep what was saved", does everything else the same and leaves the image for the next restore;
+  it is meant for the lock, after its save (ENG-38), and nothing in the app calls it yet.
 - **ENG-22** A reply stands aside while a passphrase key is being derived (PASS-11): it pauses
   between two chunks of the prompt or between two tokens of the reply, never inside a
   computation (so while a long conversation is read, the chunk in progress, up to 128 or 256 tokens
@@ -2234,6 +2240,9 @@ is what a port has to reproduce, whatever it is written in.
   - whenever the memory is cleared for another reason: the model cannot go back to the point a new
     prompt needs (ENG-08), or a reply failed (ENG-19).
 
+  A restore (ENG-39) makes the context larger again, to what the saved memory needs, before it
+  reads the memory back.
+
   A conversation that only became shorter (its latest message was edited, say) keeps its context and
   what was read of it until the next lock: reading thousands of tokens again would cost the user
   more than the memory is worth until then. A limit found by ENG-33 stays in force across all of
@@ -2263,6 +2272,67 @@ is what a port has to reproduce, whatever it is written in.
   the context to the size it was opened with.
   To the sampler the engine says explicitly that the penalties have no window (FMT-15), so that they
   cover the whole memory whatever size the context has.
+
+- **ENG-38** Saving the memory. Not yet used: nothing in the app calls it. On request the engine
+  writes what the model's memory holds into a vault (an interface the app is to implement over its
+  second encrypted form, the sealed stream), naming the conversation by an opaque key its caller
+  gives and passing it through without looking into it. The image is handed from the native session
+  to the vault's own buffer piece by piece, behind the vault's own header; the engine
+  adds to that header the model, the size of the context, the number of tokens, how long reading
+  them again would take, and the size of the image. Every checkpoint the engine holds (ENG-09) goes
+  into the image. A save is made only when all of these hold, and otherwise the caller is told
+  which did not:
+  - a model is loaded and nothing else holds the engine. When the app has left the screen a reply
+    or a load in progress goes first and nothing is saved; the save of a lock waits its turn;
+  - the memory is not empty and is the conversation named: the latest request carried that key;
+  - the memory is not marked "not to be saved" (ENG-41);
+  - reading the memory again would take at least 20 seconds by the model's reading curve on this
+    device (ENG-30); a model whose times nobody knows is not saved. This leaves out Boris-2 by its
+    numbers (its whole context of 2,048 tokens reads in about 7 seconds on the tested phone), not
+    by its name;
+  - when the app has left the screen: reading again what is new since the last save would take
+    more than 10 seconds. The lock's own save does not ask this.
+
+  The memory is only read: whatever the outcome, it, its checkpoints and the prediction are as they
+  were. A request that arrives while a save runs stops it at its next piece and then runs; so do
+  forgetting, unloading, loading another model and abandoning the save. The image becomes the
+  vault's only when its last piece was written and the vault was told to keep it.
+- **ENG-39** Restoring the memory. Not yet used: nothing in the app calls it. After a model is loaded
+  and before the first request of a conversation, the engine asks the vault what it holds. An
+  image of another model is deleted. An image of another conversation is kept and waits: the next
+  request deletes it, unless a restore for its own conversation comes first. An image of this
+  conversation is read back: whatever the memory held is cleared; the image must still be worth
+  keeping by ENG-38 on this device and the memory must not be marked (ENG-41); the context is given
+  the size the image was saved at, or the smallest step that holds its tokens, through the same
+  growth and memory checks as for a request (ENG-28, ENG-31, ENG-33), with nothing to carry over
+  and within the size the user chose, if any; then the image is read through the vault's buffer.
+  The tokens the native session reports and its count of the memory must both equal the header's
+  count, and every checkpoint must lie within the memory; the engine then takes its copy of the
+  tokens and its list of checkpoints (the latest 4, ENG-09) from what came back. From then on the
+  memory is ordinary memory (ENG-07, ENG-08); since no prediction survives, at least one token is
+  read before the first token of the reply. Any failure at any point (the vault's checks, a context
+  that cannot be made large enough, an import that fails or is stopped by forgetting, unloading or
+  the caller, counts that disagree) ends with an empty memory, the image deleted, and the
+  conversation read again at the next request. A restore over a memory that already holds the same
+  conversation keeps that memory, and deletes the image unless it is the one the engine wrote from
+  it.
+- **ENG-40** A saved image is only ever the beginning of the memory the engine holds, or waits for its
+  restore. The engine therefore deletes it whenever the memory is cleared or cut back below the
+  image's length (answering again, an edit, a changed system prompt, a reply that failed, a context
+  that could not carry its memory, ENG-34), when a request names another conversation or none,
+  when another model is loaded or the model is unloaded, and at "forget" (ENG-21). Only "forget and
+  keep what was saved" leaves it, for the restore after the next unlock. A failed deletion is not
+  retried by the engine; the app's own checks of the conversation are to catch the file before it
+  could be restored.
+- **ENG-41** "Not to be saved". A caller that has removed messages from a conversation (expiry,
+  CHAT-23) marks the memory at once, from any thread and also while a reply runs. From then on no
+  save is made and no image is restored until the memory has been emptied by a request made after
+  the mark, by "forget", or by loading or unloading a model. A request made before the mark may
+  still hold the removed messages, so its own clearing of the memory does not lift it.
+- **ENG-42** What a screen can show of a restore, without any text of the conversation: that one is in
+  progress, and that it ended with the conversation restored (with the number of tokens that need
+  not be read again) or to be read again. Forgetting and loading another model return it to
+  nothing to show.
 
 ## 20. The native session (NAT)
 
