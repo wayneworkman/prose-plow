@@ -28,6 +28,7 @@ import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.KeepAliveEntry
+import us.theworkmans.proseplow.background.KeepAliveNotice
 import us.theworkmans.proseplow.background.KeepAliveProbe
 import us.theworkmans.proseplow.background.KeepAliveSource
 import us.theworkmans.proseplow.background.ReadyNotice
@@ -331,6 +332,8 @@ class AppSessionTest {
         private val service = object : KeepAliveSource {
             override val keepAliveWanted: StateFlow<Boolean> get() = answers.keepAliveWanted
 
+            override val keepAliveNotice: StateFlow<KeepAliveNotice> get() = answers.notice
+
             override fun onKeepAlive(running: Boolean) {
                 answers.onKeepAlive(running)
                 noteKeepAlive()
@@ -480,6 +483,13 @@ class AppSessionTest {
             CoroutineScope(dispatcher).launch {
                 lock.sessionEnding.collect {
                     answers.onSessionEnding(it)
+                    noteKeepAlive()
+                }
+            }
+            // And while the lock is pending out of sight.
+            CoroutineScope(dispatcher).launch {
+                lock.lockPending.collect {
+                    answers.onLockPending(it)
                     noteKeepAlive()
                 }
             }
@@ -908,6 +918,42 @@ class AppSessionTest {
         assertEquals(MessageStatus.STOPPED, reply.status)
     }
 
+    /**
+     * "Stop the answer" on the lock screen during a lease: the answer written so far is kept as
+     * a stopped answer, the session is closed and its key destroyed, the keep-alive is let go
+     * only after that, and the process ends once the lock screen is left.
+     */
+    @Test
+    fun stoppingTheAnswerFromTheLockScreenKeepsItAsStoppedAndDestroysTheKey() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        app.leave()
+        runCurrent()
+        app.comeToFront() // The lock screen.
+        assertTrue(app.lock.leaseRunning.value)
+        assertEquals(1, app.fake.activeGenerations)
+
+        app.lock.stopAnswerBehindLock()
+        runCurrent()
+        assertFalse(app.lock.leaseRunning.value)
+        assertEquals("stopped, not finished", 0, app.fake.completedGenerations)
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertEquals(listOf("keep-alive let go, the key destroyed"), app.log.filter { it.startsWith("keep-alive") })
+        assertEquals("not while the lock screen is shown", 0, app.processEnds)
+        assertEquals("a stopped answer is not announced", 0, app.readyShown)
+
+        app.leave()
+        runCurrent()
+        assertEquals(1, app.processEnds)
+        app.comeToFront()
+        val reply = unlock(app).openSession.messages.last()
+        assertEquals(id, app.session.openSession.id)
+        assertEquals("Half ", reply.text)
+        assertEquals(MessageStatus.STOPPED, reply.status)
+    }
+
     @Test
     fun unlockingDuringALeaseFindsTheSameSessionAndTheAnswerUnbroken() = runTest {
         val app = LockedApp(temp.root, testScheduler)
@@ -1034,7 +1080,7 @@ class AppSessionTest {
         advanceTimeBy(5_000)
         runCurrent()
         assertTrue(app.lock.state.value is LockState.Unlocked)
-        assertFalse(app.answers.keepAliveWanted.value)
+        assertTrue("the answer is over, but the lock is still pending", app.answers.keepAliveWanted.value)
         assertEquals(1, app.readyShown)
 
         // Coming back takes the notification away.
@@ -1050,10 +1096,270 @@ class AppSessionTest {
         app.leave()
         session.chat.stop(id)
         runCurrent()
-        assertFalse(app.answers.keepAliveWanted.value)
+        assertTrue("stopped, and kept for the lock that is pending", app.answers.keepAliveWanted.value)
         assertEquals(1, app.readyShown)
         assertEquals(3, app.keepAliveStarts)
+        app.comeToFront()
+        runCurrent()
+        assertFalse("nothing to write and nothing to wait for", app.answers.keepAliveWanted.value)
         session.close()
+    }
+
+    // --- The timed lock on time -------------------------------------------------------------------
+
+    /** Set-up in front with the lock's default minute, and nothing being written. */
+    private fun TestScope.unlockedInFront(app: LockedApp): AppSession {
+        app.lock.onActivityCreated()
+        app.comeToFront()
+        val session = setUp(app)
+        assertEquals(60, app.lock.status.value.lockTimeoutSeconds)
+        app.log.clear()
+        return session
+    }
+
+    /**
+     * Leaving the screen unlocked with a timed lock pending starts the keep-alive at that moment,
+     * with the notification that the app will lock itself; it runs until the lock has fired and
+     * its session is closed, the key destroyed, and is let go then and not before; the process
+     * ends once, after that.
+     */
+    @Test
+    fun leavingUnlockedKeepsTheAppAliveUntilItsLockHasFiredAndTheKeyIsGone() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        unlockedInFront(app)
+        runCurrent()
+        assertEquals("nothing is kept alive while the app is in front", 0, app.keepAliveStarts)
+
+        app.leave()
+        runCurrent()
+        assertEquals("started at the moment of leaving", 1, app.keepAliveStarts)
+        assertTrue(app.answers.keepAliveWanted.value)
+        assertTrue("in the foreground, as Android confirms", app.answers.keepAliveRunning)
+        assertEquals(KeepAliveNotice.LOCK_PENDING, app.answers.notice.value)
+
+        advanceTimeBy(59_999)
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+        assertTrue(app.answers.keepAliveWanted.value)
+        assertEquals(0, app.processEnds)
+
+        advanceTimeBy(1)
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Locked)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertFalse(app.answers.keepAliveRunning)
+        assertEquals("let go once, and only once the key was gone", listOf("keep-alive let go, the key destroyed"), app.log.filter { it.startsWith("keep-alive") })
+        assertEquals(1, app.processEnds)
+        assertEquals("closed, the key still works", app.lastBeforeProcessEnd)
+        assertEquals(1, app.keepAliveStarts)
+
+        advanceTimeBy(AppLock.LEASE_MILLIS)
+        runCurrent()
+        assertEquals("the process ends once", 1, app.processEnds)
+        assertEquals(1, app.serviceCreations)
+    }
+
+    @Test
+    fun comingBackBeforeTheLockLetsTheKeepAliveGoAndLeavingAgainStartsItAgain() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = unlockedInFront(app)
+        app.leave()
+        runCurrent()
+        assertTrue(app.answers.keepAliveRunning)
+
+        advanceTimeBy(30_000)
+        app.comeToFront()
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+        assertFalse("back on screen: nothing to wait for", app.answers.keepAliveWanted.value)
+        assertFalse(app.answers.keepAliveRunning)
+        assertEquals(0, app.processEnds)
+
+        // The timer of the first absence does not fire later either.
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+
+        app.leave()
+        runCurrent()
+        assertEquals(2, app.keepAliveStarts)
+        assertEquals(2, app.serviceCreations)
+        assertTrue(app.answers.keepAliveRunning)
+        app.comeToFront()
+        runCurrent()
+        assertFalse(app.answers.keepAliveWanted.value)
+        session.close()
+    }
+
+    @Test
+    fun withImmediatelyNothingIsKeptAliveForTheLock() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        unlockedInFront(app)
+        app.lock.setLockTimeout(0)
+        app.leave()
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Locked)
+        assertEquals(0, app.keepAliveStarts)
+        assertEquals(0, app.serviceCreations)
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals(1, app.processEnds)
+    }
+
+    /**
+     * An answer that ends out of sight while the app is still unlocked no longer lets the
+     * keep-alive go: it stays until the lock has fired, and its notification then says that the
+     * app will lock itself instead of that an answer is being written.
+     */
+    @Test
+    fun anAnswerThatEndsOutOfSightKeepsTheKeepAliveUntilTheLockHasFired() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = unlockedInFront(app)
+        app.fake.enqueueReply(listOf("One ", "two"), millisBetween = 500)
+        session.chat.send(session.openSession.id, "Count")
+        runCurrent()
+        assertEquals(1, app.keepAliveStarts)
+        assertEquals(KeepAliveNotice.WRITING, app.answers.notice.value)
+
+        app.leave()
+        runCurrent()
+        assertEquals("the same keep-alive, not a second start", 1, app.keepAliveStarts)
+        assertEquals("an answer is still being written", KeepAliveNotice.WRITING, app.answers.notice.value)
+
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertEquals(MessageStatus.COMPLETE, session.openSession.messages.last().status)
+        assertEquals(1, app.readyShown)
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+        assertTrue("kept until the lock has fired", app.answers.keepAliveWanted.value)
+        assertTrue(app.answers.keepAliveRunning)
+        assertEquals(KeepAliveNotice.LOCK_PENDING, app.answers.notice.value)
+        assertEquals(1, app.serviceCreations)
+
+        advanceTimeBy(55_000)
+        runCurrent()
+        assertTrue(app.lock.state.value is LockState.Locked)
+        assertFalse("nothing was left to finish", app.log.contains("finish only"))
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertEquals(listOf("keep-alive let go, the key destroyed"), app.log.filter { it.startsWith("keep-alive") })
+        assertEquals(1, app.processEnds)
+    }
+
+    /**
+     * The lock fires while an answer is being written and the keep-alive (started in front)
+     * runs: a lease, as always, and the notification says an answer is being written. With the
+     * app's background use restricted, or the service taken out of the foreground without a
+     * word, the same lock starts no lease: the grounds are the existing ones, asked at that moment.
+     */
+    @Test
+    fun theLockFiringDuringAnAnswerStartsALeaseOnlyOnTheExistingGrounds() = runTest {
+        for (case in listOf("running", "restricted", "demoted")) {
+            val app = LockedApp(temp.newFolder(case), testScheduler)
+            val session = unlockedInFront(app)
+            app.fake.enqueue(listOf(Step.Emit(GenerationEvent.TextDelta("Still wri")), Step.Hang))
+            session.chat.send(session.openSession.id, "Tell me everything")
+            runCurrent()
+            app.leave()
+            runCurrent()
+            when (case) {
+                "restricted" -> app.backgroundRestricted = true
+                "demoted" -> app.serviceInForeground = false
+            }
+            advanceTimeBy(60_000)
+            runCurrent()
+            assertTrue(case, app.lock.state.value is LockState.Locked)
+            if (case == "running") {
+                assertTrue("a lease", app.log.contains("finish only"))
+                assertEquals(1, app.fake.activeGenerations)
+                assertTrue(app.lock.sessionEnding.value)
+                assertTrue(app.answers.keepAliveWanted.value)
+                assertEquals(KeepAliveNotice.WRITING, app.answers.notice.value)
+                assertEquals(0, app.processEnds)
+                app.lock.lock()
+                runCurrent()
+            } else {
+                assertFalse("$case: no lease", app.log.contains("finish only"))
+                assertEquals(case, 1, app.fake.cancelledGenerations)
+                assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+                assertEquals(case, MessageStatus.STOPPED, session.openSession.messages.last().status)
+            }
+            assertEquals(case, 1, app.processEnds)
+            assertEquals(case, 1, app.keepAliveStarts)
+        }
+    }
+
+    /**
+     * Android refuses the keep-alive at the moment of leaving (`startForeground` throws, or
+     * returns without effect). Nothing else changes: the app stays unlocked with its lock
+     * pending, nothing is asked for again out of sight, and the lock is taken as today, when the
+     * timer can run or when the app comes back; then the process ends once.
+     */
+    @Test
+    fun aRefusedKeepAliveForThePendingLockChangesNothingElse() = runTest {
+        for (case in listOf("thrown", "without effect")) {
+            val app = LockedApp(temp.newFolder(case), testScheduler)
+            unlockedInFront(app)
+            if (case == "thrown") app.foregroundAllowed = false else app.foregroundTakesEffect = false
+            app.leave()
+            runCurrent()
+            assertEquals(case, 1, app.keepAliveStarts)
+            assertFalse(case, app.answers.keepAliveRunning)
+            assertFalse(case, app.answers.keepAliveWanted.value)
+            assertTrue("$case: still unlocked, the lock still pending", app.lock.lockPending.value)
+            assertTrue(case, app.lock.state.value is LockState.Unlocked)
+
+            advanceTimeBy(30_000)
+            runCurrent()
+            assertEquals("$case: not asked for again out of sight", 1, app.keepAliveStarts)
+
+            // Where the process may run, the timer locks as it did before; where it was frozen, the
+            // lock is made up for at the return (AppLockTest). Either way the process ends once.
+            advanceTimeBy(30_000)
+            runCurrent()
+            assertTrue(case, app.lock.state.value is LockState.Locked)
+            assertFalse(case, app.lock.lockPending.value)
+            assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+            assertEquals(case, 1, app.processEnds)
+            assertEquals(case, 1, app.keepAliveStarts)
+            app.comeToFront()
+            runCurrent()
+            assertTrue(case, app.lock.state.value is LockState.Locked)
+            assertEquals(case, 1, app.processEnds)
+        }
+    }
+
+    /**
+     * The keep-alive is lost while the lock is pending (Android stops the service from
+     * outside). Nothing else changes and nothing starts it again out of sight; when the lock
+     * fires during an answer it starts no lease, because nothing keeps the process alive.
+     */
+    @Test
+    fun aKeepAliveLostWhileTheLockIsPendingStartsNoLeaseAndChangesNothingElse() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = unlockedInFront(app)
+        app.fake.enqueue(listOf(Step.Emit(GenerationEvent.TextDelta("Still wri")), Step.Hang))
+        session.chat.send(session.openSession.id, "Tell me everything")
+        runCurrent()
+        app.leave()
+        runCurrent()
+        assertTrue(app.answers.keepAliveRunning)
+
+        app.destroyServiceFromOutside()
+        runCurrent()
+        assertFalse(app.answers.keepAliveWanted.value)
+        assertTrue("still unlocked, the lock still pending", app.lock.lockPending.value)
+        assertTrue(app.lock.state.value is LockState.Unlocked)
+        assertEquals(1, app.fake.activeGenerations)
+
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals("never from the background", 1, app.keepAliveStarts)
+        assertTrue(app.lock.state.value is LockState.Locked)
+        assertFalse("no lease", app.log.contains("finish only"))
+        assertEquals(1, app.fake.cancelledGenerations)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+        assertEquals(1, app.processEnds)
     }
 
     // --- A disk that hangs ---------------------------------------------------------------------

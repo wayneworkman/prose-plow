@@ -205,9 +205,31 @@ private fun LockScreen(appLock: AppLock<*>, state: LockState.Locked) {
             Text(stringResource(R.string.use_fingerprint))
         }
     }
+    AnswerBehindTheLock(appLock)
     // The way on for a forgotten passphrase: it needs no passphrase, only the typed confirmation.
     Spacer(Modifier.height(24.dp))
     ResetButton(appLock)
+}
+
+/**
+ * While an answer is being finished behind the lock, one line that says so and "Stop the answer",
+ * which ends it at once ([AppLock.stopAnswerBehindLock]). Whether one is, the lock's own state
+ * says ([AppLock.leaseRunning]); the locked screens never look at the session. It needs no
+ * passphrase: stopping only takes away what someone could otherwise wait for.
+ */
+@Composable
+private fun AnswerBehindTheLock(appLock: AppLock<*>) {
+    val leaseRunning by appLock.leaseRunning.collectAsStateWithLifecycle()
+    if (!leaseRunning) return
+    Text(
+        stringResource(R.string.lock_answer_behind_lock),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    )
+    OutlinedButton(onClick = appLock::stopAnswerBehindLock, modifier = Modifier.fillMaxWidth()) {
+        Text(stringResource(R.string.lock_stop_answer))
+    }
 }
 
 @Composable

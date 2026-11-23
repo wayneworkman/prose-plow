@@ -89,8 +89,9 @@ class MainActivity : FragmentActivity() {
 
     /**
      * Asks for the permission to post notifications (Android 13 and later). Whatever the answer
-     * is, nothing follows from it here: with the permission the two notifications of an answer
-     * are shown, without it they are not, and the app is the same otherwise.
+     * is, nothing follows from it here: with the permission the app's notifications are shown
+     * (that it is working out of sight, and that an answer is ready), without it they are not,
+     * and the app is the same otherwise.
      */
     private val askForNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -360,6 +361,9 @@ class MainActivity : FragmentActivity() {
         // renewWindows asked for, which comes to the front in its place.
         if (!isChangingConfigurations && !renewing) {
             container.answerWork.onInFront(false)
+            // Starts the lock's timer and, within this call, the keep-alive that lets it run on
+            // time (AppLock.lockPending): Android still allows a foreground service to be started
+            // in the first seconds after the screen was left, and no later.
             container.appLock.onBackground(this)
         }
     }

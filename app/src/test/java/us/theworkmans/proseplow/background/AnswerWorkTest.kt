@@ -137,6 +137,8 @@ class AnswerWorkTest {
     private val source = object : KeepAliveSource {
         override val keepAliveWanted: StateFlow<Boolean> get() = work.keepAliveWanted
 
+        override val keepAliveNotice: StateFlow<KeepAliveNotice> get() = work.notice
+
         override fun onKeepAlive(running: Boolean) = work.onKeepAlive(running)
 
         override fun onKeepAliveRefused() = work.onKeepAliveRefused()
@@ -283,6 +285,8 @@ class AnswerWorkTest {
         val empty = object : KeepAliveSource {
             override val keepAliveWanted: StateFlow<Boolean>? = null
 
+            override val keepAliveNotice: StateFlow<KeepAliveNotice>? = null
+
             override fun onKeepAlive(running: Boolean) = fail("nothing to tell")
 
             override fun onKeepAliveRefused() = fail("nothing to tell")
@@ -303,6 +307,134 @@ class AnswerWorkTest {
         assertTrue(wanted)
         work.onWriting(false)
         assertFalse(wanted)
+    }
+
+    // --- The pending lock ------------------------------------------------------------------------
+
+    /**
+     * Wanted exactly from leaving the screen unlocked with a timed lock pending until the lock
+     * fires or the app comes back, and started at that moment although the app is no longer
+     * in front.
+     */
+    @Test
+    fun aPendingLockWantsTheKeepAliveFromLeavingUntilItFiresOrTheAppComesBack() {
+        work.onInFront(true)
+        work.onInFront(false)
+        assertFalse("leaving alone, with nothing pending, wants nothing", wanted)
+        assertEquals(0, starts)
+
+        work.onLockPending(true)
+        assertTrue(wanted)
+        assertEquals("started at the moment of leaving", 1, starts)
+        assertEquals(KeepAliveNotice.LOCK_PENDING, work.notice.value)
+        work.onLockPending(true)
+        assertEquals("said twice: started once", 1, starts)
+
+        // The app comes back before the lock: pending no longer, nothing wanted.
+        work.onLockPending(false)
+        work.onInFront(true)
+        assertFalse(wanted)
+
+        // It leaves again, and this time the lock fires: its session is then closing.
+        work.onInFront(false)
+        work.onLockPending(true)
+        assertEquals(2, starts)
+        work.onSessionEnding(true)
+        work.onLockPending(false)
+        assertTrue("held until the key of the session the lock ended is gone", wanted)
+        work.onSessionEnding(false)
+        assertFalse(wanted)
+        assertEquals(2, starts)
+    }
+
+    /** An answer ending out of sight while the app is still unlocked no longer drops the keep-alive before the lock. */
+    @Test
+    fun anAnswerEndingOutOfSightKeepsTheKeepAliveUntilTheLockFires() {
+        work.onInFront(true)
+        work.onWriting(true)
+        assertEquals(KeepAliveNotice.WRITING, work.notice.value)
+        work.onInFront(false)
+        work.onLockPending(true)
+        assertEquals("the answer's keep-alive serves the lock too", 1, starts)
+        assertEquals("an answer is still being written", KeepAliveNotice.WRITING, work.notice.value)
+
+        work.onWriting(false)
+        assertTrue("kept until the lock has fired", wanted)
+        assertEquals(KeepAliveNotice.LOCK_PENDING, work.notice.value)
+
+        work.onSessionEnding(true)
+        work.onLockPending(false)
+        assertTrue(wanted)
+        assertEquals("the closing changes the sentence no more", KeepAliveNotice.LOCK_PENDING, work.notice.value)
+        work.onSessionEnding(false)
+        assertFalse(wanted)
+        assertEquals(1, starts)
+    }
+
+    /** The lock fires during an answer: the keep-alive goes on for the lease, and says an answer is being written. */
+    @Test
+    fun aLockThatFiresDuringAnAnswerKeepsSayingThatAnAnswerIsWritten() {
+        work.onInFront(true)
+        work.onWriting(true)
+        work.onInFront(false)
+        work.onLockPending(true)
+        work.onSessionEnding(true) // A lease.
+        work.onLockPending(false)
+        assertTrue(wanted)
+        assertEquals(KeepAliveNotice.WRITING, work.notice.value)
+        work.onWriting(false)
+        assertTrue("until the key is gone", wanted)
+        assertEquals(KeepAliveNotice.WRITING, work.notice.value)
+        work.onSessionEnding(false)
+        assertFalse(wanted)
+        assertEquals(1, starts)
+    }
+
+    /**
+     * A refused or lost keep-alive for the pending lock changes nothing else: it is not asked
+     * for again out of sight, it is told onward (which ends a lease, and nothing more), and
+     * nothing can finish out of sight on its strength.
+     */
+    @Test
+    fun aRefusedOrLostKeepAliveForThePendingLockIsNotAskedForAgainOutOfSight() {
+        startWorks = false
+        work.onInFront(true)
+        work.onInFront(false)
+        work.onLockPending(true)
+        assertEquals(1, starts)
+        assertFalse(wanted)
+        work.onSessionEnding(false)
+        work.onWriting(false)
+        assertEquals("never again from the background", 1, starts)
+        assertFalse(work.canFinishOutOfSight())
+
+        // The next absence asks again, and this time the service reaches the foreground and is later lost.
+        startWorks = true
+        work.onLockPending(false)
+        work.onInFront(true)
+        work.onInFront(false)
+        work.onLockPending(true)
+        assertEquals(2, starts)
+        KeepAliveEntry.enter(source, { true }) { }
+        assertTrue(work.canFinishOutOfSight())
+        work.onKeepAlive(false) // Stopped from outside.
+        assertFalse(wanted)
+        assertEquals(1, endsTold)
+        assertFalse(work.canFinishOutOfSight())
+        work.onWriting(false)
+        work.onSessionEnding(false)
+        assertEquals(2, starts)
+
+        // Refused by the entry (thrown, or without effect) while the lock is pending.
+        work.onLockPending(false)
+        work.onInFront(true)
+        work.onInFront(false)
+        work.onLockPending(true)
+        assertEquals(3, starts)
+        assertNull(KeepAliveEntry.enter(source, { false }) { })
+        assertFalse(wanted)
+        assertFalse(work.keepAliveRunning)
+        assertEquals(2, endsTold)
     }
 
     @Test

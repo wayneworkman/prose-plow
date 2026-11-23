@@ -240,6 +240,12 @@ sealed interface PassphraseCheck {
  * with the same back-off and counters, and only a success whose key is the leased session's
  * key puts that same session back on screen.
  *
+ * The lock by itself on time. Its timer is a delay in this process, and Android freezes a
+ * process that is out of sight, and the phone sleeps, both of which stop it. So for as long as
+ * that timer waits, [lockPending] asks whatever keeps the process alive and awake out of sight
+ * to run; where it cannot, the lock is made up for when the app comes back ([onForeground]).
+ * This class only publishes the wish; it neither starts nor knows the keep-alive.
+ *
  * Making way for the key derivation. Every time a passphrase is put through the key derivation
  * (an unlock, a check or a change in Settings, the first set-up), whatever else loads the
  * processor is asked to stand aside for just that long ([MakesWay]), so that the wait at the
@@ -375,6 +381,29 @@ class AppLock<S : UnlockedSession>(
      * of a process that was put to sleep on its way to destroying it.
      */
     val sessionEnding: StateFlow<Boolean> = _sessionEnding.asStateFlow()
+
+    private val _leaseRunning = MutableStateFlow(false)
+
+    /**
+     * True while a lease is running: an answer is being finished behind the lock, its session
+     * and key alive. The lock screen offers to stop it ([stopAnswerBehindLock]) from this, and
+     * from nothing that belongs to the session, which the locked screens never see.
+     */
+    val leaseRunning: StateFlow<Boolean> = _leaseRunning.asStateFlow()
+
+    private val _lockPending = MutableStateFlow(false)
+
+    /**
+     * True while the app is unlocked and out of sight with a lock by itself waiting on its timer
+     * (a timeout above zero): from the moment the app leaves the screen until the lock fires,
+     * the app comes back, or it locks in any other way. Whatever keeps the process alive and
+     * awake out of sight (the answer service) is wanted for exactly that time, so that the timer
+     * can fire on time: a process that is frozen or asleep runs no timer, and the data key would
+     * stay in its memory until the app is next opened. When the lock fires, this turns false
+     * only after [sessionEnding] has turned true for the session it ended, so that nothing that
+     * follows both lets go of the keep-alive in between, while the key is still in memory.
+     */
+    val lockPending: StateFlow<Boolean> = _lockPending.asStateFlow()
 
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
     private val retired = ConcurrentLinkedQueue<Live<S>>()
@@ -610,7 +639,17 @@ class AppLock<S : UnlockedSession>(
     }
 
     private fun refreshSessionEnding() {
+        _leaseRunning.value = lease != null
         _sessionEnding.value = lease != null || unfinished > 0
+    }
+
+    /**
+     * Main thread: publishes whether the lock's timer is waiting ([lockPending]). Called after
+     * every change of [lockTimer], and, where a lock follows, only after that lock has handed
+     * its session on ([leaveUnlocked]).
+     */
+    private fun refreshLockPending() {
+        _lockPending.value = lockTimer != null
     }
 
     /**
@@ -860,6 +899,17 @@ class AppLock<S : UnlockedSession>(
     }
 
     /**
+     * "Stop the answer" on the lock screen (main thread): ends a running lease at once, exactly
+     * as [lock] ends one. The answer written so far is kept as a stopped answer, the session is
+     * closed and its key destroyed. It asks for no passphrase, because it only ever takes away
+     * what an attacker could otherwise wait for. Only while the app is locked: it never locks an
+     * app that an unlock has opened in the meantime, and without a lease it does nothing.
+     */
+    fun stopAnswerBehindLock() {
+        if (_state.value is LockState.Locked) lease?.let(::endLease)
+    }
+
+    /**
      * The app locks by itself (main thread): the background timer, and the check on coming back
      * to the foreground. As [lock], except that [endSession] may leave the session alive to
      * finish its work. No-op unless unlocked.
@@ -904,6 +954,7 @@ class AppLock<S : UnlockedSession>(
 
     /** Main thread: everything that belongs to the unlocked state goes, whatever the state is now. */
     private fun leaveUnlocked(reason: SessionEnd, lockedAt: Long = clock.elapsedMillis()) {
+        // Cancelled here, but said only at the end, once the session has been handed on: see [lockPending].
         lockTimer?.cancel()
         lockTimer = null
         backgroundPolicy.reset()
@@ -924,6 +975,7 @@ class AppLock<S : UnlockedSession>(
         live = null
         ending?.let { endSession(it, reason, lockedAt) }
         _sessionGeneration.update { it + 1 }
+        refreshLockPending()
     }
 
     /**
@@ -956,19 +1008,26 @@ class AppLock<S : UnlockedSession>(
 
     /**
      * Main thread. The timer runs on the main dispatcher's clock, which may stand still while the
-     * phone sleeps or the process is frozen; [onForeground] makes up for that before anything of
-     * the session can be seen again. Until then the key stays in memory longer than the timeout.
+     * phone sleeps or the process is frozen. While it waits, [lockPending] is true, and that is
+     * what asks for the keep-alive that lets it run on time; where the keep-alive is refused or
+     * lost, [onForeground] makes up for the timer before anything of the session can be seen
+     * again, and until then the key stays in memory longer than the timeout.
      */
     private fun scheduleLock(delayMillis: Long) {
         lockTimer?.cancel()
+        lockTimer = null
         if (delayMillis <= 0L) {
             lockByItself()
         } else {
             lockTimer = main.launch {
                 delay(delayMillis)
+                // Fired: no longer pending, whatever the lock below finds (it publishes the change itself).
+                lockTimer = null
                 lockByItself()
+                refreshLockPending()
             }
         }
+        refreshLockPending()
     }
 
     /**
@@ -986,6 +1045,8 @@ class AppLock<S : UnlockedSession>(
         // Read before onForeground clears it: a lock made up for here counts from when it was due.
         val dueAt = backgroundPolicy.dueAt()
         if (backgroundPolicy.onForeground(clock.elapsedMillis())) lockByItself(dueAt)
+        // After the lock made up for, if there was one, as at every lock (see lockPending).
+        refreshLockPending()
     }
 
     /**

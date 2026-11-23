@@ -39,6 +39,8 @@
     <string name="lock_wrong">Wrong passphrase.</string>
     <string name="lock_retry_in">Too many wrong attempts. Try again in %1$s.</string>
     <string name="lock_fingerprint_period_over">Enter your passphrase this time: the phone was restarted, or the time set for fingerprint unlock is up. After that, your fingerprint works again.</string>
+    <string name="lock_answer_behind_lock">An answer is being finished behind the lock.</string>
+    <string name="lock_stop_answer">Stop the answer</string>
 
     <!-- Reset app data: the lock screen, the error screens and Settings -->
     <string name="reset_action">Reset app data</string>
@@ -121,9 +123,10 @@
     <string name="security_lock_now">Lock now</string>
 
     <!-- Notifications. Each is one fixed sentence: nothing of an answer, a chat or a model is ever put into one. -->
-    <string name="channel_answer_writing">Answer in progress</string>
+    <string name="channel_answer_writing">Running in the background</string>
     <string name="channel_answer_ready">Answer ready</string>
     <string name="answer_writing">Writing an answer…</string>
+    <string name="keep_alive_lock_pending">Unlocked; it locks itself when its time is up.</string>
     <string name="answer_ready">Your answer is ready.</string>
     <plurals name="security_screenshots">
         <item quantity="one">Allow screenshots for %1$d minute</item>

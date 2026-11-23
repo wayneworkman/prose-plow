@@ -12,6 +12,7 @@ import android.os.Process
 import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -19,16 +20,21 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
- * Keeps the process alive and the processor awake while an answer is written out of sight: the
- * app in the background, or the phone's screen off. It does nothing itself. The answer is
- * written by the unlocked session; this service only tells Android that the process is doing
- * something the user asked for, with an ongoing notification that says so and no more, and
- * holds a partial wake lock for the same time.
+ * Keeps the process alive and the processor awake while there is something to finish or to
+ * wait for out of sight (the app in the background, or the phone's screen off): an answer that
+ * is being written, and the app's own lock that is due after its timeout ([AnswerWork] decides
+ * which). It does nothing itself. The answer is written by the unlocked session and the lock is
+ * taken by the lock's own timer; this service only tells Android that the process is doing
+ * something the user asked for, with an ongoing notification that says why in one fixed
+ * sentence ([KeepAliveSource.keepAliveNotice]) and no more, and holds a partial wake lock for the
+ * same time, so that neither the answer nor the timer stops while the phone sleeps.
  *
- * It is started when an answer begins while the app is in front, and it stops itself the moment
+ * It is started when an answer begins while the app is in front, or when the app leaves the
+ * screen unlocked with its lock pending, and it stops itself the moment
  * [KeepAliveSource.keepAliveWanted] turns false. It is started as an ordinary service
- * (`startService`), which Android allows while the app is in front, and puts itself in the
- * foreground at once when it is created. Not with `startForegroundService`: a service started
+ * (`startService`), which Android allows while the app is in front and in the seconds after its
+ * screen was left, and puts itself in the foreground at once when it is created. Not with
+ * `startForegroundService`: a service started
  * that way must reach the foreground before it may stop, and one whose `startForeground` was
  * refused could then only stop by crashing the app. Started ordinarily, a refusal is only a
  * refusal: the service tells [KeepAliveSource.onKeepAliveRefused] and stops. A `startForeground`
@@ -51,6 +57,11 @@ import kotlinx.coroutines.launch
  *
  * Not exported, and not restarted by the system: if the process dies, the answer died with it,
  * and the next start of the app is locked.
+ *
+ * The wake lock is taken in slices of [WAKE_LOCK_MILLIS], renewed every [WAKE_LOCK_RENEW_MILLIS]
+ * for as long as the service is in the foreground, so it covers the longest wait the lock can
+ * have (15 minutes) and the 10 minutes of finishing an answer after it, and is never held more
+ * than one slice beyond the service.
  */
 class AnswerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -58,6 +69,9 @@ class AnswerService : Service() {
 
     /** Set once this service has said that it runs in the foreground, so that its end is said too. */
     private var told: KeepAliveSource? = null
+
+    /** What changes the notification's sentence while the service is in the foreground. */
+    private var noticeUpdates: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -68,9 +82,11 @@ class AnswerService : Service() {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
         val source = application as? KeepAliveSource
         val probe = AndroidKeepAliveProbe(this)
+        val notice = source?.keepAliveNotice
+        var shown = notice?.value ?: KeepAliveNotice.WRITING
         // A refusal (thrown, or a call without effect) is told to the source: the answer goes on without this service.
         val wanted = KeepAliveEntry.enter(source, probe::serviceInForeground) {
-            ServiceCompat.startForeground(this, AnswerNotifications.WRITING_ID, AnswerNotifications.writing(this), type)
+            ServiceCompat.startForeground(this, AnswerNotifications.WRITING_ID, AnswerNotifications.keepAlive(this, shown), type)
         }
         if (wanted == null) {
             stopSelf()
@@ -78,6 +94,17 @@ class AnswerService : Service() {
         }
         told = source
         stayAwake(probe)
+        // The sentence follows the reason (an answer that ends while the lock is pending, a lock that fires during an answer).
+        if (notice != null) {
+            noticeUpdates = scope.launch {
+                notice.collect {
+                    if (it != shown) {
+                        shown = it
+                        AnswerNotifications.updateKeepAlive(this@AnswerService, it)
+                    }
+                }
+            }
+        }
         scope.launch {
             wanted.first { !it }
             leave()
@@ -87,9 +114,12 @@ class AnswerService : Service() {
     /**
      * Ends the service: says first that the keep-alive has ended, so that nothing goes on
      * believing in it while Android takes the service out of the foreground, then leaves the
-     * foreground and stops.
+     * foreground and stops. The notification is changed no more from here, so that nothing can
+     * post it again after it was removed.
      */
     private fun leave() {
+        noticeUpdates?.cancel()
+        noticeUpdates = null
         told?.onKeepAlive(false)
         told = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -134,8 +164,8 @@ class AnswerService : Service() {
 
         /**
          * Asks Android to start the service, as an ordinary service (see the class comment);
-         * false when it will not (the app is not in front). That it is in the foreground is
-         * known only when it says so.
+         * false when it will not (the app has been out of sight for too long). That it is in
+         * the foreground is known only when it says so.
          */
         fun start(context: Context): Boolean = try {
             context.startService(Intent(context, AnswerService::class.java))

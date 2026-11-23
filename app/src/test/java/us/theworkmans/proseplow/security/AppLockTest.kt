@@ -2,9 +2,11 @@ package us.theworkmans.proseplow.security
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -1771,6 +1773,194 @@ class AppLockTest {
         assertTrue(session.closed)
         assertDestroyed(session.cipher)
         assertFalse(lock.sessionEnding.value)
+    }
+
+    // --- The timed lock on time, and stopping a lease from the lock screen ----------------------------
+
+    /** Records every value [AppLock.lockPending], [AppLock.sessionEnding] and [AppLock.leaseRunning] take, at the moment they take it. */
+    private fun TestScope.recordFlows(): MutableList<String> {
+        val events = mutableListOf<String>()
+        val atOnce = UnconfinedTestDispatcher(testScheduler)
+        backgroundScope.launch(atOnce) { lock.lockPending.collect { events += "pending $it" } }
+        backgroundScope.launch(atOnce) { lock.sessionEnding.collect { events += "ending $it" } }
+        backgroundScope.launch(atOnce) { lock.leaseRunning.collect { events += "lease $it" } }
+        events.clear()
+        return events
+    }
+
+    /**
+     * The wish for the keep-alive: pending exactly from leaving the screen unlocked with a timed
+     * lock until the lock fires, the app comes back, or it locks otherwise. When the lock fires,
+     * the session it ended is said to be ending before the lock is said to be pending no more,
+     * so that nothing lets the keep-alive go while the key is in memory.
+     */
+    @Test
+    fun aLockIsPendingExactlyFromLeavingUnlockedUntilItFiresOrTheAppComesBack() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        val events = recordFlows()
+        assertFalse("not while the app is in front", lock.lockPending.value)
+
+        lock.onBackground()
+        assertTrue("at the moment of leaving", lock.lockPending.value)
+        pass(30_000)
+        assertTrue(lock.lockPending.value)
+        lock.onForeground()
+        assertFalse("back in front", lock.lockPending.value)
+        assertSame(session, session())
+        assertEquals(listOf("pending true", "pending false"), events)
+        events.clear()
+
+        lock.onBackground()
+        pass(59_999)
+        assertTrue(lock.lockPending.value)
+        pass(1)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertFalse("fired", lock.lockPending.value)
+        assertEquals(listOf("pending true", "ending true", "pending false", "ending false"), events)
+        assertDestroyed(session.cipher)
+
+        // Locked, coming and going pends nothing.
+        events.clear()
+        lock.onForeground()
+        lock.onBackground()
+        pass(3_600_000)
+        assertEquals(emptyList<String>(), events.filter { it.startsWith("pending") })
+    }
+
+    @Test
+    fun withImmediatelyNoLockIsEverPending() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.setLockTimeout(0)
+        val events = recordFlows()
+        lock.onBackground()
+        assertTrue(lock.state.value is LockState.Locked)
+        runCurrent()
+        assertEquals(emptyList<String>(), events.filter { it.startsWith("pending") })
+
+        // Nor for an unlock that finishes after the app left.
+        lock.onForeground()
+        lock.unlockWithPassphrase(passphrase.toCharArray())
+        lock.onBackground()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(emptyList<String>(), events.filter { it.startsWith("pending") })
+    }
+
+    @Test
+    fun anUnlockThatFinishesAfterTheAppLeftPendsItsLockFromThen() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        lock.unlockWithPassphrase(passphrase.toCharArray())
+        lock.onBackground()
+        assertFalse("nothing unlocked yet, nothing pending", lock.lockPending.value)
+        clock.advance(20_000)
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Unlocked)
+        assertTrue(lock.lockPending.value)
+        pass(40_000)
+        assertTrue(lock.state.value is LockState.Locked)
+        assertFalse(lock.lockPending.value)
+    }
+
+    @Test
+    fun lockNowAndAResetEndAPendingLock() = runTest(dispatcher) {
+        startApp(visible = true)
+        createPassphrase()
+        lock.onBackground()
+        assertTrue(lock.lockPending.value)
+        lock.lock() // As from a part of the app that is still shown; nothing pends after it.
+        assertFalse(lock.lockPending.value)
+        runCurrent()
+
+        lock.onForeground()
+        enter(passphrase)
+        lock.onBackground()
+        assertTrue(lock.lockPending.value)
+        lock.reset()
+        assertFalse(lock.lockPending.value)
+        runCurrent()
+        pass(60_000)
+        assertFalse(lock.lockPending.value)
+    }
+
+    /**
+     * The keep-alive never came, or went (the process was frozen): the timer did not run. Nothing
+     * of that reaches the lock, which makes the lock up at the return as it always did, from
+     * when it was due; the lock stops pending then.
+     */
+    @Test
+    fun aPendingLockWhoseTimerCouldNotRunIsMadeUpForAtTheReturn() = runTest(dispatcher) {
+        startApp(visible = true)
+        val session = createPassphrase()
+        lock.onBackground()
+        clock.advance(3_600_000) // Frozen: the clock moves on, the timer does not.
+        assertTrue(lock.lockPending.value)
+        lock.onKeepAliveEnded() // Told that the keep-alive is gone: no lease, so nothing changes.
+        assertSame(session, session())
+        lock.onForeground()
+        assertEquals(LockState.Locked(1), lock.state.value)
+        assertFalse(lock.lockPending.value)
+        runCurrent()
+        assertDestroyed(session.cipher)
+    }
+
+    /** Item of the lock screen: the lock's own state says whether a lease runs, and "Stop the answer" ends it as "Lock now" does. */
+    @Test
+    fun theLockSaysWhileALeaseRunsAndStoppingTheAnswerEndsIt() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        assertFalse(lock.leaseRunning.value)
+        lock.stopAnswerBehindLock() // Unlocked: nothing to stop, and it does not lock.
+        runCurrent()
+        assertSame(session, session())
+        assertFalse(session.closeStarted)
+
+        lockItselfDuringAnAnswer(session)
+        assertTrue("an answer is being finished behind the lock", lock.leaseRunning.value)
+        assertEquals(1, session.finishOnly)
+        val generation = (lock.state.value as LockState.Locked).generation
+
+        lock.stopAnswerBehindLock()
+        runCurrent()
+        assertFalse(lock.leaseRunning.value)
+        assertTrue("closed, which stops the answer and keeps it as stopped", session.closed)
+        assertDestroyed(session.cipher)
+        assertFalse(lock.sessionEnding.value)
+        assertEquals(LockState.Locked(generation), lock.state.value)
+        assertEquals(listOf("screens cleared", "finish only", "session closed", "session stopped"), log)
+
+        // Again, and with no lease: nothing changes.
+        val stored = files.lockConfig.readBytes().toList()
+        lock.stopAnswerBehindLock()
+        runCurrent()
+        assertEquals(4, log.size)
+        assertEquals(stored, files.lockConfig.readBytes().toList())
+        assertEquals(LockState.Locked(generation), lock.state.value)
+    }
+
+    @Test
+    fun theLeaseIsPublishedOnlyWhileItRuns() = runTest(dispatcher) {
+        startApp()
+        val session = createPassphrase()
+        val events = recordFlows()
+        // An ordinary lock: a session closing is not a lease.
+        lock.lock()
+        runCurrent()
+        assertEquals(emptyList<String>(), events.filter { it.startsWith("lease") })
+
+        enter(passphrase)
+        val next = session()
+        val answer = lockItselfDuringAnAnswer(next)
+        assertTrue(lock.leaseRunning.value)
+        answer.complete(Unit)
+        runCurrent()
+        assertFalse("over with the answer", lock.leaseRunning.value)
+        assertEquals(listOf("lease true", "lease false"), events.filter { it.startsWith("lease") })
+        assertTrue(session.closed)
     }
 
     @Test

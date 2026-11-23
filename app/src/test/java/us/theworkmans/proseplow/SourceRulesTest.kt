@@ -594,8 +594,8 @@ class SourceRulesTest {
 
     /**
      * A notification is shown outside the app: on the phone's lock screen, and to whatever is
-     * allowed to read notifications. So each of the app's two is one fixed sentence from the
-     * resources, without a placeholder, and nothing that could carry a word of an answer, the
+     * allowed to read notifications. So each of the app's two says one fixed sentence from the
+     * resources (the ongoing one, one of two, by why it is shown), without a placeholder, and nothing that could carry a word of an answer, the
      * title of a chat or the name of a model is ever set on one. The code that builds them
      * cannot even reach a chat: it imports nothing of the chats, the stores or the models.
      */
@@ -606,8 +606,22 @@ class SourceRulesTest {
         assertEquals(listOf("AnswerNotifications.kt"), users(all, ".notify("))
         val notifications = code(File(module, "$main/background/AnswerNotifications.kt"))
         assertEquals(
-            listOf(".setContentTitle(context.getString(R.string.answer_writing))", ".setContentTitle(context.getString(R.string.answer_ready))"),
+            listOf(".setContentTitle(title)", ".setContentTitle(context.getString(R.string.answer_ready))"),
             notifications.filter { it.contains("setContentTitle(") },
+        )
+        // The ongoing notification's title is one of two fixed sentences, one for each reason it is shown.
+        assertEquals(
+            listOf(
+                "KeepAliveNotice.WRITING -> context.getString(R.string.answer_writing)",
+                "KeepAliveNotice.LOCK_PENDING -> context.getString(R.string.keep_alive_lock_pending)",
+            ),
+            notifications.filter { it.contains("KeepAliveNotice.") && it.contains("->") },
+        )
+        assertEquals(listOf("val title = when (notice) {"), notifications.filter { it.contains("val title") })
+        assertEquals(
+            "every text a notification can show",
+            listOf("R.string.channel_answer_writing", "R.string.channel_answer_ready", "R.string.answer_writing", "R.string.keep_alive_lock_pending", "R.string.answer_ready"),
+            notifications.flatMap { line -> Regex("""R\.string\.[a-z_]+""").findAll(line).map { it.value }.toList() },
         )
         for (word in listOf("setContentText(", "setSubText(", "setTicker(", "setStyle(", "setContentInfo(", "setLargeIcon(", "addAction(", "setExtras(", "addExtras(", "setRemoteInputHistory(")) {
             assertEquals("$word could carry something of an answer into a notification", emptyList<String>(), users(all, word))
@@ -621,10 +635,11 @@ class SourceRulesTest {
         val strings = File(module, "src/main/res/values/strings.xml").readText()
         fun text(name: String) = Regex("""<string name="$name">([^<]*)</string>""").find(strings)?.groupValues?.get(1)
         assertEquals("Writing an answer\u2026", text("answer_writing"))
+        assertEquals("Unlocked; it locks itself when its time is up.", text("keep_alive_lock_pending"))
         assertEquals("Your answer is ready.", text("answer_ready"))
-        assertEquals("Answer in progress", text("channel_answer_writing"))
+        assertEquals("Running in the background", text("channel_answer_writing"))
         assertEquals("Answer ready", text("channel_answer_ready"))
-        for (name in listOf("answer_writing", "answer_ready", "channel_answer_writing", "channel_answer_ready")) {
+        for (name in listOf("answer_writing", "keep_alive_lock_pending", "answer_ready", "channel_answer_writing", "channel_answer_ready")) {
             assertTrue("$name takes an argument", !text(name)!!.contains("%"))
         }
     }
@@ -669,7 +684,15 @@ class SourceRulesTest {
         // the foreground (finding 4), and in onDestroy when Android stopped it from outside.
         val leave = file.readText().substringAfter("private fun leave() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
         assertEquals(
-            listOf("told?.onKeepAlive(false)", "told = null", "ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)", "stopSelf()"),
+            listOf(
+                // The sentence is changed no more: nothing can post the notification again after it is removed.
+                "noticeUpdates?.cancel()",
+                "noticeUpdates = null",
+                "told?.onKeepAlive(false)",
+                "told = null",
+                "ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)",
+                "stopSelf()",
+            ),
             leave,
         )
         assertEquals("the service leaves the foreground in one place", listOf("ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)"), service_.filter { it.contains("stopForeground(") })
@@ -682,6 +705,8 @@ class SourceRulesTest {
         val application = code(File(module, "$main/ProsePlowApp.kt"))
         assertTrue(application.contains("canFinishOutOfSight = answerWork::canFinishOutOfSight,"))
         assertTrue(application.contains("answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)"))
+        // The keep-alive is asked for while the lock's timer waits out of sight, so that the timer runs on time.
+        assertTrue(application.any { it.contains("appLock.lockPending.collect(answerWork::onLockPending)") })
         assertTrue(application.contains("val answerWork = AnswerWork(keepAlive = { AnswerService.start(app) }, readyNotice = AndroidReadyNotice(app), probe = AndroidKeepAliveProbe(app))"))
 
         assertEquals(listOf("AnswerService.kt"), users(all, "newWakeLock("))

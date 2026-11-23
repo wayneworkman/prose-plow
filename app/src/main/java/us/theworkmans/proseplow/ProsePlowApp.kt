@@ -18,6 +18,7 @@ import us.theworkmans.proseplow.background.AndroidReadyNotice
 import us.theworkmans.proseplow.background.AnswerService
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.AndroidMaintenanceSlot
+import us.theworkmans.proseplow.background.KeepAliveNotice
 import us.theworkmans.proseplow.background.KeepAliveSource
 import us.theworkmans.proseplow.background.MaintenanceHost
 import us.theworkmans.proseplow.background.MaintenanceSchedule
@@ -61,6 +62,9 @@ class ProsePlowApp : Application(), KeepAliveSource, MaintenanceHost {
 
     override val keepAliveWanted: StateFlow<Boolean>?
         get() = if (lazyContainer.isInitialized()) container.answerWork.keepAliveWanted else null
+
+    override val keepAliveNotice: StateFlow<KeepAliveNotice>?
+        get() = if (lazyContainer.isInitialized()) container.answerWork.notice else null
 
     override fun onKeepAlive(running: Boolean) {
         if (lazyContainer.isInitialized()) container.answerWork.onKeepAlive(running)
@@ -236,6 +240,10 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         // For the life of the process: the answer service stays until a session that is being
         // finished or closed behind the lock has lost its key.
         CoroutineScope(Dispatchers.Main.immediate).launch { appLock.sessionEnding.collect(answerWork::onSessionEnding) }
+        // And from the moment the app leaves the screen unlocked until its lock has fired, so
+        // that the lock's timer runs on time. Collected on the main thread at once, inside the
+        // activity's onStop, which is when Android still lets the service be started.
+        CoroutineScope(Dispatchers.Main.immediate).launch { appLock.lockPending.collect(answerWork::onLockPending) }
         // And a session left alive behind the lock does not outlive the keep-alive: its end, told
         // by the service on the main thread, ends the lease at once.
         answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)

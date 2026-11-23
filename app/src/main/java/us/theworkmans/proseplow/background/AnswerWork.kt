@@ -33,24 +33,40 @@ interface ReadyNotice {
     fun clear()
 }
 
+/**
+ * What the ongoing notification of the keep-alive says: why the process is kept alive. Each is
+ * one fixed sentence ([AnswerNotifications]).
+ */
+enum class KeepAliveNotice {
+    /** An answer is being written, in front, out of sight, or behind the lock: "Writing an answer...". */
+    WRITING,
+
+    /** Only the lock that is due is waited for: the app is unlocked, out of sight, and will lock itself. */
+    LOCK_PENDING,
+}
+
 /** Where the answer service finds out whether it is still wanted, and says whether it runs, without making anything exist that does not yet. */
 interface KeepAliveSource {
-    /** Null when nothing in this process has ever written an answer. */
+    /** Null when nothing in this process has ever asked for the keep-alive. */
     val keepAliveWanted: StateFlow<Boolean>?
+
+    /** What its notification is to say, for as long as it runs; null exactly when [keepAliveWanted] is. */
+    val keepAliveNotice: StateFlow<KeepAliveNotice>?
 
     /**
      * The answer service has reached the foreground ([running] true), or is leaving it or has
      * ended (false). Only a service in the foreground keeps the process alive and awake, so only
      * this says that the keep-alive exists. The service says false before it leaves the
      * foreground, not afterwards, so that nothing believes in a keep-alive that is already gone.
-     * Ignored when nothing in this process has written an answer.
+     * Ignored when nothing in this process has asked for the keep-alive.
      */
     fun onKeepAlive(running: Boolean)
 
     /**
      * Android refused to put the answer service in the foreground. Nothing keeps the process
      * alive, so nothing may go on believing that something does: the answer is written as far as
-     * the system lets the process run, and a lock does not leave its session alive for it.
+     * the system lets the process run, a lock does not leave its session alive for it, and a
+     * pending lock fires when the process may run, at the latest when the app comes back.
      */
     fun onKeepAliveRefused()
 }
@@ -77,8 +93,8 @@ object KeepAliveEntry {
     /**
      * Puts the service in the foreground through [startForeground], first and at once, and tells
      * [source] how that went. Returns what the service is to watch, or null when it is to stop
-     * at once: when Android refused, and when nothing in the process has ever written an answer
-     * (no [source], or one with no flow). A refusal is a [RuntimeException] from
+     * at once: when Android refused, and when nothing in the process has ever asked for the
+     * keep-alive (no [source], or one with no flow). A refusal is a [RuntimeException] from
      * [startForeground], and equally a call that returned without effect, which Android does
      * when its app-op is set to ignore or the app's background use is restricted and the app is
      * not on top: so success is only what [inForeground] confirms afterwards.
@@ -105,21 +121,32 @@ object KeepAliveEntry {
  * when to say that an answer is ready. Plain Kotlin, so that the rules are tested; what it
  * decides is carried out by the answer service and the notifications. Main thread only.
  *
- * - **Kept alive exactly while there is something to finish.** [keepAliveWanted] turns true
- *   when an answer begins to be written, and the app is in front (Android lets a foreground
- *   service be started from nowhere else). It turns false when no answer is being written any
- *   more and no session is still ending behind the lock: between the last word of an answer
- *   and the destruction of the data key the session is saved and closed, and a process that
- *   was put to sleep in that moment would keep the key in memory.
+ * - **Kept alive exactly while there is something to finish or to wait for.** [keepAliveWanted]
+ *   turns true when an answer begins to be written while the app is in front, and when the app
+ *   leaves the screen unlocked with a lock by itself pending on its timer ([onLockPending]).
+ *   Android lets a foreground service be started only from those moments: while the app is in
+ *   front, and in the seconds after its screen was left. It turns false when no answer is being
+ *   written any more, no lock is pending, and no session is still ending behind the lock:
+ *   between the last word of an answer, or the lock, and the destruction of the data key the
+ *   session is saved and closed, and a process that was put to sleep in that moment would keep
+ *   the key in memory. So an answer that ends out of sight while the app is still unlocked
+ *   leaves the keep-alive running until the lock has fired, and a lock that fires leaves it
+ *   running until its session is closed.
  * - **A keep-alive exists only once the service says so, and only while Android agrees.**
  *   [keepAliveRunning] is true from the moment the answer service has confirmed that it is in
  *   the foreground until it says that it is leaving it. A refusal, or the end of the service
  *   while it was still wanted, turns [keepAliveWanted] false at once, and the app asks again
- *   when it next comes to the front with the answer still being written. The lock leaves a
+ *   when it next comes to the front with the answer still being written; a pending lock that
+ *   was refused is not asked for again out of sight, and is made up for by the lock itself
+ *   when the app comes back. The lock leaves a
  *   session alive behind it only when [canFinishOutOfSight] holds at that moment: without the
  *   service in the foreground the process may be frozen, and with it every timer that would end
  *   the session. And whoever was told through [whenKeepAliveEnds] hears of every end, so that a
  *   session left alive on the strength of the keep-alive does not outlive it.
+ * - **The notification says why.** [notice] is [KeepAliveNotice.WRITING] while an answer is
+ *   being written and [KeepAliveNotice.LOCK_PENDING] while only the pending lock is waited for.
+ *   While neither holds (a session is closing after the lock) it stays as it was, for those few
+ *   seconds.
  * - **"Your answer is ready" only for someone who is not looking.** It is shown when the model
  *   finished an answer by itself while the app was not in front, and taken away when the app
  *   comes to the front. It never says anything about the answer.
@@ -131,6 +158,7 @@ class AnswerWork(
 ) : AnswerEvents {
     private var writing = false
     private var sessionEnding = false
+    private var lockPending = false
     private var inFront = false
     private var keepAliveEnded: () -> Unit = {}
 
@@ -138,6 +166,11 @@ class AnswerWork(
 
     /** The answer service runs while this is true, and stops itself when it turns false. */
     val keepAliveWanted: StateFlow<Boolean> = _keepAliveWanted.asStateFlow()
+
+    private val _notice = MutableStateFlow(KeepAliveNotice.WRITING)
+
+    /** What the answer service's notification says; see the class comment. */
+    val notice: StateFlow<KeepAliveNotice> = _notice.asStateFlow()
 
     /** True while the answer service says it is in the foreground: what keeps the process alive and awake runs, as far as the service knows. */
     var keepAliveRunning: Boolean = false
@@ -186,15 +219,22 @@ class AnswerWork(
     override fun onWriting(writing: Boolean) {
         if (this.writing == writing) return
         this.writing = writing
+        refreshNotice()
         if (!writing) settle() else askForKeepAlive()
     }
 
     /**
-     * Starts the keep-alive if an answer is being written, none is wanted yet, and the app is in
-     * front (Android lets a foreground service be started from nowhere else).
+     * Starts the keep-alive if an answer is being written and the app is in front (Android lets
+     * a foreground service be started from there, and from the moment of leaving, which
+     * [onLockPending] covers).
      */
     private fun askForKeepAlive() {
-        if (!writing || _keepAliveWanted.value || !inFront) return
+        if (writing && inFront) startKeepAlive()
+    }
+
+    /** Starts the keep-alive unless it is wanted already. */
+    private fun startKeepAlive() {
+        if (_keepAliveWanted.value) return
         // Wanted before it is started: the service looks at this the moment it exists.
         _keepAliveWanted.value = true
         if (!keepAlive.start()) _keepAliveWanted.value = false
@@ -206,8 +246,31 @@ class AnswerWork(
         settle()
     }
 
+    /**
+     * The app is unlocked and out of sight with a lock by itself waiting on its timer ([pending]
+     * true), or no longer (the lock fired, the app came back, or it locked otherwise). It turns
+     * true only at the moment the app leaves the screen, or a moment after when an unlock that
+     * was under way then completes, and that is when the keep-alive is started: Android allows
+     * it in the seconds after the screen was left, and refuses it later, which is then a refusal
+     * like any other. It is not asked for again until the next time a lock is pending.
+     */
+    fun onLockPending(pending: Boolean) {
+        if (lockPending == pending) return
+        lockPending = pending
+        refreshNotice()
+        if (pending) startKeepAlive() else settle()
+    }
+
     private fun settle() {
-        if (!writing && !sessionEnding) _keepAliveWanted.value = false
+        if (!writing && !sessionEnding && !lockPending) _keepAliveWanted.value = false
+    }
+
+    private fun refreshNotice() {
+        when {
+            writing -> _notice.value = KeepAliveNotice.WRITING
+            lockPending -> _notice.value = KeepAliveNotice.LOCK_PENDING
+            // Neither: a session is closing, or nothing is kept alive. The notice stays as it was.
+        }
     }
 
     override fun onReplyFinished() {
@@ -236,7 +299,8 @@ object NotificationPermission {
     /**
      * Once, and only where it means something: on a version that asks at all, while the
      * permission is not given, and never a second time, whatever the answer was. Without the
-     * permission everything works; the two notifications are simply not shown.
+     * permission everything works, the keep-alive included; its notification and the one that
+     * an answer is ready are simply not shown.
      */
     fun shouldAsk(sdk: Int, granted: Boolean, askedBefore: Boolean): Boolean = sdk >= FIRST_SDK_ASKING && !granted && !askedBefore
 }

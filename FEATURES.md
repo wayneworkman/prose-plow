@@ -217,9 +217,10 @@ is about things that are **not** built and is kept apart from everything else.
 - **LOCK-04** The lock screen shows, in this order: the title "Prose Plow is locked"; one
   passphrase field labelled "Passphrase"; a place for messages; the button "Unlock"; when
   fingerprint unlock is on and its time has not run out (BIO-18), an outlined button "Use
-  fingerprint"; and, set apart below them, the action "Reset app data" in the colour for errors
-  (RESET-05). When fingerprint unlock is on but its time has run out, the place for messages
-  holds the line of BIO-19 instead of the button.
+  fingerprint"; while an answer is being finished behind the lock, the line and the outlined
+  button of LEASE-14; and, set apart below them, the action "Reset app data" in the colour for
+  errors (RESET-05). When fingerprint unlock is on but its time has run out, the place for
+  messages holds the line of BIO-19 instead of the button.
 - **LOCK-05** The passphrase is submitted with "Unlock" or with the keyboard's action key.
   Nothing is submitted while the field is empty, while a check is running or while a wait is in
   force (PASS-07). Submitting empties the field.
@@ -257,10 +258,17 @@ is about things that are **not** built and is kept apart from everything else.
     Someone who leaves and comes straight back within that moment finds the app as it was, also
     with "Immediately". `onPause` is not used.
 - **LOCK-13** The time is measured on the device clock, so it cannot be slept through and is not
-  affected by setting the date. A timer does the locking; because a timer may not run while the
-  process is frozen or the device sleeps, the elapsed time is looked at again whenever the app
-  comes back to the screen, before anything of the session is drawn, and the app locks first if
-  the time is up.
+  affected by setting the date. A timer does the locking, and a timer does not run while the
+  process is frozen or the device sleeps. So from the moment the app leaves the screen unlocked
+  with a time other than "Immediately" until that lock has happened or the app is back on
+  screen, the app keeps its process running and the processor awake (BG-16), and the lock
+  happens on time. Where the platform does not allow that (it refuses, or the user has
+  restricted the app's background use) or stops it on the way, nothing else changes: the
+  elapsed time is looked at again whenever the app comes back to the screen, before anything
+  of the session is drawn, and the app locks first if the time is up. Until then the key and
+  the decrypted chats stay in the memory of the frozen process (MEM-11).
+  - **On Android:** measured on the phone that was tested (Android 17): the process is counted
+    as cached within 1 to 2 seconds of leaving the screen and frozen about 60 seconds later.
 - **LOCK-14** With "Immediately", the app locks at the moment LOCK-12 describes.
 - **LOCK-15** An unlock that completes after the app has already left the screen (the key
   derivation takes a second or two) counts its timeout from the moment the app left, not from
@@ -568,7 +576,8 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
 
 **Source:** `security/AppLock.kt` (`endSession`, `startLease`, `openOrReattach`),
 `security/UnlockedSession.kt`, `AppSession.kt`, `chat/ChatController.kt` (`finishOnly`,
-`resume`); tests `security/AppLockTest.kt`, `AppSessionTest.kt`.
+`resume`), `lock/LockScreens.kt` (`AnswerBehindTheLock`); tests `security/AppLockTest.kt`,
+`AppSessionTest.kt`.
 
 - **LEASE-01** When the app locks by itself (LOCK-11 to LOCK-15) while an answer is being
   written, and "Finish the answer after locking" is on (the default, SECSET-05), the screen
@@ -611,7 +620,7 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   check (PASS-11).
 - **LEASE-08** "Lock now" never leaves a session alive, and it ends one that is being finished:
   the answer is stopped and the key overwritten at once, whatever the setting. A reset ends it
-  too (RESET-07).
+  too (RESET-07), and so does "Stop the answer" on the lock screen (LEASE-14).
 - **LEASE-09** With the setting off, with no answer being written, without a running keep-alive,
   or with the app's background use restricted (LEASE-01), the app's own lock stops whatever is
   running and overwrites the key at once, as LOCK-17 describes.
@@ -635,6 +644,15 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   part of the answer (ENG-34), so an answer in a conversation that takes longer than that to read is
   stopped at the limit, possibly before it has written a word, and has to be asked for with the app
   open. The text of MSET-19 says so to the user.
+- **LEASE-14** For as long as a session is being finished behind the lock, the lock screen
+  (LOCK-04) shows the line "An answer is being finished behind the lock." and an outlined
+  button "Stop the answer". The button ends it exactly as "Lock now" does (LEASE-08): the
+  answer written so far is kept as a stopped message, the session is closed and its key
+  overwritten (LOCK-17, steps 3 to 6, and step 7). It asks for no passphrase, because stopping
+  only ever takes away what an attacker could otherwise wait for. Line and button go when the
+  session is no longer being finished, however that came about. The lock screen learns that a
+  session is being finished from the lock's own state, never from the session; the button does
+  nothing when none is, and never locks an app that was unlocked meanwhile.
 
 ## 7. The end of the process (END)
 
@@ -656,6 +674,8 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   the end of a session behind the lock included (LEASE-03).
 - **END-03** What follows from END-01:
   - after the app has locked in the background and its session is closed, the process ends;
+    what kept it running until then (BG-16) is let go at that moment, never before the key has
+    been overwritten;
   - leaving the lock screen without unlocking ends the process;
   - leaving the first-run set-up screen does not (nothing was ever decrypted in that process);
   - the app stays in the list of recent apps, and opening it is a fresh start at the lock
@@ -1778,35 +1798,42 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 `SourceRulesTest.kt`.
 
 - **BG-01** An answer goes on being written when the app is put in the background or the
-  device's screen turns off. For that, the app keeps its process alive and the processor awake
-  for exactly as long as there is something to finish.
+  device's screen turns off, and the app's own lock happens on time while the app waits out of
+  sight (BG-16). For that, the app keeps its process alive and the processor awake for exactly
+  as long as there is something to finish or to wait for.
   - **On Android:** a foreground service of the type "special use" (required from Android 14;
     no named type describes running a model on the device, and the manifest states the use),
     with a partial wake lock that is taken with a limit of 2 minutes and renewed every minute,
     so that it can never be left held. The service is started as an ordinary service while the
-    app is in front and puts itself in the foreground the moment it is created; it is not
+    app is in front, or at the moment it leaves the screen (BG-16), and puts itself in the foreground the moment it is created; it is not
     started with `startForegroundService`, because a service started that way that fails to
     reach the foreground can only stop by crashing the app. It counts as running only from the
     moment the system confirms that it is in the foreground (a `startForeground` that returns
     without effect is a refusal) until it says, before leaving the foreground, that it ends.
     Each time it renews its wake lock it asks the system whether it is still in the
     foreground, and ends if it is not.
-- **BG-02** The keep-alive begins when an answer begins to be written while the app is in front
-  (the platform lets it be started from nowhere else). It ends by itself at the moment no answer
-  is being written any more and no session is still ending behind the lock: it is held until the
+- **BG-02** The keep-alive begins when an answer begins to be written while the app is in front,
+  or when the app leaves the screen unlocked with its lock pending (BG-16); the platform lets it
+  be started from nowhere else. It ends by itself at the moment no answer is being written any
+  more, no lock is pending and no session is still ending behind the lock: it is held until the
   data key has been overwritten, so that the process cannot be put to sleep on its way there.
-  If it was refused or lost while an answer is still being written, it is asked for again when
-  the app comes back to the front.
+  An answer that ends while the app is out of sight and still unlocked therefore leaves it
+  running until the lock has happened. If it was refused or lost while an answer is still being
+  written, it is asked for again when the app comes back to the front.
 - **BG-03** If the platform refuses the keep-alive, does not grant it although it raised no
   error, or the user has restricted the app's background use, the answer is written all the
   same, as far as the system lets the process run, but it is not finished behind the lock: the
   app's own lock stops it (LEASE-01, LEASE-09). A refusal is recorded at once, so nothing goes on
   counting on a keep-alive. A keep-alive that the platform stops while an answer is being
   finished behind the lock ends that session at once (LEASE-03).
-- **BG-04** While the keep-alive runs, a notification says "Writing an answer…" and nothing
-  else. It is silent, is marked as ongoing and carries no badge. In the system's settings for
-  the app's notifications its kind is named "Answer in progress". It is gone with the
-  keep-alive.
+- **BG-04** While the keep-alive runs, a notification says why, in one of two fixed sentences
+  and nothing else: "Writing an answer…" while an answer is being written (in front, out of
+  sight or behind the lock), and "Unlocked; it locks itself when its time is up." while only the
+  pending lock of BG-16 is waited for. The sentence changes in place when the reason does (an
+  answer ends while the lock is pending; the lock happens during an answer), and stays as it was
+  for the moment a session takes to close after the lock. It is silent, is marked as ongoing and
+  carries no badge. In the system's settings for the app's notifications its kind is named
+  "Running in the background". It is gone with the keep-alive.
 - **BG-05** The keep-alive does nothing itself: the answer is written by the unlocked session.
   It takes no commands, cannot be started by another app, and is never restarted by the system:
   if the process dies, the answer died with it and the next start of the app is locked.
@@ -1826,16 +1853,20 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **BG-09** The app asks once whether it may show notifications: at the first answer that is
   started while the app is on screen. That it asked is recorded, in the encrypted settings and
   before the question is shown, so it is never asked a second time, whatever the answer was.
-  Without the permission everything else works the same; the two notifications are simply not
-  shown.
+  Without the permission everything else works the same, the keep-alive included; the
+  notifications are simply not shown.
+  - **On Android:** a foreground service runs without the permission; its notification is then
+    not shown in the notification drawer, and the platform still lists the app among the active
+    apps (Android 13 and later).
   - **On Android:** the question exists from Android 13; on earlier versions nothing is asked
     and the notifications are shown.
 - **BG-10** Out of sight the platform gives the app fewer and slower processor cores, and the
   engine adapts its threads by itself (NAT-03). On the phone that was tested, reading the
   conversation into the model was about a quarter slower in the background, and writing the
   answer was as fast as in front.
-- **BG-11** The app asks for five permissions: four for finishing an answer out of sight (the
-  foreground service, its type, notifications, and keeping the processor awake), and one that
+- **BG-11** The app asks for five permissions: four for finishing an answer and keeping the
+  lock's time out of sight (the foreground service, its type, notifications, and keeping the
+  processor awake), and one that
   keeps the background maintenance job scheduled across restarts of the device (BG-12, DEC-43).
   Libraries add three more: two for the use of biometrics, and one private permission of the
   app's own that guards its internal receivers. The network is not among them (BUILD-01).
@@ -1878,6 +1909,30 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **BG-15** Opening the app during a run changes nothing for either: the lock screen comes up
   as at any start, a passphrase is checked once the lock's start (and its clean-up) is done, and
   the process is not ended while the app is on screen.
+- **BG-16** The keep-alive of BG-01 also runs while the app is unlocked and out of sight with
+  its lock pending (LOCK-11, LOCK-13): from the moment the app leaves the screen with a time
+  other than "Immediately" ("Immediately" needs none) until that lock has happened or the app
+  is back on screen. It is the same keep-alive, with the same wake lock and the same
+  notification (BG-04); one that is already running for an answer simply goes on. When the lock
+  happens, the keep-alive is held until the session it ended is closed and its key overwritten,
+  or, while an answer is still being written, for the session finished behind the lock on the
+  usual grounds (LEASE-01), and then the process ends (END-01). If the platform refuses it, or
+  later stops it or takes it out of the foreground, nothing else changes and nothing asks for it
+  again until the app next leaves the screen: no session is left alive behind the lock on its
+  strength, and the lock is made up for as LOCK-13 describes. "Lock now" and a reset end the
+  pending lock as they end the session, and the keep-alive goes with it once the key is gone.
+  The setting of SECSET-05 and the permission to show notifications (BG-09) change nothing
+  about it.
+  - **On Android:** the service is started from within the activity's `onStop`, in the same
+    call that starts the lock's timer. The platform allows a foreground service to be started
+    while the app has a visible screen and, from Android 12, for a grace period after its last
+    one was hidden (5 seconds by default); on Android 9 to 11 for as long as the app has not
+    become idle in the background, about a minute. A start the platform refuses is a refusal
+    like any other (BG-03); with the app's background use restricted, the platform returns from
+    `startForeground` without putting the service in the foreground, which is recognised as a
+    refusal. The wake lock is taken for 2 minutes at a time and renewed every minute while the
+    service is in the foreground, so it covers the longest pending lock (15 minutes) and the 10
+    minutes of LEASE-03 after it, and is never held more than 2 minutes beyond the service.
 
 ## 19. The inference engine (ENG)
 
@@ -2332,6 +2387,10 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   memory, the data key included, for at most 10 minutes and then the closing, which is bounded
   by three waits of up to 10 seconds each (LEASE-03, LEASE-12).
 - **MEM-09** Nothing is done about what the system may have moved to compressed swap.
+- **MEM-11** While the app is unlocked and out of sight, waiting to lock itself, everything of
+  MEM-01 is in memory for the time chosen (LOCK-11). The app keeps itself running so that the
+  lock happens on time (BG-16); where the platform does not allow that, the process is frozen
+  with all of it in memory until the lock is made up for (LOCK-13).
 - **MEM-10** Clearing the model's memory at a lock also returns a grown context to the size it
   started with (ENG-35), so the memory a long conversation took is given back to the device then.
   The phone's times in NAT-13 were measured with contexts of the starting size; a context that has
@@ -2969,7 +3028,12 @@ without these properties has not reached parity.
   "Finish the answer after locking" on, the lock screen shows, but for up to 10 minutes, and then
   the closing of LEASE-03, the data key and the conversation are in memory as if the app were
   unlocked; nothing on the screen
-  gives access to them, but whoever can read the process's memory in that time finds them.
+  gives access to them, but whoever can read the process's memory in that time finds them. The
+  lock happens on time only while the platform keeps the app running out of sight (BG-16):
+  with the app's background use restricted, or the keep-alive refused or stopped, it is made up
+  for only when the frozen process may run again or the app is opened, and until then the key
+  and the decrypted chats are in the memory of the frozen process (MEM-11), for hours if the
+  device is left alone.
 - **THREAT-10** A compromised device. Root access, malware with system privileges or an
   exploited system can read the app's memory while it is unlocked, record what is typed and
   capture the screen whatever the app asks for. The app relies on the platform's separation of
@@ -3011,7 +3075,7 @@ without these properties has not reached parity.
   (whether fingerprint unlock is on, whether an answer is finished after locking, how many wrong
   attempts were made and when).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
-  one, and when. Nothing else.
+  one, or is unlocked and waiting to lock itself (BG-04), and when. Nothing else.
 - **THREAT-25** What the expiry of messages (CHAT-22) does not do. Deleting is not erasing:
   the medium may keep the encrypted bytes of an expired message (THREAT-20), and text that
   was decrypted stays in the memory of the process until it ends (MEM-04, MEM-05). Nothing
@@ -3251,6 +3315,16 @@ only state a rule, the item says so and states its effect instead of inventing a
   off; it has no receiver of its own (the platform's scheduler handles the restart); it runs the
   lock's own clean-up through the lock and never beside it; it never touches a key, loads a
   model or shows anything; and it never keeps the process alive longer than its work.
+- **DEC-44** *While the app is unlocked and out of sight with a timed lock pending, it keeps
+  itself running until that lock has happened* (LOCK-13, BG-16). The owner's decision of
+  2026-11-23, after it was measured that the platform freezes the process about a minute after
+  it leaves the screen, so that a lock of 5 or 15 minutes never happened while the app was away
+  and the key stayed in memory until it was opened again. Reasons: the lock is to happen when
+  the user chose; the keep-alive that finishes an answer exists already and needs no new
+  permission. Preserve: the same keep-alive and notification as an answer, no second one;
+  "Immediately" needs none; a refusal or loss changes nothing else and leaves no session alive
+  on false grounds; the lock is still made up for at the return; and after the lock everything
+  goes on as before, the end of the process included.
 
 ## 27. Planned tools: design considerations (TOOL)
 

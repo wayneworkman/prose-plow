@@ -92,7 +92,8 @@ Chats:
 - **Drafts.** What you have typed and not sent is kept with its chat.
 - **An answer is finished when you leave.** While an answer is being written the app runs a
   foreground service, with a silent notification that says "Writing an answer..." and nothing
-  else, so the answer goes on when the app is in the background or the screen is off. When one
+  else, so the answer goes on when the app is in the background or the screen is off. The same
+  service keeps the app's lock on time while it waits out of sight (see "Locks by itself"). When one
   is finished while you are not looking, a second notification says "Your answer is ready.";
   neither ever contains a word of an answer, the name of a chat or of a model. The app asks
   once, at the first answer, whether it may show notifications (Android 13 and later); without
@@ -123,11 +124,17 @@ Privacy:
   every few hours, also after the phone restarts, to delete what has expired. It never unlocks
   anything, never loads a model and shows nothing. Turned off, nothing of the app runs in the
   background, and messages are only deleted when you open the app.
-- **Locks by itself.** The app is locked at every start and after it has been in the background
-  for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time starts
-  when Android reports that the app has left the screen, which is a fraction of a second after
-  you leave it; coming straight back within that moment finds the app still open, also with
-  "immediately". "Lock now", in the chat's menu and in Settings, does not wait for anything.
+- **Locks by itself, on time.** The app is locked at every start and after it has been in the
+  background for the chosen time: immediately, 1 minute (the default), 5 or 15 minutes. The time
+  starts when Android reports that the app has left the screen, which is a fraction of a second
+  after you leave it; coming straight back within that moment finds the app still open, also
+  with "immediately". Android freezes an app soon after it leaves the screen, which would stop
+  the lock's timer, so while the app waits out of sight to lock itself it keeps itself running
+  with the same foreground service and silent notification it uses to finish an answer; the
+  notification then says "Unlocked; it locks itself when its time is up.". If Android does not
+  allow that (for example when the app's background use is restricted), the lock waits until
+  the app may run again, at the latest until it is opened, as it always did. "Lock now", in the
+  chat's menu and in Settings, does not wait for anything.
 - **Finishes the answer after locking**, unless you turn that off. If the app locks by itself
   while an answer is being written, the screen is locked as always, and behind it that one
   answer is finished and saved before the encryption key is erased. The price: until then the
@@ -138,7 +145,9 @@ Privacy:
   behind the lock, but stopped at the lock as with the setting off, when Android has the app's
   background use restricted (App info, Battery) or does not grant it the foreground service;
   and if Android stops that service while the answer is being finished, the answer is stopped
-  and the key erased at that moment.
+  and the key erased at that moment. While an answer is being finished, the lock screen says so
+  and offers "Stop the answer", which needs no passphrase: it stops the answer, keeps what was
+  written as a stopped answer and erases the key at once.
 - **Ends its own process when it is locked.** Once the app is locked, has nothing left to
   finish and is not on screen, it ends its process, because that is the only thing that
   removes every copy of a conversation from memory. Opening it again starts it afresh, at the
@@ -156,8 +165,8 @@ Privacy:
   older that preview can only be hidden by blocking screenshots altogether, so there the
   allowance is not available and the setting says so.
 - **No network permission.** The app asks for five permissions: four for finishing an answer
-  out of sight (the foreground service and its type, notifications, and keeping the processor
-  awake), and `RECEIVE_BOOT_COMPLETED`, which keeps the background maintenance job scheduled
+  and keeping the lock's time out of sight (the foreground service and its type, notifications,
+  and keeping the processor awake), and `RECEIVE_BOOT_COMPLETED`, which keeps the background maintenance job scheduled
   after the phone restarts. The build fails if the merged manifest contains any permission that
   is not on its allow-list (those five, and the three that the fingerprint and support
   libraries add); the network is not on it.
@@ -460,6 +469,38 @@ optionally a second time by a fingerprint key.
   fraction of a second after it was left (on the phone that was tested, between 0.2 and 0.5
   seconds after the Home gesture), so someone who leaves and comes straight back within that
   moment finds the app as it was, also with "immediately".
+- **The lock keeps its time out of sight.** The timer that locks the app is part of the app's
+  process, and on the phone that was tested (Android 17) Android counted that process as cached
+  within one or two seconds of leaving the screen and froze it about a minute later; a frozen
+  process, or a phone asleep with its screen off, runs no timer. So from the moment the app
+  leaves the screen unlocked with a lock time other than "immediately", until that lock has
+  happened or the app is back on screen, the app keeps its process alive with the same
+  foreground service that finishes an answer, and the processor awake with the same partial wake
+  lock (taken for two minutes at a time and renewed every minute while the service is in the
+  foreground, so that it is never held more than two minutes beyond the service). The service is
+  started in the same call that starts the timer, when Android reports that the screen was left:
+  Android allows an app to start a foreground service while it has a visible screen and for a
+  few seconds after its last one was hidden (five by default, from Android 12), and on Android 9
+  to 11 for as long as the app has not yet been idle in the background for about a minute. When
+  the lock happens, the service stays until the session is closed and the key overwritten, as
+  after an answer, and then the process ends as described below; an answer that is still being
+  written then is finished behind the lock (the next point) on the same grounds as always. When
+  an answer ends while the app is out of sight and still unlocked, the service stays until the
+  lock. While nothing but the lock is waited for, its notification says "Unlocked; it locks
+  itself when its time is up."; while an answer is being written it says "Writing an
+  answer...". Both are one fixed sentence in the same notification, whose kind is named
+  "Running in the background" in the phone's settings.
+- **When Android does not keep the app running, the lock waits for the return.** If Android
+  refuses the service, starts it without putting it in the foreground (as it does when the app's
+  background use is restricted: App info, Battery, "Restricted", or "Allow background usage"
+  off), or later takes it out of the foreground or stops it, nothing else changes and nothing
+  asks for it again until the app next leaves the screen: the lock happens when the frozen
+  process is next allowed to run, and at the latest when the app is opened, before anything of
+  the session is shown, counted from when it was due. Until then the data key and the decrypted
+  chats stay in the memory of the frozen process. Without the permission to post notifications
+  (Android 13 and later; the app asks for it at the first answer), the service runs all the same
+  and the notification is simply not shown in the notification drawer; Android then still lists
+  the app among the active apps in the quick settings.
 - When it locks, the screens are torn down at once, a reply that is being written is stopped and
   kept as a stopped message (the lock waits up to ten seconds for the engine to let go), the
   inference engine is told to forget the conversation (again up to ten seconds), the writes
@@ -488,7 +529,11 @@ optionally a second time by a fingerprint key.
   part of the answer, so one that takes longer than that to read is not finished behind the
   lock (see [The context grows with the conversation](#the-context-grows-with-the-conversation)).
   "Lock now" is the stronger action and never leaves anything alive, whatever the setting; a
-  reset ends it too. The setting is a field of `lock.json`, because it is needed while the app
+  reset ends it too. The lock screen shows "An answer is being finished behind the lock." and
+  the button "Stop the answer" for as long as this lasts; the button ends it as "Lock now"
+  would (the answer is kept as a stopped answer, the session closed, the key overwritten) and
+  asks for no passphrase, because stopping only takes away what someone could otherwise wait
+  for. The setting is a field of `lock.json`, because it is needed while the app
   is locked; a file without the field means on.
 - **Unlocking in that time is a real unlock.** The passphrase is put through the whole key
   derivation and the Keystore, or the fingerprint through its prompt and its key, exactly as
@@ -639,6 +684,10 @@ it or losing the phone loses the chats.
 - While an answer is being finished behind the lock, everything of the first point is still in
   memory, the data key included: for at most ten minutes, and then for as long as the session
   takes to close (at most three waits of ten seconds each, see [The lock](#the-lock)).
+- While the app is unlocked and out of sight, waiting to lock itself, everything of the first
+  point is in memory as well, for the time chosen. The app keeps itself running for that time so
+  that the lock happens on time; where Android does not allow that, the process is frozen with
+  all of it in memory until the lock is made up for, at the latest when the app is opened again.
 - The loaded model stays in memory for as long as the process lives, across "Lock now" for
   one. Its weights are no secret. After the process has ended, the next unlock loads it again.
 - Nothing decrypted is put into the saved instance state, and the main code contains no logging
@@ -681,10 +730,12 @@ it or losing the phone loses the chats.
   through which the system's shell installs a start-up profile, which other apps cannot call
   (it requires the `DUMP` permission). No build type contains the user interface library's
   preview activity.
-- The app's two notifications are each one fixed sentence ("Writing an answer...", "Your
-  answer is ready."). The code that builds them has no access to a chat, and a test that reads
+- The app's two notifications are each one fixed sentence: the ongoing one says "Writing an
+  answer..." or "Unlocked; it locks itself when its time is up.", the other "Your answer is
+  ready.". The code that builds them has no access to a chat, and a test that reads
   the sources fails if a notification is ever given a text with something filled in.
-- The service that keeps the process alive while an answer is written is not exported, takes
+- The service that keeps the process alive while an answer is written, or while the lock waits
+  out of sight, is not exported, takes
   no commands and does nothing itself; its type is "special use", stated in the manifest,
   because Android has no type for running a model on the device. The wake lock it holds has a
   time limit and is renewed, so it cannot be left held.
@@ -703,7 +754,13 @@ it or losing the phone loses the chats.
 - **Anyone who knows the passphrase**, and, while fingerprint unlock is on and within the time
   you chose for it, anyone whose fingerprint is enrolled on the phone.
 - **The unlocked app.** Whoever holds the phone while the app is unlocked reads everything, and
-  the app stays unlocked in the background for the time you chose.
+  the app stays unlocked in the background for the time you chose. It locks on time only while
+  Android keeps it running (see [The lock](#the-lock)): with the app's background use restricted,
+  or the keep-alive refused or stopped by Android, the lock is made up for only when the frozen
+  process can run again or the app is opened, and until then the key and the decrypted chats
+  stay in the memory of the frozen process, for hours if the phone is left alone. The
+  notification "Unlocked; it locks itself when its time is up." also tells anyone who sees the
+  phone's notifications that the app is unlocked.
 - **The minutes in which an answer is finished behind the lock.** With "Finish the answer after
   locking" on, the lock screen shows, but for up to ten minutes, and the half minute at most
   that closing the session then takes, the data key and the conversation are in memory as if
@@ -729,7 +786,8 @@ it or losing the phone loses the chats.
   a write to failing storage does not return. And whatever the system moved to compressed
   swap.
 - **What the notifications tell.** Anyone who sees the phone's notifications learns that the
-  app is writing an answer, or has finished one, and when. They never learn anything else.
+  app is writing an answer, or has finished one, or is unlocked and waiting to lock itself, and
+  when. They never learn anything else.
 - **The keyboard, the clipboard and accessibility services.** A keyboard sees everything typed
   into it. Text you copy leaves the app and can be read by the keyboard and by the app it is
   pasted into. An accessibility service that you have enabled can read what is on the screen,
@@ -1384,7 +1442,7 @@ None of it has been tried.
 | Suite | What it covers | Command |
 | --- | --- | --- |
 | `core` (JVM, 430 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 680 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `app` (JVM, 699 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (50 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
