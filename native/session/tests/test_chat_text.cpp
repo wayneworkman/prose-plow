@@ -106,6 +106,7 @@ bool configure(pp_session * s, const std::vector<llama_token> & banned) {
     config.top_p = 1.0f;
     config.repetition_penalty = 1.0f;
     config.penalty_window = 1;
+    config.reply_start = PP_REPLY_START_AT_SAMPLING;
     config.banned_tokens = banned.data();
     config.n_banned_tokens = (int32_t) banned.size();
     return pp_session_configure_sampler(s, &config) == PP_STATUS_OK;

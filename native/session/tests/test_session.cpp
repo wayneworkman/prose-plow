@@ -222,6 +222,7 @@ pp_sampler_config greedy_config(const std::vector<llama_token> & banned) {
     config.top_p              = 1.0f;
     config.repetition_penalty = 1.0f;
     config.penalty_window     = PP_PENALTY_NO_WINDOW;
+    config.reply_start        = PP_REPLY_START_AT_SAMPLING;
     config.banned_tokens      = banned.data();
     config.n_banned_tokens    = (int32_t) banned.size();
     return config;

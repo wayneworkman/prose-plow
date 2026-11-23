@@ -13,6 +13,15 @@
 // Rules for every function in this file:
 // - Calls on one session are made one at a time, never concurrently. Callbacks are made on the
 //   calling thread, before the call returns.
+// - In one process, contexts are created from one thread at a time only: no two of
+//   pp_session_open_path, pp_session_open_fd, pp_session_resize_context and
+//   pp_session_clear_memory may run at once, on the same session or on different ones. llama.cpp
+//   has one log callback for the whole process, and a session reads from it the cost of each
+//   context it creates and the description of a failed open; two creations at once would mix
+//   their lines (the result is memory-safe, but a cost or an error text could be another
+//   creation's). The allocator's count of what a creation allocated (pp_session_context_bytes)
+//   is process-wide for the same reason. The Kotlin engine has one session and serialises its
+//   calls.
 // - "Memory" is the context's memory for sequence 0. Its length in tokens is the only position
 //   the caller and the session share; evaluation always appends at the end.
 // - No function logs, prints or stores prompt text, token ids or pieces. llama.cpp's own log is
@@ -57,8 +66,8 @@ enum pp_status {
     PP_STATUS_SAMPLING_FAILED   = 6,
     PP_STATUS_OUT_OF_MEMORY     = 7,
     PP_STATUS_INVALID_ARGUMENT  = 8, // the caller broke a documented precondition
-    PP_STATUS_CONTEXT_REFUSED   = 9, // a context size was refused before anything was touched: above what the
-                                     // model was trained for, or its computed cost above the budget
+    PP_STATUS_CONTEXT_REFUSED   = 9, // a context size was refused: above what the model was trained for, its
+                                     // computed cost above the budget, or its cost not known (see each function)
     PP_STATUS_CONTEXT_NOT_CREATED = 10, // a context of the asked size could not be created after the old one
                                      // was freed; pp_session_context_size says what the session has instead
 };
@@ -163,9 +172,11 @@ struct pp_session_params {
                         // trained for is taken as that. It is also the size pp_session_clear_memory returns
                         // to. Read the real value back with pp_session_context_size: llama.cpp rounds it up
     int64_t context_budget_bytes; // the most bytes the context may cost (see pp_session_context_bytes); at
-                        // least 1. An opening size that costs more is refused: PP_STATUS_CONTEXT_REFUSED
+                        // least 1. An opening size that costs more is refused: PP_STATUS_CONTEXT_REFUSED.
+                        // INT64_MAX states that there is no limit (see pp_session_open_path)
     int32_t n_batch;    // the most tokens evaluated by one llama_process call (and one micro-batch); from 1 to
-                        // PP_BATCH_TOKENS_MAX. More than the context is taken as the context
+                        // PP_BATCH_TOKENS_MAX. More than the opening context n_ctx is taken as n_ctx, for
+                        // the life of the session: a context it grows to later keeps that batch
     int32_t n_threads;  // threads for evaluation when they are not pinned; at least 1
     const int32_t * pinned_cpus; // CPU numbers to run one pinned thread each; NULL when n_pinned_cpus is 0
     int32_t n_pinned_cpus;       // 0: never pin
@@ -184,15 +195,27 @@ struct pp_session;
 //
 // Returns PP_STATUS_INVALID_ARGUMENT for parameters outside the ranges stated at
 // pp_session_params, before the file is touched. Returns PP_STATUS_CONTEXT_REFUSED, with the
-// model freed again, when the opening context costs more than the budget.
+// model freed again and nothing left allocated, when the opening context costs more than the
+// budget, and when its cost cannot be known (llama.cpp's report was not understood, see
+// pp_session_context_bytes) while the budget is below INT64_MAX. With a budget of INT64_MAX the
+// caller states no limit: such a session opens although its cost is unknown, and every
+// pp_session_resize_context of it is then refused.
 //
 // What a context costs is only known from llama.cpp's report of one, so a session creates a
-// small context first and frees it (an eighth of the opening size and at most four batches,
-// rounded up to 256 tokens, when that is at least a batch and less than the opening size): the
-// one allocation that is made before any cost is known.
-// The opening size is then held to the budget before it is allocated. A session that opens
-// smaller is held to the budget after its context exists, and that context is freed again if
-// it costs more.
+// small context first and frees it (the larger of one batch and an eighth of the opening size,
+// the eighth at most four batches, rounded up to 256 tokens, when that is less than the opening
+// size): the one allocation that is made before any cost is known. The budget is then checked
+// twice, and the promise is the pair of checks, not the first alone:
+// - before the opening context is allocated, against an estimate from that one small context.
+//   With one size known, the growth of the compute reservation and of llama.cpp's bookkeeping
+//   between it and the opening size is not known yet and counted as nothing, so this estimate
+//   can be below the true cost; a budget below it is refused with nothing more allocated;
+// - after the opening context exists, against its cost from its own report (two sizes are known
+//   then). A budget that the first check let through and this one does not is refused, and the
+//   context is freed again. A session too small for the first context has only this check.
+// So the opening context can exist for a moment although the budget does not cover it: by at
+// most that growth, which is small beside the context itself (the attention mask and about 52
+// bytes per token).
 int32_t pp_session_open_path(
         const char * path,
         const struct pp_session_params * params,
@@ -300,10 +323,47 @@ int32_t pp_session_max_context_size(const struct pp_session * session);
 // key-value buffer, is what a caller should budget with.
 //
 // The figures are llama.cpp's own, read from the lines in which it reports each buffer it
-// allocated for a context of this session ("... buffer size = 48.00 MiB"): the key-value bytes
-// per token from the largest context created so far, the growth of the compute reservation
-// from two contexts of different sizes, and what llama.cpp does not report from the
-// allocator's statistics, where the system has any. Nothing is derived from the architecture.
+// allocated for a context of this session ("... buffer size = 48.00 MiB"), and only from
+// contexts created at the session's batch (pp_session_params.n_batch): a context smaller than
+// the batch has a smaller compute reservation, and its report is not used at all. A size below
+// the batch is therefore costed as if it had the whole batch: too high, never too low. The
+// figures are the key-value bytes per token from the largest context created so far; the
+// compute reservation from two contexts of different sizes, the two farthest apart, growing
+// in a straight line between and beyond them and taken at the smaller's figure below it; the
+// other buffers llama.cpp reports (the recurrent state, the output), the largest figure seen;
+// and the unreported part below. Nothing is derived from the architecture.
+//
+// While only one size has been created (a session opened at about one batch, which makes no
+// small first context: see pp_session_open_path), what the compute reservation and the
+// unreported part grow by is not known, and a larger size is costed as if both grew in
+// proportion to the size: several times too high, never too low. The first larger context
+// the session creates (within a budget that covers that figure) gives the second size, and the
+// figures are close from then on. Beyond the largest size created, the straight line is
+// continued, and what grows can grow faster there (the compute reservation is the largest of
+// several buffers, and a faster growing one can take over): what a size beyond adds to the
+// cost is counted 2% higher. That is a margin, measured (without it the cost was up to 0.3%
+// short at a model's largest context), not a bound.
+//
+// The unreported part is what llama.cpp allocates for a context without reporting it (the
+// scheduler's and the cells' bookkeeping). It is measured as the allocator's count of bytes
+// in use (mallinfo) after llama_init_from_model less the count before, less the buffers
+// reported. That count is process-wide: whatever another thread allocates or frees during the
+// creation is in it. The figure is a fixed part plus a part per token: the part per token is
+// fitted from the first two sizes created (the small first context and the opening context, one
+// straight after the other), never less than nothing; the fixed part is the largest that any
+// creation since has shown (its measurement less the part per token times its size), and never
+// less than the largest measurement of all; before a second size exists it is that largest
+// measurement, in proportion to the size as above. A later
+// creation can therefore raise the figure, never lower it: memory freed elsewhere during a
+// creation makes that measurement smaller and is ignored, memory allocated elsewhere makes it
+// larger and is kept. Its error goes towards costing more, by what other threads allocated
+// during a creation, with one exception: the part per token rests on two measurements and is
+// lower than llama.cpp's real bookkeeping (about 52 bytes per token) when other threads freed
+// memory during the second of them. Where the allocator cannot be asked (neither glibc nor
+// Android) the figure is 0. Not included at all: the sets in which llama.cpp records which
+// cells are in use, which grow by roughly 90 bytes per token in memory while a conversation
+// runs.
+//
 // Returns -1 for a size below 1 or above pp_session_max_context_size, and when the report was
 // not understood (its form is llama.cpp's to change): no size is costed then, and none can be
 // changed to.
@@ -340,15 +400,29 @@ int64_t pp_session_carry_bytes(const struct pp_session * session);
 // Which of the first two happened is what pp_session_memory_token_count says afterwards. No
 // prediction is ready after either: evaluate at least one token before sampling, as after a
 // restored checkpoint. llama.cpp makes every context a whole number of 256 tokens, so a size
-// is rounded up to one before it is costed or compared; a size that rounds to the present one
-// is nothing to do and changes nothing, a ready prediction included.
+// is rounded up to one before it is costed or compared.
+//
+// The checks are made in this order, and the first that applies answers: a size or budget
+// below 1 (PP_STATUS_INVALID_ARGUMENT); a size above pp_session_max_context_size, a cost that
+// is not known, a cost above the budget (each PP_STATUS_CONTEXT_REFUSED); and only then a size
+// that rounds to the present one, which is nothing to do and changes nothing, a ready
+// prediction included (PP_STATUS_OK). So asking for the present size with a budget below its
+// cost is refused, not answered OK.
 //
 // When the new context cannot be created although its cost fits the budget, the session tries
 // the size it had, then halves of that down to 256 tokens, each only if it fits the budget, and
 // answers PP_STATUS_CONTEXT_NOT_CREATED: pp_session_context_size says which exists, and 0
 // means none (the session is then as after a failed pp_session_clear_memory). A memory that
-// was being carried over is put into the size it had if that could be created again, and is
-// gone otherwise.
+// was being carried over is put into whichever of those sizes was created when it fits there
+// (the size it had, or a half that still holds every token in memory), with its checkpoints
+// and penalties as after a carry-over; otherwise it is gone, as after a clear.
+//
+// When the memory did not come through (it was not carried, or it was lost in the fall-back)
+// the sampler is built again as at a clear. If that fails the answer is
+// PP_STATUS_OUT_OF_MEMORY, whatever became of the size: the session then has no sampler and
+// sampling fails until pp_session_configure_sampler or pp_session_clear_memory succeeds;
+// pp_session_context_size says which size exists, and pp_session_last_error names both
+// failures when the size was not as asked either.
 //
 // What is and is not promised about failing. A size is costed and held to the budget before
 // anything is allocated, and before llama.cpp is asked for a context the session maps and
@@ -362,7 +436,7 @@ int64_t pp_session_carry_bytes(const struct pp_session * session);
 // buffer is zeroed. The budget is the protection there, and it is the caller's to derive from
 // the memory the system has free.
 //
-// Returns PP_STATUS_INVALID_ARGUMENT for a size or a budget below 1.
+// Returns PP_STATUS_INVALID_ARGUMENT for a size or a budget below 1; the others as above.
 int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, int64_t budget_bytes);
 
 // The number of tokens in memory: llama_memory_seq_pos_max + 1, which is 0 when it is empty,
@@ -519,6 +593,11 @@ struct pp_sampler_config {
     int32_t  penalty_window;      // how many of the latest tokens in memory the penalties look at: at least 1, or
                                   // PP_PENALTY_NO_WINDOW for the whole memory, which is what the definitions
                                   // below have. 0 and every other negative value are refused
+    int32_t  reply_start;         // where the reply began, for the presence and frequency penalties:
+                                  // PP_REPLY_START_AT_SAMPLING (-1) for where the first token is sampled after
+                                  // this call, or the position in memory (0 or more) at which the answer began,
+                                  // for a reply that continues an answer already in memory. Below -1 is refused.
+                                  // Mind that a zero-initialised struct says position 0: the whole memory
     uint32_t seed;
     const llama_token * banned_tokens; // tokens that must never be sampled; may be NULL when n_banned_tokens is 0
     int32_t  n_banned_tokens;     // at most the size of the vocabulary
@@ -527,6 +606,10 @@ struct pp_sampler_config {
 // No window for the penalties: llama.cpp's own value for "the whole context". Named and not a
 // number of tokens, because the context of a session can change (pp_session_resize_context).
 #define PP_PENALTY_NO_WINDOW (-1)
+
+// The reply begins where the first token is sampled after the sampler is configured: see
+// pp_sampler_config.reply_start.
+#define PP_REPLY_START_AT_SAMPLING (-1)
 
 // The lowest temperature that is used as one. The scores are divided by the temperature: a
 // value this side of a millionth turns their differences into infinities, and the "choice"
@@ -564,12 +647,19 @@ struct pp_sampler_config {
 // The session computes them from its own record of the tokens in memory, so they follow the
 // memory: a token is covered from the moment it is evaluated, whoever chose it, and no longer
 // once it is removed (pp_session_rewind_to, pp_session_restore_checkpoint,
-// pp_session_clear_memory). The reply is what the memory holds from the length it had when the
-// first token was sampled after this call; pp_session_clear_memory ends it as this call does.
-// Configure the sampler once for every reply, before its first token is sampled.
+// pp_session_clear_memory). The reply is what the memory holds from reply_start on: with
+// PP_REPLY_START_AT_SAMPLING, from the length the memory had when the first token was sampled
+// after this call; with a position, from that position, so that a reply which continues an
+// answer already in memory ("Continue": a new generation after a partial assistant message)
+// counts the whole answer and not only what is sampled now. A position beyond the memory counts
+// nothing until the memory reaches it, and a window (penalty_window) still limits what is
+// counted to the latest tokens. pp_session_clear_memory, and a pp_session_resize_context that
+// empties the memory, end the reply: the next one begins where sampling begins, whatever
+// position was configured, because the memory it was a position in is gone. Configure the
+// sampler once for every reply, before its first token is sampled.
 //
-// Returns PP_STATUS_INVALID_ARGUMENT for a value outside the ranges above, a number that is not
-// finite, more banned tokens than the vocabulary has, or a banned token outside the
+// Returns PP_STATUS_INVALID_ARGUMENT for a value outside the ranges above (reply_start below -1
+// among them), a number that is not finite, more banned tokens than the vocabulary has, or a banned token outside the
 // vocabulary; the previous sampler is kept in that case.
 int32_t pp_session_configure_sampler(struct pp_session * session, const struct pp_sampler_config * config);
 

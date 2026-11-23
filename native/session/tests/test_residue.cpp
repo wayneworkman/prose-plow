@@ -346,6 +346,7 @@ int main(int argc, char ** argv) {
     config.top_p = 1.0f;
     config.repetition_penalty = 1.1f;
     config.penalty_window = 256;
+    config.reply_start = PP_REPLY_START_AT_SAMPLING;
     const pp_evaluation_observer observer = {[](void *) { return false; }, [](int32_t, void *) {}, nullptr};
     int32_t in_memory = 0;
     int32_t status = pp_session_configure_sampler(s, &config);

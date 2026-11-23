@@ -20,9 +20,12 @@
 #include "support/test_support.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <thread>
 
 #include <malloc.h>
 #include <sys/resource.h>
@@ -31,8 +34,15 @@ namespace {
 
 using pp_test::report;
 
-constexpr int32_t k_batch  = 32;                // small, so that a context of 256 already has a first, smaller context before it
+constexpr int32_t k_batch  = 32;                // small, so that a session opened at 512 tokens first creates a context of 256
 constexpr int32_t k_open   = 256;               // the size most sessions here are opened with
+// A session whose batch is larger than a context it creates: opened at k_wide_open with a batch
+// of k_wide_batch (it creates a first context of one batch), then given k_wide_small tokens,
+// whose batch is that size; k_wide_far is the larger size it then costs.
+constexpr int32_t k_wide_batch = 512;
+constexpr int32_t k_wide_open  = 1024;
+constexpr int32_t k_wide_small = 256;
+constexpr int32_t k_wide_far   = 2048;
 constexpr int64_t k_budget = (int64_t) 8 << 30; // a limit that is stated, not memory that is taken
 constexpr double  k_mib    = 1048576.0;
 
@@ -84,16 +94,18 @@ int64_t reported(const char * name) {
 struct real_context {
     int64_t allocated = 0;
     int64_t kv = -1, compute = -1;
+    int64_t reported = 0; // every buffer in the report
 };
 
-real_context measure(llama_model * model, int32_t n_ctx) {
+real_context measure(llama_model * model, int32_t n_ctx, int32_t batch = k_batch) {
     llama_context_params p = llama_context_default_params();
     p.n_ctx = (uint32_t) n_ctx;
-    p.n_batch = (uint32_t) std::min(k_batch, n_ctx);
+    p.n_batch = (uint32_t) std::min(batch, n_ctx);
     p.n_ubatch = p.n_batch;
     p.n_seq_max = 1;
-    p.n_threads = 2;
-    p.n_threads_batch = 2;
+    // As a session's: the threads change what the backend allocates for a context.
+    p.n_threads = pp_test::n_threads();
+    p.n_threads_batch = pp_test::n_threads();
     p.no_perf = true;
     g_lines.clear();
     real_context out;
@@ -105,8 +117,93 @@ real_context measure(llama_model * model, int32_t n_ctx) {
     out.allocated = allocated() - before;
     out.kv = reported("KV");
     out.compute = reported("compute");
+    out.reported = std::max<int64_t>(0, reported(""));
     llama_free(ctx);
     return out;
+}
+
+// The bytes this process has mapped (VmSize), or 0 when it cannot be read.
+int64_t mapped_bytes() {
+    unsigned long long mapped_kb = 0;
+    if (std::FILE * f = std::fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            unsigned long long kb = 0;
+            if (std::sscanf(line, "VmSize: %llu kB", &kb) == 1) {
+                mapped_kb = kb;
+            }
+        }
+        std::fclose(f);
+    }
+    return (int64_t) mapped_kb * 1024;
+}
+
+// Things the test does in the middle of a session's call, through llama.cpp's log: the one
+// place where the test is called back while the session creates or frees a context. The
+// session's own log callback is installed by pp_runtime_init and is handed every line on, so
+// its reading of the report is what it would be without the test; only `garble` changes what
+// it is handed.
+struct hooks {
+    ggml_log_callback next = nullptr;
+    void *            next_data = nullptr;
+    // Every "buffer size =" line handed on with its unit spoilt, so that the session cannot
+    // read the report: the form llama.cpp would have after an upstream change of it.
+    bool   garble = false;
+    // A block to be freed on another thread while a context is being created (at its first
+    // "buffer size =" line): memory that the process gives back during the creation, as an
+    // app's other threads do, which the allocator's process-wide count shows.
+    void * free_during_creation = nullptr;
+    // A limit on the address space to be set when the next context is freed (at the line its
+    // destructor logs, while its buffers are still mapped): this many bytes less than is
+    // mapped then, so that once it is gone the room is its size less these bytes.
+    bool    limit_at_free = false;
+    int64_t limit_less = 0;
+    struct rlimit saved = {};
+    bool    limited = false;
+    int     fired = 0;
+};
+hooks g_hooks;
+
+void hooked_sink(enum ggml_log_level level, const char * text, void * data) {
+    hooks & h = g_hooks;
+    if (text != nullptr && std::strstr(text, "buffer size =") != nullptr) {
+        if (h.free_during_creation != nullptr) {
+            void * block = h.free_during_creation;
+            h.free_during_creation = nullptr;
+            std::thread([block] { std::free(block); }).join();
+            h.fired++;
+        }
+        if (h.garble) {
+            std::string spoilt = text;
+            for (size_t at = spoilt.find(" MiB"); at != std::string::npos; at = spoilt.find(" MiB", at)) {
+                spoilt.replace(at, 4, " M?B");
+            }
+            h.next(level, spoilt.c_str(), data);
+            return;
+        }
+    }
+    if (text != nullptr && h.limit_at_free && std::strstr(text, "~llama_context") != nullptr) {
+        h.limit_at_free = false;
+        const int64_t mapped = mapped_bytes();
+        if (mapped > 0 && getrlimit(RLIMIT_AS, &h.saved) == 0) {
+            struct rlimit limited = h.saved;
+            limited.rlim_cur = (rlim_t) std::max<int64_t>(4096, mapped - h.limit_less);
+            if (h.saved.rlim_max == RLIM_INFINITY || limited.rlim_cur <= h.saved.rlim_max) {
+                h.limited = setrlimit(RLIMIT_AS, &limited) == 0;
+            }
+        }
+        h.fired++;
+    }
+    h.next(level, text, data);
+}
+
+// Lifts a limit that hooked_sink set.
+void lift_hooked_limit() {
+    if (g_hooks.limited) {
+        setrlimit(RLIMIT_AS, &g_hooks.saved);
+        g_hooks.limited = false;
+    }
+    g_hooks.limit_at_free = false;
 }
 
 // While one of these exists the process can map `room` bytes more than it has mapped now, or,
@@ -173,11 +270,38 @@ struct talk {
         config.top_p = 1.0f;
         config.repetition_penalty = 1.6f;
         config.penalty_window = PP_PENALTY_NO_WINDOW;
+        config.reply_start = PP_REPLY_START_AT_SAMPLING;
         config.banned_tokens = banned.data();
         config.n_banned_tokens = (int32_t) banned.size();
         if (pp_session_configure_sampler(s, &config) != PP_STATUS_OK) {
             pp_test::die(std::string("pp_session_configure_sampler failed: ") + pp_session_last_error(s));
         }
+    }
+
+    // Greedy with presence and frequency penalties, which count the reply alone: what is
+    // chosen depends on where the session holds the reply to have begun.
+    void configure_presence() {
+        pp_sampler_config config = {};
+        config.top_p = 1.0f;
+        config.repetition_penalty = 1.0f;
+        config.presence_penalty = 0.5f;
+        config.frequency_penalty = 1.5f;
+        config.penalty_window = PP_PENALTY_NO_WINDOW;
+        config.reply_start = PP_REPLY_START_AT_SAMPLING;
+        config.banned_tokens = banned.data();
+        config.n_banned_tokens = (int32_t) banned.size();
+        if (pp_session_configure_sampler(s, &config) != PP_STATUS_OK) {
+            pp_test::die(std::string("pp_session_configure_sampler failed: ") + pp_session_last_error(s));
+        }
+    }
+
+    // A token sampled and not evaluated, as the last token of a reply is left.
+    llama_token sample_only() {
+        llama_token token = LLAMA_TOKEN_NULL;
+        if (pp_session_sample_next(s, &token) != PP_STATUS_OK) {
+            pp_test::die(std::string("pp_session_sample_next failed: ") + pp_session_last_error(s));
+        }
+        return token;
     }
 
     std::vector<llama_token> reply(int n) {
@@ -194,14 +318,14 @@ struct talk {
     }
 };
 
-talk open(const std::string & gguf, int32_t n_ctx, int64_t budget = k_budget, int32_t * status = nullptr, std::string * why = nullptr) {
+talk open(const std::string & gguf, int32_t n_ctx, int64_t budget = k_budget, int32_t * status = nullptr, std::string * why = nullptr, int32_t batch = k_batch) {
     talk t;
     char error[256] = "";
     pp_session * opened = nullptr;
     pp_session_params params = {};
     params.n_ctx = n_ctx;
     params.context_budget_bytes = budget;
-    params.n_batch = k_batch;
+    params.n_batch = batch;
     params.n_threads = pp_test::n_threads();
     params.load_mode = PP_LOAD_MODE_MMAP;
     const int32_t result = pp_session_open_path(gguf.c_str(), &params, &opened, error, sizeof(error));
@@ -263,12 +387,16 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     const std::vector<int32_t> sizes = {k_open, 2 * k_open, 4 * k_open};
     std::vector<real_context> real;
-    real_context sized_small, sized_large;
+    real_context sized_small, sized_large, wide_real;
     {
         pp_test::model_ptr model = pp_test::load_model(gguf, false);
+        // The first context of a process allocates a few things once and keeps them (tens of
+        // KiB): not part of what a context costs, so it is not one of the measured.
+        measure(model.get(), k_open);
         for (const int32_t n : sizes) {
             real.push_back(measure(model.get(), n));
         }
+        wide_real = measure(model.get(), k_wide_far, k_wide_batch);
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers = 0;
         mp.no_alloc = true;
@@ -283,6 +411,13 @@ int main(int argc, char ** argv) {
     if (pp_runtime_init(nullptr, 0) != PP_STATUS_OK) {
         pp_test::die("pp_runtime_init failed");
     }
+    // The session's log callback, with the test's hooks in front of it.
+    llama_log_get(&g_hooks.next, &g_hooks.next_data);
+    if (g_hooks.next == nullptr) {
+        pp_test::die("pp_runtime_init installed no log callback");
+    }
+    llama_log_set(hooked_sink, g_hooks.next_data);
+    const bool can_measure = !k_sanitized && real.front().allocated > 0;
 
     // --- The model's two facts, and the report the session reads ---
 
@@ -308,21 +443,43 @@ int main(int argc, char ** argv) {
     r.check(known > 0 && pp_session_context_bytes(s, 0) == -1 && pp_session_context_bytes(s, n_max) > 0 && (n_max == std::numeric_limits<int32_t>::max() || pp_session_context_bytes(s, n_max + 1) == -1),
             "the session knows what a context costs: %" PRId64 " bytes for %d tokens, %" PRId64 " for the model's %d; none for 0 tokens or for one more than that",
             known, k_open, pp_session_context_bytes(s, n_max), n_max);
-    if (k_sanitized || real.front().allocated <= 0) {
+    // The promise is one-sided: a cost is at least what a context of the size takes, so that a
+    // budget the cost fits is a budget the context fits. "Not absurdly more" is the 1% here.
+    // A session opened at 512 tokens creates one of 256 first and so knows two sizes; the
+    // session t, opened at 256, knows one and costs every larger size as if the compute
+    // reservation and the bookkeeping grew in proportion to it.
+    talk two = open(gguf, 2 * k_open);
+    if (!can_measure) {
         r.note("the allocator cannot be asked what it handed out here (a sanitizer's allocator): the costs are NOT compared with real allocations");
     } else {
-        double worst = 0.0;
-        std::string table;
+        double worst = -1.0;
+        bool under = false, bound_under = false;
+        std::string table, bound_table;
         for (size_t i = 0; i < sizes.size(); i++) {
-            const int64_t cost = pp_session_context_bytes(s, sizes[i]) - (int64_t) sizes[i] * (int64_t) sizeof(llama_token); // less the session's own record
-            worst = std::max(worst, std::fabs((double) (cost - real[i].allocated)) / (double) real[i].allocated);
+            const int64_t record = (int64_t) sizes[i] * (int64_t) sizeof(llama_token); // the session's own record of the tokens, not llama.cpp's
+            const int64_t cost = pp_session_context_bytes(two.s, sizes[i]) - record;
+            const int64_t bound = pp_session_context_bytes(s, sizes[i]) - record;
+            // The allocator's count for one creation differs by a few KiB between two states of
+            // the process (here: the test's own context and the session's): that much below is
+            // the same.
+            const int64_t noise = real[i].allocated / 10000;
+            under = under || cost < real[i].allocated - noise;
+            bound_under = bound_under || bound < real[i].allocated - noise;
+            worst = std::max(worst, (double) (cost - real[i].allocated) / (double) real[i].allocated);
             table += (i ? ", " : "") + std::to_string(sizes[i]) + ": " + std::to_string(cost) + " against " + std::to_string(real[i].allocated);
+            bound_table += (i ? ", " : "") + std::to_string(sizes[i]) + ": " + std::to_string(bound);
         }
         const double step_real = (double) (real[2].allocated - real[0].allocated) / (double) (sizes[2] - sizes[0]);
-        const double step_cost = (double) (pp_session_context_bytes(s, sizes[2]) - pp_session_context_bytes(s, sizes[0])) / (double) (sizes[2] - sizes[0]);
-        r.check(worst <= 0.01, "the cost of a context against what the allocator handed llama.cpp for one, at most %.2f%% apart (limit 1%%): %s bytes", 100.0 * worst, table.c_str());
-        r.check(std::fabs(step_cost - step_real) <= 0.01 * step_real, "the difference between two sizes, which is what a caller budgets with: %.0f bytes per token costed, %.0f allocated",
+        const double step_cost = (double) (pp_session_context_bytes(two.s, sizes[2]) - pp_session_context_bytes(two.s, sizes[0])) / (double) (sizes[2] - sizes[0]);
+        r.check(!under && worst <= 0.01, "the cost of a context is at least what the allocator handed llama.cpp for one (less 0.01%%, the count's noise), and at most 1%% more (%.3f%% at most) "
+                "in a session that knows two sizes: %s bytes", 100.0 * worst, table.c_str());
+        // Beyond the larger of its two sizes a cost has a margin of 2% of what the size adds
+        // (see context_cost), so the costed difference may be that much more.
+        r.check(step_cost >= 0.99 * step_real && step_cost <= 1.03 * step_real,
+                "the difference between two sizes, which is what a caller budgets with: %.0f bytes per token costed, %.0f allocated (at least 99%%, at most 103%%)",
                 step_cost, step_real);
+        r.check(!bound_under, "a session that knows one size costs the larger ones as if what grows grew in proportion to the size: never below the allocation, less 0.01%% (%s bytes)",
+                bound_table.c_str());
     }
 
     // At the model's largest context, against llama.cpp's own sizing of it from the model loaded
@@ -330,14 +487,105 @@ int main(int argc, char ** argv) {
     // allocates. The key-value buffers are rows of one size and need no measuring.
     {
         const real_context & small = sized_small, & large = sized_large;
-        const int64_t cost_small = pp_session_context_bytes(s, k_open), cost_large = pp_session_context_bytes(s, n_max);
+        const int64_t cost_small = pp_session_context_bytes(two.s, k_open), cost_large = pp_session_context_bytes(two.s, n_max);
         const int64_t expected = cost_small + (int64_t) (n_max - k_open) * (file_per_token + (int64_t) sizeof(llama_token)) + (large.compute - small.compute) +
                                  (k_sanitized ? 0 : large.allocated - small.allocated);
         const double apart = (double) (cost_large - expected) / (double) expected;
-        r.check(small.compute > 0 && large.compute > 0 && std::fabs(apart) <= 0.03,
+        r.check(small.compute > 0 && large.compute > 0 && apart >= 0.0 && apart <= 0.03,
                 "the model's largest context, %d tokens: costed at %.1f MiB, and %.1f MiB by llama.cpp's own sizing of it without allocating "
-                "(compute reservation %.2f MiB there against %.2f MiB at %d tokens): %+.2f%% apart (limit 3%%)",
+                "(compute reservation %.2f MiB there against %.2f MiB at %d tokens): %+.2f%% more (at least 0, at most 3%%)",
                 n_max, (double) cost_large / k_mib, (double) expected / k_mib, (double) large.compute / k_mib, (double) small.compute / k_mib, k_open, 100.0 * apart);
+    }
+
+    // --- A context smaller than the session's batch ---
+
+    // llama.cpp gives a context no batch larger than itself, and the compute reservation is
+    // mostly the scores of one batch. A session that took the figures of such a context for
+    // its own would cost every larger size too little (by the scores of the missing part of
+    // the batch, and its growth with the context); its figures come from contexts at its batch
+    // only, so the cost of a larger size is the same before and after.
+    {
+        talk w = open(gguf, k_wide_open, k_budget, nullptr, nullptr, k_wide_batch);
+        const int64_t before = pp_session_context_bytes(w.s, k_wide_far);
+        const int32_t down = pp_session_resize_context(w.s, k_wide_small, k_budget);
+        const int64_t after = pp_session_context_bytes(w.s, k_wide_far);
+        const int64_t allocated = wide_real.allocated + (int64_t) k_wide_far * (int64_t) sizeof(llama_token);
+        const bool compared = can_measure && wide_real.allocated > 0;
+        r.check(down == PP_STATUS_OK && pp_session_context_size(w.s) == k_wide_small && after == before && (!compared || (after >= allocated && after <= allocated + allocated / 100)),
+                "a session with a batch of %d, opened at %d tokens and then given %d (a context whose batch is %d): a context of %d tokens costs %" PRId64 " bytes "
+                "before and %" PRId64 " after; llama.cpp allocates %s for one at that batch",
+                k_wide_batch, k_wide_open, k_wide_small, k_wide_small, k_wide_far, before, after, compared ? std::to_string(allocated).c_str() : "(not measured here)");
+    }
+
+    // --- Memory freed elsewhere while a context is created ---
+
+    // The unreported part of a cost is measured with the allocator's count, which is the whole
+    // process's. Memory that another thread frees during a creation makes that measurement too
+    // small; a figure that took the smallest measurement (as the session once did) would then
+    // cost every size less by as much, for the rest of the session.
+    if (!can_measure) {
+        r.note("the allocator cannot be asked here: memory freed during a creation is NOT tested");
+    } else {
+        talk m = open(gguf, 2 * k_open); // two sizes known: 256 and 512
+        const int64_t unreported = real[1].allocated - real[1].reported;
+        const size_t freed = (size_t) std::max<int64_t>((int64_t) 1 << 20, unreported * 3 / 4);
+        void * block = std::malloc(freed); // well above the mapping threshold: its free shows in the count at once
+        if (block == nullptr) {
+            pp_test::die("no memory for the block to be freed");
+        }
+        const int64_t before_near = pp_session_context_bytes(m.s, 2 * k_open), before_far = pp_session_context_bytes(m.s, n_max);
+        const int fired = g_hooks.fired;
+        g_hooks.free_during_creation = block;
+        // A size already measured, so that nothing but the unreported part can change.
+        const int32_t status = pp_session_resize_context(m.s, k_open, k_budget);
+        const bool freed_then = g_hooks.fired > fired;
+        if (!freed_then) {
+            std::free(g_hooks.free_during_creation);
+            g_hooks.free_during_creation = nullptr;
+        }
+        const int64_t after_near = pp_session_context_bytes(m.s, 2 * k_open), after_far = pp_session_context_bytes(m.s, n_max);
+        r.check(status == PP_STATUS_OK && freed_then && after_near >= before_near && after_far >= before_far,
+                "%.1f MiB freed on another thread while a context of %d tokens was created (llama.cpp allocates %.1f MiB for a context without reporting it): "
+                "a context of %d tokens costs %" PRId64 " bytes before and %" PRId64 " after, one of %d %" PRId64 " and %" PRId64 "; a figure that took the "
+                "smaller measurement would cost each about %.1f MiB less",
+                (double) freed / k_mib, k_open, (double) unreported / k_mib, 2 * k_open, before_near, after_near, n_max, before_far, after_far, (double) freed / k_mib);
+    }
+
+    // --- A report that cannot be read ---
+
+    // The form of llama.cpp's report is upstream's to change. When the session cannot read it,
+    // no cost is known: an opening with a budget is refused with nothing left, an opening that
+    // states no limit (INT64_MAX) succeeds, and no change of size is allowed.
+    {
+        g_hooks.garble = true;
+        int32_t refused_status = PP_STATUS_OK, opened_status = PP_STATUS_OK;
+        std::string why;
+        talk refused = open(gguf, 2 * k_open, k_budget, &refused_status, &why);
+        talk unlimited = open(gguf, 2 * k_open, std::numeric_limits<int64_t>::max(), &opened_status);
+        g_hooks.garble = false;
+        bool unknown = false;
+        int32_t grow = PP_STATUS_OK, grow_unlimited = PP_STATUS_OK;
+        size_t replied = 0;
+        if (unlimited.s != nullptr) {
+            unknown = pp_session_context_bytes(unlimited.s, k_open) == -1 && pp_session_context_bytes(unlimited.s, 2 * k_open) == -1;
+            grow = pp_session_resize_context(unlimited.s, 4 * k_open, k_budget);
+            grow_unlimited = pp_session_resize_context(unlimited.s, 4 * k_open, std::numeric_limits<int64_t>::max());
+            std::vector<llama_token> some;
+            for (llama_token id = 5; some.size() < 4; id++) {
+                if (!pp_session_is_end_of_generation(unlimited.s, id)) {
+                    some.push_back(id);
+                }
+            }
+            unlimited.evaluate(some);
+            unlimited.configure();
+            replied = unlimited.reply(2).size();
+        }
+        r.check(refused_status == PP_STATUS_CONTEXT_REFUSED && refused.s == nullptr && why.find("not known") != std::string::npos &&
+                opened_status == PP_STATUS_OK && unknown && grow == PP_STATUS_CONTEXT_REFUSED && grow_unlimited == PP_STATUS_CONTEXT_REFUSED &&
+                pp_session_context_size(unlimited.s) == 2 * k_open && replied == 2,
+                "with llama.cpp's report unreadable: an opening with a budget is refused (%d, \"%s\"); one with a budget of INT64_MAX opens (%d), costs nothing it "
+                "could know (-1), refuses a change of size with a budget and without one (%d, %d) and evaluates and samples as any session",
+                refused_status, why.c_str(), opened_status, grow, grow_unlimited);
     }
 
     // --- Changing the size: what is refused, with nothing touched ---
@@ -362,14 +610,18 @@ int main(int argc, char ** argv) {
         const int32_t none = pp_session_resize_context(s, 0, k_budget);
         const int32_t no_budget = pp_session_resize_context(s, n_grown, 0);
         const int32_t same = pp_session_resize_context(s, k_open, k_budget);
+        // The order of the checks: a budget below the present size's cost is refused before
+        // "it is that size already" is answered.
+        const int32_t same_too_dear = pp_session_resize_context(s, k_open, pp_session_context_bytes(s, k_open) - 1);
         llama_token token = LLAMA_TOKEN_NULL;
         const int32_t sampled = pp_session_sample_next(s, &token);
         r.check(too_many == PP_STATUS_CONTEXT_REFUSED && too_dear == PP_STATUS_CONTEXT_REFUSED && none == PP_STATUS_INVALID_ARGUMENT && no_budget == PP_STATUS_INVALID_ARGUMENT &&
-                same == PP_STATUS_OK && pp_session_context_size(s) == k_open && pp_session_memory_token_count(s) == count &&
+                same == PP_STATUS_OK && same_too_dear == PP_STATUS_CONTEXT_REFUSED && pp_session_context_size(s) == k_open && pp_session_memory_token_count(s) == count &&
                 pp_session_checkpoint_size(s, mark) > 0 && sampled == PP_STATUS_OK,
                 "one token more than the model was trained for, and a size whose cost is one byte above the budget: CONTEXT_REFUSED (%d, %d: \"%s\"); 0 tokens, a budget of 0: "
-                "INVALID_ARGUMENT (%d, %d); the size it has: OK (%d). After all five the context is %d tokens with the same %d in memory, the checkpoint is valid and "
-                "the prediction that was ready is sampled from (%d)", too_many, too_dear, why.c_str(), none, no_budget, same, pp_session_context_size(s), count, sampled);
+                "INVALID_ARGUMENT (%d, %d); the size it has: OK (%d), and CONTEXT_REFUSED with a budget one byte below its cost (%d). After all six the context is %d tokens "
+                "with the same %d in memory, the checkpoint is valid and the prediction that was ready is sampled from (%d)",
+                too_many, too_dear, why.c_str(), none, no_budget, same, same_too_dear, pp_session_context_size(s), count, sampled);
         t.evaluate({token});
     }
 
@@ -448,6 +700,52 @@ int main(int argc, char ** argv) {
         t.memory.clear();
     }
 
+    // --- Where the reply began, across a carried change of size ---
+
+    // A reply of 16 tokens with the presence and frequency penalties, the last of them sampled
+    // and not yet evaluated, as an app leaves it; then the size is changed with the memory
+    // carried over; then 16 more, which must be chosen with the penalties counting the whole
+    // reply. The mistake, a reply begun anew at the change (the session's place of the reply's
+    // beginning lost on the way), is what `restart` does in a session that never changes size:
+    // the sampler configured again at that point.
+    // A prompt that repeats a few tokens over and over, which a model goes on repeating: so
+    // that whether a token of the reply's first part still counts decides what comes next.
+    std::vector<llama_token> pattern;
+    while (pattern.size() < 64) {
+        pattern.push_back(prompt[pattern.size() % 6]);
+    }
+    const auto begin_reply = [&](talk & x) {
+        x.configure_presence();
+        x.reply(15);
+        return x.sample_only();
+    };
+    const auto go_on = [&](talk & x, llama_token pending, bool restart) {
+        x.evaluate({pending});
+        if (restart) {
+            x.configure_presence();
+        }
+        return x.reply(16);
+    };
+    const auto continued_fresh = [&](int32_t n_ctx, bool restart) {
+        talk x = open(gguf, n_ctx);
+        x.evaluate(pattern);
+        const llama_token pending = begin_reply(x);
+        return go_on(x, pending, restart);
+    };
+    {
+        talk x = open(gguf, k_open);
+        x.evaluate(pattern);
+        const llama_token pending = begin_reply(x);
+        const int32_t status = pp_session_resize_context(x.s, n_grown, k_budget);
+        const bool held = pp_session_memory_token_count(x.s) == (int32_t) pattern.size() + 15 && pp_session_context_size(x.s) == n_grown;
+        const std::vector<llama_token> here = go_on(x, pending, false);
+        const std::vector<llama_token> right = continued_fresh(n_grown, false), wrong = continued_fresh(n_grown, true);
+        r.check(status == PP_STATUS_OK && held && here == right && right != wrong,
+                "a reply continued after its memory was carried from %d to %d tokens (%d): the 16 tokens after the change are those of a session that never changed "
+                "size (%s), and a reply begun anew at the change would have given others (%s)",
+                k_open, n_grown, status, here == right ? "the same" : "NOT the same", right != wrong ? "it would" : "NO: nothing here tells the two apart");
+    }
+
     // --- A size that cannot be had: the address space has no room for it ---
 
     if (k_sanitized) {
@@ -465,8 +763,9 @@ int main(int argc, char ** argv) {
         t = talk();
         t = open(gguf, n_old);
         s = t.s;
-        t.evaluate(prompt);
+        t.evaluate(pattern);
         const int32_t kept_mark = pp_session_save_checkpoint(s);
+        const llama_token pending = begin_reply(t);
         const int64_t cost_old = pp_session_context_bytes(s, n_old), cost_new = pp_session_context_bytes(s, n_new), cost_half = pp_session_context_bytes(s, n_old / 2);
         int32_t status = PP_STATUS_OK;
         bool limited = false;
@@ -480,48 +779,86 @@ int main(int argc, char ** argv) {
         if (!limited) {
             r.note("no address space limit can be set here: the checks of a context that cannot be created are NOT run");
         } else {
+            // The fall-back into the size there was, with the memory carried into it.
             const std::string why = pp_session_last_error(s);
-            r.check(status == PP_STATUS_CONTEXT_NOT_CREATED && pp_session_context_size(s) == n_old && pp_session_memory_token_count(s) == (int32_t) prompt.size() &&
+            const int32_t count = pp_session_memory_token_count(s);
+            r.check(status == PP_STATUS_CONTEXT_NOT_CREATED && pp_session_context_size(s) == n_old && count == (int32_t) pattern.size() + 15 &&
                     pp_session_checkpoint_size(s, kept_mark) > 0,
                     "from %d to %d tokens (%.0f MiB more) with room in the address space for half of that and the carried block: CONTEXT_NOT_CREATED (%d), the context of %d again with its %d tokens "
-                    "in memory and its checkpoint (\"%s\")", n_old, n_new, (double) (cost_new - cost_old) / k_mib, status, pp_session_context_size(s), pp_session_memory_token_count(s), why.c_str());
+                    "in memory and its checkpoint (\"%s\")", n_old, n_new, (double) (cost_new - cost_old) / k_mib, status, pp_session_context_size(s), count, why.c_str());
+            const std::vector<llama_token> here = go_on(t, pending, false);
+            const std::vector<llama_token> right = continued_fresh(n_old, false), wrong = continued_fresh(n_old, true);
+            r.check(here == right && right != wrong,
+                    "and the reply goes on as in a session that never tried another size (%s); a reply begun anew there would have differed (%s)",
+                    here == right ? "the same 16 tokens" : "NOT the same tokens", right != wrong ? "it would" : "NO: nothing here tells the two apart");
 
-            // Nothing in memory, and so little room that the present size cannot be created
-            // again once it is freed, while half of it can.
-            pp_session_resize_context(s, n_old, k_budget);
-            pp_session_clear_memory(s);
-            {
-                const address_space limit(-(cost_old - cost_half) / 4);
-                status = pp_session_resize_context(s, n_new, k_budget);
-            }
-            r.check(status == PP_STATUS_CONTEXT_NOT_CREATED && pp_session_context_size(s) == n_old / 2 && pp_session_memory_token_count(s) == 0,
-                    "the same with %.0f MiB less address space than was mapped: CONTEXT_NOT_CREATED (%d), neither %d nor %d could be had, and the session has a context of %d (\"%s\")",
-                    (double) (cost_old - cost_half) / 4.0 / k_mib, status, n_new, n_old, pp_session_context_size(s), pp_session_last_error(s));
+            // The fall-back into a half, with the memory carried into it: so little room once the
+            // present context is freed (the limit is set at that moment, after the block was
+            // written) that it cannot be created again, while half of it can.
+            const int32_t count_half = pp_session_memory_token_count(s);
+            int fired = g_hooks.fired;
+            // The room is what freeing the old context gives back, less a MiB: never enough for
+            // that context again (its cost is at least what it took), and enough for a half as
+            // long as the allocator keeps less of what was freed than the half saves (it keeps
+            // tens of MiB of heap that are not unmapped).
+            g_hooks.limit_less = (int64_t) 1 << 20;
+            g_hooks.limit_at_free = true;
+            status = pp_session_resize_context(s, n_new, k_budget);
+            bool hooked = g_hooks.fired > fired && g_hooks.limited;
+            lift_hooked_limit();
+            r.check(hooked && status == PP_STATUS_CONTEXT_NOT_CREATED && pp_session_context_size(s) == n_old / 2 && pp_session_memory_token_count(s) == count_half &&
+                    pp_session_checkpoint_size(s, kept_mark) > 0,
+                    "the same with %.0f MiB less address space than freeing the old context gave back: CONTEXT_NOT_CREATED (%d), neither %d nor %d could be had, and the session "
+                    "has a context of %d (costed at %.0f MiB) with the %d tokens in memory carried into it and its checkpoint (\"%s\")",
+                    (double) g_hooks.limit_less / k_mib, status, n_new, n_old, pp_session_context_size(s), (double) cost_half / k_mib, pp_session_memory_token_count(s), pp_session_last_error(s));
 
-            // No room for any size at all.
-            {
-                const address_space limit(std::numeric_limits<int64_t>::min() / 2);
-                status = pp_session_resize_context(s, n_new, k_budget);
-            }
+            // The memory lost: no room for any size at all once the context is freed.
+            fired = g_hooks.fired;
+            g_hooks.limit_less = std::numeric_limits<int64_t>::max() / 4;
+            g_hooks.limit_at_free = true;
+            status = pp_session_resize_context(s, n_new, k_budget);
+            hooked = g_hooks.fired > fired && g_hooks.limited;
+            lift_hooked_limit();
+            const int32_t size_then = pp_session_context_size(s), count_then = pp_session_memory_token_count(s);
+            const bool mark_gone = pp_session_checkpoint_size(s, kept_mark) < 0;
             int32_t n_in = 0;
             pp_evaluation_observer observer = {[](void *) { return false; }, [](int32_t, void *) {}, nullptr};
             const int32_t evaluated = pp_session_evaluate(s, prompt.data(), 1, 1, &observer, &n_in);
             const int32_t cleared = pp_session_clear_memory(s);
-            r.check(status == PP_STATUS_CONTEXT_NOT_CREATED && evaluated == PP_STATUS_OUT_OF_MEMORY && cleared == PP_STATUS_OK && pp_session_context_size(s) == n_old,
-                    "with no address space to be had at all: CONTEXT_NOT_CREATED (%d) and no context, an evaluation answers OUT_OF_MEMORY (%d); with the limit lifted "
-                    "a clear creates the opening context of %d again (%d)", status, evaluated, pp_session_context_size(s), cleared);
+            r.check(hooked && status == PP_STATUS_CONTEXT_NOT_CREATED && size_then == 0 && count_then == 0 && mark_gone && evaluated == PP_STATUS_OUT_OF_MEMORY &&
+                    cleared == PP_STATUS_OK && pp_session_context_size(s) == n_old,
+                    "with no address space to be had at all once the context is freed: CONTEXT_NOT_CREATED (%d), no context, the carried memory and its checkpoint gone; "
+                    "an evaluation answers OUT_OF_MEMORY (%d); with the limit lifted a clear creates the opening context of %d again (%d)",
+                    status, evaluated, pp_session_context_size(s), cleared);
             t.memory.clear();
             t.evaluate(prompt);
             t.configure();
             r.check(t.reply(4).size() == 4, "and the session evaluates and samples as before");
         }
 
-        // Opening is held to the same budget from nothing.
-        int32_t opened = PP_STATUS_OK;
-        std::string why;
-        talk refused = open(gguf, n_old, cost_old - 1, &opened, &why);
-        r.check(opened == PP_STATUS_CONTEXT_REFUSED && refused.s == nullptr, "opening at %d tokens with a budget one byte below their cost: CONTEXT_REFUSED (%d), no session (\"%s\")",
-                n_old, opened, why.c_str());
+        // Opening is held to the same budget from nothing, by two checks (see
+        // pp_session_open_path): an estimate from the first, small context before the opening
+        // context is allocated, and its own report after. Each is named by its refusal.
+        // The cost is the one a session that has just opened at that size states: one with
+        // another history has measured other sizes. 32 KiB below it is clear of the allocator's
+        // noise between two openings (a few KiB) and above the estimate before the allocation,
+        // which leaves out the growth from the first, small context (more than 100 KiB for each
+        // model here).
+        int64_t cost_open = 0;
+        {
+            const talk fresh_open = open(gguf, n_old);
+            cost_open = pp_session_context_bytes(fresh_open.s, n_old);
+        }
+        int32_t opened = PP_STATUS_OK, opened_early = PP_STATUS_OK;
+        std::string why, why_early;
+        talk refused = open(gguf, n_old, cost_open - 32768, &opened, &why);
+        talk refused_early = open(gguf, n_old, cost_open / 2, &opened_early, &why_early);
+        r.check(opened == PP_STATUS_CONTEXT_REFUSED && refused.s == nullptr && why.find("once it existed") != std::string::npos,
+                "opening at %d tokens with a budget 32 KiB below their cost: CONTEXT_REFUSED (%d), no session, by the check after the allocation, which the "
+                "estimate before it let through (\"%s\")", n_old, opened, why.c_str());
+        r.check(opened_early == PP_STATUS_CONTEXT_REFUSED && refused_early.s == nullptr && why_early.find("before it was allocated") != std::string::npos,
+                "opening at %d tokens with half their cost as the budget: CONTEXT_REFUSED (%d), no session, by the estimate before the allocation (\"%s\")",
+                n_old, opened_early, why_early.c_str());
     }
 
     return r.finish();

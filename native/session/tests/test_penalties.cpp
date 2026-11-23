@@ -525,6 +525,7 @@ int main(int argc, char ** argv) {
         config.presence_penalty   = presence;
         config.frequency_penalty  = frequency;
         config.penalty_window     = PP_PENALTY_NO_WINDOW; // as the engine sets it
+        config.reply_start        = PP_REPLY_START_AT_SAMPLING; // the engine's value outside "Continue"
         config.banned_tokens      = banned.data();
         config.n_banned_tokens    = (int32_t) banned.size();
         return config;
@@ -620,6 +621,68 @@ int main(int argc, char ** argv) {
         const verdict v = run(t, o, config, run_flags, k_steps, [&](const std::vector<llama_token> & m) { return coverage{m, from(m, n_begun)}; }, {});
         r.check(v.sound(k_steps) && v.tokens == presence_reply, "configured before the memory was brought to the prompt: the same %zu tokens as when configured after it (%d of %d judged)",
                 v.tokens.size(), v.agreed, v.judged);
+    }
+
+    // --- A reply that continues an answer: the penalties count the whole answer ---
+
+    {
+        // "Continue": the memory holds the prompt and the beginning of its answer (`begun`),
+        // and a new generation goes on from there. Configured with reply_start at the length of
+        // the prompt, the presence and frequency penalties count the whole answer. The mistake
+        // they must be told from is counting from where this sampling began, which is what
+        // PP_REPLY_START_AT_SAMPLING does, as all of the runs above.
+        struct setting {
+            float repetition, presence, frequency;
+        };
+        const setting settings[] = {{1.0f, 2.0f, 0.0f}, {1.0f, 0.5f, 0.5f}, {1.1f, 1.5f, 0.3f}};
+        const cover_fn right = [&](const std::vector<llama_token> & m) { return coverage{m, from(m, n_a)}; };
+        const cover_fn from_sampling = [&](const std::vector<llama_token> & m) { return coverage{m, from(m, n_begun)}; };
+        int telling = 0, telling_again = 0;
+        bool all_sound = true, all_again = true;
+        std::string misses;
+        for (const setting & p : settings) {
+            pp_sampler_config config = greedy(run_banned, p.repetition, p.presence, p.frequency);
+            config.reply_start = (int32_t) n_a;
+            t.bring_to(begun);
+            t.configure(config);
+            const verdict v = run(t, o, config, run_flags, k_steps, right, {from_sampling});
+            telling += v.telling[0];
+            all_sound = all_sound && v.sound(k_steps);
+
+            // Back to where the generation began, through a checkpoint, with the sampler left as
+            // it is: the configured beginning of the answer still holds, and the same tokens
+            // follow.
+            t.try_rewind = false;
+            const int restored = t.n_restored;
+            t.ready_at(n_begun);
+            const verdict again = run(t, o, config, run_flags, k_steps, right, {from_sampling});
+            t.try_rewind = true;
+            telling_again += again.telling[0];
+            all_again = all_again && again.sound(k_steps) && again.tokens == v.tokens && t.n_restored > restored;
+            misses += (misses.empty() ? "" : ", ") + v.first_miss + " / " + again.first_miss;
+        }
+        r.check(all_sound && telling >= 1,
+                "configured with reply_start at the end of the prompt (%zu) after %zu tokens of the answer: presence and frequency count the whole answer at every judged "
+                "step; at %d steps counting from where sampling began would have chosen another token (first misses: %s)",
+                n_a, n_begun - n_a, telling, misses.c_str());
+        r.check(all_again && telling_again >= 1,
+                "back to where the generation began through a checkpoint, sampler untouched: the same tokens again, the definition's at every judged step; "
+                "%d steps tell the two beginnings apart", telling_again);
+
+        // Below -1 is refused, and the sampler configured before stays.
+        pp_sampler_config bad = greedy(run_banned, 1.0f, 2.0f, 0.0f);
+        bad.reply_start = -2;
+        const int32_t refused = pp_session_configure_sampler(s, &bad);
+        bad.reply_start = std::numeric_limits<int32_t>::min();
+        const int32_t refused_min = pp_session_configure_sampler(s, &bad);
+        t.ready_at(t.memory.size());
+        llama_token token = LLAMA_TOKEN_NULL;
+        const int32_t sampled = pp_session_sample_next(s, &token);
+        if (sampled == PP_STATUS_OK) {
+            t.push(token);
+        }
+        r.check(refused == PP_STATUS_INVALID_ARGUMENT && refused_min == PP_STATUS_INVALID_ARGUMENT && sampled == PP_STATUS_OK,
+                "reply_start -2 and INT32_MIN: INVALID_ARGUMENT (%d, %d), and the sampler configured before still samples (%d)", refused, refused_min, sampled);
     }
 
     // --- Going back in the memory, with the sampler left as it is ---

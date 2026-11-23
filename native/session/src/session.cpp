@@ -324,22 +324,36 @@ struct pp_checkpoint {
 // and those lines are read (see read_report). The key-value buffers are exactly as many rows
 // as the context has tokens, so their bytes per token are known from one context. The compute
 // reservation grows with the context too, by the attention mask, and its growth is taken from
-// two contexts of different sizes with the same batch: the small one a session creates first
-// for this purpose, and the largest created since. What llama.cpp allocates without reporting
-// it (the scheduler's own bookkeeping, a fixed amount per model that is mostly never touched)
-// is measured through the allocator's statistics where they can be asked.
+// two contexts of different sizes: the small one a session creates first for this purpose,
+// and the largest created since. What llama.cpp allocates without reporting it (the
+// scheduler's and the cells' bookkeeping) is measured through the allocator's statistics where
+// they can be asked.
+//
+// Every figure comes from contexts created at the session's batch (n_batch_max) only. A context
+// smaller than the batch has a batch of its own size and a compute reservation to match (the
+// scores of a whole batch are most of it), so its report would make every larger size cost too
+// little; it is not used at all, and a size below the batch is costed at the whole batch, too
+// high and never too low. Every figure errs towards costing more, so that a budget that a cost
+// fits is a budget the context fits: see pp_session_context_bytes in the header.
 struct pp_context_cost {
     bool    known = false;       // false until a report was understood: no size can be costed then
     double  kv_per_token = 0.0;  // bytes of the key-value buffers per token of context
     int32_t kv_from = 0;         // the size of the context that figure was taken from (the largest)
-    int64_t fixed = 0;           // the buffers whose size does not depend on the context
-    int64_t unreported = 0;      // allocated by llama.cpp for a context and not in its report
-    bool    unreported_known = false;
-    int32_t batch = 0;           // the batch the two compute figures belong to
+    int64_t fixed = 0;           // the buffers whose size does not depend on the context: the largest seen
     int32_t n_low = 0;           // the smaller context whose compute reservation is known
     int64_t compute_low = 0;
     int32_t n_high = 0;          // and the larger; the same as n_low while only one is known
     int64_t compute_high = 0;
+    // What llama.cpp allocated and did not report: max(unreported_fixed + unreported_per_token
+    // * n, unreported_max) once two sizes were measured, unreported_max before. Each figure only
+    // ever rises, so no later measurement can lower a cost (see learn_cost).
+    bool    unreported_known = false;
+    int32_t unreported_n0 = 0;          // the size of the first measurement
+    int64_t unreported_first = 0;       // the largest measurement at that size
+    bool    unreported_slope_known = false;
+    double  unreported_per_token = 0.0; // from the first two sizes measured; set once
+    double  unreported_fixed = 0.0;     // the largest (measurement - per token * size) since
+    int64_t unreported_max = 0;         // the largest measurement of all
 };
 
 // The caller's load progress callback, and whether it asked for the load to be abandoned.
@@ -421,8 +435,10 @@ struct pp_session {
     // in it: it grows through reserve_history only, and what is cut off is overwritten.
     std::vector<llama_token> history;
     // Where the reply begins in the memory, for the penalties that count the reply alone: the
-    // length of the memory when the first token was sampled after the sampler was configured
-    // or the conversation forgotten. -1 until then.
+    // position the configuration named (pp_sampler_config.reply_start), or else the length of
+    // the memory when the first token was sampled after the sampler was configured or the
+    // conversation forgotten, -1 until then. It may lie beyond the memory (apply_penalties
+    // clamps it).
     int32_t reply_start = -1;
 
     // The candidate list a token is sampled from: every token with its score. The session's own,
@@ -593,17 +609,18 @@ context_report read_report(const std::string & text) {
 void learn_cost(pp_session * s, int32_t n, int32_t batch, const std::string & text, int64_t allocated) {
     const context_report report = read_report(text);
     pp_context_cost & cost = s->cost;
-    if (!report.complete || n < 1) {
+    // A context below the session's batch tells nothing about the contexts at the batch, which
+    // every larger size has (see pp_context_cost): its report neither replaces nor resets what
+    // is known.
+    if (!report.complete || n < 1 || batch != s->n_batch_max) {
         return;
     }
     if (n >= cost.kv_from) {
         cost.kv_per_token = (double) report.kv / (double) n;
         cost.kv_from = n;
     }
-    cost.fixed = report.fixed;
-    if (cost.batch != batch || cost.n_high == 0) {
-        // Another batch is another compute reservation altogether: what was known is void.
-        cost.batch = batch;
+    cost.fixed = std::max(cost.fixed, report.fixed);
+    if (cost.n_high == 0) {
         cost.n_low = cost.n_high = n;
         cost.compute_low = cost.compute_high = report.compute;
     } else if (n >= cost.n_high) {
@@ -621,12 +638,32 @@ void learn_cost(pp_session * s, int32_t n, int32_t batch, const std::string & te
         cost.n_low = n;
         cost.compute_low = report.compute;
     }
-    // The rest of what the allocator handed out. It does not grow with the context but for
-    // the cells' own bookkeeping, so the smallest value seen is the nearest to the fixed part.
+    // The rest of what the allocator handed out: a fixed part (the scheduler's bookkeeping)
+    // and a part per token (the cells' bookkeeping). The allocator's count is the whole
+    // process's, so another thread that frees memory during the creation makes a measurement
+    // too small and one that allocates makes it too large. The figures therefore only ever
+    // rise: a measurement that is too small is outweighed by the earlier ones, one that is too
+    // large costs more than needed, and no measurement lowers a cost that was given before.
+    // The part per token is fitted once, from the first two sizes, which a session creates one
+    // straight after the other when it opens; fitting it again from later pairs would let one
+    // disturbed measurement lower it, or multiply a disturbance by the context's size.
     const int64_t rest = allocated - (report.kv + report.compute + report.fixed);
-    if (allocated > 0 && rest >= 0 && rest < ((int64_t) 1 << 32) && (!cost.unreported_known || rest < cost.unreported)) {
-        cost.unreported = rest;
-        cost.unreported_known = true;
+    if (allocated > 0 && rest >= 0 && rest < ((int64_t) 1 << 32)) {
+        if (!cost.unreported_known) {
+            cost.unreported_known = true;
+            cost.unreported_n0 = n;
+            cost.unreported_first = rest;
+        } else if (!cost.unreported_slope_known && n == cost.unreported_n0) {
+            cost.unreported_first = std::max(cost.unreported_first, rest);
+        } else if (!cost.unreported_slope_known) {
+            cost.unreported_per_token = std::max(0.0, (double) (rest - cost.unreported_first) / (double) (n - cost.unreported_n0));
+            cost.unreported_slope_known = true;
+            cost.unreported_fixed = std::max((double) cost.unreported_first - cost.unreported_per_token * (double) cost.unreported_n0,
+                                             (double) rest - cost.unreported_per_token * (double) n);
+        } else {
+            cost.unreported_fixed = std::max(cost.unreported_fixed, (double) rest - cost.unreported_per_token * (double) n);
+        }
+        cost.unreported_max = std::max(cost.unreported_max, rest);
     }
     cost.known = true;
 }
@@ -637,24 +674,67 @@ void learn_cost(pp_session * s, int32_t n, int32_t batch, const std::string & te
 // about is the size that will exist; what exists is read back from llama.cpp all the same.
 constexpr int32_t k_ctx_step = 256;
 
+// What is added, in proportion, to the part of a cost that lies beyond the largest context
+// created (see context_cost).
+constexpr double k_extrapolation_margin = 0.02;
+
 int32_t rounded_ctx(int32_t n) {
     return n > std::numeric_limits<int32_t>::max() - k_ctx_step ? n : (n + k_ctx_step - 1) / k_ctx_step * k_ctx_step;
 }
 
 // What a context of n tokens costs in bytes: what llama.cpp allocates for it at this session's
 // batch, with the session's own record of the tokens. -1 when it is not known.
-int64_t context_cost(const pp_session * s, int32_t n) {
+//
+// The compute reservation and the unreported bookkeeping are each at most proportional to the
+// size beyond a size measured (every buffer in them is a fixed part and a part that grows with
+// the context, neither negative), and never more than the larger of two sizes below it costs. So:
+// - with one size measured, a larger size is costed as if both grew in proportion to it. That
+//   is far too high (the fixed part of each is most of it), and it is meant to be: what they
+//   grow by is not known until a second size was created, and a cost must not be too low. With
+//   `estimate` set they are taken as not growing at all instead, which can be too low: only
+//   the first of the two checks of an opening uses that (see pp_session_open_path);
+// - with two, a size between them is costed on the line through them, a size beyond the larger
+//   on that line continued (the growth is the attention mask's, which grows in a straight line),
+//   and a size below the smaller at the smaller's figure.
+int64_t context_cost(const pp_session * s, int32_t n, bool estimate = false) {
     const pp_context_cost & cost = s->cost;
     if (!cost.known || n < 1) {
         return -1;
     }
     n = rounded_ctx(n);
-    double compute = (double) cost.compute_high;
-    if (cost.n_high > cost.n_low) {
-        const double per_token = std::max(0.0, (double) (cost.compute_high - cost.compute_low) / (double) (cost.n_high - cost.n_low));
-        compute = std::max(0.0, compute + per_token * (double) (n - cost.n_high));
+    const auto line = [&](int32_t m) {
+        const double beyond = m > cost.n_high && !estimate ? (double) m / (double) cost.n_high : 1.0; // the proportion while one size is known
+        double compute = (double) cost.compute_high;
+        if (cost.n_high > cost.n_low) {
+            const double per_token = std::max(0.0, (double) (cost.compute_high - cost.compute_low) / (double) (cost.n_high - cost.n_low));
+            compute = m <= cost.n_low ? (double) cost.compute_low : compute + per_token * (double) (m - cost.n_high);
+        } else {
+            compute *= beyond;
+        }
+        // Before two sizes are measured the largest measurement, in proportion as above;
+        // afterwards the line through them, and never below the largest measurement: a size
+        // below one that was measured is costed at least at that measurement, too high by its
+        // few bytes per token.
+        double unreported = 0.0;
+        if (cost.unreported_known) {
+            unreported = (double) cost.unreported_max;
+            if (cost.unreported_slope_known) {
+                unreported = std::max(unreported, cost.unreported_fixed + cost.unreported_per_token * (double) m);
+            } else if (m > cost.unreported_n0 && !estimate) {
+                unreported *= (double) m / (double) cost.unreported_n0;
+            }
+        }
+        return cost.kv_per_token * (double) m + compute + (double) cost.fixed + unreported + (double) m * sizeof(llama_token);
+    };
+    double bytes = line(n);
+    // Beyond the largest size created the line is continued, and what grows can grow faster
+    // there than between the sizes measured: the compute reservation is the largest of several
+    // buffers, and a faster growing one can take over (measured: up to 0.3% short at a model's
+    // largest context, from contexts of 256 and 512 tokens). What a size beyond adds to the cost
+    // is therefore counted k_extrapolation_margin higher. A margin, measured, not a bound.
+    if (!estimate && n > cost.n_high) {
+        bytes += k_extrapolation_margin * (bytes - line(cost.n_high));
     }
-    const double bytes = cost.kv_per_token * (double) n + compute + (double) cost.fixed + (double) cost.unreported + (double) n * sizeof(llama_token);
     return bytes >= 9.0e18 ? std::numeric_limits<int64_t>::max() : (int64_t) std::llround(bytes);
 }
 
@@ -969,8 +1049,9 @@ void destroy_context(pp_session * s, bool keep_record = false) {
 
 // Creates a context of n_ctx tokens from the kept parameters, and the batch that belongs to it,
 // and learns from llama.cpp's report what such a context costs. Returns false, with nothing
-// created, when llama.cpp cannot. The record of the memory's tokens is left alone when the
-// creation succeeds and emptied when it fails.
+// created, when llama.cpp cannot. The record of the memory's tokens and where the reply began
+// are left alone either way: a caller with no memory to keep has emptied them already, and one
+// that carries a memory over (pp_session_resize_context) needs them through a failed attempt.
 bool create_context(pp_session * s, int32_t n_ctx) {
     try {
         s->cparams.n_ctx    = (uint32_t) n_ctx;
@@ -1014,7 +1095,7 @@ bool create_context(pp_session * s, int32_t n_ctx) {
     } catch (...) {
         // Whatever exists of the two is freed below.
     }
-    destroy_context(s);
+    destroy_context(s, true);
     return false;
 }
 
@@ -1080,11 +1161,14 @@ void build_sampler(int32_t n_vocab, const pp_sampler_config & config, sampler_pa
 }
 
 // Hands the parts of a new sampler to the session, which has none at this point. A reply
-// begins anew for the penalties with it.
-void install_sampler(pp_session * s, sampler_parts & parts) {
+// begins anew for the penalties with it: at reply_start, a position in the memory as it is now,
+// or where sampling begins for PP_REPLY_START_AT_SAMPLING. A sampler that is built again after
+// the memory was emptied passes the latter whatever was configured: the position was one in
+// the memory that is gone.
+void install_sampler(pp_session * s, sampler_parts & parts, int32_t reply_start) {
     s->sampler = parts.chain;
     s->chooser = parts.chooser;
-    s->reply_start = -1;
+    s->reply_start = reply_start;
     parts.chain = nullptr;
     parts.chooser = nullptr;
 }
@@ -1242,7 +1326,11 @@ int32_t open_session(const pp_session_params * params, pp_session ** session, ch
         }
         s->n_ctx_max   = n_ctx_train;
         s->n_ctx_open  = std::min(params->n_ctx, n_ctx_train);
-        s->n_batch_max = params->n_batch;
+        // A batch above the opening size is that size, and stays so when the context grows:
+        // llama.cpp gives a context no batch above its own size, and the costs are learnt from
+        // contexts at the session's batch only (see pp_context_cost), so the opening context
+        // has to be one of them.
+        s->n_batch_max = std::min(params->n_batch, s->n_ctx_open);
 
         s->cparams = llama_context_default_params();
         s->cparams.n_seq_max       = 1;
@@ -1259,20 +1347,40 @@ int32_t open_session(const pp_session_params * params, pp_session ** session, ch
         // opening size can be held to the budget before it is allocated, and so that the
         // growth of the compute reservation is known from two sizes, a small context comes
         // first and is freed again: an eighth of the opening size and at most four batches,
-        // when that is still a whole batch. It is the one allocation made before any cost is
-        // known. A session opened too small for that learns from its own context alone.
-        const int32_t n_first = rounded_ctx(std::max(1, std::min(s->n_ctx_open / 8, (int32_t) std::min<int64_t>((int64_t) 4 * s->n_batch_max, std::numeric_limits<int32_t>::max()))));
-        if (s->n_vocab > 0 && n_first >= s->n_batch_max && n_first < rounded_ctx(s->n_ctx_open)) {
+        // and never less than a batch, whose figures are the only ones kept (see
+        // pp_context_cost). It is the one allocation made before any cost is known, and never
+        // larger than the opening context. A session opened at about one batch learns from its
+        // own context alone.
+        // A budget of INT64_MAX is the caller's statement that there is no limit: only then may
+        // a context whose cost cannot be known be opened.
+        const int64_t budget = params->context_budget_bytes;
+        const bool unlimited = budget == std::numeric_limits<int64_t>::max();
+        const auto refuse = [&](int64_t cost, const char * when) {
+            put_error(error, error_size, cost < 0
+                    ? std::string("what a context costs is not known (llama.cpp's report of its buffers was not understood), and the budget is ") + std::to_string(budget)
+                    : "a context of " + std::to_string(s->n_ctx_open) + " tokens needs " + std::to_string(cost) + " bytes and the budget is " +
+                      std::to_string(budget) + " (" + when + ")");
+            return PP_STATUS_CONTEXT_REFUSED;
+        };
+        const int32_t n_first = rounded_ctx(std::max(s->n_batch_max, std::min(s->n_ctx_open / 8, (int32_t) std::min<int64_t>((int64_t) 4 * s->n_batch_max, std::numeric_limits<int32_t>::max()))));
+        bool estimated = false;
+        if (s->n_vocab > 0 && n_first < rounded_ctx(s->n_ctx_open)) {
+            estimated = true;
             if (!create_context(s, n_first)) {
                 put_error(error, error_size, log.empty() ? std::string("llama.cpp could not create a context") : tidy(log));
                 return mentions_memory(log) ? PP_STATUS_OUT_OF_MEMORY : PP_STATUS_LOAD_FAILED;
             }
             destroy_context(s);
-            const int64_t cost = context_cost(s, s->n_ctx_open);
-            if (cost > params->context_budget_bytes) {
-                put_error(error, error_size, "a context of " + std::to_string(s->n_ctx_open) + " tokens needs " + std::to_string(cost) +
-                                             " bytes and the budget is " + std::to_string(params->context_budget_bytes));
-                return PP_STATUS_CONTEXT_REFUSED;
+            // A new context must not inherit the resident pages of the one it replaces: they
+            // would stay resident under its untouched reservations, and they hold what was not
+            // overwritten. So the free pages go back before the next context is created.
+            release_free_pages();
+            // The estimate: with the small context the only one measured, what the compute
+            // reservation and the bookkeeping grow by up to the opening size is counted as
+            // nothing; the check after the allocation makes up for that.
+            const int64_t cost = context_cost(s, s->n_ctx_open, true);
+            if (cost > budget || (cost < 0 && !unlimited)) {
+                return refuse(cost, "refused before it was allocated");
             }
             if (cost >= 0 && !can_reserve(cost)) {
                 put_error(error, error_size, "no room in the address space for a context of " + std::to_string(s->n_ctx_open) + " tokens (" + std::to_string(cost) + " bytes)");
@@ -1283,11 +1391,13 @@ int32_t open_session(const pp_session_params * params, pp_session ** session, ch
             put_error(error, error_size, log.empty() ? std::string("llama.cpp could not create the context") : tidy(log));
             return mentions_memory(log) ? PP_STATUS_OUT_OF_MEMORY : PP_STATUS_LOAD_FAILED;
         }
-        if (context_cost(s, s->n_ctx_open) > params->context_budget_bytes) {
-            // Only reached by a session too small for the first context above.
-            put_error(error, error_size, "a context of " + std::to_string(s->n_ctx_open) + " tokens needs " + std::to_string(context_cost(s, s->n_ctx_open)) +
-                                         " bytes and the budget is " + std::to_string(params->context_budget_bytes));
-            return PP_STATUS_CONTEXT_REFUSED;
+        // The second check, from the opening context's own report. It refuses what the
+        // estimate from the small context let through (see pp_session_open_path in the
+        // header), and is the only check of a session too small for that context. The owner
+        // closes the session on the way out, which frees the context again.
+        const int64_t cost = context_cost(s, s->n_ctx_open);
+        if (cost > budget || (cost < 0 && !unlimited)) {
+            return refuse(cost, estimated ? "refused once it existed: the estimate before its allocation was lower" : "refused once it existed: no estimate could be made before");
         }
         s->candidates.resize((size_t) s->n_vocab);
 
@@ -1857,6 +1967,9 @@ int32_t pp_session_clear_memory(struct pp_session * session) {
     // that its random numbers start where they started.
     destroy_sampler(s);
     destroy_context(s);
+    // A new context must not inherit the resident pages of the one it replaces: they would stay
+    // resident under its untouched reservations, and they hold what was not overwritten.
+    release_free_pages();
 
     int32_t status = PP_STATUS_OK;
     try {
@@ -1869,7 +1982,7 @@ int32_t pp_session_clear_memory(struct pp_session * session) {
         if (s->sampler_configured) {
             sampler_parts parts;
             build_sampler(s->n_vocab, s->sampler_config, parts);
-            install_sampler(s, parts);
+            install_sampler(s, parts, PP_REPLY_START_AT_SAMPLING);
         }
     } catch (...) {
         status = fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while creating the context and the sampler again");
@@ -1966,6 +2079,9 @@ int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, in
         free_all_checkpoints(s);
     }
     destroy_context(s, carried);
+    // A new context must not inherit the resident pages of the one it replaces: they would stay
+    // resident under its untouched reservations, and they hold what was not overwritten.
+    release_free_pages();
 
     // The size that was asked for; if it cannot be had, the size there was; then halves of
     // that, down to one token. Each only after the address space was seen to have room for it.
@@ -1973,21 +2089,10 @@ int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, in
     const auto attempt = [&](int32_t n) {
         try {
             const int64_t cost = context_cost(s, n);
-            // create_context empties the record when it fails; with a memory to carry over
-            // the record has to outlive a failed attempt, so it is put aside around it.
-            std::vector<llama_token> record;
-            if (carried) {
-                record.swap(s->history);
-            }
-            const int32_t reply_start = s->reply_start;
-            const bool ok = cost >= 0 && cost <= budget_bytes && can_reserve(cost) && create_context(s, n);
-            if (carried) {
-                // What comes back in `record` never held a token. The record itself grows
-                // when an evaluation needs it to (see reserve_history).
-                s->history.swap(record);
-                s->reply_start = reply_start;
-            }
-            return ok;
+            // A failed attempt leaves the record of the memory's tokens and where the reply
+            // began as they are (see create_context): a memory being carried over keeps them
+            // through every attempt until it is read into a context or given up below.
+            return cost >= 0 && cost <= budget_bytes && can_reserve(cost) && create_context(s, n);
         } catch (...) {
             return false;
         }
@@ -1995,6 +2100,9 @@ int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, in
     created = as_asked = attempt(n_ctx);
     // Down to the smallest context llama.cpp makes: below it every size is that one.
     for (int32_t n = n_old > 0 ? n_old : n_ctx / 2; !created && n >= 1; n = n > k_ctx_step ? std::max(k_ctx_step, n / 2) : 0) {
+        // The failed attempt before may have allocated and freed part of a context; the next
+        // must not inherit those pages either, for the same two reasons.
+        release_free_pages();
         created = attempt(n);
     }
 
@@ -2023,32 +2131,45 @@ int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, in
             s->reply_start = -1;
         }
     }
-    int32_t status = PP_STATUS_OK;
+    bool sampler_lost = false;
     if (!carried) {
-        // As after a clear: the sampler begins again where it began.
+        // As after a clear: the sampler begins again where it began, and a reply position that
+        // was configured named a place in the memory that is gone.
         destroy_sampler(s);
         try {
             if (s->sampler_configured) {
                 sampler_parts parts;
                 build_sampler(s->n_vocab, s->sampler_config, parts);
-                install_sampler(s, parts);
+                install_sampler(s, parts, PP_REPLY_START_AT_SAMPLING);
             }
         } catch (...) {
-            status = fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while creating the sampler again");
+            sampler_lost = true;
         }
     }
     release_free_pages();
-    if (!as_asked) {
-        // Said without an allocation when there is no memory even for the sentence.
+    // A missing sampler outranks a size other than the one asked for: the session cannot
+    // sample until it is configured again, and that is what the caller must hear. Each message
+    // is said without an allocation when there is no memory even for the sentence.
+    if (sampler_lost) {
         try {
-            status = fail(s, PP_STATUS_CONTEXT_NOT_CREATED, created
+            return fail(s, PP_STATUS_OUT_OF_MEMORY, as_asked
+                    ? std::string("out of memory while creating the sampler again")
+                    : "out of memory while creating the sampler again; also, a context of " + std::to_string(n_ctx) + " tokens could not be created and the session has " +
+                      (created ? "one of " + std::to_string(s->n_ctx) : std::string("none")));
+        } catch (...) {
+            return fail(s, PP_STATUS_OUT_OF_MEMORY, "out of memory while creating the sampler again");
+        }
+    }
+    if (!as_asked) {
+        try {
+            return fail(s, PP_STATUS_CONTEXT_NOT_CREATED, created
                     ? "a context of " + std::to_string(n_ctx) + " tokens could not be created; the session has one of " + std::to_string(s->n_ctx) + " now"
                     : "a context of " + std::to_string(n_ctx) + " tokens could not be created, and no smaller one either: the session has none");
         } catch (...) {
-            status = fail(s, PP_STATUS_CONTEXT_NOT_CREATED, "a context of the size asked for could not be created");
+            return fail(s, PP_STATUS_CONTEXT_NOT_CREATED, "a context of the size asked for could not be created");
         }
     }
-    return status;
+    return PP_STATUS_OK;
 }
 
 //
@@ -2062,7 +2183,8 @@ int32_t pp_session_configure_sampler(struct pp_session * session, const struct p
     pp_session * s = session;
     if (config == nullptr || !finite(config->temperature) || config->top_k < 0 || !finite(config->top_p) || !finite(config->min_p) ||
         !finite(config->repetition_penalty) || config->repetition_penalty <= 0.0f || !finite(config->presence_penalty) ||
-        !finite(config->frequency_penalty) || (config->penalty_window < 1 && config->penalty_window != PP_PENALTY_NO_WINDOW) || config->n_banned_tokens < 0 || config->n_banned_tokens > s->n_vocab ||
+        !finite(config->frequency_penalty) || (config->penalty_window < 1 && config->penalty_window != PP_PENALTY_NO_WINDOW) ||
+        config->reply_start < PP_REPLY_START_AT_SAMPLING || config->n_banned_tokens < 0 || config->n_banned_tokens > s->n_vocab ||
         (config->banned_tokens == nullptr && config->n_banned_tokens > 0)) {
         return fail(s, PP_STATUS_INVALID_ARGUMENT, "a sampler setting is outside its documented range");
     }
@@ -2092,7 +2214,7 @@ int32_t pp_session_configure_sampler(struct pp_session * session, const struct p
 
     // Nothing below can fail: the previous sampler is only given up for a complete new one.
     destroy_sampler(s);
-    install_sampler(s, parts);
+    install_sampler(s, parts, config->reply_start);
     s->banned_list.swap(list);
     s->banned.swap(flags);
     s->sampler_config = kept;

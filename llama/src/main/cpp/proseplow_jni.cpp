@@ -507,7 +507,8 @@ void configure_sampler(JNIEnv * env, jclass, jlong handle, jfloat temperature, j
         config.presence_penalty   = presence_penalty;
         config.frequency_penalty  = frequency_penalty;
         config.penalty_window     = penalty_window;
-        config.seed               = (uint32_t) seed; // the 32 bits as they are, read as unsigned
+        config.reply_start        = -1; // where sampling begins; a zero-initialised field would mean position 0
+        config.seed              = (uint32_t) seed; // the 32 bits as they are, read as unsigned
         config.banned_tokens      = banned_tokens.empty() ? nullptr : banned_tokens.data();
         config.n_banned_tokens    = (int32_t) banned_tokens.size();
         const int32_t status = pp_session_configure_sampler(s, &config);
