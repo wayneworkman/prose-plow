@@ -38,7 +38,7 @@ class ThreadMoveDeviceTest {
 
     private val model: ModelSpec by lazy {
         val present = listOf(ModelCatalog.BORIS_2_INSTRUCT, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.QWEN35_0_8B, ModelCatalog.SHARD_2)
-            .firstOrNull { ModelFiles.locate(appContext, it) != null }
+            .firstOrNull { locateForTests(it) != null }
         assumeTrue("no model is in this test APK or sideloaded", present != null)
         present!!
     }

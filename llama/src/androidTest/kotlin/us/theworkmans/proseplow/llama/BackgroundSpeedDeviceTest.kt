@@ -63,7 +63,7 @@ private fun powerSource(): String {
  * present is passed over.
  */
 private fun reportSpeed(condition: String, model: ModelSpec) {
-    if (ModelFiles.locate(appContext, model) == null) {
+    if (locateForTests(model) == null) {
         report("${model.id} $condition: the model is not in this test APK")
         return
     }
@@ -104,7 +104,7 @@ class BackgroundSpeedDeviceTest {
 
     @Test
     fun inFrontAndThenInTheBackground() {
-        assumeTrue("neither model of this measurement is present", SPEED_MODELS.any { ModelFiles.locate(appContext, it) != null })
+        assumeTrue("neither model of this measurement is present", SPEED_MODELS.any { locateForTests(it) != null })
         for (model in SPEED_MODELS) reportSpeed("with the test's activity in front", model)
         inFront.scenario.close()
         Thread.sleep(1500) // the system moves the process to its new set of cores a moment after the activity has gone
@@ -134,7 +134,7 @@ class ScreenOffSpeedDeviceTest {
             "not asked for: pass -e screenOff true (the test turns the screen off, which locks the phone)",
             InstrumentationRegistry.getArguments().getString("screenOff") == "true",
         )
-        assumeTrue("neither model of this measurement is present", SPEED_MODELS.any { ModelFiles.locate(appContext, it) != null })
+        assumeTrue("neither model of this measurement is present", SPEED_MODELS.any { locateForTests(it) != null })
         val power = powerManager()
         val scenario = ActivityScenario.launch(ForegroundActivity::class.java)
         try {

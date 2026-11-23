@@ -134,9 +134,9 @@ is about things that are **not** built and is kept apart from everything else.
   chat screen, such as the results of fingerprint actions).
 - **APP-16** A development build is a different app as far as the device is concerned: its own
   identifier (ending in `.debug`), its own data and its own hardware keys, and the name "Prose
-  Plow (debug)" wherever the name is shown. Only a development build looks for a model file
-  that a developer placed in the app's private storage (MODEL-23). Development and tests can
-  therefore never touch a real installation.
+  Plow (debug)" wherever the name is shown. In behaviour it is the release build: it runs the
+  models its APK carries and no other file (MODEL-23). Development and tests can therefore never
+  touch a real installation.
 - **APP-17** The app runs on 64-bit ARM devices only.
   - **On Android:** Android 9 (API 28) or later, `arm64-v8a` only; the app is built against
     API 37.
@@ -1402,7 +1402,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   metadata of its model card, and the app ships a model only when its licence is established.
   No build can package it (the build accepts only models the manifest marks as bundled, and
   fails on any other model file it finds in the package), and no build offers it, not even a
-  development build with its file in place (MODEL-02, MODEL-23). The support that exists, and
+  build of any kind with its file in place (MODEL-02, MODEL-23). The support that exists, and
   that a port must carry if it is to be switched on, is therefore reached today only by the
   tests:
   - It is not a chat model. It is given only the latest message, exactly as typed, and writes on
@@ -1431,12 +1431,13 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   whitespace in front of it (Markdown would otherwise take indented text for a block of code),
   although it is stored with it, and copies it exactly as written, first character to last,
   since that whitespace is part of the text.
-- **MODEL-23** A development build also uses a model file that a developer placed in the app's
-  private storage, in preference to a packaged one, so that the weights need not be packaged
-  again for every change of the code. Nothing verifies such a file, and the code that looks for
-  it is not part of a release build. Such a file is used only for a model the build offers
-  anyway (MODEL-02): a file of a model that is not bundled, such as Shard-2, does not make the
-  app offer it. The device tests open such a file directly, without the app's list of models.
+- **MODEL-23** Every build of the app, development builds included, uses the model files its
+  APK carries and no other: a model file placed in the app's private storage is never looked
+  for. Only the device tests of the native binding use such a file, placed in the private
+  storage of their own test package, for a model too large for the test APK or not bundled
+  (Shard-2); the code that looks for it is part of those tests and of no build of the app, and
+  nothing verifies the file. A test with such a file in place checks that the binding's own
+  lookup still finds only the APK's assets.
 
 ## 15. Settings of each model (MSET)
 
@@ -2572,8 +2573,9 @@ its own means for each of them.
   converted file must have the pinned SHA-256. A checkpoint that is a Python pickle (Shard-2) is
   only ever loaded in the mode that constructs weights and refuses everything else, and the code
   published with it is never run.
-- **BUILD-10** A release build contains no development aid: the code that looks for a model file
-  placed by a developer is not compiled into it (MODEL-23).
+- **BUILD-10** A release build contains no development aid, and neither does a development build:
+  the code that looks for a model file placed in private storage exists only in the device tests
+  (MODEL-23).
 - **BUILD-11** The tests that run on a device use hardware keys under a name space of their own
   and run inside the development build only, so they can never see, replace or delete the keys
   or the data of a real installation.
@@ -3107,9 +3109,9 @@ without these properties has not reached parity.
   replace the data key (KEY-07).
 - **THREAT-21** What another app does with a link it was handed (MD-06, MSET-15): it uses the
   network. The app only passes the address on.
-- **THREAT-22** A development build: it can be debugged, its private files can be read by a
-  computer the user authorised for debugging, and it accepts a model file that nothing verified
-  (MODEL-23).
+- **THREAT-22** A development build: it can be debugged, and its private files can be read by a
+  computer the user authorised for debugging. It runs only the model files of its APK, as a
+  release build does (MODEL-23).
 - **THREAT-23** The inputs of a build that are pinned by version or name only (library packages,
   tool-chain packages), as opposed to those pinned by hash (the llama.cpp commit, the build
   tool's distribution, the model files).

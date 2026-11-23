@@ -1296,15 +1296,16 @@ need a device with USB debugging, awake and unlocked: they put an activity of th
 front while they measure, because Android gives a process without a visible activity fewer
 cores.
 
-### A model without rebuilding the APK
+### A model without rebuilding the test APK
 
-Debug builds only: a model file in the app's private storage is used in place of (or instead
-of) the asset, so that 1.5 GB of weights need not be packaged and installed again for every
-change to the code. The file is `files/models/<id>.gguf` in the data directory of the package,
-written through `run-as` without a temporary copy on the phone:
+For the device tests below only: a model file in the private storage of the test package is
+used in place of (or instead of) the asset of the test APK, so that 1.5 GB of weights need not
+be packaged and installed again for every change to the code, and so that Shard-2, which no
+build packages, can be tested at all. The file is `files/models/<id>.gguf` in the data
+directory of the test package, written through `run-as` without a temporary copy on the phone:
 
 ```sh
-PACKAGE=us.theworkmans.proseplow.debug          # or us.theworkmans.proseplow.llama.test for the tests below
+PACKAGE=us.theworkmans.proseplow.llama.test
 adb shell "run-as $PACKAGE sh -c 'umask 077 && mkdir -p files/models'"
 adb exec-in "run-as $PACKAGE sh -c 'umask 077 && cat > files/models/qwen3.5-0.8b.gguf'" < /path/to/models/qwen3.5-0.8b/qwen3.5-0.8b-f16.gguf
 adb shell "run-as $PACKAGE sha256sum files/models/qwen3.5-0.8b.gguf"    # compare with output_sha256 in the manifest
@@ -1313,9 +1314,13 @@ adb shell "run-as $PACKAGE rm files/models/qwen3.5-0.8b.gguf"           # to rem
 
 `adb exec-in` sends the file to the command's standard input as it is (`adb shell` would
 translate line ends). It took 5 seconds for the 1.5 GB file over USB 3. The file survives
-`adb install -r` and is deleted with the app's data. A sideloaded file wins over an asset of the
-same model. Nothing verifies it, which is the point of it and the reason a release build does
-not contain the code that looks for it (`../llama/src/debug` against `../llama/src/release`).
+`adb install -r` and is deleted with the package's data. For the tests, a sideloaded file wins
+over an asset of the same model. Nothing verifies it, which is the point of it and the reason
+the code that looks for it is part of the tests (`../llama/src/androidTest/.../SideloadedModels.kt`,
+handed to the factory by the tests themselves) and of no build of the library or the app: the
+library's own lookup finds the assets of its APK and nothing else, so a debug build of the app
+runs exactly the models a release build carries. `RuntimeDeviceTest` checks that on the phone
+for every file placed.
 
 ### The tests
 

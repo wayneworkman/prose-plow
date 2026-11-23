@@ -137,16 +137,24 @@ internal object NativeRuntime {
     private fun isBackend(name: String): Boolean = name.startsWith(BACKEND_PREFIX) && name.endsWith(LIBRARY_SUFFIX)
 }
 
-/** The app's [NativeLlamaFactory]. Stateless apart from the thread plan, which is read once. */
+/**
+ * The app's [NativeLlamaFactory]. Stateless apart from the thread plan, which is read once.
+ *
+ * @param locate where a model's file is. The app always has [ModelFiles.locate], the APK's own
+ *   assets ([NativeEngine.factory] passes nothing else, and the class is internal to this
+ *   module). Only this module's device tests pass another, which also finds files they placed in
+ *   the test package's private storage, for models too large for the test APK or not bundled.
+ */
 internal class LlamaFactory(
     private val context: Context,
     private val settings: NativeSettings,
     private val threadPlan: ThreadPlan = ThreadPlanner.plan(CpuSysfs().capacities(), Runtime.getRuntime().availableProcessors()),
+    private val locate: (Context, ModelSpec) -> ModelLocation? = ModelFiles::locate,
 ) : NativeLlamaFactory {
 
     override fun open(model: ModelSpec, progress: LoadProgress, contextTokens: Int, budgetBytes: Long): NativeLlama {
         NativeRuntime.start(context)
-        val location = ModelFiles.locate(context, model)
+        val location = locate(context, model)
             ?: throw NativeLlamaException(NativeLlamaException.LOAD_FAILED, "This build does not carry the file of ${model.id}")
         val pinned = if (settings.pinThreads) threadPlan.pinnedCpus.toIntArray() else IntArray(0)
         return ModelFiles.open(context, location) { fd, offset, length ->
@@ -160,8 +168,8 @@ internal class LlamaFactory(
                     load(map = true)
                 } catch (e: NativeLlamaException) {
                     // Mapping needs the model's data at a multiple of 32 bytes in its file, which
-                    // the build guarantees for an asset but nothing guarantees for a file a
-                    // developer placed. Reading works at any offset. A file that is no model at
+                    // the build guarantees for an asset but nothing guarantees for a file the
+                    // device tests placed. Reading works at any offset. A file that is no model at
                     // all fails a second time, with the message of that second attempt.
                     if (e.code != NativeLlamaException.LOAD_FAILED) throw e
                     load(map = false)

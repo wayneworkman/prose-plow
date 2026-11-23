@@ -137,7 +137,7 @@ internal fun measureSpeeds(
     plan: ThreadPlan? = null,
     isEnd: (Int) -> Boolean = { false },
 ): Speeds {
-    val factory = if (plan == null) LlamaFactory(appContext, settings) else LlamaFactory(appContext, settings, plan)
+    val factory = testFactory(settings, plan)
     val native = factory.open(model, { true }, model.contextLength, TEST_BUDGET_BYTES) as LlamaSession
     try {
         // Once unmeasured: the first evaluation builds the thread pool and touches every page.
@@ -210,7 +210,7 @@ internal fun checkLoadAndMemory(label: String, model: ModelSpec, settings: Nativ
  */
 internal fun checkEngineChat(model: ModelSpec, systemPrompt: String?, first: String, second: String, maxNewTokens: Int = 48): String {
     val executor = Executors.newSingleThreadExecutor()
-    val engine = LlamaEngine(LlamaFactory(appContext, NativeSettings()), executor.asCoroutineDispatcher())
+    val engine = LlamaEngine(testFactory(), executor.asCoroutineDispatcher())
     try {
         return runBlocking {
             engine.load(model)

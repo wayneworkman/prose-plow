@@ -276,7 +276,7 @@ class BorisDeviceTest {
     fun theEngineReproducesTheReferenceChatSession() {
         val reference = readChatReference("${model.id}-chat.bin")
         val executor = Executors.newSingleThreadExecutor()
-        val engine = LlamaEngine(LlamaFactory(appContext, NativeSettings()), executor.asCoroutineDispatcher())
+        val engine = LlamaEngine(testFactory(), executor.asCoroutineDispatcher())
         try {
             runBlocking {
                 engine.load(model)

@@ -27,7 +27,7 @@ class JniBoundaryDeviceTest {
 
     private val model: ModelSpec by lazy {
         val present = listOf(ModelCatalog.BORIS_2_INSTRUCT, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.QWEN35_0_8B, ModelCatalog.SHARD_2)
-            .firstOrNull { ModelFiles.locate(appContext, it) != null }
+            .firstOrNull { locateForTests(it) != null }
         assumeTrue("no model is in this test APK or sideloaded", present != null)
         present!!
     }
@@ -77,7 +77,7 @@ class JniBoundaryDeviceTest {
      */
     @Test
     fun aSizeBeyondItsLimitIsAnExceptionWithItsCode() {
-        val factory = LlamaFactory(appContext, NativeSettings())
+        val factory = testFactory()
         val before = memory()
         // The largest number there is, with a budget that no context of any model fits: the
         // model's own largest context is what is costed, and refused.
@@ -162,7 +162,7 @@ class JniBoundaryDeviceTest {
     @Test
     fun theLongestTextIsTokenisedWithoutAStall() {
         val present = listOf(ModelCatalog.BORIS_2_INSTRUCT, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.QWEN35_0_8B, ModelCatalog.SHARD_2)
-            .filter { ModelFiles.locate(appContext, it) != null }
+            .filter { locateForTests(it) != null }
         assumeTrue("no model is in this test APK or sideloaded", present.isNotEmpty())
         val lineBreaks = ByteArray(262144) { '\n'.code.toByte() }
         for (spec in present) {
@@ -225,7 +225,7 @@ class JniBoundaryDeviceTest {
 
     @Test
     fun aLoadCanBeAbandonedAndCanFail() {
-        val factory = LlamaFactory(appContext, NativeSettings())
+        val factory = testFactory()
         val before = memory()
 
         var reports = 0

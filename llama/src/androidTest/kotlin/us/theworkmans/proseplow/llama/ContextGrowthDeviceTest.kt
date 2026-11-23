@@ -42,7 +42,7 @@ class ContextGrowthDeviceTest {
             arguments.getString("contextGrowth") == "true",
         )
         val fraction = (arguments.getString("contextFraction")?.toDoubleOrNull() ?: DEFAULT_FRACTION).coerceIn(0.05, 0.5)
-        val models = GROWTH_MODELS.filter { ModelFiles.locate(appContext, it) != null }
+        val models = GROWTH_MODELS.filter { locateForTests(it) != null }
         assumeTrue("no model of this measurement is present", models.isNotEmpty())
         for (model in models) measure(model, fraction)
     }

@@ -51,4 +51,21 @@ class RuntimeDeviceTest {
             assertEquals(model.id, model.bundled && ModelFiles.locate(appContext, model) != null, model in present)
         }
     }
+
+    /**
+     * The library finds the assets of its APK and nothing else, in every build type: a file
+     * placed for the tests is found by the tests' own locator only. Meaningful on a phone where
+     * such a file was placed (Qwen3.5 or Shard-2, see native/README.md, "On the phone"); it
+     * reports which models it could check.
+     */
+    @Test
+    fun theLibraryNeverFindsAFilePlacedInPrivateStorage() {
+        val placed = ModelCatalog.all.filter { SideloadedModels.find(appContext, it) != null }
+        report("files placed for the tests: ${placed.joinToString { it.id }.ifEmpty { "none" }}")
+        for (model in placed) {
+            assertEquals(model.id, ModelLocation.PrivateFile(checkNotNull(SideloadedModels.find(appContext, model))), locateForTests(model))
+            val found = ModelFiles.locate(appContext, model)
+            assertTrue("${model.id}: the library found $found", found == null || found is ModelLocation.Asset)
+        }
+    }
 }

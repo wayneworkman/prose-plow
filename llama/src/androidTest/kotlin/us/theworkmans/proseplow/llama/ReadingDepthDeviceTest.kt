@@ -59,7 +59,7 @@ class ReadingDepthDeviceTest {
         val fraction = (arguments.getString("contextFraction")?.toDoubleOrNull() ?: DEFAULT_FRACTION).coerceIn(0.05, 0.5)
         val chunk = (arguments.getString("readingChunk")?.toIntOrNull() ?: ENGINE_CHUNK).coerceIn(1, NativeSettings().batchTokens)
         val only = arguments.getString("readingModel")
-        val models = DEPTH_MODELS.filter { ModelFiles.locate(appContext, it) != null && (only == null || it.id == only) }
+        val models = DEPTH_MODELS.filter { locateForTests(it) != null && (only == null || it.id == only) }
         assumeTrue("no model of this measurement is present", models.isNotEmpty())
         for (model in models) measure(model, checkNotNull(asked), fraction, chunk)
     }

@@ -15,7 +15,11 @@ internal sealed interface ModelLocation {
     /** An asset of the APK, stored without compression: `assets/[path]`. */
     data class Asset(val path: String) : ModelLocation
 
-    /** A file in the app's private storage; debug builds only (see [SideloadedModels]). */
+    /**
+     * A file in private storage. [ModelFiles.locate] never returns one, so no build of the app
+     * opens such a file: only this module's device tests do, through a locator of their own
+     * that they hand to [LlamaFactory].
+     */
     data class PrivateFile(val file: File) : ModelLocation
 }
 
@@ -40,11 +44,11 @@ internal object ModelFiles {
     fun assetPath(model: ModelSpec): String = "$ASSET_DIRECTORY/${model.ggufFileName}.so"
 
     /**
-     * Where [model] is, or null when this build does not have it. A file placed by a developer
-     * (debug builds only) wins over the asset: it is there on purpose.
+     * Where [model] is, or null when this build does not have it: the asset of the APK and
+     * nothing else, in every build type alike, so that a debug build runs exactly the models a
+     * release build of the same sources runs.
      */
     fun locate(context: Context, model: ModelSpec): ModelLocation? {
-        SideloadedModels.find(context, model)?.let { return ModelLocation.PrivateFile(it) }
         val bundled = try {
             context.assets.list(ASSET_DIRECTORY)
         } catch (_: IOException) {
@@ -56,8 +60,8 @@ internal object ModelFiles {
     /**
      * The models this installation offers: those of [ModelCatalog.offered], the bundled models
      * whose files this build has, in catalogue order. A model that is not bundled is left out
-     * even when [locate] finds its file; the factory still opens such a file when asked for it
-     * directly, as the device tests do.
+     * even when [locate] finds its file; a factory still opens it when asked for it directly,
+     * as the device tests do.
      */
     fun present(context: Context): List<ModelSpec> = ModelCatalog.offered { locate(context, it) != null }
 

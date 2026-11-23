@@ -36,7 +36,7 @@ internal fun report(line: String) {
 internal fun assumePresent(model: ModelSpec) {
     assumeTrue(
         "${model.id} is not in this test APK and was not sideloaded (see native/README.md, \"On the phone\")",
-        ModelFiles.locate(appContext, model) != null,
+        locateForTests(model) != null,
     )
 }
 
@@ -52,7 +52,7 @@ internal fun open(
     settings: NativeSettings = NativeSettings(),
     contextTokens: Int = model.contextLength,
     budgetBytes: Long = TEST_BUDGET_BYTES,
-): LlamaSession = LlamaFactory(appContext, settings).open(model, { true }, contextTokens, budgetBytes) as LlamaSession
+): LlamaSession = testFactory(settings).open(model, { true }, contextTokens, budgetBytes) as LlamaSession
 
 /** An observer that never cancels and ignores progress. */
 internal object Uninterrupted : EvaluationObserver {

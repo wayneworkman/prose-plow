@@ -834,9 +834,9 @@ it or losing the phone loses the chats.
   attempts were made and when, how long messages are kept, the latest trusted time, and when,
   on the clock since the phone's start, the app last locked or was unlocked).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
-  debugging can read its private files with `run-as` and attach a debugger to it, and a debug
-  build accepts a model file that nothing has verified. Use a release build for chats that
-  matter.
+  debugging can read its private files with `run-as` and attach a debugger to it. It runs
+  the same models as a release build, from its own APK and from nowhere else. Use a release
+  build for chats that matter.
 - **Loss.** A forgotten passphrase, an uninstalled app or a lost phone loses the chats. "Reset
   app data" needs no passphrase, so anyone who holds the phone can delete everything, though
   not read it.
