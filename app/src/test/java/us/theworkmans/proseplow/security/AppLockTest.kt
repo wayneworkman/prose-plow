@@ -114,6 +114,9 @@ class AppLockTest {
         var closeStarted = false
         var closed = false
 
+        /** How the lock asked for the close ([UnlockedSession.close]); null before it did. */
+        var closedAs: SessionClose? = null
+
         /** A write that is queued when the session ends; [close] waits until the test completes it. */
         var pendingWrite: CompletableDeferred<Unit>? = null
 
@@ -149,7 +152,8 @@ class AppLockTest {
             log += "screens cleared"
         }
 
-        override suspend fun close() {
+        override suspend fun close(how: SessionClose) {
+            closedAs = how
             closeStarted = true
             pendingWrite?.await()
             lateWrite()
@@ -1760,6 +1764,73 @@ class AppLockTest {
         assertDestroyed(session.cipher)
         assertFalse(lock.sessionEnding.value)
         assertEquals(listOf("screens cleared", "session closed", "session stopped"), log)
+    }
+
+    /**
+     * How each kind of end has its session closed ([SessionClose]), decided in one place: a lock
+     * by itself and every end of a lease but "Lock now" leave the session its one more bounded
+     * wait (UNATTENDED); "Lock now", also over a lease, and a reset never do (IMMEDIATE). Catches
+     * a "Lock now" that would wait for a save, and a lock by itself or a lease end that would
+     * not keep the model's memory.
+     */
+    @Test
+    fun everyKindOfEndClosesItsSessionAsItShould() = runTest(dispatcher) {
+        startApp()
+        var session = createPassphrase()
+        lock.lock()
+        runCurrent()
+        assertEquals("Lock now", SessionClose.IMMEDIATE, session.closedAs)
+
+        enter(passphrase)
+        session = session()
+        lock.onBackground()
+        pass(60_000)
+        assertEquals("a lock by itself", SessionClose.UNATTENDED, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lockItselfDuringAnAnswer(session).complete(Unit)
+        runCurrent()
+        assertEquals("a lease whose answer ended", SessionClose.UNATTENDED, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lockItselfDuringAnAnswer(session)
+        pass(AppLock.LEASE_MILLIS)
+        assertEquals("a lease at its time limit", SessionClose.UNATTENDED, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lockItselfDuringAnAnswer(session)
+        lock.stopAnswerBehindLock()
+        runCurrent()
+        assertEquals("a lease stopped from the lock screen", SessionClose.UNATTENDED, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lockItselfDuringAnAnswer(session)
+        lock.onKeepAliveEnded()
+        runCurrent()
+        assertEquals("a lease whose keep-alive ended", SessionClose.UNATTENDED, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lockItselfDuringAnAnswer(session)
+        lock.lock()
+        runCurrent()
+        assertEquals("Lock now over a lease", SessionClose.IMMEDIATE, session.closedAs)
+
+        lock.onForeground()
+        enter(passphrase)
+        session = session()
+        lock.reset()
+        runCurrent()
+        assertEquals("a reset", SessionClose.IMMEDIATE, session.closedAs)
     }
 
     @Test

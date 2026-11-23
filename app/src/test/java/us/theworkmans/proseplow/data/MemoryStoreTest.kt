@@ -16,11 +16,13 @@ import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.MessageLifetime.Companion.DAY_MILLIS
 import us.theworkmans.proseplow.core.chat.Role
 import us.theworkmans.proseplow.core.engine.MemoryReader
+import us.theworkmans.proseplow.core.engine.MemoryVaultUnavailableException
 import us.theworkmans.proseplow.core.engine.MemoryWriter
 import us.theworkmans.proseplow.core.engine.NativeLlama
 import us.theworkmans.proseplow.core.engine.SavedMemory
 import us.theworkmans.proseplow.security.ChunkCipher
 import us.theworkmans.proseplow.security.DataCrypto
+import us.theworkmans.proseplow.security.DataKey
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import us.theworkmans.proseplow.security.SealedStream
 import us.theworkmans.proseplow.security.TestKeys
@@ -28,6 +30,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -370,7 +373,11 @@ class MemoryStoreTest {
         assertNull("the header's date has expired, whatever the file says", store().saved())
     }
 
-    /** Catches a store that deletes a memory for a failure that says nothing about it. */
+    /**
+     * Catches a store that deletes a memory for a failure that says nothing about it, and one
+     * that says so in a way the engine would answer with a deletion: "cannot tell now" is
+     * [MemoryVaultUnavailableException], from checking and from beginning a restore alike.
+     */
     @Test
     fun aLockOrAFailureToReadDeletesNothingWhenChecking() {
         chat()
@@ -379,12 +386,15 @@ class MemoryStoreTest {
         assertTrue(store(key).save(memoryOf(image), image))
 
         conversationsFail = true
-        assertThrows(IOException::class.java) { store(key).saved() }
+        assertThrows(MemoryVaultUnavailableException::class.java) { store(key).saved() }
+        assertThrows(MemoryVaultUnavailableException::class.java) { store(key).beginRestore() }
         assertTrue(memoryFile().exists())
         conversationsFail = false
 
         key.destroy()
-        assertThrows(KeyDestroyedException::class.java) { store(key).saved() }
+        val checking = assertThrows(MemoryVaultUnavailableException::class.java) { store(key).saved() }
+        assertTrue(checking.cause is KeyDestroyedException)
+        assertThrows(MemoryVaultUnavailableException::class.java) { store(key).beginRestore() }
         assertTrue(memoryFile().exists())
     }
 
@@ -423,20 +433,27 @@ class MemoryStoreTest {
         assertThrows("nothing to restore", IOException::class.java) { store().beginRestore() }
     }
 
-    /** The key gone in the middle of a restore: nothing more is handed over, and the memory goes. */
+    /**
+     * The key gone in the middle of a restore (a lock): nothing more is handed over, the read
+     * says "cannot tell now", and the memory, which nothing speaks against, stays for the next
+     * unlock. Catches the store's half of the defect of deleting a good memory at a lock.
+     */
     @Test
-    fun theKeyDestroyedDuringARestoreStopsItAndDeletesTheMemory() {
+    fun theKeyDestroyedDuringARestoreStopsItAndKeepsTheMemory() {
         chat()
         val image = image(3 * SMALL)
-        val key = TestKeys.cipher()
+        val keyBytes = ByteArray(DataKey.SIZE).also { SecureRandom().nextBytes(it) }
+        val key = DataCrypto(DataKey(keyBytes))
         assertTrue(store(key).save(memoryOf(image), image))
         store(key).beginRestore().use { reader ->
             assertTrue(reader.read() > 0)
             key.destroy()
-            assertEquals(-1, reader.read())
-            assertEquals(-1, reader.read())
+            assertThrows(MemoryVaultUnavailableException::class.java) { reader.read() }
+            assertEquals("and nothing after it", -1, reader.read())
         }
-        assertFalse(memoryFile().exists())
+        assertTrue(memoryFile().exists())
+        // With the cipher of the next unlock (the same data key) it is whole and restores.
+        assertNotNull(store(DataCrypto(DataKey(keyBytes))).restored())
     }
 
     // --- Saving: what is refused, and the file's date ---

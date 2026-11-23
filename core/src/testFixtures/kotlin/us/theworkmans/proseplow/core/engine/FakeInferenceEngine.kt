@@ -141,6 +141,19 @@ class FakeInferenceEngine : InferenceEngine {
     /** What [restoreMemory] answers. */
     var restoreResult: MemoryRestoreResult = MemoryRestoreResult.NothingSaved
 
+    /**
+     * When set, [saveMemory] runs this once the call is recorded and answers what it returns in
+     * place of [saveResult]: for a test that needs a save to take time, to hang, or to write into
+     * the vault it was given as the real engine would.
+     */
+    var onSave: (suspend (vault: MemoryVault, conversationKey: String, trigger: SaveTrigger) -> MemorySaveResult)? = null
+
+    /** As [onSave], for [restoreMemory]. */
+    var onRestore: (suspend (vault: MemoryVault, conversationKey: String, maxContextTokens: Int?) -> MemoryRestoreResult)? = null
+
+    /** The context size passed with every restore, in the order of [restores]. */
+    val restoreContexts = ArrayList<Int?>()
+
     private val _memoryRestore = MutableStateFlow<MemoryRestoreState>(MemoryRestoreState.Idle)
     override val memoryRestore: StateFlow<MemoryRestoreState> = _memoryRestore.asStateFlow()
 
@@ -189,12 +202,13 @@ class FakeInferenceEngine : InferenceEngine {
 
     override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult {
         saves += conversationKey to trigger
-        return saveResult
+        return onSave?.invoke(vault, conversationKey, trigger) ?: saveResult
     }
 
     override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
         restores += conversationKey
-        return restoreResult
+        restoreContexts += maxContextTokens
+        return onRestore?.invoke(vault, conversationKey, maxContextTokens) ?: restoreResult
     }
 
     override fun markNotToBeSaved() {

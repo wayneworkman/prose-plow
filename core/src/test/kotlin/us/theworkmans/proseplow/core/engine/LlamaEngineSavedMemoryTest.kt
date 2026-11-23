@@ -189,17 +189,15 @@ class LlamaEngineSavedMemoryTest {
             var calls = 0
             vault.reportAs = { if (++calls > 1) it.copy(contextTokens = it.contextTokens + 1) else it }
         }
+        cases += Case("the vault read the image again and refused it", NotRestored.Reason.FAILED, readAgain) { vault.restoreRefused = true }
         for (piece in 0 until pieces) {
             cases += Case("the native side refuses piece $piece", NotRestored.Reason.FAILED, readAgain) { it.fake.importFailsAtPiece = piece }
             cases += Case("the vault stops at piece $piece", NotRestored.Reason.STOPPED, readAgain) { vault.readStopsAtPiece = piece }
         }
-        // The forgetting itself runs afterwards, and leaves nothing to show.
-        cases += Case("forgetting stops the import", NotRestored.Reason.STOPPED, MemoryRestoreState.Idle) { test ->
-            vault.beforeRead = { piece -> if (piece == 1) launch(start = CoroutineStart.UNDISPATCHED) { test.engine.forgetKeepingSavedMemory() } }
-        }
 
         for (case in cases) {
             vault.savedFails = false
+            vault.restoreRefused = false
             vault.reportAs = null
             vault.readStopsAtPiece = null
             vault.beforeRead = {}
@@ -598,9 +596,13 @@ class LlamaEngineSavedMemoryTest {
         assertEquals(MemoryRestoreState.Idle, test.engine.memoryRestore.value)
     }
 
-    /** Catches a restore that ignores the caller's cancellation. */
+    /**
+     * Catches a restore that ignores the caller's cancellation, and one whose stop deletes the
+     * image: the session cancels a restore at a lock, and the image is then still the good one
+     * for the next unlock.
+     */
     @Test
-    fun `a restore whose caller is cancelled stops and leaves nothing`() = runTest {
+    fun `a restore whose caller is cancelled stops, leaves an empty memory and keeps the image`() = runTest {
         val (header, bytes, note) = imageOfFirst()
         vault.put(header, bytes, note)
         val test = engine()
@@ -610,8 +612,101 @@ class LlamaEngineSavedMemoryTest {
         runCurrent()
         assertTrue(restoring.isCancelled)
         assertTrue(test.fake.memory.isEmpty())
-        assertDeleted("a cancelled restore")
-        assertEquals(MemoryRestoreState.ReadAgain(model.id), test.engine.memoryRestore.value)
+        assertTrue(test.fake.checkpoints.isEmpty())
+        assertEquals("the image is kept", header, vault.image)
+        assertEquals(0, vault.deletes)
+        assertEquals(MemoryRestoreState.Idle, test.engine.memoryRestore.value)
+
+        // At the next unlock it is restored after all.
+        test.engine.forgetKeepingSavedMemory()
+        vault.beforeRead = {}
+        assertEquals(MemoryRestoreResult.Restored(header.tokenCount), test.restore())
+    }
+
+    /**
+     * The defect this guards against: a lock that destroys the key in the middle of a restore
+     * made the engine delete a good image, whatever the vault had said. Catches an engine that
+     * answers "cannot tell now" with a deletion at any of the three places a vault can say it
+     * (before the restore, as it begins, in the middle of reading), and one that forgets the
+     * memory's state: the memory must be empty and the conversation read again from nothing.
+     * The contrast, a vault that read the image and refused it, is in the test of every failure
+     * above and must still delete.
+     */
+    @Test
+    fun `a vault that cannot tell now keeps its image, and the conversation is read again`() = runTest {
+        val (header, bytes, note) = imageOfFirst()
+        class Case(val name: String, val began: Boolean, val arrange: () -> Unit)
+        val cases = listOf(
+            Case("saved() cannot tell", began = false) { vault.unavailable = true },
+            Case("beginRestore() cannot tell", began = true) { vault.restoreUnavailable = true },
+            Case("a read in the middle cannot tell", began = true) { vault.readUnavailableAtPiece = 1 },
+        )
+        for (case in cases) {
+            vault.unavailable = false
+            vault.restoreUnavailable = false
+            vault.readUnavailableAtPiece = null
+            vault.put(header, bytes, note)
+            val test = engine()
+            case.arrange()
+            val deletesBefore = vault.deletes
+
+            assertEquals(case.name, NotRestored(NotRestored.Reason.UNAVAILABLE), test.restore())
+
+            assertEquals("${case.name}: nothing was deleted", deletesBefore, vault.deletes)
+            assertEquals("${case.name}: the image is kept", header, vault.image)
+            assertTrue("${case.name}: the memory is empty", test.fake.memory.isEmpty())
+            assertTrue("${case.name}: no checkpoint is held", test.fake.checkpoints.isEmpty())
+            assertEquals(case.name, MemoryRestoreState.Idle, test.engine.memoryRestore.value)
+            if (case.began) {
+                // The image waits as one of another conversation does: a lock lets go of it,
+                // and the next unlock restores it.
+                test.engine.forgetKeepingSavedMemory()
+                vault.restoreUnavailable = false
+                vault.readUnavailableAtPiece = null
+                assertEquals(case.name, MemoryRestoreResult.Restored(header.tokenCount), test.restore())
+            } else {
+                vault.unavailable = false
+                val events = test.ask(*second)
+                assertEquals("${case.name}: read from nothing", 0, events.done().stats.reusedPromptTokens)
+            }
+        }
+    }
+
+    /** Catches a stop by forgetting at a lock that deletes the image the next unlock would use. */
+    @Test
+    fun `forgetting at a lock in the middle of a restore keeps the image for the next unlock`() = runTest {
+        val (header, bytes, note) = imageOfFirst()
+        vault.put(header, bytes, note)
+        val test = engine()
+        vault.beforeRead = { piece -> if (piece == 1) launch(start = CoroutineStart.UNDISPATCHED) { test.engine.forgetKeepingSavedMemory() } }
+
+        assertEquals(NotRestored(NotRestored.Reason.STOPPED), test.restore())
+        runCurrent()
+
+        assertTrue(test.fake.memory.isEmpty())
+        assertEquals(0, vault.deletes)
+        assertEquals(header, vault.image)
+        assertEquals(MemoryRestoreState.Idle, test.engine.memoryRestore.value)
+        vault.beforeRead = {}
+        assertEquals(MemoryRestoreResult.Restored(header.tokenCount), test.restore())
+    }
+
+    /** Catches an image kept after a stop that a request elsewhere, or a forgetting that is not a lock's, fails to delete. */
+    @Test
+    fun `an image kept after a stop is deleted by the next request or by forgetting`() = runTest {
+        val (header, bytes, note) = imageOfFirst()
+        for (end in listOf("request", "forget")) {
+            vault.put(header, bytes, note)
+            val test = engine()
+            lateinit var restoring: Job
+            vault.beforeRead = { piece -> if (piece == 1) restoring.cancel() }
+            restoring = launch { test.restore() }
+            runCurrent()
+            vault.beforeRead = {}
+            assertEquals(end, header, vault.image)
+            if (end == "request") test.ask(*second, key = B) else test.engine.forget()
+            assertDeleted(end)
+        }
     }
 
     private companion object {

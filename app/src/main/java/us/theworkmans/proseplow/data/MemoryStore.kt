@@ -6,6 +6,7 @@ import us.theworkmans.proseplow.core.chat.MessageExpiry
 import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.engine.MemoryReader
 import us.theworkmans.proseplow.core.engine.MemoryVault
+import us.theworkmans.proseplow.core.engine.MemoryVaultUnavailableException
 import us.theworkmans.proseplow.core.engine.MemoryWriter
 import us.theworkmans.proseplow.core.engine.SavedMemory
 import us.theworkmans.proseplow.security.AppFiles
@@ -96,6 +97,9 @@ data class FreeSpace(val usableBytes: Long, val totalBytes: Long)
  * authenticated date in the header and never by the file's date; and the file's date is not
  * later than that, or the clean-up without the key would keep it too long. A memory that fails
  * any of these is deleted; nothing of it is acted on before its chunk has authenticated.
+ * A memory is never deleted for what says nothing against it: a key that was destroyed (the app
+ * locked) or a file or conversation that could not be read now. The store then throws
+ * [MemoryVaultUnavailableException], which the engine answers without a deletion.
  *
  * **How a save is written.** The engine's thread seals each piece as a chunk where the native
  * export left it and hands the ciphertext to a writer thread of the save through a queue of
@@ -183,9 +187,9 @@ class MemoryStore internal constructor(
      * whatever was there has been deleted. More than one memory file, or one whose name no chat
      * has, is deleted too: the store never leaves that.
      *
-     * @throws us.theworkmans.proseplow.security.KeyDestroyedException once the app has locked,
-     *   and [IOException] when the file or the conversation could not be read: neither says
-     *   anything about the memory, which is not deleted here for them.
+     * @throws MemoryVaultUnavailableException once the app has locked (the key is destroyed), and
+     *   when the file or the conversation could not be read: neither says anything about the
+     *   memory, which is not deleted for them.
      */
     @Throws(IOException::class)
     override fun saved(): SavedMemory? {
@@ -195,6 +199,8 @@ class MemoryStore internal constructor(
         } catch (_: RefusedMemory) {
             deleteQuietly()
             return null
+        } catch (e: IOException) {
+            throw cannotTell(e)
         } ?: return null
         opened.reader.close()
         return opened.header.memory
@@ -248,23 +254,36 @@ class MemoryStore internal constructor(
      * Begins reading the memory back; see [MemoryVault.beginRestore]. Every check of [saved] is
      * made again on the first chunk, which is then the first piece handed over; every later
      * piece is a chunk that has authenticated, and the last read returns 0 only once the stream
-     * has ended with its last chunk and is as long as its header says. Any failure here or in a
-     * read deletes the memory.
+     * has ended with its last chunk and is as long as its header says. A memory that was read and
+     * refused, here or in a read, is deleted (a read then returns -1); one that cannot be told
+     * now (the key destroyed by a lock, a read of the disk that failed) is kept, and
+     * [MemoryVaultUnavailableException] is thrown, here or from the read.
      */
     @Throws(IOException::class)
     override fun beginRestore(): MemoryReader {
         try {
-            val chatId = onlyMemory() ?: throw IOException("No memory is kept")
-            val opened = openChecked(chatId) ?: throw IOException("No memory is kept")
+            val chatId = onlyMemory() ?: throw MemoryVaultUnavailableException("No memory is kept now")
+            val opened = openChecked(chatId) ?: throw MemoryVaultUnavailableException("No memory is kept now")
             return Restore(opened)
         } catch (e: RefusedMemory) {
             deleteQuietly()
             throw IOException("The kept memory does not pass its checks", e)
+        } catch (e: IOException) {
+            throw cannotTell(e)
         } catch (e: Exception) {
             deleteQuietly()
             throw e
         }
     }
+
+    /**
+     * [e], which says nothing against the memory (a destroyed key, a read of the disk that
+     * failed, a conversation that could not be read), as the engine is to hear it. A refusal is
+     * never one of these: [openChecked] turns every chunk that does not authenticate into
+     * [RefusedMemory] before it gets here, and a read of the stream turns it into a deletion.
+     */
+    private fun cannotTell(e: IOException): MemoryVaultUnavailableException =
+        e as? MemoryVaultUnavailableException ?: MemoryVaultUnavailableException("The kept memory cannot be read now", e)
 
     /**
      * Deletes the memory kept and stops a save that is under way, which keeps nothing. Needs no
@@ -415,6 +434,13 @@ class MemoryStore internal constructor(
                 }
                 total += length
                 if (total > expected) fail() else length
+            } catch (_: UndecryptableException) {
+                fail()
+            } catch (e: IOException) {
+                // The key was destroyed, or the disk did not answer: nothing against the memory.
+                failed = true
+                opened.reader.close()
+                throw cannotTell(e)
             } catch (_: Exception) {
                 fail()
             }

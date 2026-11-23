@@ -2,7 +2,9 @@ package us.theworkmans.proseplow
 
 import android.app.Application
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
+import android.os.storage.StorageManager
 import android.provider.Settings
 import androidx.biometric.BiometricManager
 import androidx.compose.foundation.ComposeFoundationFlags
@@ -30,8 +32,12 @@ import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
+import us.theworkmans.proseplow.data.BuildIdentity
 import us.theworkmans.proseplow.data.ExpiredFiles
+import us.theworkmans.proseplow.data.FreeSpace
 import us.theworkmans.proseplow.data.ModelMemoryFiles
+import us.theworkmans.proseplow.data.ModelMemoryPlatform
+import us.theworkmans.proseplow.data.ModelMemorySupport
 import us.theworkmans.proseplow.llama.NativeEngine
 import us.theworkmans.proseplow.security.AndroidKeyVault
 import us.theworkmans.proseplow.security.AppFiles
@@ -143,6 +149,27 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
     private val modelMemory = ModelMemoryFiles(layout.modelMemory, layout.sessions)
 
     /**
+     * What the store of the model's saved memory needs of Android, made afresh at every unlock;
+     * null on a version of Android where that memory is never kept ([ModelMemorySupport]).
+     *
+     * The build is the package's version code with the time it was installed or last updated
+     * (a debug build installed again keeps its version code). Free space is what can be
+     * allocated on the volume (`StorageManager.getAllocatableBytes`), which counts cached data the
+     * system would clear for the app; the volume's size is the directory's total space.
+     */
+    private fun modelMemoryPlatform(): ModelMemoryPlatform? {
+        if (!ModelMemorySupport.supported(Build.VERSION.SDK_INT)) return null
+        val packageInfo = app.packageManager.getPackageInfo(app.packageName, 0)
+        val models = NativeEngine.availableModels(app)
+        val storage = app.getSystemService(StorageManager::class.java)
+        return ModelMemoryPlatform(
+            build = BuildIdentity(packageInfo.longVersionCode, packageInfo.lastUpdateTime),
+            modelFileLength = { id -> models.firstOrNull { it.id == id }?.let { NativeEngine.packagedLength(app, it) } },
+            freeSpace = { directory -> FreeSpace(storage.getAllocatableBytes(storage.getUuidForPath(directory)), directory.totalSpace) },
+        )
+    }
+
+    /**
      * The inference engine, for the life of the process: loading a model takes seconds, and its
      * weights are no secret, so the loaded model survives a lock, and an unlock in the same
      * process finds it ready. (The process itself ends once the app is locked and out of sight;
@@ -217,6 +244,7 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
                 expiryIntervalMillis = ChatController.EXPIRY_INTERVAL_MILLIS,
                 lockedMessageLifetimeDays = lockedMessageLifetimeDays,
                 memoryFiles = modelMemory,
+                memoryPlatform = modelMemoryPlatform(),
             )
         },
         biometricStatus = {

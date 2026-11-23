@@ -641,6 +641,9 @@ class LlamaEngine(
         val model = loaded ?: return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.NOT_LOADED)
         val image = try {
             vault.saved()
+        } catch (_: MemoryVaultUnavailableException) {
+            // Nothing is known against the image, and nothing was touched: it stays as it was.
+            return MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.UNAVAILABLE)
         } catch (_: Exception) {
             return refuseImage(vault, MemoryRestoreResult.NotRestored.Reason.FAILED)
         }
@@ -700,14 +703,26 @@ class LlamaEngine(
 
         val reader = try {
             vault.beginRestore()
+        } catch (_: MemoryVaultUnavailableException) {
+            return keepImage(vault, image, native, MemoryRestoreResult.NotRestored.Reason.UNAVAILABLE)
         } catch (_: Exception) {
             return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
         }
+        // Whether a stop came from here (forgetting, unloading, loading, the caller) and not from
+        // the vault's refusal of a piece: only the vault's refusal says anything against the image.
+        var stoppedHere = false
         try {
             reader.use {
                 if (reader.memory != image) return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
                 // Stops for forgetting, unloading or loading, and for the caller.
-                val source = MemorySource { if (epoch.get() != startEpoch || !job.isActive) -1 else reader.read() }
+                val source = MemorySource {
+                    if (epoch.get() != startEpoch || !job.isActive) {
+                        stoppedHere = true
+                        -1
+                    } else {
+                        reader.read()
+                    }
+                }
                 val restored = native.importMemory(reader.buffer, reader.firstPieceOffset, source)
                 // Restored only when the import returned normally and the memory is as long as the header said.
                 val tokens = native.memoryTokens()
@@ -730,7 +745,16 @@ class LlamaEngine(
                 for (checkpoint in ordered.drop(surplus)) checkpoints += Checkpoint(checkpoint.tokenCount, checkpoint.handle)
             }
         } catch (e: NativeLlamaException) {
-            return readAgain(vault, native, if (e.code == NativeLlamaException.MEMORY_STOPPED) MemoryRestoreResult.NotRestored.Reason.STOPPED else MemoryRestoreResult.NotRestored.Reason.FAILED)
+            if (e.code == NativeLlamaException.MEMORY_STOPPED) {
+                return if (stoppedHere) {
+                    keepImage(vault, image, native, MemoryRestoreResult.NotRestored.Reason.STOPPED)
+                } else {
+                    readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.STOPPED)
+                }
+            }
+            return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
+        } catch (_: MemoryVaultUnavailableException) {
+            return keepImage(vault, image, native, MemoryRestoreResult.NotRestored.Reason.UNAVAILABLE)
         } catch (_: Exception) {
             return readAgain(vault, native, MemoryRestoreResult.NotRestored.Reason.FAILED)
         }
@@ -761,6 +785,27 @@ class LlamaEngine(
             _state.value = EngineState.Unloaded
         }
         if (modelId != null) _memoryRestore.value = MemoryRestoreState.ReadAgain(modelId)
+        return MemoryRestoreResult.NotRestored(reason)
+    }
+
+    /**
+     * A restore that began and could not finish for a reason that says nothing against [image]:
+     * the vault could not tell now ([MemoryVaultUnavailableException]), or the engine itself or
+     * the caller stopped it (a lock forgets and destroys the key in the middle of a restore). The
+     * memory is emptied as for any failure (and the model freed if even that fails, which lets go
+     * of the image too, as an unload does), but the image is not deleted: it waits, as one of
+     * another conversation does, for a restore of its own conversation, and the first request
+     * deletes it. A lock lets go of it without deleting it ([forgetKeepingSavedMemory]).
+     */
+    private fun keepImage(vault: MemoryVault, image: SavedMemory, native: NativeLlama, reason: MemoryRestoreResult.NotRestored.Reason): MemoryRestoreResult {
+        savedImage = null
+        if (clearMemory(native)) {
+            savedImage = KnownImage(vault, image.conversationKey, image.modelId, image.tokenCount, waiting = true)
+        } else {
+            closeNative()
+            _state.value = EngineState.Unloaded
+        }
+        _memoryRestore.value = MemoryRestoreState.Idle
         return MemoryRestoreResult.NotRestored(reason)
     }
 

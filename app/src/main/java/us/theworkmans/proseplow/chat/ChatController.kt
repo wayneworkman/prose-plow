@@ -35,15 +35,21 @@ import us.theworkmans.proseplow.core.engine.EngineState
 import us.theworkmans.proseplow.core.engine.FinishReason
 import us.theworkmans.proseplow.core.engine.GenerationEvent
 import us.theworkmans.proseplow.core.engine.InferenceEngine
+import us.theworkmans.proseplow.core.engine.MemoryRestoreResult
+import us.theworkmans.proseplow.core.engine.MemoryRestoreState
+import us.theworkmans.proseplow.core.engine.MemoryVault
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.SamplingParams
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import us.theworkmans.proseplow.data.CoalescingWriter
+import us.theworkmans.proseplow.data.MemoryConversation
+import us.theworkmans.proseplow.data.MemoryConversations
 import us.theworkmans.proseplow.data.SessionIndex
 import us.theworkmans.proseplow.data.SessionStore
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /** The chat that is on screen. */
 sealed interface OpenChat {
@@ -95,6 +101,8 @@ data class Turn(val sessionId: String, val assistantId: String, val phase: TurnP
  *   that chat, when something did.
  * @property trimmedMessages by chat id, how many of the oldest messages the latest reply in that
  *   chat was generated without, because the conversation no longer fitted the model's context.
+ * @property restoringMemory true while the engine reads a saved memory of a conversation back
+ *   ([MemoryRestoreState.Restoring]); a reply waiting for it says so.
  */
 data class ChatState(
     val chats: List<SessionSummary>,
@@ -104,6 +112,7 @@ data class ChatState(
     val models: List<ModelSpec> = emptyList(),
     val trimmedMessages: Map<String, Int> = emptyMap(),
     val contextNotes: Map<String, ContextNote> = emptyMap(),
+    val restoringMemory: Boolean = false,
 ) {
     /** True when [modelId] is one of [models]. */
     fun offers(modelId: String): Boolean = models.any { it.id == modelId }
@@ -172,13 +181,27 @@ enum class ChatNotice {
  *   removed ([MessageExpiry]) when a stored chat is opened, every [expiryIntervalMillis] while
  *   the session lives (hourly in the app), when [expireMessages] is called (the setting was shortened), and from a
  *   chat whose reply was being written as soon as that reply has ended, never during it. A chat
- *   left without messages is deleted whole, quietly. When the engine holds the conversation of
- *   a chat that was pruned, it is made to forget it. (What expired before the unlock was
- *   removed before this class was made; see [SessionStore.expireAll].)
+ *   left without messages is deleted whole, quietly. When the engine may hold the conversation
+ *   of a chat that was pruned, its memory is marked not to be saved at once
+ *   ([InferenceEngine.markNotToBeSaved]), before any request can be built, and the engine is
+ *   made to forget it. (What expired before the unlock was removed before this class was made;
+ *   see [SessionStore.expireAll].)
+ * - **The model's saved memory comes back before the first request.** While [memoryVault] gives
+ *   a vault, the memory saved of a chat is read back ([InferenceEngine.restoreMemory]) before a
+ *   request of that chat is built, whenever the engine may not hold that chat already: after
+ *   the unlock for the chat on screen once its model is loaded, and before the first request of
+ *   any other chat. A request is built only after that call has returned. Every request carries
+ *   its chat's [conversationKeyOf].
+ * - **No memory is saved of text that is gone.** This class is the session's
+ *   [MemoryConversations]: it tells the store what a conversation is now, and answers "no such
+ *   conversation" for a chat whose stored messages were removed or changed (an edit, an answer
+ *   asked for again, a retry, an expiry) until the engine has read a request built after that
+ *   change. So a save at a lock that comes before that request cannot keep the old text.
  *
- * Threading: everything except the constructor and [shutdown] is called on the main dispatcher
- * and all state is confined to it. The constructor reads the chat that was on screen last from
- * the disk, so it is called off the main thread, when the session is opened.
+ * Threading: everything except the constructor, [shutdown], [conversation], [requestsBuilt] and
+ * [heldConversationKey] is called on the main dispatcher and all state is confined to it. The
+ * constructor reads the chat that was on screen last from the disk, so it is called off the
+ * main thread, when the session is opened.
  *
  * @param opened the index of chats as the store has just reconciled it.
  * @param requestSettings what the settings hold for a model right now. It is asked for every
@@ -193,6 +216,12 @@ enum class ChatNotice {
  * @param expiryIntervalMillis how often expired messages are looked for while the session lives
  *   ([EXPIRY_INTERVAL_MILLIS] in the app); null for no timer. The unit tests leave it out,
  *   because a timer that repeats for ever never lets virtual time come to rest.
+ * @param memoryVault where the engine finds the model's saved memory now; null while none may be
+ *   restored (the switch is off, the platform cannot keep one, the session is closing).
+ * @param onTurnEnded called on the main dispatcher whenever a reply has ended, however it ended,
+ *   and no other reply has begun in its place.
+ * @param onMemoryRestored called on the main dispatcher when the engine's memory was read back
+ *   from the saved one, or already was it.
  */
 class ChatController(
     private val store: SessionStore,
@@ -208,11 +237,17 @@ class ChatController(
     private val onReplyFinished: () -> Unit = {},
     private val lifetime: () -> MessageLifetime = { MessageLifetime.NEVER },
     private val expiryIntervalMillis: Long? = null,
-) {
+    private val memoryVault: () -> MemoryVault? = { null },
+    private val onTurnEnded: () -> Unit = {},
+    private val onMemoryRestored: () -> Unit = {},
+) : MemoryConversations {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
-    /** The sessions read or made since the unlock, by id. The truth about each of them. */
-    private val sessions = HashMap<String, ChatSession>()
+    /**
+     * The sessions read or made since the unlock, by id. The truth about each of them. Written on
+     * the main thread only; concurrent so that [conversation] can read it from the engine's.
+     */
+    private val sessions: MutableMap<String, ChatSession> = ConcurrentHashMap()
 
     /** What could not be read of a loaded session, until the user has been told. */
     private val incomplete = HashMap<String, SessionStore.Incomplete>()
@@ -227,10 +262,31 @@ class ChatController(
     private var running: Running? = null
 
     /**
-     * The chat whose conversation the engine was last given, and so may still hold in its
-     * memory; null when it was made to forget since. Main thread only.
+     * The chat whose conversation the engine was last given, or read back from a saved memory,
+     * and so may still hold in its memory; null when it was made to forget since. Written on the
+     * main thread only.
      */
-    private var engineHolds: String? = null
+    @Volatile private var engineHolds: String? = null
+
+    /** The chat whose saved memory the engine is reading back right now, if any. Main thread only. */
+    private var restoring: String? = null
+
+    /** The restore queued at the opening ([queueRestore]), so that [shutdown] can stop it. Main thread only. */
+    private var restoreJob: Job? = null
+
+    private val builtRequests = AtomicLong(0)
+
+    /** How many requests have been handed to the engine since the session opened; from any thread. */
+    val requestsBuilt: Long get() = builtRequests.get()
+
+    /**
+     * Counts every change of a chat that removes or alters stored messages ([keepsSavedMemory]
+     * false); [staleSince] holds, by chat, the count of its latest such change until the engine
+     * has read a request built after it. See the class comment: such a chat has no conversation
+     * the store may save.
+     */
+    private val changes = AtomicLong(0)
+    private val staleSince = ConcurrentHashMap<String, Long>()
 
     /** The job of the latest turn, running or not: the next turn waits until it has let go of the engine. */
     private var lastTurn: Job? = null
@@ -276,8 +332,15 @@ class ChatController(
         scope.launch {
             engine.state.collect { engineState -> _state.update { it.copy(engine = engineState) } }
         }
-        // The model of the chat on screen, so that the first message does not have to wait for it.
-        (first as? OpenChat.Ready)?.let { preload(it.session.modelId) }
+        scope.launch {
+            engine.memoryRestore.collect { restore -> _state.update { it.copy(restoringMemory = restore is MemoryRestoreState.Restoring) } }
+        }
+        // The model of the chat on screen, so that the first message does not have to wait for
+        // it, and then its saved memory, so that the first message need not read it all again.
+        (first as? OpenChat.Ready)?.let {
+            preload(it.session.modelId)
+            queueRestore(it.id)
+        }
         expiryIntervalMillis?.let { interval ->
             scope.launch {
                 while (true) {
@@ -525,6 +588,8 @@ class ChatController(
             closed = true
             opening?.cancel()
             loading?.job?.cancel()
+            // A restore stops at its next piece; the saved memory it was reading stays on disk.
+            restoreJob?.cancel()
             endRunning()
             withTimeoutOrNull(ENGINE_TIMEOUT_MILLIS) { listOfNotNull(lastTurn, loading?.job, opening).joinAll() }
             scope.cancel()
@@ -615,7 +680,10 @@ class ChatController(
             )
         }
         if (stored) {
-            if (!keepsSavedMemory(current, updated)) memoryToDrop += id
+            if (!keepsSavedMemory(current, updated)) {
+                memoryToDrop += id
+                staleSince[id] = changes.incrementAndGet()
+            }
             writer.submit(sessionKey(id), urgent) { store.save(updated, dropMemoryFirst = memoryToDrop.remove(id)) }
             saveIndex(urgent = false)
         }
@@ -730,7 +798,10 @@ class ChatController(
      * the one before.
      */
     private fun forgetIfHeld(id: String) {
-        if (engineHolds != id || closed) return
+        if ((engineHolds != id && restoring != id) || closed) return
+        // At once, before any request can be built without the removed messages: no save of
+        // what the engine holds now, and no restore, until its memory has been emptied.
+        engine.markNotToBeSaved()
         engineHolds = null
         val previous = lastTurn
         lastTurn = scope.launch {
@@ -840,11 +911,23 @@ class ChatController(
                 fail(reply, engineState.error)
                 return
             }
+            // The saved memory of this chat, unless the engine may hold the chat already: read
+            // back before the request is built, never after. The restore of the opening comes first.
+            restoreJob?.join()
+            if (engineHolds != reply.sessionId) restoreMemory(reply.sessionId, spec)
             // Read again: the draft may have changed while the model was loading.
             val settings = requestSettings(spec)
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)
+            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens).copy(conversationKey = conversationKeyOf(reply.sessionId))
+            val builtAfter = changes.get()
+            builtRequests.incrementAndGet()
             engineHolds = reply.sessionId
-            engine.generate(request).collect { event -> if (running === reply) onEvent(reply, event) }
+            engine.generate(request).collect { event ->
+                if (running === reply) {
+                    // The engine has read this request: what it holds no longer has the text of a change made before it.
+                    if (event.showsPromptRead()) staleSince.computeIfPresent(reply.sessionId) { _, since -> since.takeIf { it > builtAfter } }
+                    onEvent(reply, event)
+                }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: RuntimeException) {
@@ -864,7 +947,79 @@ class ChatController(
                 val limit = lifetime()
                 if (limit.limitMillis != null) expireLoaded(reply.sessionId, limit, clock.nowMillis())
             }
+            if (running == null && !closed) onTurnEnded()
         }
+    }
+
+    // --- Internals: the model's saved memory -----------------------------------------------------
+
+    /**
+     * Starts the restore of the saved memory of the chat [id] once the load that is under way has
+     * ended: at the opening, for the chat on screen, so that it is read back while the user reads
+     * and types. Every request waits for it to have returned before it is built ([run]).
+     */
+    private fun queueRestore(id: String) {
+        val load = loading?.job
+        restoreJob = scope.launch {
+            load?.join()
+            val session = sessions[id] ?: return@launch
+            val spec = models.firstOrNull { it.id == session.modelId } ?: return@launch
+            if (engineHolds != id) restoreMemory(id, spec)
+        }
+    }
+
+    /**
+     * Has the engine read back the saved memory of the chat [id], when there is a vault and
+     * [spec] is the loaded model, with the context size the user chose. Main thread, in turn with
+     * the replies. While it runs, a prune of the chat marks and forgets as for a chat the engine
+     * holds ([forgetIfHeld]).
+     */
+    private suspend fun restoreMemory(id: String, spec: ModelSpec) {
+        val vault = memoryVault() ?: return
+        val loaded = engine.state.value
+        if (loaded !is EngineState.Ready || loaded.modelId != spec.id) return
+        restoring = id
+        try {
+            val result = engine.restoreMemory(vault, conversationKeyOf(id), requestSettings(spec).maxContextTokens)
+            if (result is MemoryRestoreResult.Restored || result == MemoryRestoreResult.AlreadyHeld) {
+                engineHolds = id
+                onMemoryRestored()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: RuntimeException) {
+            // The engine promises not to throw; the request reads the conversation as it is.
+        } finally {
+            restoring = null
+        }
+    }
+
+    /** The conversation key of what the engine holds now, as far as this class knows; null when nothing. From any thread. */
+    fun heldConversationKey(): String? = engineHolds?.let(::conversationKeyOf)
+
+    /**
+     * The conversation [conversationKey] names, for the store of the saved memory; see
+     * [MemoryConversations.conversation]. Null for a key that is not a chat's, for a chat that
+     * was deleted, and for one whose stored messages were changed since the engine last read a
+     * request of it (see the class comment). A chat that was not opened since the unlock is read
+     * from the disk. From any thread.
+     *
+     * @throws IOException when the chat's file exists and cannot be read.
+     */
+    override fun conversation(conversationKey: String): MemoryConversation? {
+        val id = chatIdOf(conversationKey) ?: return null
+        if (staleSince.containsKey(id)) return null
+        val listed = _state.value.chats.firstOrNull { it.id == id }
+        val session = sessions[id] ?: run {
+            if (listed == null) return null
+            when (val loaded = store.load(id)) {
+                is SessionStore.Loaded.Readable -> loaded.session
+                SessionStore.Loaded.Missing -> return null
+                SessionStore.Loaded.Unreadable -> throw IOException("The chat cannot be read")
+            }
+        }
+        val oldest = listOfNotNull(listed?.oldestMessageAtMillis, session.messages.minOfOrNull { it.createdAtMillis }).minOrNull() ?: return null
+        return MemoryConversation(id, session.messages, oldest)
     }
 
     private fun onEvent(reply: Running, event: GenerationEvent) {
@@ -921,6 +1076,26 @@ class ChatController(
 
         /** The key of the session [id] in the [CoalescingWriter]. */
         fun sessionKey(id: String): String = "session:$id"
+
+        /**
+         * The conversation key ([us.theworkmans.proseplow.core.engine.GenerationRequest.conversationKey])
+         * of the chat [id]: its id after a fixed prefix. Two chats never share one, and a chat
+         * keeps its key for life, through every unlock, so that a memory saved of it is found
+         * again; whether that memory still fits the chat's messages is the store's to check.
+         */
+        fun conversationKeyOf(id: String): String = CONVERSATION_KEY_PREFIX + id
+
+        /** The chat id in [key], or null when [key] is not a chat's conversation key. */
+        fun chatIdOf(key: String): String? = key.takeIf { it.startsWith(CONVERSATION_KEY_PREFIX) }?.removePrefix(CONVERSATION_KEY_PREFIX)?.takeIf { it.isNotEmpty() }
+
+        private const val CONVERSATION_KEY_PREFIX = "chat:"
+
+        /** True for an event that is only emitted once the engine has read the request's prompt into its memory. */
+        private fun GenerationEvent.showsPromptRead(): Boolean = when (this) {
+            is GenerationEvent.TextDelta, is GenerationEvent.TextReplaced -> true
+            is GenerationEvent.Done -> finishReason != FinishReason.CANCELLED
+            else -> false
+        }
 
         /**
          * True when going from [before] to [after] leaves every message a saved memory of the

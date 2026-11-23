@@ -13,6 +13,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.SessionFixture
+import us.theworkmans.proseplow.close
 import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec

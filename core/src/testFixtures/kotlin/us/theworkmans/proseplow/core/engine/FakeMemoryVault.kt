@@ -48,6 +48,21 @@ class FakeMemoryVault(
     /** When true, [saved] throws, as when the vault's own checks cannot run. */
     var savedFails: Boolean = false
 
+    /**
+     * When true, [saved] and [beginRestore] throw [MemoryVaultUnavailableException], as when the
+     * key was destroyed by a lock: the vault cannot tell now, and nothing speaks against the image.
+     */
+    var unavailable: Boolean = false
+
+    /** When true, [beginRestore] (but not [saved]) throws [MemoryVaultUnavailableException]. */
+    var restoreUnavailable: Boolean = false
+
+    /** When true, [beginRestore] throws as a vault does that read the image again and refused it. */
+    var restoreRefused: Boolean = false
+
+    /** When set, [MemorySource.read] throws [MemoryVaultUnavailableException] at the piece with this index. */
+    var readUnavailableAtPiece: Int? = null
+
     /** Changes what [saved] and the reader report of the image, as a header that does not agree with the image would. */
     var reportAs: ((SavedMemory) -> SavedMemory)? = null
 
@@ -91,6 +106,7 @@ class FakeMemoryVault(
 
     override fun saved(): SavedMemory? {
         if (savedFails) throw IllegalStateException("the vault could not check its image")
+        if (unavailable) throw MemoryVaultUnavailableException("the key is gone")
         return reported()
     }
 
@@ -110,6 +126,8 @@ class FakeMemoryVault(
 
     override fun beginRestore(): MemoryReader {
         restoresBegun++
+        if (unavailable || restoreUnavailable) throw MemoryVaultUnavailableException("the key is gone")
+        if (restoreRefused) throw IllegalStateException("the image was read again and refused")
         val header = checkNotNull(reported()) { "a restore of nothing" }
         return Reader(header, checkNotNull(stored))
     }
@@ -164,6 +182,7 @@ class FakeMemoryVault(
             if (at == bytes.size) return 0
             beforeRead(piece)
             if (readStopsAtPiece == piece) return -1
+            if (readUnavailableAtPiece == piece) throw MemoryVaultUnavailableException("the key is gone")
             val n = minOf(pieceBytes, bytes.size - at)
             for (index in 0 until n) buffer.put(index, bytes[at + index])
             at += n

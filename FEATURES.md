@@ -247,7 +247,9 @@ is about things that are **not** built and is kept apart from everything else.
   read and decrypted (CHAT-02). Only then do the unlocked screens appear. If the stored data
   cannot be looked at, the app shows the "could not be opened" screen instead of an empty app.
   If the session of the unlock before is still closing, its last writes get their bounded time
-  (LOCK-17) before the new session reads anything.
+  (LOCK-17) before the new session reads anything. A lock by itself that is still waiting for
+  the model's memory to be saved (LOCK-17, step 4) therefore holds the unlock for at most those
+  10 seconds more.
 - **LOCK-11** The app locks by itself after it has been in the background for the chosen time:
   immediately, 1 minute (the default), 5 minutes or 15 minutes (SECSET-04).
 - **LOCK-12** "In the background" begins when the platform reports that the app's screen is no
@@ -278,7 +280,9 @@ is about things that are **not** built and is kept apart from everything else.
 - **LOCK-16** "Lock now" locks at once, without a confirmation. It is offered in the menu of the
   chat screen and in the security settings. It is the strongest way to lock: a reply that is
   being written is stopped, and nothing is left alive behind the lock whatever the settings say
-  (LEASE-08).
+  (LEASE-08). It never waits for the model's memory to be saved and never begins a save; a save
+  that is under way is stopped (LOCK-17, step 4). A memory that an earlier save completed stays
+  on disk and is used at the next unlock as far as it goes (STORE-31).
 - **LOCK-17** What a lock does, in this order:
   1. The state changes and every unlocked screen is torn down within the same call, not at the
      next frame, so that nothing of a chat or a setting stays referenced by the interface. The
@@ -286,35 +290,49 @@ is about things that are **not** built and is kept apart from everything else.
      dropped.
   2. Changes that were waiting to be written are sent to the disk without further delay.
   3. Away from the interface thread: a reply that is being written is stopped and kept as a
-     stopped message (MSG-07); a model load that is under way is abandoned. The lock waits at
-     most 10 seconds for the engine to let go.
-  4. The engine forgets the conversation (ENG-21); the model itself stays loaded. This too is
-     waited for at most 10 seconds; if forgetting fails, the model is unloaded instead.
-  5. The writer accepts nothing more and is given at most 10 seconds to finish what it was
+     stopped message (MSG-07); a model load that is under way is abandoned, and so is a restore
+     of the model's memory (STORE-31), whose saved memory stays. The lock waits at most 10
+     seconds for the engine to let go.
+  4. The model's memory (STORE-28). For a lock by itself and at the end of a lease, a save that
+     is under way is waited for, or one is begun (with the lock's own rules, ENG-38) when the
+     memory on disk is not already the memory in the engine; then whatever is still saving is
+     stopped. All of this takes at most 10 seconds. For "Lock now" and a reset nothing is waited
+     for and nothing begun, and a save that is under way is stopped at once. A memory that a
+     save completed before stays on disk either way. Nothing is saved with SECSET-15 off, or
+     below Android 12 (STORE-30).
+  5. The engine forgets the conversation and keeps what was saved of it (ENG-21); the model
+     itself stays loaded. This too is waited for at most 10 seconds; if forgetting fails, the
+     model is unloaded instead.
+  6. The writer accepts nothing more and is given at most 10 seconds to finish what it was
      handed.
-  6. The data key is overwritten with zeros, whatever became of the steps before. From then on
-     every use of the session's cipher fails.
-  7. With fingerprint unlock on, the period of BIO-18 starts again from the moment the lock
+  7. The data key is overwritten with zeros, whatever became of the steps before. From then on
+     every use of the session's cipher fails, and a save of step 4 that was stopped can seal
+     nothing more.
+  8. With fingerprint unlock on, the period of BIO-18 starts again from the moment the lock
      was due, and that is stored. For "Lock now" that is the moment of step 1. For a lock by
      itself it is the moment the app left the screen plus the timeout in force, or the moment
      of step 1 if that is earlier: a lock that runs late, because its timer could not run while
      the process was frozen or the device slept (LOCK-13), counts as having happened when it
      was due, whether it is made up for when the app comes back or by the timer itself running
-     late. It is stored after step 6, so it never keeps the key in memory, and before the
+     late. It is stored after step 7, so it never keeps the key in memory, and before the
      process can end (END-01): the process is not ended while the lock's own work is still
-     running. When steps 3 to 6 are put off (LEASE-01), this step is not: it is taken at the
-     lock, and again when the lease ends, after its own step 6. The end of a lease counts at
+     running. When steps 3 to 7 are put off (LEASE-01), this step is not: it is taken at the
+     lock, and again when the lease ends, after its own step 7. The end of a lease counts at
      the latest at the end of its 10 minutes, and at the latest 10 minutes after the lock that
      began it was due, however late it is noticed.
 
-  Steps 3 to 6 therefore take at most three waits of 10 seconds each, and they begin once a
-  passphrase check that is running at that moment has returned (the two never overlap). LEASE-01
-  is the one case in which steps 3 to 6 are put off.
+  Steps 3 to 7 therefore take at most four waits of 10 seconds each for a lock by itself and
+  the end of a lease, and at most three for "Lock now" and a reset, which skip the wait of step
+  4. They begin once a passphrase check that is running at that moment has returned (the two
+  never overlap). LEASE-01 is the one case in which steps 3 to 7 are put off.
 - **LOCK-18** A write that the storage does not complete within its time is not waited for, so
   that it cannot keep the key in memory. Its bytes were encrypted before the key went, so it may
   still reach the disk later. Until it has, an unlock that follows may already be writing the
   same file, and the late write can then replace the newer content; the stores cannot tell the
-  two apart. Only a reset waits for such a write (RESET-07).
+  two apart. Only a reset waits for such a write (RESET-07). The same holds for a save of the
+  model's memory that was stopped at step 4: a chunk sealed before the key went may still be
+  written by the save's own thread, which then removes its temporary file; nothing of it is
+  ever kept (STORE-26), and the process does not end before that thread has returned (END-01).
 - **LOCK-19** A session that fails to close still loses its key.
 - **LOCK-20** Closing the app's last screen for good (leaving with the back action) drops the
   state of the screens but does not lock: the session stays until the time of LOCK-11 is up.
@@ -326,7 +344,7 @@ is about things that are **not** built and is kept apart from everything else.
   are the lock's own work, which an unlock waits for, so the deletion can never run beside an
   unlock. While a session is alive, being finished behind the lock (LEASE-01) or still closing
   (LOCK-18), nothing is deleted and only the trusted time is stored: the files are that
-  session's, and its own expiry covers them. Every unlock and every lock (step 7 of LOCK-17,
+  session's, and its own expiry covers them. Every unlock and every lock (step 8 of LOCK-17,
   and the end of a lease) store the trusted time as well, and every unlock writes the readable
   copy of the limit of SECSET-13 in the lock configuration again from the setting itself. The
   background maintenance job (BG-12) runs this same clean-up through the lock; it never runs
@@ -537,7 +555,7 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   the period last started, and less than the chosen time has passed since then on the device
   clock. Exactly at the end the period has run out. The period starts again at every successful
   unlock, by passphrase (the first, at set-up, included) or by fingerprint, and at every lock
-  (LOCK-17, step 7): the timeout, "Lock now", and the end of a lease (LEASE-01). A lock starts
+  (LOCK-17, step 8): the timeout, "Lock now", and the end of a lease (LEASE-01). A lock starts
   it at the moment the lock was due, never later: a lock that could only be made up for hours
   later (the device was asleep, the process frozen) does not count as recent use. A correct
   passphrase entered in the security settings starts it too. Otherwise only the passphrase
@@ -602,9 +620,10 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   stopped it, or took it out of the foreground), whichever comes first. At the limit, and when
   the keep-alive is lost, an answer that is still being written is stopped and kept as a
   stopped message. Then the session is closed in the order of
-  LOCK-17 (steps 3 to 6) and the key is overwritten. The key is therefore in memory for at most
-  10 minutes and then the closing, which is bounded by three waits of up to 10 seconds each
-  (LOCK-17).
+  LOCK-17 (steps 3 to 7), the model's memory of the conversation saved on the way (step 4), and
+  the key is overwritten. The key is therefore in memory for at most 10 minutes and then the
+  closing, which is bounded by four waits of up to 10 seconds each (LOCK-17); when the lease is
+  ended by "Lock now", by three.
 - **LEASE-04** The limit is counted on the device clock. Because a timer can be late, the
   deadline itself is checked when the app comes to the front and before a session is handed back
   (LEASE-05); a session whose time is up is ended, not resumed.
@@ -627,13 +646,14 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   running and overwrites the key at once, as LOCK-17 describes.
 - **LEASE-10** While a session is alive behind the lock its key cannot be wrapped anew: changing
   the passphrase and setting up fingerprint unlock need a session that is on screen.
-- **LEASE-11** When the answer is finished behind the lock, it is saved, the engine forgets the
-  conversation, the key is overwritten, the notification of BG-06 says that an answer is ready,
+- **LEASE-11** When the answer is finished behind the lock, it is saved, the model's memory of
+  the conversation with the finished answer is saved (STORE-28) unless SECSET-15 is off, the
+  engine forgets the conversation and keeps that memory, the key is overwritten, the notification of BG-06 says that an answer is ready,
   and the process ends (END-01). What keeps the process running in the background (BG-01) is
   held until the key has been overwritten, never released before.
 - **LEASE-12** The price is stated to the user (SECSET-05) and is part of the security model
   (THREAT-09): until the session ends, for at most 10 minutes and then the closing of LEASE-03
-  (at most three waits of 10 seconds each), the data key and the conversation are in memory as
+  (at most four waits of 10 seconds each), the data key and the conversation are in memory as
   if the app were unlocked, although nothing on the screen gives access to them.
   - **Parity note:** the feature needs the process to keep computing for up to 10 minutes while
     the app is out of sight or the screen is off. A platform that suspends background apps
@@ -644,12 +664,14 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
 - **LEASE-13** The 10 minutes count whatever the model is doing. Reading a conversation again is
   part of the answer (ENG-34), so an answer in a conversation that takes longer than that to read is
   stopped at the limit, possibly before it has written a word, and has to be asked for with the app
-  open. The text of MSET-19 says so to the user.
+  open. The text of MSET-19 says so to the user. A conversation whose saved memory (STORE-28) could
+  be read back after the unlock is not read again: only what is new since is read.
 - **LEASE-14** For as long as a session is being finished behind the lock, the lock screen
   (LOCK-04) shows the line "An answer is being finished behind the lock." and an outlined
   button "Stop the answer". The button ends it exactly as "Lock now" does (LEASE-08): the
   answer written so far is kept as a stopped message, the session is closed and its key
-  overwritten (LOCK-17, steps 3 to 6, and step 7). It asks for no passphrase, because stopping
+  overwritten (LOCK-17, steps 3 to 7, and step 8), and, like every end of a lease other than
+  "Lock now", it saves the model's memory on the way (step 4). It asks for no passphrase, because stopping
   only ever takes away what an attacker could otherwise wait for. Line and button go when the
   session is no longer being finished, however that came about. The lock screen learns that a
   session is being finished from the lock's own state, never from the session; the button does
@@ -663,7 +685,8 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
 - **END-01** Whenever all of the following hold, the app ends its own process:
   - no screen of the app is shown, and none is on its way to being shown;
   - no session is open, being finished behind the lock, or still closing. A session only counts
-    as closed once its last write has returned, so nothing is lost;
+    as closed once its last write has returned, the last write of a save of the model's memory
+    (STORE-28) included, so nothing is lost and no file is touched afterwards;
   - no passphrase or fingerprint check, set-up or other work of the lock is running;
   - no run of the background maintenance job holds the process (BG-14). A run that has finished
     holds it until the platform has been told so, and is looked at again only after that;
@@ -676,7 +699,9 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
 - **END-03** What follows from END-01:
   - after the app has locked in the background and its session is closed, the process ends;
     what kept it running until then (BG-16) is let go at that moment, never before the key has
-    been overwritten;
+    been overwritten. A lock by itself first saves the model's memory (LOCK-17, step 4), so
+    the process lives up to 10 seconds longer, and a save that was stopped at that bound keeps
+    it alive until its writing thread has returned;
   - leaving the lock screen without unlocking ends the process;
   - leaving the first-run set-up screen does not (nothing was ever decrypted in that process);
   - the app stays in the list of recent apps, and opening it is a fresh start at the lock
@@ -850,7 +875,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   | `session-index.enc` | The list of chats (a summary of each) and which chat was on screen last | Encrypted, purpose `session-index` |
   | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); whether the question about notifications has been asked; and how long messages are kept (SECSET-13) | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
-  | `model-memory/<chat id>.enc` | The model's saved memory of one conversation, at most one such file (STORE-24); nothing writes it yet. The file's last-modified time is the date of the oldest message it was made from | A sealed stream (FMT-21) for the purpose `model-memory:<chat id>`, with the store's header (FMT-22) |
+  | `model-memory/<chat id>.enc` | The model's saved memory of one conversation, at most one such file (STORE-24), written as STORE-28 describes. The file's last-modified time is the date of the oldest message it was made from | A sealed stream (FMT-21) for the purpose `model-memory:<chat id>`, with the store's header (FMT-22) |
   | `security/lock.json` | The lock configuration (FMT-06), with a readable copy of how long messages are kept and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
 
   The model files are part of the installed app and are not encrypted: they are public files.
@@ -993,8 +1018,8 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   conversation the model last worked on: a new one replaces that of any other chat. It is never
   copied into `kept/` (STORE-09): a memory that does not pass its checks is deleted. Its
   directory follows STORE-02, so the lock counts a memory as encrypted data and never makes a
-  new key over one, and a reset deletes it (RESET-07). **Nothing saves a memory yet:** the store
-  exists, with its clean-up, but the session does not call it, so no such file is written.
+  new key over one, and a reset deletes it (RESET-07). The session writes it (STORE-28) and
+  reads it back (STORE-31), on Android 12 and later only (STORE-30) and while SECSET-15 is on.
 - **STORE-25** What makes a saved memory usable. Before the engine is told what is kept, and
   again when it is read back: its first chunk authenticates and begins with a header of the
   store's version; the build (the app's version code and the time its package was last installed
@@ -1010,7 +1035,10 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   deleted. A failure to read the disk or the chats, or the key going, deletes nothing at that
   check. When a memory is read back, only chunks that have authenticated are handed on, its end
   is reported only once its last chunk has opened with nothing behind it and its length is the
-  header's, and any failure on the way deletes it.
+  header's, and a chunk that does not authenticate, or a length that does not agree, deletes it.
+  What says nothing against the memory deletes nothing, also in the middle of reading it back:
+  the key going (a lock), or a read of the disk or of the chats that failed. The engine is then
+  told that the store cannot tell now (ENG-39), and the memory stays for the next unlock.
 - **STORE-26** Saving a memory. It is refused, and what was kept stays, for a conversation the
   session does not know or that has no messages, with a message without a usable date (none, or
   one later than the trusted time), whose oldest message has already passed the limit, for a
@@ -1037,6 +1065,51 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   that only adds (a new message or reply, an answer that is carried on, a draft, another model)
   keeps the memory. A memory that cannot be deleted then does not stop the change: STORE-25 and
   STORE-22 catch it before it could be used.
+- **STORE-28** When the model's memory is saved. Always of the conversation the model last
+  worked on, as the engine's rules allow (ENG-38), and only while SECSET-15 is on and on
+  Android 12 or later (STORE-30):
+  - when the app leaves the screen for real (not for a rotation) while it is unlocked, no answer
+    is being written and no answer is being finished behind the lock: a save of a model that has
+    read enough that is new (ENG-38, more than 10 seconds of reading since the last save);
+  - when an answer ends, however it ends, while the app is out of sight and still unlocked: the
+    same save. Until that save has ended the answer counts as still being written, so the
+    keep-alive that ran for it (BG-01) covers the save too;
+  - when the session closes for a lock by itself or at the end of a lease (LOCK-17, step 4): a
+    save that is under way is joined; then, unless that save left the memory on disk as it is in
+    the engine, the lock's own save is begun, which saves whenever the memory is worth keeping
+    at all. Both together take at most 10 seconds; then the save is stopped both ways (the
+    engine's side at its next piece, and the store lets the engine's thread go within one chunk)
+    and nothing of it is kept. A memory that is on disk as it is in the engine, because it was
+    saved or read back and no request was made since, is not written again.
+
+  "Lock now" and a reset never save (LOCK-16). No save is asked for while an answer is being
+  written; one that is running is stopped by the next request (ENG-38).
+- **STORE-29** What the store is told of a conversation, which it binds a memory to (STORE-25):
+  the chat whose conversation key names it (every request names its chat by `chat:` followed by
+  the chat's id, the same at every unlock and never the same for two chats), with its messages
+  as they are now. There is none for a chat that was deleted, and none for a chat whose stored
+  messages were removed or changed (pruned, edited, asked for again, retried) until the engine
+  has read a request of it made after that change: so a save at a lock that comes between the
+  change and the next answer keeps nothing, rather than a memory of text that is gone. A chat
+  that was not opened since the unlock is read from its file; one whose file cannot be read
+  cannot be told now, which deletes nothing (STORE-25).
+- **STORE-30** Android 12 and later only. On Android 9, 10 and 11 the platform's cipher copies
+  every chunk of plaintext it is given into memory of its own that nothing can overwrite, which
+  for the model's memory would leave the keys and values of a conversation, and from the first
+  chunk the ids of its tokens, in memory that cannot be wiped at every save and every restore.
+  There the feature does not exist: nothing is saved or restored, a memory file found at an
+  unlock is deleted, and the switch of SECSET-15 is shown disabled. The version is checked in one
+  place.
+- **STORE-31** When a saved memory is read back. After an unlock, for the chat on screen, once
+  its model is loaded, with the context size chosen for that model (MSET-19); and before the
+  first request of any other chat whose conversation the model may not hold already. A request
+  is built only after that has returned, whatever it returned. An image that cannot be used is
+  deleted and the conversation is read again (ENG-39), with the ordinary progress of MSG-06; a
+  restore under way says so instead (MSG-06). A restore that a lock stops (LOCK-17, step 3)
+  keeps the memory for the next unlock. With SECSET-15 off nothing is read back.
+- **STORE-32** SECSET-15 off deletes the saved memory at once and stops a save that is under way;
+  while it is off nothing is saved or read back, and a memory file found at an unlock is
+  deleted. On again, the next save writes a new memory.
 
 ## 11. Chats (CHAT)
 
@@ -1156,9 +1229,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **CHAT-23** While the app is unlocked, the expiry of CHAT-22 is applied at the unlock
   (STORE-23), when a stored chat is opened (before it is shown), every hour, and at once when
   the limit is shortened (SECSET-13). A chat whose reply is being written is never changed by
-  it: it is pruned as soon as that reply has ended. When the engine holds the conversation of a
-  chat that was pruned or deleted this way, it is made to forget it (ENG-21), in turn with the
-  replies, so that no expired text stays in the model's memory. A stored chat that has expired
+  it: it is pruned as soon as that reply has ended. When the engine may hold the conversation of
+  a chat that was pruned or deleted this way, its memory is first marked not to be saved
+  (ENG-41), within the same pass and before any request is built, and it is then made to forget
+  it (ENG-21), in turn with the replies, so that no expired text stays in the model's memory or
+  reaches a saved one. A stored chat that has expired
   whole between two passes and is then opened is reported as gone (CHAT-12).
 - **CHAT-24** Messages are dated, and their age is measured, by the trusted time: the latest
   time seen, which never goes back. It is the date and time now, or the last trusted time plus
@@ -1200,6 +1275,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   for, as "{model} · {stage}":
   - "Getting ready…" (the engine is still busy, for example ending the reply before);
   - "Loading the model…", with a bar for the progress of the load;
+  - "Restoring the conversation…", without a bar, while the model's saved memory of the
+    conversation is read back (STORE-31); when it cannot be used, nothing is said about it and
+    the line goes on as below;
   - "Reading the conversation…", with a bar for the share of the prompt that is in the model's
     memory (it starts above zero when part of the conversation was still there, ENG-07);
   - "Writing…".
@@ -1425,7 +1503,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   model of the chat on screen, so that the first message does not wait for it); when the user
   picks one, unless a reply is being written somewhere, in which case it is loaded when it is
   first needed; and when a reply needs one. Opening another chat loads nothing, so looking
-  through chats that use different models costs nothing.
+  through chats that use different models costs nothing. After the load at the unlock, the
+  model's saved memory of the chat on screen is read back (STORE-31) before its first answer.
 - **MODEL-09** While a model is being loaded for no reply in particular, a strip under the AI
   notice says "Loading {model}…" with a bar for the progress. A reply that is waiting for the
   load says so itself (MSG-06), and the strip is then not shown.
@@ -1433,7 +1512,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   abandoned. Stopping a reply that is waiting for its model abandons that load too.
 - **MODEL-11** The loaded model stays in memory across a lock for as long as the process lives;
   its weights are no secret. Since the process ends once the app is locked and out of sight
-  (END-01), the unlock after that loads the model again.
+  (END-01), the unlock after that loads the model again. What it had read of a conversation does
+  not stay in memory across a lock; it comes back only from the saved memory (STORE-28), and is
+  otherwise read again.
 - **MODEL-12** A reply is always written by the model named on it: a request is addressed to the
   model its reply was stamped with, and the engine refuses it if another model has been loaded
   since.
@@ -1624,11 +1705,15 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   model whose context can grow on this device (ENG-29). The text under the heading says, with the
   size the context starts with as its number: "How much of a conversation this model reads at once,
   in tokens. It starts at {start} and grows only when a conversation needs more, which takes more of
-  the phone's memory. After the app was locked and left, the whole conversation is read again before
-  the next answer, so a longer conversation means a longer wait. An answer that goes on after the
+  the phone's memory. After a lock, the whole conversation is read again before the next answer
+  whenever the model's saved memory of it cannot be used, so a longer conversation can mean a
+  longer wait. An answer that goes on after the
   app locks is stopped after ten minutes at the latest, so a conversation that takes longer than
   that to read is best read with the app open. Beyond the limit chosen here, the oldest messages are
-  left out of an answer." Under it one size is chosen from a list:
+  left out of an answer." The saved memory cannot be used when SECSET-15 is off, below Android 12,
+  after an update of the app, when the platform ended the app before it was saved, when it was
+  not worth keeping (ENG-38), or when a lock had to give its save up (LOCK-17, step 4). Under it
+  one size is chosen from a list:
   - first "Automatic: up to {n} tokens on this phone", which is the default and stores nothing. The
     number is the limit the context has when it is left to itself (ENG-29), worked out with the
     reading times of MODEL-04;
@@ -1641,8 +1726,10 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   sizes 4,096, 8,192, 16,384, 32,768, 65,536 and 111,616; for Peacebell it is automatic up to 9,216
   and the fixed sizes 4,096, 8,192, 16,384 and 20,480.
 - **MSET-20** Every size in that list says under its name what it costs, when the catalogue knows
-  the model's bytes for each token: "About {memory} of memory when full, and about {time} to read it
-  all again.", or for a model without known reading times "About {memory} of memory when full."
+  the model's bytes for each token: "About {memory} of memory when full, and at worst about {time} to
+  read it all again.", or for a model without known reading times "About {memory} of memory when
+  full." The time is the worst case: what reading the whole context again takes when no saved
+  memory can be used (MSET-19); a saved memory of a conversation is read back in seconds.
   The memory is the size times the model's bytes for each token (MODEL-04), in the platform's short
   form for an amount of bytes. The time is what the model's reading times (MODEL-04) give for the
   size, by the arithmetic of FMT-20, rounded up to whole seconds. Below 90 seconds it is said in
@@ -1741,6 +1828,24 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   when off: "Off: when the app locks, an answer that is being written is stopped and the
   encryption key is erased at once. Turn this on to let an answer be finished behind the lock
   screen, for at most 10 minutes."
+- **SECSET-15** Right after it, the switch "Keep the model's memory after locking" (STORE-28),
+  on by default and stored with the encrypted settings (FMT-08), where a file without the field
+  means on and a value that cannot be read means off. No passphrase is asked for. The line under
+  it says, when on: "On: what the model has read of the conversation it worked on last is saved
+  when you leave the app and when it locks by itself, encrypted like the chats, so that after
+  unlocking the next answer need not read it all again. It takes storage, up to about 1.5 GB,
+  and a lock by itself can take up to 10 seconds longer while it is saved. Lock now never waits
+  for it." And when off: "Off: nothing of the model's memory is kept, and after a lock the whole
+  conversation is read again before the next answer. Turning this off deletes what was saved."
+  Turning it off deletes the saved memory at once (STORE-32). Below Android 12 (STORE-30) the
+  switch is off and disabled, with the line "Needs Android 12 or later: older versions leave
+  copies of the model's memory in the phone's memory that cannot be erased." The number of
+  seconds comes from the code, as SECSET-11 says of minutes. Its singular form is never shown,
+  and reads: "On: what the model has read of the conversation it worked on last is saved when
+  you leave the app and when it locks by itself, encrypted like the chats, so that after
+  unlocking the next answer need not read it all again. It takes storage, up to about 1.5 GB,
+  and a lock by itself can take up to {n} second longer while it is saved. Lock now never waits
+  for it."
 - **SECSET-06** The button "Lock now" (LOCK-16).
 - **SECSET-07** The switch "Allow screenshots for 10 minutes" (PRIV-02). No passphrase is asked
   for: the app is unlocked, and the allowance opens no key. The line under it says:
@@ -2160,7 +2265,8 @@ is what a port has to reproduce, whatever it is written in.
   "Forget" also deletes a saved image of the memory that the engine knows of (ENG-40), since it is
   the forgetting of a conversation that must not come back (CHAT-23). A second form, "forget and
   keep what was saved", does everything else the same and leaves the image for the next restore;
-  it is meant for the lock, after its save (ENG-38), and nothing in the app calls it yet.
+  the app's lock uses it (LOCK-17, step 5), after its save, and "Lock now" too, so that a memory
+  an earlier save completed is kept.
 - **ENG-22** A reply stands aside while a passphrase key is being derived (PASS-11): it pauses
   between two chunks of the prompt or between two tokens of the reply, never inside a
   computation (so while a long conversation is read, the chunk in progress, up to 128 or 256 tokens
@@ -2345,7 +2451,7 @@ is what a port has to reproduce, whatever it is written in.
   To the sampler the engine says explicitly that the penalties have no window (FMT-15), so that they
   cover the whole memory whatever size the context has.
 
-- **ENG-38** Saving the memory. Not yet used: nothing in the app calls it. On request the engine
+- **ENG-38** Saving the memory. The session asks for it as STORE-28 describes. On request the engine
   writes what the model's memory holds into a vault (an interface; the app's is the store of
   STORE-24, over its second encrypted form, the sealed stream), naming the conversation by an opaque key its caller
   gives and passing it through without looking into it. The image is handed from the native session
@@ -2369,7 +2475,7 @@ is what a port has to reproduce, whatever it is written in.
   were. A request that arrives while a save runs stops it at its next piece and then runs; so do
   forgetting, unloading, loading another model and abandoning the save. The image becomes the
   vault's only when its last piece was written and the vault was told to keep it.
-- **ENG-39** Restoring the memory. Not yet used: nothing in the app calls it. After a model is loaded
+- **ENG-39** Restoring the memory. The session asks for it as STORE-31 describes. After a model is loaded
   and before the first request of a conversation, the engine asks the vault what it holds. An
   image of another model is deleted. An image of another conversation is kept and waits: the next
   request deletes it, unless a restore for its own conversation comes first. An image of this
@@ -2383,9 +2489,15 @@ is what a port has to reproduce, whatever it is written in.
   tokens and its list of checkpoints (the latest 4, ENG-09) from what came back. From then on the
   memory is ordinary memory (ENG-07, ENG-08); since no prediction survives, at least one token is
   read before the first token of the reply. Any failure at any point (the vault's checks, a context
-  that cannot be made large enough, an import that fails or is stopped by forgetting, unloading or
-  the caller, counts that disagree) ends with an empty memory, the image deleted, and the
-  conversation read again at the next request. A restore over a memory that already holds the same
+  that cannot be made large enough, an import that fails or that the vault stops by refusing a
+  piece, counts that disagree) ends with an empty memory, the image deleted, and the
+  conversation read again at the next request. Two endings say nothing against the image and
+  keep it, also with an empty memory and the conversation read again: the vault cannot tell now
+  (its key was destroyed by a lock, its storage did not answer; STORE-25), before the restore,
+  as it begins or in the middle of reading; and the restore was stopped by forgetting, unloading,
+  loading or the caller. The image then waits as one of another conversation does: a restore of
+  its own conversation reads it, the next request deletes it, "forget" and unloading delete it,
+  and "forget and keep what was saved" lets go of it. A restore over a memory that already holds the same
   conversation keeps that memory, and deletes the image unless it is the one the engine wrote from
   it.
 - **ENG-40** A saved image is only ever the beginning of the memory the engine holds, or waits for its
@@ -2397,7 +2509,10 @@ is what a port has to reproduce, whatever it is written in.
   retried by the engine; the app's own checks of the conversation are to catch the file before it
   could be restored.
 - **ENG-41** "Not to be saved". A caller that has removed messages from a conversation (expiry,
-  CHAT-23) marks the memory at once, from any thread and also while a reply runs. From then on no
+  CHAT-23) marks the memory at once, from any thread and also while a reply runs. The app marks
+  at every prune of a chat whose conversation the engine may hold (it was given that chat's
+  latest request, or is reading its memory back), before any request is built; a prune of
+  another chat marks nothing, so that it does not cost the conversation held its save. From then on no
   save is made and no image is restored until the memory has been emptied by a request made after
   the mark, by "forget", or by loading or unloading a model. A request made before the mark may
   still hold the removed messages, so its own clearing of the memory does not lift it.
@@ -2536,8 +2651,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   exactly how many bytes it would hand over, and gives the record of the tokens to a caller
   that keeps a copy of its own.
 
-  The binding carries it to the engine's seam (NAT-21). Nothing above the seam uses it yet:
-  the engine does not call it, and the app writes no model's memory to storage.
+  The binding carries it to the engine's seam (NAT-21). The engine saves and restores through
+  it (ENG-38, ENG-39), into the app's sealed stream (STORE-24, STORE-28).
   - **Parity note:** an image is not a stored form to adopt. It is written as the machine holds
     it, its state is that of the pinned llama.cpp for this model, and it is only ever read by
     the build that wrote it, on the same model file; the size of the context is not part of
@@ -2632,7 +2747,9 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   model's context, whose size follows the conversation (ENG-28): from the size it starts with up to
   a quarter of the device's memory (ENG-29).
 - **MEM-02** When the session is closed (at a lock, or when an answer that was finished behind
-  the lock has been saved), the data key's bytes are overwritten and the key refuses every
+  the lock has been saved), after the model's memory was saved where LOCK-17 (step 4) saves it,
+  which keeps the key and the conversation in memory up to 10 seconds longer, the data key's
+  bytes are overwritten and the key refuses every
   further use; the engine overwrites its own copy of the conversation's tokens; and the native
   session overwrites its buffers and checkpoints before it frees them (NAT-13). The native
   binding overwrites its copies of what it was handed. Every array of token ids a generation
@@ -2653,6 +2770,13 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   image, NAT-17), the lists in which it gathers the token ids of the whole conversation,
   replies included, are overwritten before they are freed (NAT-20); that was measured on a
   desktop and not on the phone.
+- **MEM-12** Saving and reading back the model's memory (STORE-28, STORE-31) hands it to the
+  platform's cipher a chunk at a time, from a direct buffer that is overwritten after every chunk;
+  nothing of it passes through an array of the runtime. What the cipher itself keeps of the
+  chunk it last worked on is not the app's to overwrite: on Android 9 to 11 that is a copy of
+  every chunk, which is why the feature exists only from Android 12 (STORE-30); from Android 12
+  on it is assumed to be no more than the cipher's own working state, which was not verified in
+  the platform's source.
 - **MEM-05** Nor does it reach what the language runtime holds: strings cannot be overwritten at
   all, and chat text passes through strings in the text fields, the Markdown renderer, the
   JSON codec and the engine's prompt formats; the cryptography classes keep copies of keys
@@ -2670,7 +2794,7 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   being finished behind the lock) they remain.
 - **MEM-08** While an answer is being finished behind the lock, everything of MEM-01 is still in
   memory, the data key included, for at most 10 minutes and then the closing, which is bounded
-  by three waits of up to 10 seconds each (LEASE-03, LEASE-12).
+  by four waits of up to 10 seconds each (LEASE-03, LEASE-12).
 - **MEM-09** Nothing is done about what the system may have moved to compressed swap.
 - **MEM-11** While the app is unlocked and out of sight, waiting to lock itself, everything of
   MEM-01 is in memory for the time chosen (LOCK-11). The app keeps itself running so that the
@@ -2881,7 +3005,7 @@ This section is exact where the others describe. Each item carries one of three 
 
 - **FMT-01** *(Adopt)* An encrypted file holds one of two forms, and nothing else is ever
   written into one: a blob, which is one encrypted message, or a sealed stream (FMT-21), which
-  is for content too large to be held in memory at once and which no file of the app has yet.
+  is for content too large to be held in memory at once: the model's saved memory (STORE-24).
   Every encrypted blob has this layout:
 
   | Bytes | Content |
@@ -2901,8 +3025,7 @@ This section is exact where the others describe. Each item carries one of three 
   with it. It is a name space, or a name space, a colon and an id; a name space is a lower-case
   letter followed by lower-case letters, digits and hyphens, and contains no colon. In use:
   `settings`; `session-index`; `session:` followed by the chat's id; and for the model's saved
-  memory, a stream (FMT-21, STORE-24): `model-memory:` followed by the chat's id (nothing saves a
-  memory yet). The name space `dek` is reserved for the lock (`dek:passphrase`, FMT-04) and
+  memory, a stream (FMT-21, STORE-24): `model-memory:` followed by the chat's id. The name space `dek` is reserved for the lock (`dek:passphrase`, FMT-04) and
   refused to every store. A purpose is permanent once data has been sealed with it.
 - **FMT-03** *(Adopt)* Names of files. A chat is `sessions/<id>.enc`, where the id is the text
   form of a random (version 4) UUID; an id is valid as a file name if it matches
@@ -3020,10 +3143,12 @@ This section is exact where the others describe. Each item carries one of three 
   - The settings: `{"schemaVersion": 1, "settings": {...}}`, where `settings` has `systemPrompts`
     (an object from model id to text), `models` (an object from model id to an object with the
     optional numbers `temperature`, `maxNewTokens` and `contextTokens`, the last being the size
-    chosen for the context, MSET-22), the boolean `notificationsAsked` and the number
-    `messageLifetimeDays` (SECSET-13, as in FMT-06). A value that is not set is not written, a
-    model with nothing set has no entry, `notificationsAsked` is written only once it is true, and
-    `messageLifetimeDays` only when it is not 7. On reading, unknown fields are ignored; a system prompt that is not text, a
+    chosen for the context, MSET-22), the boolean `notificationsAsked`, the number
+    `messageLifetimeDays` (SECSET-13, as in FMT-06) and the boolean `keepModelMemory`
+    (SECSET-15). A value that is not set is not written, a model with nothing set has no entry,
+    `notificationsAsked` is written only once it is true, `messageLifetimeDays` only when it is
+    not 7, and `keepModelMemory` only when it is false; a `keepModelMemory` that is not a boolean
+    is counted and read as false. On reading, unknown fields are ignored; a system prompt that is not text, a
     temperature that is not a number from 0 to 2, a longest reply that is not a whole number of at
     least 16 written as one, a context size that is not a whole number of at least 1,024 written as
     one, a flag that is not a boolean and a limit for messages that is not one of the choices are
@@ -3034,7 +3159,7 @@ This section is exact where the others describe. Each item carries one of three 
   content too large to be held in memory at once. A blob is one message, which can only be
   encrypted and decrypted whole; a stream is a header followed by chunks, each a message of its
   own under the same data key, so that it is written and read one chunk at a time. It is the
-  form of the model's saved memory (STORE-24), which nothing saves yet.
+  form of the model's saved memory (STORE-24).
 
   | Bytes | Content |
   | --- | --- |
@@ -3445,7 +3570,10 @@ without these properties has not reached parity.
   it is the newest version. Someone who can write the app's private storage, without knowing any
   key, can replace a chat or the settings with an older copy of the same file and can put back a
   chat that was deleted; the app accepts both without notice. An older lock configuration is
-  accepted in the same way unless the passphrase was changed after it was written.
+  accepted in the same way unless the passphrase was changed after it was written. An older saved
+  memory of the model put back is read back only as the memory of the very messages and tokens
+  it was made from (STORE-25), so it changes no answer; its name and its date still delete it
+  with its chat or its oldest message.
 - **THREAT-16** Another app that imitates this one. The app cannot show the user that the screen
   in front is its own; an app that may draw over others can show a look-alike screen, or cover
   everything except one button. Discarding covered taps (PRIV-13) does not help against what is
@@ -3458,7 +3586,9 @@ without these properties has not reached parity.
   app's private storage: that the app is installed and which models it carries; how many chats
   there are, their sizes and when they were changed; whether the model's memory of a
   conversation is kept (STORE-24), of which chat, how large it is (which says roughly how long
-  that conversation is) and the date of the oldest message it was made from; and the content of
+  that conversation is), the date of the oldest message it was made from, and, by when the
+  file last changed on the medium, roughly when the app last left the screen or locked after
+  that conversation; and the content of
   the lock configuration (whether fingerprint unlock is on, whether an answer is finished after
   locking, how many wrong attempts were made and when).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
@@ -3478,7 +3608,9 @@ without these properties has not reached parity.
 - **THREAT-20** Old data on the storage medium. Deleting a chat deletes its file, but the medium
   may keep the encrypted bytes until it reuses the space; they stay as unreadable as they were,
   and after a reset the keys that could open them are gone. Changing the passphrase does not
-  replace the data key (KEY-07).
+  replace the data key (KEY-07). The saved memory of the model (STORE-28) makes far more of them:
+  every save writes the whole memory again, up to about 1.5 GB, and the copy it replaces is only
+  deleted. SECSET-15 off stops that.
 - **THREAT-21** What another app does with a link it was handed (MD-06, MSET-15): it uses the
   network. The app only passes the address on.
 - **THREAT-22** A development build: it can be debugged, and its private files can be read by a
@@ -3754,6 +3886,36 @@ only state a rule, the item says so and states its effect instead of inventing a
   nothing runs that the build did not vouch for (DEC-39), and what is tested is what is
   released. Preserve: only the device tests of the native binding use a placed file, in the
   storage of their own test package.
+- **DEC-49** *The model's memory is saved when the app leaves the screen and when an answer ends
+  out of sight, and a lock by itself only finishes that* (STORE-28). The owner's decision of
+  2026-11-23. Reasons: the timed lock runs on a timer in a process that the platform freezes
+  about a minute after it leaves the screen, so a save made only at the lock would often run
+  late or never; a save begun on leaving the screen was measured to finish in about 2 seconds
+  for 600 MB out of sight. Preserve: the lock still saves when nothing was saved before it, and
+  only within its bound.
+- **DEC-50** *"Lock now" never saves the model's memory* (LOCK-16). The owner's decision of
+  2026-11-23. Reason: the strongest lock stays as fast as it was and leaves nothing alive a
+  moment longer; the price is that after "Lock now" a conversation is read again from where the
+  last save left it, or from nothing. Preserve: it starts no save, waits for none, stops one in
+  progress, and keeps a memory an earlier save completed.
+- **DEC-51** *A lock waits at most 10 seconds for the save* (LOCK-17, step 4). The owner's
+  decision of 2026-11-23: a fourth bounded wait beside the three that were there. Reason: at
+  the speeds measured out of sight, 10 seconds cover the largest memory with room to spare;
+  longer would keep the key alive longer for little. Preserve: the key is destroyed whatever
+  became of the save, and nothing more of the save can be sealed afterwards.
+- **DEC-52** *Keeping the model's memory is on by default, with a switch* (SECSET-15). The
+  owner's decision of 2026-11-23. Reason: reading a long conversation again after every lock
+  costs minutes; the price (storage, a longer lock by itself, more old ciphertext on the
+  medium) is stated where it is switched. Preserve: off deletes at once, and nothing is saved
+  or read back while off.
+- **DEC-53** *One saved memory, of the conversation the model last worked on* (STORE-24). The
+  owner's decision of 2026-11-23. Reasons: a memory can take up to about 1.5 GB, and one for
+  every chat would need a cap and more of the engine; switching chats is rarer than locking.
+  Whether a memory is worth saving at all is the engine's rule (20 seconds of reading, ENG-38).
+- **DEC-54** *Only on Android 12 and later* (STORE-30). The owner's decision of 2026-11-23.
+  Reason: on Android 9 to 11 the platform's cipher would leave a copy of every chunk of the
+  model's memory in memory that cannot be wiped. Preserve: the check is made in one place, and
+  where it fails nothing is saved or read back and any memory file is deleted.
 
 ## 27. Planned tools: design considerations (TOOL)
 

@@ -153,10 +153,14 @@ interface InferenceEngine {
      * would have for a request naming [maxContextTokens]. Afterwards the memory is ordinary
      * memory, and the next request keeps of it what it has in common with its prompt.
      *
-     * Any failure, at any point, leaves the memory empty and the image deleted, and the
-     * conversation is then read again as it would have been without a saved memory. An image of
-     * another conversation is kept until a request comes (which deletes it) or a restore for its
-     * own conversation. [memoryRestore] says what happened.
+     * Any failure, at any point, leaves the memory empty, and the conversation is then read again
+     * as it would have been without a saved memory. The image is deleted, except when nothing
+     * speaks against it: when the vault cannot tell now ([MemoryVaultUnavailableException], a
+     * key destroyed by a lock), and when [forget], [forgetKeepingSavedMemory], [unload], a [load]
+     * or the caller stopped the restore. Such an image, like one of another conversation, is
+     * kept until a request comes (which deletes it) or a restore for its own conversation; a
+     * [forget] or an [unload] deletes it, [forgetKeepingSavedMemory] lets go of it.
+     * [memoryRestore] says what happened.
      */
     suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int? = null): MemoryRestoreResult
 

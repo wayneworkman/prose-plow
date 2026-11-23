@@ -88,12 +88,17 @@ data class ModelOverrides(val temperature: Float? = null, val maxNewTokens: Int?
  * @property messageLifetime how long messages are kept. This is the setting itself; the lock
  *   configuration holds a readable copy of it for what is deleted while the app is locked, which
  *   every unlock writes again from this one.
+ * @property keepModelMemory whether the model's memory of a conversation is saved, encrypted,
+ *   when the app leaves the screen or locks, and read back at the next unlock: on by default.
+ *   Nothing needs it while the app is locked, so it lives here and not in the lock
+ *   configuration. Where the platform cannot keep it safely it is never used, whatever it says.
  */
 data class AppSettings(
     val systemPrompts: Map<String, String> = emptyMap(),
     val modelOverrides: Map<String, ModelOverrides> = emptyMap(),
     val notificationsAsked: Boolean = false,
     val messageLifetime: MessageLifetime = MessageLifetime.DEFAULT,
+    val keepModelMemory: Boolean = true,
 ) {
 
     /** These settings once the user has been asked whether the app may post notifications. */
@@ -159,7 +164,7 @@ data class AppSettings(
     /** Says which models have a prompt and never what it is: prompts must not end up in a log. */
     override fun toString(): String =
         "AppSettings(systemPrompts for ${systemPrompts.keys}, modelOverrides=$modelOverrides, notificationsAsked=$notificationsAsked, " +
-            "messageLifetime=$messageLifetime)"
+            "messageLifetime=$messageLifetime, keepModelMemory=$keepModelMemory)"
 }
 
 /**
@@ -169,8 +174,13 @@ data class AppSettings(
  * {"schemaVersion": 1, "settings": {
  *     "systemPrompts": {"<model id>": "<text>", ...},
  *     "models": {"<model id>": {"temperature": 0.7, "maxNewTokens": 512, "contextTokens": 8192}, ...},
- *     "notificationsAsked": true, "messageLifetimeDays": 30}}
+ *     "notificationsAsked": true, "messageLifetimeDays": 30, "keepModelMemory": false}}
  * ```
+ *
+ * `keepModelMemory` is only written when it is false (the default is true), and was added
+ * without a new schema version: a file without it means the default. A value that is not a
+ * boolean is left out and counted, and then reads as false: what the user may have switched off
+ * is not switched on again by a value that cannot be read.
  *
  * `messageLifetimeDays` is how long messages are kept, in days, 0 for Never
  * ([MessageLifetime.storedDays]); it is only written when it is not the default (7), and was
@@ -240,6 +250,7 @@ object SettingsCodec {
             }
             if (settings.notificationsAsked) put("notificationsAsked", true)
             if (settings.messageLifetime != MessageLifetime.DEFAULT) put("messageLifetimeDays", settings.messageLifetime.storedDays)
+            if (!settings.keepModelMemory) put("keepModelMemory", false)
         }
     }.toString()
 
@@ -319,8 +330,19 @@ object SettingsCodec {
                 lifetime = value
             }
         }
+        var keepMemory = true
+        val storedKeepMemory = stored["keepModelMemory"]
+        if (storedKeepMemory != null) {
+            val value = (storedKeepMemory as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+            if (value == null) {
+                skipped++
+                keepMemory = false
+            } else {
+                keepMemory = value
+            }
+        }
         return Decoded.Readable(
-            AppSettings(systemPrompts = prompts, modelOverrides = overrides, notificationsAsked = asked, messageLifetime = lifetime),
+            AppSettings(systemPrompts = prompts, modelOverrides = overrides, notificationsAsked = asked, messageLifetime = lifetime, keepModelMemory = keepMemory),
             version,
             skipped,
             messageLifetimeRead = lifetimeRead,

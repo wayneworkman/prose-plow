@@ -27,6 +27,7 @@ import us.theworkmans.proseplow.security.FakeScreenOffWatch
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
 import us.theworkmans.proseplow.security.LockState
+import us.theworkmans.proseplow.security.SessionClose
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SoftwareKeyVault
@@ -78,6 +79,18 @@ class SecurityViewModelTest {
         }
     }
 
+    /** The session's switch for the model's memory, on a platform that keeps one unless a test says otherwise. */
+    private val memorySetting = object : ModelMemorySetting {
+        override var modelMemorySupported: Boolean = true
+        override var keepModelMemory: Boolean = true
+        val changes = mutableListOf<Boolean>()
+
+        override fun changeKeepModelMemory(keep: Boolean) {
+            keepModelMemory = keep && modelMemorySupported
+            changes += keep
+        }
+    }
+
     @Before
     fun viewModelsRunOnTheTestDispatcher() = Dispatchers.setMain(dispatcher)
 
@@ -94,7 +107,7 @@ class SecurityViewModelTest {
                 object : UnlockedSession {
                     override fun clearScreens() = Unit
 
-                    override suspend fun close() = Unit
+                    override suspend fun close(how: SessionClose) = Unit
                 }
             },
             biometricStatus = { biometric },
@@ -112,7 +125,7 @@ class SecurityViewModelTest {
         lock.setUp(passphrase.toCharArray(), passphrase.toCharArray())
         runCurrent()
         assertTrue(lock.state.value is LockState.Unlocked)
-        viewModel = SecurityViewModel(lock, lifetimeSetting)
+        viewModel = SecurityViewModel(lock, lifetimeSetting, memorySetting)
     }
 
     private fun TestScope.confirmWith(text: String) {
@@ -126,6 +139,35 @@ class SecurityViewModelTest {
         lock.unlockWithPassphrase(text.toCharArray())
         runCurrent()
         return lock.state.value is LockState.Unlocked
+    }
+
+    /** Catches a switch that does not reach the session, does not show what it stored, or asks for a passphrase. */
+    @Test
+    fun theSwitchForTheModelsMemoryChangesTheSessionsSettingAtOnce() = runTest(dispatcher) {
+        unlockedApp()
+        assertTrue(viewModel.modelMemorySupported)
+        assertTrue("on by default", viewModel.keepModelMemory.value)
+
+        viewModel.setKeepModelMemory(false)
+        assertEquals(listOf(false), memorySetting.changes)
+        assertFalse(viewModel.keepModelMemory.value)
+        assertNull("no dialog, no passphrase", viewModel.state.value.dialog)
+        viewModel.setKeepModelMemory(true)
+        assertTrue(viewModel.keepModelMemory.value)
+    }
+
+    /** Below Android 12: catches a switch that can be turned on, or that reaches the session at all. */
+    @Test
+    fun whereTheMemoryCannotBeKeptTheSwitchIsOffAndDoesNothing() = runTest(dispatcher) {
+        memorySetting.modelMemorySupported = false
+        memorySetting.keepModelMemory = false
+        unlockedApp()
+        assertFalse(viewModel.modelMemorySupported)
+        assertFalse(viewModel.keepModelMemory.value)
+
+        viewModel.setKeepModelMemory(true)
+        assertEquals(emptyList<Boolean>(), memorySetting.changes)
+        assertFalse(viewModel.keepModelMemory.value)
     }
 
     @Test

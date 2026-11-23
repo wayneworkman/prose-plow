@@ -159,20 +159,22 @@ fun AssistantMessage(
 /**
  * The line under a reply that is being written. Its words change only when the reply moves from
  * one stage to the next, and it is a polite live region: a screen reader says "Loading", then
- * "Reading", then "Writing", not a number for every step. The numbers are in the bar.
+ * "Restoring" or "Reading", then "Writing", not a number for every step. The numbers are in the
+ * bar; a restore has none, because it takes seconds and its pieces say nothing a user can use.
  */
 @Composable
 private fun ReplyProgress(model: String?, status: ReplyStatus?, hasText: Boolean) {
     val stage = when (status) {
         is ReplyStatus.LoadingModel -> stringResource(R.string.status_loading_model)
         is ReplyStatus.Reading -> stringResource(R.string.status_reading)
+        ReplyStatus.Restoring -> stringResource(R.string.status_restoring)
         ReplyStatus.Writing -> stringResource(R.string.status_writing)
         ReplyStatus.Preparing, null -> stringResource(R.string.status_preparing)
     }
     val progress = when (status) {
         is ReplyStatus.LoadingModel -> status.progress
         is ReplyStatus.Reading -> status.fraction
-        ReplyStatus.Preparing, ReplyStatus.Writing, null -> null
+        ReplyStatus.Preparing, ReplyStatus.Restoring, ReplyStatus.Writing, null -> null
     }
     Column(modifier = Modifier.padding(end = 12.dp, top = if (hasText) 0.dp else 4.dp, bottom = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {

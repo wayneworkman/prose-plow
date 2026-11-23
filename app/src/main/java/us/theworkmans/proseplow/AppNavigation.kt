@@ -96,7 +96,7 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
                 factory = viewModelFactory { initializer { SettingsViewModel(session.settings, session.models, contextLimits = session.contextLimits) } },
             )
             val securityViewModel: SecurityViewModel = viewModel(
-                factory = viewModelFactory { initializer { SecurityViewModel(appLock, session) } },
+                factory = viewModelFactory { initializer { SecurityViewModel(appLock, session, session) } },
             )
             val lifecycle = LocalLifecycleOwner.current.lifecycle
             SettingsScreen(

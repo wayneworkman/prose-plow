@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.engine
 
 import java.io.Closeable
+import java.io.IOException
 import java.nio.ByteBuffer
 
 /**
@@ -46,12 +47,20 @@ data class SavedMemory(
  * in this build, for this model file, and that the conversation it was built from is still as it
  * was: the engine compares only the fields of [SavedMemory]. The native session believes what an
  * image says, and a changed one can end the process later, so no unchecked byte may reach it.
+ *
+ * **Refused, or not known now.** A vault that read its image and refused it says so with any
+ * exception, or with -1 from a read, and the engine then deletes the image. A vault that cannot
+ * tell now whether its image is good (its key was destroyed because the app locked, its storage
+ * did not answer) throws [MemoryVaultUnavailableException] instead, from [saved],
+ * [beginRestore] or a read: that says nothing against the image, and the engine keeps it.
  */
 interface MemoryVault {
 
     /**
      * What the vault holds, as its header says once the vault has checked it; null when it holds
      * nothing or nothing that passes its checks (it deletes such a thing itself).
+     *
+     * @throws MemoryVaultUnavailableException when it cannot tell now; the image is kept.
      */
     fun saved(): SavedMemory?
 
@@ -66,6 +75,8 @@ interface MemoryVault {
     /**
      * Begins reading the image that [saved] reported. [MemoryReader.memory] is its header as
      * checked again now: the engine goes on only when it equals what [saved] said.
+     *
+     * @throws MemoryVaultUnavailableException when it cannot tell now; the image is kept.
      */
     fun beginRestore(): MemoryReader
 
@@ -103,9 +114,18 @@ interface MemoryWriter : MemorySink, Closeable {
 }
 
 /**
+ * Says that a [MemoryVault] cannot tell now whether the image it holds is good: the key it opens
+ * images with was destroyed, or its storage did not answer. The engine never deletes an image for
+ * this; see the class comment of [MemoryVault].
+ */
+class MemoryVaultUnavailableException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+/**
  * One restore in progress: [NativeLlama.importMemory] reads the image through [buffer], with this
  * as its source. Every piece [MemorySource.read] returns has been checked by the vault first, and
- * it returns 0 only after the image's last piece, with nothing after it. [close] always follows.
+ * it returns 0 only after the image's last piece, with nothing after it. A read that cannot go
+ * on for a reason that says nothing against the image throws [MemoryVaultUnavailableException];
+ * a piece that was read and refused returns -1. [close] always follows.
  */
 interface MemoryReader : MemorySource, Closeable {
 
@@ -180,9 +200,11 @@ sealed interface MemoryRestoreResult {
     data object AlreadyHeld : MemoryRestoreResult
 
     /**
-     * Nothing was restored, for [reason]. For [Reason.OTHER_CONVERSATION] the image is kept and
-     * waits for its own conversation, unless a request comes first; for every other reason it
-     * was deleted, and the memory is empty when the restore had begun.
+     * Nothing was restored, for [reason]. The image is kept for [Reason.OTHER_CONVERSATION] and
+     * [Reason.UNAVAILABLE], and for [Reason.STOPPED] when the engine itself or the caller stopped
+     * the restore: it then waits for a restore of its own conversation, unless a request comes
+     * first (which deletes it). For every other reason, and when the vault stopped the restore
+     * by refusing a piece, it was deleted. The memory is empty whenever the restore had begun.
      */
     data class NotRestored(val reason: Reason) : MemoryRestoreResult {
         enum class Reason {
@@ -207,8 +229,14 @@ sealed interface MemoryRestoreResult {
             /** The context could not be given a size that holds the image's tokens. */
             CONTEXT_TOO_SMALL,
 
-            /** Forgetting, unloading or the caller stopped the restore, or the vault stopped it. */
+            /**
+             * Forgetting, unloading, loading or the caller stopped the restore (the image is
+             * kept), or the vault stopped it by refusing a piece (the image is deleted).
+             */
             STOPPED,
+
+            /** The vault could not tell now whether its image is good ([MemoryVaultUnavailableException]); the image is kept. */
+            UNAVAILABLE,
 
             /** The vault, the image or the native session failed, or the counts did not agree. */
             FAILED,

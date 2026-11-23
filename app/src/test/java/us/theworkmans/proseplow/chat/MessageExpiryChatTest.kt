@@ -18,6 +18,7 @@ import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.DataLayout
 import us.theworkmans.proseplow.SessionFixture
+import us.theworkmans.proseplow.close
 import us.theworkmans.proseplow.core.chat.MessageLifetime
 import us.theworkmans.proseplow.core.chat.MessageLifetime.Companion.DAY_MILLIS
 import us.theworkmans.proseplow.core.chat.MessageLifetime.Companion.HOUR_MILLIS

@@ -56,6 +56,7 @@ import us.theworkmans.proseplow.security.ProofExpiredException
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.ScreenshotsAllowed
 import us.theworkmans.proseplow.security.SecurityStatus
+import us.theworkmans.proseplow.security.SessionClose
 import us.theworkmans.proseplow.security.UnlockUi
 import us.theworkmans.proseplow.security.WindowSecurity
 import us.theworkmans.proseplow.security.wipe
@@ -96,6 +97,21 @@ interface MessageLifetimeSetting {
     fun changeMessageLifetimeDays(days: Int)
 }
 
+/**
+ * The switch "Keep the model's memory after locking", as the unlocked session holds it
+ * (encrypted). The security settings read it and change it through this.
+ */
+interface ModelMemorySetting {
+    /** False where the platform cannot keep the model's memory safely: the switch is then shown disabled, and says why. */
+    val modelMemorySupported: Boolean
+
+    /** Whether the model's memory is kept now; always false where it is not [modelMemorySupported]. */
+    val keepModelMemory: Boolean
+
+    /** Makes [keep] the setting; off deletes the saved memory at once. Main thread. */
+    fun changeKeepModelMemory(keep: Boolean)
+}
+
 /** What went wrong, said once in words. A wait after wrong attempts is not one of these: it is counted down ([SecurityViewModel.unlockUi]). */
 enum class SecurityError { MISMATCH, TOO_SHORT, TOO_LONG, DIGITS_ONLY, WRONG, EXPIRED, FAILED, SCREENSHOTS_NOT_ALLOWED }
 
@@ -124,8 +140,30 @@ data class SecurityUiState(
  *
  * It lives in the unlocked session's ViewModel store, so a lock or a reset clears it.
  */
-class SecurityViewModel(private val appLock: AppLock<*>, private val lifetimeSetting: MessageLifetimeSetting) : ViewModel() {
+class SecurityViewModel(
+    private val appLock: AppLock<*>,
+    private val lifetimeSetting: MessageLifetimeSetting,
+    private val memorySetting: ModelMemorySetting,
+) : ViewModel() {
     val status: StateFlow<SecurityStatus> = appLock.status
+
+    /** Whether the switch "Keep the model's memory after locking" can be used on this device. */
+    val modelMemorySupported: Boolean get() = memorySetting.modelMemorySupported
+
+    private val _keepModelMemory = MutableStateFlow(memorySetting.keepModelMemory)
+
+    /** Whether the model's memory is kept across a lock; what that switch shows. */
+    val keepModelMemory: StateFlow<Boolean> = _keepModelMemory.asStateFlow()
+
+    /**
+     * The switch "Keep the model's memory after locking". No passphrase is asked for: the app is
+     * unlocked, the choice opens no key, and off only deletes. Off deletes the saved memory at once.
+     */
+    fun setKeepModelMemory(keep: Boolean) {
+        if (!memorySetting.modelMemorySupported) return
+        memorySetting.changeKeepModelMemory(keep)
+        _keepModelMemory.value = memorySetting.keepModelMemory
+    }
 
     private val _messageLifetimeDays = MutableStateFlow(lifetimeSetting.messageLifetimeDays)
 
@@ -369,7 +407,8 @@ class SecurityViewModel(private val appLock: AppLock<*>, private val lifetimeSet
 /**
  * The rows of the Security section: change passphrase, fingerprint unlock and how long the
  * fingerprint works, the background timeout, how long messages are kept and the background
- * maintenance that deletes them while the app is not used, "Lock now", the
+ * maintenance that deletes them while the app is not used, finishing an answer and keeping the
+ * model's memory across a lock, "Lock now", the
  * temporary screenshot allowance and "Reset app data", with their dialogs. It emits its rows into the column of the Settings screen it is placed in (which
  * supplies the section title and the spacing), and needs nothing but its ViewModel.
  *
@@ -421,6 +460,22 @@ fun SecuritySettingsSection(viewModel: SecurityViewModel) {
         ),
         checked = status.finishAnswerAfterLocking,
         onCheckedChange = viewModel::setFinishAnswerAfterLocking,
+    )
+    val keepModelMemory by viewModel.keepModelMemory.collectAsStateWithLifecycle()
+    SwitchRow(
+        title = stringResource(R.string.security_keep_memory),
+        support = when {
+            !viewModel.modelMemorySupported -> stringResource(R.string.security_keep_memory_unavailable)
+            keepModelMemory -> pluralStringResource(
+                R.plurals.security_keep_memory_on,
+                SessionClose.KEEPING_WAIT_SECONDS,
+                SessionClose.KEEPING_WAIT_SECONDS,
+            )
+            else -> stringResource(R.string.security_keep_memory_off)
+        },
+        checked = viewModel.modelMemorySupported && keepModelMemory,
+        enabled = viewModel.modelMemorySupported,
+        onCheckedChange = viewModel::setKeepModelMemory,
     )
     OutlinedButton(onClick = viewModel::lockNow) { Text(stringResource(R.string.security_lock_now)) }
     ScreenshotsRow(viewModel)

@@ -335,6 +335,8 @@ class MainActivity : FragmentActivity() {
     override fun onStart() {
         super.onStart()
         container.appLock.onForeground(this)
+        // After the lock has looked: a lock by itself that was due has ended the session by now.
+        (container.appLock.state.value as? LockState.Unlocked)?.session?.cameOnScreen()
         // Whoever is looking at the app needs no notification that an answer is ready.
         container.answerWork.onInFront(true)
         // Before anything is drawn again: an allowance that ran out while the app was away is over.
@@ -361,6 +363,10 @@ class MainActivity : FragmentActivity() {
         // renewWindows asked for, which comes to the front in its place.
         if (!isChangingConfigurations && !renewing) {
             container.answerWork.onInFront(false)
+            // While still unlocked: what is waiting is written, and the model's memory saved if
+            // enough is new, before the lock's timer starts. A lock that is due at once then
+            // finds that save running and waits for it (within its bound) instead of starting one.
+            (container.appLock.state.value as? LockState.Unlocked)?.session?.leftScreen()
             // Starts the lock's timer and, within this call, the keep-alive that lets it run on
             // time (AppLock.lockPending): Android still allows a foreground service to be started
             // in the first seconds after the screen was left, and no later.

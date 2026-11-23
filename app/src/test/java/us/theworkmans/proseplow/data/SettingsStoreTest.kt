@@ -68,6 +68,26 @@ class SettingsStoreTest {
         assertEquals(SettingsCodec.Decoded.Readable(AppSettings(), schemaVersion = 1), SettingsCodec.decode(SettingsCodec.encode(AppSettings())))
     }
 
+    /**
+     * The switch for the model's memory: on unless stored off, written only when off, and read
+     * as off when what is stored is not a boolean. Catches a default other than on, a file of an
+     * older version read as off, and a value that cannot be read switching saving back on.
+     */
+    @Test
+    fun keepingTheModelsMemoryIsOnUnlessStoredOff() {
+        assertTrue(AppSettings().keepModelMemory)
+        assertFalse(SettingsCodec.encode(AppSettings()).contains("keepModelMemory"))
+        val off = AppSettings(keepModelMemory = false)
+        assertTrue(SettingsCodec.encode(off).contains("\"keepModelMemory\":false"))
+        assertEquals(SettingsCodec.Decoded.Readable(off, schemaVersion = 1), SettingsCodec.decode(SettingsCodec.encode(off)))
+
+        val older = SettingsCodec.decode("""{"schemaVersion":1,"settings":{"systemPrompts":{}}}""") as SettingsCodec.Decoded.Readable
+        assertTrue("a file from before the switch", older.settings.keepModelMemory)
+        val unreadable = SettingsCodec.decode("""{"schemaVersion":1,"settings":{"keepModelMemory":"yes"}}""") as SettingsCodec.Decoded.Readable
+        assertFalse(unreadable.settings.keepModelMemory)
+        assertEquals(1, unreadable.skippedEntries)
+    }
+
     @Test
     fun fieldsThisVersionDoesNotKnowAreIgnored() {
         val decoded = SettingsCodec.decode(

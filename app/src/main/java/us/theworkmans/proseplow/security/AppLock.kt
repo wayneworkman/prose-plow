@@ -268,7 +268,7 @@ class AppLock<S : UnlockedSession>(
      * setting cannot be read. Called off the main thread, under the mutex; may read the stores
      * and may fail.
      */
-    private val openSession: (BlobCipher, Int) -> S,
+    private val openSession: (DataCipher, Int) -> S,
     private val biometricStatus: () -> BiometricStatus,
     /**
      * The temporary permission to take screenshots. It is not part of the lock (locking leaves
@@ -405,8 +405,11 @@ class AppLock<S : UnlockedSession>(
      */
     val lockPending: StateFlow<Boolean> = _lockPending.asStateFlow()
 
+    /** A session that has ended, and how [closeRetired] is to close it ([UnlockedSession.close]). */
+    private class Retired<S>(val live: Live<S>, val how: SessionClose)
+
     /** Sessions that have ended and wait to be closed by [closeRetired]. */
-    private val retired = ConcurrentLinkedQueue<Live<S>>()
+    private val retired = ConcurrentLinkedQueue<Retired<S>>()
 
     /**
      * One job for every closed session, which ends when that session has really stopped
@@ -623,18 +626,26 @@ class AppLock<S : UnlockedSession>(
      * handed to [closeRetired], and with it goes the data key, which stops anything still
      * working on decrypted data. "Lock now" always ends it, and so does a reset, which deletes
      * the files under it.
+     *
+     * How it is closed is decided here too: a lock by itself closes it as [SessionClose.UNATTENDED]
+     * (it may take one more bounded wait to keep what it can for the next unlock); "Lock now", a
+     * reset and a session that was never shown close it as [SessionClose.IMMEDIATE].
      */
     private fun endSession(session: Live<S>, reason: SessionEnd, lockedAt: Long) {
         session.session.clearScreens()
         val finishBehindTheLock = reason == SessionEnd.LOCK_BY_ITSELF && _status.value.finishAnswerAfterLocking &&
             session.session.hasUnfinishedWork() && canFinishOutOfSight()
-        if (finishBehindTheLock) startLease(session, lockedAt) else retire(session)
+        if (finishBehindTheLock) {
+            startLease(session, lockedAt)
+        } else {
+            retire(session, if (reason == SessionEnd.LOCK_BY_ITSELF) SessionClose.UNATTENDED else SessionClose.IMMEDIATE)
+        }
     }
 
-    /** Main thread: [session] has ended. It waits for [closeRetired], which whoever called this arranges. */
-    private fun retire(session: Live<S>) {
+    /** Main thread: [session] has ended, to be closed as [how]. It waits for [closeRetired], which whoever called this arranges. */
+    private fun retire(session: Live<S>, how: SessionClose) {
         unfinished++
-        retired.add(session)
+        retired.add(Retired(session, how))
         refreshSessionEnding()
     }
 
@@ -682,7 +693,7 @@ class AppLock<S : UnlockedSession>(
      * destroyed. Without a lease this changes nothing.
      */
     fun onKeepAliveEnded() {
-        lease?.let(::endLease)
+        lease?.let { endLease(it) }
     }
 
     /**
@@ -692,10 +703,13 @@ class AppLock<S : UnlockedSession>(
      * the lease was due to end at the latest, never later: every caller may run late (a timer
      * that could not run, the check when the app comes to the front, an unlock), and a late end
      * must not count as recent use. See [Lease.latestPeriodStart] for a lease that began late.
+     *
+     * The session is closed as [how]: [SessionClose.UNATTENDED] for every end but "Lock now",
+     * which passes [SessionClose.IMMEDIATE].
      */
-    private fun endLease(parked: Lease<S>) {
+    private fun endLease(parked: Lease<S>, how: SessionClose = SessionClose.UNATTENDED) {
         if (!release(parked)) return
-        retire(parked.live)
+        retire(parked.live, how)
         val endedAt = minOf(clock.elapsedMillis(), parked.untilElapsed, parked.latestPeriodStart)
         launchWork {
             withManager { m ->
@@ -765,9 +779,10 @@ class AppLock<S : UnlockedSession>(
     private suspend fun closeRetired() {
         stopping.removeAll { it.isCompleted }
         while (true) {
-            val ended = retired.poll() ?: return
+            val next = retired.poll() ?: return
+            val ended = next.live
             try {
-                ended.session.close()
+                ended.session.close(next.how)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -895,7 +910,7 @@ class AppLock<S : UnlockedSession>(
      * answer that is being written is stopped, and a lease that is running ends here too.
      */
     fun lock() {
-        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW, lockedAt = clock.elapsedMillis()) else lease?.let(::endLease)
+        if (_state.value is LockState.Unlocked) lockAs(SessionEnd.LOCK_NOW, lockedAt = clock.elapsedMillis()) else lease?.let { endLease(it, SessionClose.IMMEDIATE) }
     }
 
     /**
@@ -906,7 +921,7 @@ class AppLock<S : UnlockedSession>(
      * app that an unlock has opened in the meantime, and without a lease it does nothing.
      */
     fun stopAnswerBehindLock() {
-        if (_state.value is LockState.Locked) lease?.let(::endLease)
+        if (_state.value is LockState.Locked) lease?.let { endLease(it) }
     }
 
     /**
@@ -1547,7 +1562,7 @@ class AppLock<S : UnlockedSession>(
         screenshots.end()
         leaveUnlocked(SessionEnd.RESET)
         // A session that was being finished behind the lock ends with the rest: its files are about to go.
-        lease?.let { if (release(it)) retire(it.live) }
+        lease?.let { if (release(it)) retire(it.live, SessionClose.IMMEDIATE) }
         pendingPurpose = null
         _unlockUi.value = UnlockUi()
         _setupUi.value = SetupUi()

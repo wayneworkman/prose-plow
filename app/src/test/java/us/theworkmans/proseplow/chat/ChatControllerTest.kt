@@ -18,6 +18,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.SessionFixture
+import us.theworkmans.proseplow.close
 import us.theworkmans.proseplow.core.chat.ChatErrorKind
 import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.MessageStatus
@@ -156,7 +157,7 @@ class ChatControllerTest {
 
         session.close()
         assertEquals("a chat with nothing in it is not stored", emptyList<String>(), app.fileNames())
-        assertEquals(1, app.engine.forgetCount)
+        assertEquals(1, app.engine.forgetKeepingSavedCount)
     }
 
     // --- A turn --------------------------------------------------------------------------------
@@ -1408,7 +1409,7 @@ class ChatControllerTest {
 
         assertEquals(0, app.engine.activeGenerations)
         assertEquals(1, app.engine.cancelledGenerations)
-        assertEquals(1, app.engine.forgetCount)
+        assertEquals(1, app.engine.forgetKeepingSavedCount)
         val reply = app.stored(id)!!.messages.last()
         assertEquals("Half ", reply.text)
         assertEquals(MessageStatus.STOPPED, reply.status)

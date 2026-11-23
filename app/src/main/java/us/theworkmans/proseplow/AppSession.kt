@@ -11,6 +11,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -32,14 +33,18 @@ import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.data.CoalescingWriter
 import us.theworkmans.proseplow.data.MemoryStore
 import us.theworkmans.proseplow.data.ModelMemoryFiles
+import us.theworkmans.proseplow.data.ModelMemoryPlatform
 import us.theworkmans.proseplow.data.SealedDirectory
 import us.theworkmans.proseplow.data.SealedFile
+import us.theworkmans.proseplow.data.SealedStreamFile
 import us.theworkmans.proseplow.data.SessionStore
 import us.theworkmans.proseplow.data.SettingsStore
 import us.theworkmans.proseplow.lock.MessageLifetimeSetting
+import us.theworkmans.proseplow.lock.ModelMemorySetting
 import us.theworkmans.proseplow.security.AppFiles
-import us.theworkmans.proseplow.security.BlobCipher
+import us.theworkmans.proseplow.security.DataCipher
 import us.theworkmans.proseplow.security.Purposes
+import us.theworkmans.proseplow.security.SessionClose
 import us.theworkmans.proseplow.security.UnlockedSession
 import java.io.File
 import java.io.IOException
@@ -120,11 +125,17 @@ class DataLayout(files: AppFiles) {
  *   (see [ModelMemoryFiles]). At the opening, before anything else, what has expired of it goes
  *   by the rules that need no key; and every pruning, edit and deletion of a chat's stored
  *   messages deletes the chat's memory before the chat is written.
+ * @param memoryPlatform what the store of the model's saved memory needs of the platform; null
+ *   where the platform cannot keep that memory safely
+ *   ([us.theworkmans.proseplow.data.ModelMemorySupport]). Without it, or with the setting off,
+ *   nothing is saved or restored and any memory file found at the opening is deleted.
+ * @param memorySaveBoundMillis how long a close for a lock by itself waits for the model's memory
+ *   to be saved: the fourth bounded wait of [close].
  * @throws IOException from the constructor when what is stored cannot be looked at. The lock
  *   then shows that the data could not be opened, with Try again, instead of an empty app.
  */
 class AppSession(
-    cipher: BlobCipher,
+    cipher: DataCipher,
     layout: DataLayout,
     private val engine: InferenceEngine,
     val models: List<ModelSpec>,
@@ -138,7 +149,9 @@ class AppSession(
     expiryIntervalMillis: Long? = null,
     lockedMessageLifetimeDays: Int? = null,
     val memoryFiles: ModelMemoryFiles = ModelMemoryFiles(layout.modelMemory, layout.sessions),
-) : UnlockedSession, MessageLifetimeSetting {
+    memoryPlatform: ModelMemoryPlatform? = null,
+    memorySaveBoundMillis: Long = MEMORY_SAVE_BOUND_MILLIS,
+) : UnlockedSession, MessageLifetimeSetting, ModelMemorySetting {
 
     private val _writeFailure = MutableStateFlow<String?>(null)
 
@@ -163,6 +176,15 @@ class AppSession(
     /** The chats, and the reply that may be being written in one of them. */
     val chat: ChatController
 
+    /** The saves of the model's memory; null where the platform cannot keep one ([memoryPlatform]). */
+    private val memoryKeeper: ModelMemoryKeeper?
+
+    /** Whether the app's screen is in front, as the activity last said ([cameOnScreen], [leftScreen]). Main thread only. */
+    private var inSight = true
+
+    /** Set while the session only finishes its answer behind the lock, and once it is ending. Main thread only. */
+    private var finishingOnly = false
+
     init {
         try {
             val settingsStore = SettingsStore.open(
@@ -177,11 +199,13 @@ class AppSession(
             )
             settings = settingsStore
             // Nothing else uses the files yet: what has expired goes before anything is shown or
-            // restored, the model's memory first.
+            // restored, the model's memory first; and all of it where none may be kept now.
             val now = clock.nowMillis()
             memoryFiles.sweep(settingsStore.settings.value.messageLifetime, now)
+            if (memoryPlatform == null || !settingsStore.settings.value.keepModelMemory) deleteMemoryFiles()
             val opened = sessionStore.expireAll(sessionStore.open(), settingsStore.settings.value.messageLifetime, now)
-            chat = ChatController(
+            var keeper: ModelMemoryKeeper? = null
+            val chats = ChatController(
                 store = sessionStore,
                 writer = writer,
                 engine = engine,
@@ -204,7 +228,35 @@ class AppSession(
                 onReplyFinished = answerEvents::onReplyFinished,
                 lifetime = { settingsStore.settings.value.messageLifetime },
                 expiryIntervalMillis = expiryIntervalMillis,
+                memoryVault = { keeper?.vault() },
+                onTurnEnded = ::onTurnEnded,
+                onMemoryRestored = { keeper?.noteRestored() },
             )
+            keeper = memoryPlatform?.let { platform ->
+                val store = MemoryStore(
+                    files = memoryFiles,
+                    conversations = chats,
+                    build = platform.build,
+                    modelFileLength = platform.modelFileLength,
+                    lifetime = { settingsStore.settings.value.messageLifetime },
+                    clock = clock,
+                    streamFile = { file, purpose -> SealedStreamFile(file, purpose, cipher) },
+                    freeSpace = platform.freeSpace,
+                    setFileDate = { file, millis -> file.setLastModified(millis) },
+                    beforeAppend = platform.beforeAppend,
+                )
+                ModelMemoryKeeper(
+                    engine = engine,
+                    store = store,
+                    ioDispatcher = ioDispatcher,
+                    heldConversation = chats::heldConversationKey,
+                    requestsBuilt = { chats.requestsBuilt },
+                    enabled = settingsStore.settings.value.keepModelMemory,
+                    saveBoundMillis = memorySaveBoundMillis,
+                )
+            }
+            chat = chats
+            memoryKeeper = keeper
         } catch (e: Exception) {
             // The session was never opened: its writer must not stay behind.
             writerScope.cancel()
@@ -212,8 +264,22 @@ class AppSession(
             throw e
         }
         val chats = chat
+        val savingOutOfSight = memoryKeeper?.savingOutOfSight ?: MutableStateFlow(false)
         watchScope.launch {
-            chats.state.map { it.turn != null }.distinctUntilChanged().collect { writing -> answerEvents.onWriting(writing) }
+            // A save that an answer ending out of sight asked for counts as part of that answer:
+            // the keep-alive that was running for it covers the save too.
+            combine(chats.state.map { it.turn != null }, savingOutOfSight) { writing, saving -> writing || saving }
+                .distinctUntilChanged()
+                .collect { writing -> answerEvents.onWriting(writing) }
+        }
+    }
+
+    /** Deletes the model's saved memory, without the key; what cannot be deleted now is tried again at the next opening. */
+    private fun deleteMemoryFiles() {
+        try {
+            memoryFiles.deleteAll()
+        } catch (_: IOException) {
+            // See above.
         }
     }
 
@@ -243,11 +309,55 @@ class AppSession(
         _writeFailure.value = null
     }
 
+    override val modelMemorySupported: Boolean get() = memoryKeeper != null
+
+    override val keepModelMemory: Boolean get() = memoryKeeper != null && settings.settings.value.keepModelMemory
+
+    /**
+     * The switch "Keep the model's memory after locking". Main thread. Off deletes the saved
+     * memory at once and stops a save that is running; nothing is then saved or restored until
+     * it is turned on again. Does nothing where the platform cannot keep the memory.
+     */
+    override fun changeKeepModelMemory(keep: Boolean) {
+        val keeper = memoryKeeper ?: return
+        settings.update(urgent = true) { it.copy(keepModelMemory = keep) }
+        keeper.setEnabled(keep)
+    }
+
     /**
      * Hands everything that is waiting to be written to the disk now, without waiting for it.
      * Called when the app leaves the screen: the process may not live to see the lock.
      */
     fun flushWrites() = writer.flush()
+
+    /**
+     * The app's screen has left the front for real (not for a rotation). Main thread. What is
+     * waiting is written now ([flushWrites]), and, while the app is unlocked and no answer is
+     * being written, the model's memory is saved if the engine finds enough new in it
+     * ([us.theworkmans.proseplow.core.engine.SaveTrigger.LEFT_SCREEN]): the process may be frozen
+     * or ended before the lock comes.
+     */
+    fun leftScreen() {
+        flushWrites()
+        inSight = false
+        saveIfIdle(outOfSight = false)
+    }
+
+    /** The app's screen is in front again. Main thread. */
+    fun cameOnScreen() {
+        inSight = true
+    }
+
+    /** A reply has ended ([ChatController]'s `onTurnEnded`); out of sight, the memory is saved as on leaving the screen. */
+    private fun onTurnEnded() {
+        if (!inSight) saveIfIdle(outOfSight = true)
+    }
+
+    /** Asks for a save on leaving the screen only while the session is unlocked and on its own, and nothing is being written. */
+    private fun saveIfIdle(outOfSight: Boolean) {
+        if (finishingOnly || chat.state.value.turn != null) return
+        memoryKeeper?.saveOnLeaving(outOfSight)
+    }
 
     /**
      * Clears the screens' ViewModels: when the app locks, and when the activity finishes (not for
@@ -268,16 +378,30 @@ class AppSession(
     }
 
     /** Behind the lock: the answer that is being written is finished and saved; nothing else begins. */
-    override fun finishOnly() = chat.finishOnly()
+    override fun finishOnly() {
+        finishingOnly = true
+        chat.finishOnly()
+    }
 
-    override fun resume() = chat.resume()
+    override fun resume() {
+        finishingOnly = false
+        inSight = true
+        chat.resume()
+    }
 
     /**
      * Ends the session, in this order:
-     * 1. The reply in flight is stopped. What was written of it is kept, marked as stopped, and
-     *    handed to the writer with everything else that changed.
-     * 2. The engine forgets the conversation; the model stays loaded.
-     * 3. The writer accepts nothing more and gets [writeTimeoutMillis] to finish what it was
+     * 1. The reply in flight is stopped, and a restore of the model's memory in progress with
+     *    it. What was written of the reply is kept, marked as stopped, and handed to the writer
+     *    with everything else that changed.
+     * 2. The model's memory. For a close that nobody waits at ([SessionClose.UNATTENDED]: the app
+     *    locked by itself, or an answer finished behind the lock has ended) a save that is
+     *    running is joined, or one is started, and waited for at most the save bound (ten
+     *    seconds). Then, and at once for "Lock now" and a reset ([SessionClose.IMMEDIATE]),
+     *    whatever is still saving is stopped. A memory saved before stays on disk either way.
+     * 3. The engine forgets the conversation without deleting what was saved of it
+     *    ([InferenceEngine.forgetKeepingSavedMemory]); the model stays loaded.
+     * 4. The writer accepts nothing more and gets [writeTimeoutMillis] to finish what it was
      *    given.
      *
      * Then this returns, and the lock destroys the data key. Every step is bounded, so that a
@@ -289,9 +413,12 @@ class AppSession(
      * disk when the disk lets it; everything queued behind it fails, because sealing needs the
      * key. [awaitStopped] waits for that last write, for the reset. Until it has ended, another
      * unlock can already be writing the same file, and the late write may then replace the
-     * newer content with what this session had; the stores cannot tell the two apart.
+     * newer content with what this session had; the stores cannot tell the two apart. The
+     * same holds for a save of the model's memory: its writer thread may still be writing
+     * ciphertext, and [awaitStopped] waits for it as well.
      */
-    override suspend fun close() {
+    override suspend fun close(how: SessionClose) {
+        withContext(NonCancellable + mainDispatcher) { finishingOnly = true }
         try {
             chat.shutdown()
         } finally {
@@ -299,34 +426,40 @@ class AppSession(
             watchScope.cancel()
             withContext(NonCancellable + mainDispatcher) { answerEvents.onWriting(false) }
             try {
-                forgetConversation()
+                memoryKeeper?.close(how)
             } finally {
-                withTimeoutOrNull(writeTimeoutMillis) { writer.closeAndJoin() }
-                // Not joined: a blocking write cannot be cancelled, and waiting for it here is
-                // what would keep the key alive.
-                writerScope.cancel()
+                try {
+                    forgetConversation()
+                } finally {
+                    withTimeoutOrNull(writeTimeoutMillis) { writer.closeAndJoin() }
+                    // Not joined: a blocking write cannot be cancelled, and waiting for it here is
+                    // what would keep the key alive.
+                    writerScope.cancel()
+                }
             }
         }
     }
 
     /**
-     * Returns when the writer has really ended: when the write that [close] may have left
-     * behind has returned, however long that takes. Nothing of this session touches a file after
-     * that.
+     * Returns when the writer has really ended (the write that [close] may have left behind has
+     * returned), and every writer thread of a save of the model's memory with it, however long
+     * that takes. Nothing of this session touches a file after that.
      */
     override suspend fun awaitStopped() {
         writerScope.coroutineContext.job.join()
+        memoryKeeper?.awaitStopped()
     }
 
     /**
-     * Makes the engine drop the conversation, and waits for that, but not for ever. The request
-     * is made in a scope of its own: once made it is carried out even if this session's close is
-     * given up on.
+     * Makes the engine drop the conversation, and waits for that, but not for ever. What was
+     * saved of the memory stays for the next unlock: a memory that had to go was deleted when its
+     * messages went. The request is made in a scope of its own: once made it is carried out even
+     * if this session's close is given up on.
      */
     private suspend fun forgetConversation() {
         val forgetting = CoroutineScope(ioDispatcher).launch {
             try {
-                engine.forget()
+                engine.forgetKeepingSavedMemory()
             } catch (e: CancellationException) {
                 throw e
             } catch (_: RuntimeException) {
@@ -345,6 +478,9 @@ class AppSession(
 
     private companion object {
         const val WRITE_TIMEOUT_MILLIS = 10_000L
+
+        /** How long a close for a lock by itself waits for the model's memory to be saved. */
+        const val MEMORY_SAVE_BOUND_MILLIS = SessionClose.KEEPING_WAIT_SECONDS * 1000L
 
         /** How far the files may lag behind a reply that is streaming or a text that is being typed. */
         const val LAZY_WRITE_MILLIS = 1_000L

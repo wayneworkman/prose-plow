@@ -37,6 +37,13 @@ object NativeEngine {
     fun availableModels(context: Context): List<ModelSpec> = ModelFiles.present(context.applicationContext)
 
     /**
+     * The length in bytes of the file of [model] as this build carries it, or null when it does
+     * not carry it. A saved memory of a model is bound to this length, so that a memory saved
+     * with one file of a model is never read into another.
+     */
+    fun packagedLength(context: Context, model: ModelSpec): Long? = ModelFiles.packagedLength(context.applicationContext, model)
+
+    /**
      * A line about the native side for an About or diagnostics screen: which processor variant
      * of the backend was loaded and the instruction sets it uses. Loads the native libraries if
      * they are not loaded yet. It describes the device, never a conversation.

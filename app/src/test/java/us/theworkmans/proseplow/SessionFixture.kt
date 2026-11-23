@@ -2,6 +2,7 @@ package us.theworkmans.proseplow
 
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
+import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.chat.OpenChat
 import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.FakeClock
@@ -12,11 +13,16 @@ import us.theworkmans.proseplow.core.engine.FakeInferenceEngine
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
+import us.theworkmans.proseplow.data.BuildIdentity
+import us.theworkmans.proseplow.data.FreeSpace
+import us.theworkmans.proseplow.data.ModelMemoryPlatform
 import us.theworkmans.proseplow.security.AppFiles
-import us.theworkmans.proseplow.security.BlobCipher
+import us.theworkmans.proseplow.security.DataCipher
 import us.theworkmans.proseplow.security.DataCrypto
+import us.theworkmans.proseplow.security.SessionClose
 import us.theworkmans.proseplow.security.TestKeys
 import java.io.File
+import java.nio.ByteBuffer
 
 /**
  * What a test needs to open the real [AppSession] again and again over one directory, as the
@@ -37,14 +43,24 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
     /** What the device of the next session allows a model's context; a device with plenty of memory unless a test says otherwise. */
     var contextLimits = DeviceContextLimits()
 
+    /**
+     * What the next session's store of the model's memory knows of the platform; null stands for
+     * a version of Android on which no memory is kept. A platform that keeps one unless a test
+     * says otherwise: every model of the catalogue 1 GB long, plenty of space.
+     */
+    var memoryPlatform: ModelMemoryPlatform? = testMemoryPlatform()
+
     private var unlocks = 0
 
     /**
      * A session as the lock opens one. Ids are `u<unlock>-<n>`, so a test can name a chat or a
      * message and ids of different unlocks never collide.
      */
-    fun open(cipher: BlobCipher = this.cipher, engine: InferenceEngine = this.engine): AppSession =
-        AppSession(cipher, layout, engine, models, dispatcher, dispatcher, clock, SequentialIds("u${++unlocks}-"), contextLimits = contextLimits)
+    fun open(cipher: DataCipher = this.cipher, engine: InferenceEngine = this.engine, answerEvents: AnswerEvents = AnswerEvents.None): AppSession =
+        AppSession(
+            cipher, layout, engine, models, dispatcher, dispatcher, clock, SequentialIds("u${++unlocks}-"),
+            answerEvents = answerEvents, contextLimits = contextLimits, memoryPlatform = memoryPlatform,
+        )
 
     /** The session [id] as it is on disk right now, or null when it has no file. */
     fun stored(id: String): ChatSession? {
@@ -72,3 +88,20 @@ class SessionFixture(root: File, scheduler: TestCoroutineScheduler) {
 
 /** The chat on screen, which the test expects to be a readable one. */
 val AppSession.openSession: ChatSession get() = (chat.state.value.open as OpenChat.Ready).session
+
+/**
+ * Closes the session as "Lock now" and a reset do ([SessionClose.IMMEDIATE]), for the tests that
+ * are not about which kind of close it is.
+ */
+suspend fun AppSession.close() = close(SessionClose.IMMEDIATE)
+
+/**
+ * A platform on which the model's memory is kept, for tests: one build, every model of the
+ * catalogue 1 GB long, plenty of free space. [beforeAppend] stands for the disk of a save.
+ */
+fun testMemoryPlatform(beforeAppend: (ByteBuffer) -> Unit = {}): ModelMemoryPlatform = ModelMemoryPlatform(
+    build = BuildIdentity(versionCode = 1, lastUpdateMillis = 1_000),
+    modelFileLength = { id -> if (ModelCatalog.all.any { it.id == id }) 1L shl 30 else null },
+    freeSpace = { FreeSpace(usableBytes = 1L shl 40, totalBytes = 1L shl 40) },
+    beforeAppend = beforeAppend,
+)

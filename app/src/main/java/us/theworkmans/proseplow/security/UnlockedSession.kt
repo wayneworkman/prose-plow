@@ -3,7 +3,7 @@ package us.theworkmans.proseplow.security
 /**
  * Everything that holds or reads decrypted data while the app is unlocked: the stores, their
  * writers, whatever works on their content, and the state of the screens. [AppLock] has one made
- * at every unlock, handing it the [BlobCipher] of that unlock, and ends it when the app locks.
+ * at every unlock, handing it the [DataCipher] of that unlock, and ends it when the app locks.
  * Nothing outside a session may keep decrypted data or the cipher.
  *
  * The lock only knows this interface, not what a session contains. The order at a lock is fixed:
@@ -61,14 +61,16 @@ interface UnlockedSession {
     /**
      * Stops all work of the session, gives the writes that are queued their time to reach the
      * disk, and lets go of everything decrypted. Called once, off the main thread, after
-     * [clearScreens].
+     * [clearScreens]. [how] says what kind of end it is: whether the session may take one more
+     * bounded wait to keep something for the next unlock ([SessionClose.UNATTENDED]) or must
+     * wait for nothing it can drop ([SessionClose.IMMEDIATE]).
      *
      * It must return within a bounded time, whatever the session is stuck in: the data key is
      * destroyed when this returns, and a write that hangs must not keep it alive. What is left
      * running then can seal nothing more. At most a write whose bytes were already sealed can
      * still reach the disk, which is what [awaitStopped] is for.
      */
-    suspend fun close()
+    suspend fun close(how: SessionClose)
 
     /**
      * Returns only when nothing of the session can touch a file any more, however long that
@@ -77,4 +79,35 @@ interface UnlockedSession {
      * here, which is the default.
      */
     suspend fun awaitStopped() {}
+}
+
+/**
+ * What kind of end [UnlockedSession.close] is closing a session for. The lock decides it in one
+ * place, from why the session ended; the session decides what it does with it.
+ */
+enum class SessionClose {
+    /**
+     * The user's own "Lock now" (also when it ends an answer being finished behind the lock), a
+     * reset, or a session that was never shown: the strongest end. Nothing is waited for that can
+     * be dropped, and nothing new is begun.
+     */
+    IMMEDIATE,
+
+    /**
+     * The app locked by itself, or an answer that was being finished behind the lock ended (by
+     * itself, at its time limit, with the keep-alive, or by "Stop the answer"). Nobody is waiting
+     * at that moment, and the session may take one more bounded wait to keep for the next unlock
+     * what it can, for at most [KEEPING_WAIT_SECONDS].
+     */
+    UNATTENDED,
+    ;
+
+    companion object {
+        /**
+         * How long a close as [UNATTENDED] may wait, beside the waits every close has, to keep
+         * something for the next unlock (the model's memory): ten seconds. The setting that
+         * keeps the model's memory states it, so it is taken from here.
+         */
+        const val KEEPING_WAIT_SECONDS: Int = 10
+    }
 }

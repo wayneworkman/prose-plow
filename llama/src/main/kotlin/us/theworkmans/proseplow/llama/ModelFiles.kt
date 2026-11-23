@@ -65,6 +65,16 @@ internal object ModelFiles {
      */
     fun present(context: Context): List<ModelSpec> = ModelCatalog.offered { locate(context, it) != null }
 
+    /** The length of [model]'s asset, or null when this build does not carry it or it cannot be opened as a file. */
+    fun packagedLength(context: Context, model: ModelSpec): Long? {
+        val location = locate(context, model) as? ModelLocation.Asset ?: return null
+        return try {
+            context.assets.openFd(location.path).use { it.length }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
     /**
      * Opens [location] and passes the descriptor with the offset and length of the model's bytes
      * to [use]; the descriptor is closed when [use] returns.

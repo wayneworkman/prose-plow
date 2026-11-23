@@ -80,7 +80,9 @@ Chats:
   available, and
   it takes no step that would leave too little. The chat says when the context has grown and
   when it could not. Locking the app gives the memory back, and so does the next answer in
-  another conversation that needs no more than the starting size.
+  another conversation that needs no more than the starting size. Each size on the model's page
+  says the memory it takes and, at worst, how long reading it all again takes: what an answer
+  after a lock costs when the model's saved memory of the conversation cannot be used.
   [The context grows with the conversation](#the-context-grows-with-the-conversation) has
   the numbers.
 - **Long conversations.** At the limit of the context, the oldest messages are left out of
@@ -103,8 +105,8 @@ Chats:
 
 Privacy:
 
-- **Encrypted storage.** Chats, drafts, the list of chats and the settings are only ever written
-  to the phone encrypted (AES-256-GCM).
+- **Encrypted storage.** Chats, drafts, the list of chats, the settings and the model's saved
+  memory of a conversation are only ever written to the phone encrypted (AES-256-GCM).
 - **A mandatory lock.** The first start asks for a passphrase of at least 10 characters that is
   not only digits, so a PIN is refused. There is no way to use the app without one and no
   setting that turns the lock off.
@@ -139,7 +141,7 @@ Privacy:
   while an answer is being written, the screen is locked as always, and behind it that one
   answer is finished and saved before the encryption key is erased. The price: until then the
   key is still in memory, for at most ten minutes and then the closing of the session, which
-  takes at most three waits of ten seconds each (see [The lock](#the-lock)). Unlocking in that time takes the full
+  takes at most four waits of ten seconds each (see [The lock](#the-lock)). Unlocking in that time takes the full
   passphrase or fingerprint check as always and brings you back to the answer under way. "Lock
   now" never waits: it stops the answer and erases the key at once. The answer is not finished
   behind the lock, but stopped at the lock as with the setting off, when Android has the app's
@@ -148,6 +150,16 @@ Privacy:
   and the key erased at that moment. While an answer is being finished, the lock screen says so
   and offers "Stop the answer", which needs no passphrase: it stops the answer, keeps what was
   written as a stopped answer and erases the key at once.
+- **Keeps the model's memory across a lock**, unless you turn that off, on Android 12 and
+  later. What the model has read of the conversation it worked on last is saved, encrypted like
+  the chats, when you leave the app and when it locks by itself, so that after unlocking the
+  next answer reads only what is new instead of the whole conversation again. The price: up to
+  about 1.5 GB of storage, a lock by itself that can take up to ten seconds longer while the
+  save finishes (the key stays in memory for that time), and far more old encrypted data on the
+  phone's storage (see [What this does not protect against](#what-this-does-not-protect-against)).
+  "Lock now" never waits for it and saves nothing; what an earlier save kept is used. Turning it
+  off deletes the saved memory at once. On Android 9 to 11 it does not exist (see
+  [What stays in memory](#what-stays-in-memory)).
 - **Ends its own process when it is locked.** Once the app is locked, has nothing left to
   finish and is not on screen, it ends its process, because that is the only thing that
   removes every copy of a conversation from memory. Opening it again starts it afresh, at the
@@ -293,15 +305,23 @@ needs more.
   can be carried over, and reads only what is new. Where it cannot, the conversation is read
   again from the start, and the chat says so.
 - **What a long conversation costs after a lock.** When the app is locked and left, its
-  process ends (see [The lock](#the-lock)), and the next answer in a conversation reads all of
-  it again. By the curve measured on the tested phone, 7,168 tokens take Qwen3.5 about two
+  process ends (see [The lock](#the-lock)). The model's memory of the conversation it worked on
+  last is saved before that (see [The lock](#the-lock)), and after the unlock it is read back
+  instead (on the tested phone a 600 MB save took about two seconds out of sight; the reading
+  back has not been timed on the phone as a whole), so the next answer reads only what is new.
+  The whole conversation is read again only when that memory cannot be used: with the setting
+  off, below Android 12, after an update of the app, when Android ended the app before it was
+  saved, when the model reads that conversation again in under twenty seconds anyway (Boris-2
+  always does), when "Lock now" came before any save of what is new, or when a lock had to give
+  its save up after ten seconds. Then, by the curve measured on the tested phone, 7,168 tokens take Qwen3.5 about two
   minutes, 10,240 about three, 16,384 about five and a half, 32,768 about fourteen, and the
   111,616 that the phone's memory allows it about an hour and forty minutes (everything
   beyond 15,872 tokens extrapolated). Peacebell reads 9,216 tokens in under two minutes,
   16,384 in about four, and the 20,480 that the phone's memory allows it in about six.
   Behind the lock nothing changes for that: an answer that is still being read or
   written ten minutes after the app locked is stopped. A conversation that takes longer than
-  that to read has to be read with the app open.
+  that to read has to be read with the app open. The times a model's page shows for each size
+  are these worst cases.
 - **Giving it back.** Clearing the model's memory returns the context to its starting size.
   That happens at every lock, and when an answer is asked for in another conversation that
   fits the starting size: the little the two conversations have in common (1,024 tokens at
@@ -433,8 +453,8 @@ sealed with AES-256-GCM under its own random nonce and bound to the header, the 
 `model-memory:<chat id>`, its place in the stream and whether it is the last. At most one exists,
 and it is deleted whenever a message it was made from is pruned, edited or deleted. It is written
 to a temporary file and renamed without the two `fsync`s, because it can always be made again and
-a damaged one fails authentication; its deletion is flushed. The app does not write one yet: the
-store is there, but nothing calls it.
+a damaged one fails authentication; its deletion is flushed. When it is written and read back is
+described under [The lock](#the-lock) and [What stays in memory](#what-stays-in-memory).
 
 ### The key hierarchy
 
@@ -519,14 +539,38 @@ optionally a second time by a fingerprint key.
   and the notification is simply not shown in the notification drawer; Android then still lists
   the app among the active apps in the quick settings.
 - When it locks, the screens are torn down at once, a reply that is being written is stopped and
-  kept as a stopped message (the lock waits up to ten seconds for the engine to let go), the
-  inference engine is told to forget the conversation (again up to ten seconds), the writes
-  that are waiting get up to ten seconds to finish, and the data key is overwritten with zeros
-  whether or not any of that did. Closing a session therefore takes at most three waits of ten
-  seconds each, plus the moment a passphrase check that is running at the same time needs to
-  return. A write that the storage does not complete in that time is
-  not waited for, so that it cannot keep the key in memory; only a reset waits for it, because
-  a reset deletes the files.
+  kept as a stopped message (the lock waits up to ten seconds for the engine to let go), and so
+  is a restore of the model's memory that is under way. Then the model's memory of the
+  conversation is saved, for a lock by itself and at the end of an answer finished behind the
+  lock: a save that began when the app left the screen is waited for, or one is begun if what is
+  on disk is not already what the model holds, for at most ten seconds in all; then whatever is
+  still saving is stopped. "Lock now" and a reset skip this step: they wait for no save, begin
+  none, and stop one that is under way, and a memory an earlier save completed stays on disk.
+  Then the inference engine is told to forget the conversation and keep what was saved of it
+  (again up to ten seconds), the writes that are waiting get up to ten seconds to finish, and
+  the data key is overwritten with zeros whether or not any of that did. Closing a session
+  therefore takes at most four waits of ten seconds each (three for "Lock now" and a reset),
+  plus the moment a passphrase check that is running at the same time needs to return. A write
+  that the storage does not complete in that time is not waited for, so that it cannot keep
+  the key in memory; only a reset waits for it, because a reset deletes the files. A save of
+  the model's memory that was stopped is the same: its own thread may still write a chunk that
+  was encrypted before the key went, and then removes what it wrote; the process does not end
+  before that thread has returned. An unlock that comes while a lock is still saving waits for
+  that lock to finish, within the same bounds.
+- **When the model's memory is saved.** Only on Android 12 and later, and while "Keep the
+  model's memory after locking" is on (the default). When the app leaves the screen unlocked
+  and no answer is being written, the model's memory of the conversation it worked on last is
+  saved, provided reading again what is new since the last save would take the model more than
+  about ten seconds; when an answer ends while the app is out of sight and still unlocked, the
+  same, and the service that kept the app running for the answer stays until that save has
+  ended. A memory is saved at all only when reading it again would take at least twenty
+  seconds. Saving on leaving the screen is the main path, because Android freezes the app about
+  a minute after it leaves the screen and the lock's timer may then run late; on the tested
+  phone a 600 MB save begun when the screen was left took about two seconds. At most one saved
+  memory exists. After an unlock it is read back for the chat on screen once its model is
+  loaded, before the first answer ("Restoring the conversation…" under a reply that waits for
+  it), and checked first against the build, the model file and the chat's messages as they are
+  now; whenever it does not fit, it is deleted and the conversation is read as before.
 - **An answer can be finished behind the lock.** When the app locks by itself (the timeout, or
   the check on coming back) while an answer is being written, and "Finish the answer after
   locking" is on (the default), everything above happens for the screen: it is torn down, the
@@ -540,8 +584,8 @@ optionally a second time by a fingerprint key.
   nothing would then keep the app awake to end the session on time. When that one answer is
   finished, ten minutes after the moment of locking if it is not, or the moment Android stops
   that service on the way (the answer is then stopped and kept as a stopped message), the
-  session is closed in the order described above, which takes at most three waits of ten
-  seconds, and the key is overwritten.
+  session is closed in the order described above, the model's memory with the finished answer
+  saved on the way, which takes at most four waits of ten seconds, and the key is overwritten.
   The ten minutes count whatever the model is doing: reading a long conversation again is
   part of the answer, so one that takes longer than that to read is not finished behind the
   lock (see [The context grows with the conversation](#the-context-grows-with-the-conversation)).
@@ -671,7 +715,8 @@ it or losing the phone loses the chats.
   has made it grow, up to a quarter of the phone's memory (see
   [The context grows with the conversation](#the-context-grows-with-the-conversation)).
 - When the session is closed (at a lock, or when an answer that was finished behind the lock
-  is saved), the data key's array is zeroed and the key refuses every further use, and the
+  is saved), and after the model's memory was saved where the lock saves it (up to ten seconds
+  in which the key and the conversation are still in memory), the data key's array is zeroed and the key refuses every further use, and the
   engine clears the model's memory of the conversation: the native session overwrites its own
   buffers and the saved checkpoints in place before it frees them, which takes between 15 and
   about 160 milliseconds on the phone that was tested, depending on the model. That was
@@ -691,6 +736,17 @@ it or losing the phone loses the chats.
   measured (the three bundled ones and Shard-2), and copies of the prompt's token numbers for
   all four, some of them even after the session was closed (the
   token numbers of replies were not). Java strings cannot be overwritten at all.
+- Saving and reading back the model's memory hands it to Android's AES-GCM one chunk of 4 MiB
+  at a time, from a buffer outside the Java heap that is overwritten after every chunk; none of
+  it passes through a Java array. What the cipher itself keeps of the chunk it last worked on is
+  not the app's to wipe. On Android 9, 10 and 11 the platform's cipher copies every chunk it is
+  given into memory of its own that cannot be wiped, which would leave the model's memory of a
+  conversation (and, in its first chunk, the token numbers) in the process at every save and
+  restore; so there the app never saves or restores it, deletes a saved memory it finds, and
+  shows the setting disabled. From Android 12 on that copy is not made; what the cipher keeps
+  beyond that was not verified in Android's source. When llama.cpp reads a saved memory back,
+  it gathers the token numbers of the whole conversation in lists that the native session
+  overwrites before freeing them (measured on a desktop, not on the phone).
 - **So the process is ended.** When the app is locked, has nothing left to finish and is not
   on screen, it ends its own process (see "The lock"), and with the process every one of
   those copies is released, in the app's memory and in the native library's. Until that
@@ -708,7 +764,7 @@ it or losing the phone loses the chats.
   collector made when it moved the array in memory before it was overwritten.
 - While an answer is being finished behind the lock, everything of the first point is still in
   memory, the data key included: for at most ten minutes, and then for as long as the session
-  takes to close (at most three waits of ten seconds each, see [The lock](#the-lock)).
+  takes to close (at most four waits of ten seconds each, see [The lock](#the-lock)).
 - While the app is unlocked and out of sight, waiting to lock itself, everything of the first
   point is in memory as well, for the time chosen. The app keeps itself running for that time so
   that the lock happens on time; where Android does not allow that, the process is frozen with
@@ -787,12 +843,16 @@ it or losing the phone loses the chats.
   notification "Unlocked; it locks itself when its time is up." also tells anyone who sees the
   phone's notifications that the app is unlocked.
 - **The minutes in which an answer is finished behind the lock.** With "Finish the answer after
-  locking" on, the lock screen shows, but for up to ten minutes, and the half minute at most
+  locking" on, the lock screen shows, but for up to ten minutes, and the forty seconds at most
   that closing the session then takes, the data key and the conversation are in memory as if
   the app were unlocked. Nothing on the screen or in the
   app's interface gives access to them without the passphrase or the fingerprint; an attacker
   who can read the memory of the process in that time (a compromised phone, see below) finds
   them. Turn the setting off, or use "Lock now", if that matters more than the answer.
+- **The seconds a lock by itself spends saving the model's memory.** With "Keep the model's
+  memory after locking" on, a lock by itself keeps the data key and the conversation in memory
+  for up to ten seconds more while the save finishes. "Lock now" does not, and the setting can
+  be turned off.
 - **A compromised phone.** Root access, malware with system privileges or an exploited system
   can read the app's memory while it is unlocked, record what is typed and capture the screen
   whatever the window says. The app relies on Android's separation of apps.
@@ -825,7 +885,9 @@ it or losing the phone loses the chats.
   storage, without knowing any key, can replace a chat or the settings with an older copy of
   the same file, and can put back a chat that was deleted; the app accepts both without
   notice. An older `lock.json` is accepted in the same way unless the passphrase was changed
-  after it was written. On a phone that is not rooted only the app itself can write there
+  after it was written. An older saved memory of the model put back is used only as the memory
+  of the very messages it was made from, so it changes no answer, and it is still deleted with
+  its chat or its oldest message. On a phone that is not rooted only the app itself can write there
   (and, for a debug build, a computer that is authorised for USB debugging).
 - **Another app that imitates this one.** The app cannot show you that the screen in front is
   its own. On Android 9 and 10 an installed app can make one of its screens appear when this
@@ -840,8 +902,9 @@ it or losing the phone loses the chats.
 - **What the files reveal without being decrypted**, to someone who can read the app's private
   storage: that the app is installed and which models it carries, how many chats there are, their
   sizes and the dates of their newest messages, whether the model's memory of a conversation is
-  kept, for which chat, its size (and so roughly how long that conversation is) and the date of
-  its oldest message, and the content of `lock.json` (whether fingerprint
+  kept, for which chat, its size (and so roughly how long that conversation is), the date of
+  its oldest message and, by when the file last changed, roughly when the app last left the
+  screen or locked, and the content of `lock.json` (whether fingerprint
   unlock is on and for how long, whether an answer is finished after locking, how many wrong
   attempts were made and when, how long messages are kept, the latest trusted time, and when,
   on the clock since the phone's start, the app last locked or was unlocked).
@@ -870,7 +933,9 @@ it or losing the phone loses the chats.
   storage when each chat last changed.
 - **Old ciphertext on the flash storage.** Deleting a chat deletes its file; the phone's storage
   may keep the encrypted bytes until it reuses the space. They stay as unreadable as they were,
-  and after a reset the keys that could open them are gone.
+  and after a reset the keys that could open them are gone. Keeping the model's memory makes far
+  more of them: every save writes the whole memory again, up to about 1.5 GB, and the one it
+  replaces is only deleted. Turning the setting off stops that.
 - **An old data key.** Changing the passphrase wraps the same data key again; it does not
   encrypt the chats anew. Only a reset replaces the data key.
 - **What another app does with a link.** A link you choose to open is handed to another app,
@@ -1472,12 +1537,12 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 468 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, saving the memory and reading it back (not yet used by the app), stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 792 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 471 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 817 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, the switch, and Android below 12; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
-| `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark | `./gradlew :app:connectedDebugAndroidTest` |
+| `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark, the sealed stream's frozen vectors and a stream of three 4 MiB chunks through the phone's own AES-GCM | `./gradlew :app:connectedDebugAndroidTest` |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
 The test counts are those of the commit named above. The two suites that need a phone are not

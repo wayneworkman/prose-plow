@@ -31,6 +31,9 @@ sealed interface ReplyStatus {
     /** The engine is getting ready (it may still be ending the reply before). */
     data object Preparing : ReplyStatus
 
+    /** The model's saved memory of the conversation is being read back, in place of reading the conversation again. */
+    data object Restoring : ReplyStatus
+
     /** The conversation is being read into the model's memory; [fraction] runs from 0 to 1. */
     data class Reading(val fraction: Float) : ReplyStatus
 
@@ -97,7 +100,7 @@ data class ChatUiState(
             val turn = chat.turn?.takeIf { it.sessionId == chat.open.id } ?: return null
             return when (val phase = turn.phase) {
                 TurnPhase.Preparing -> (chat.engine as? EngineState.Loading)?.let { ReplyStatus.LoadingModel(it.modelId, it.progress) }
-                    ?: ReplyStatus.Preparing
+                    ?: if (chat.restoringMemory) ReplyStatus.Restoring else ReplyStatus.Preparing
                 is TurnPhase.ReadingPrompt ->
                     ReplyStatus.Reading(if (phase.totalTokens > 0) (phase.evaluatedTokens.toFloat() / phase.totalTokens).coerceIn(0f, 1f) else 0f)
                 TurnPhase.Writing -> ReplyStatus.Writing

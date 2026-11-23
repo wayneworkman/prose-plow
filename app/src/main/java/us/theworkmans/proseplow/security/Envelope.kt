@@ -146,6 +146,12 @@ interface BlobCipher {
 }
 
 /**
+ * Both ciphers of an unlocked session in one object: what the lock hands every session it opens.
+ * A store sees only the half it needs.
+ */
+interface DataCipher : BlobCipher, ChunkCipher
+
+/**
  * The [BlobCipher] and the [ChunkCipher] of an unlocked session, using the data key. [destroy]
  * waits for operations in progress, zeroes the key, and makes every later operation fail with
  * [KeyDestroyedException], so nothing can be written with a cleared (all-zero) key.
@@ -154,7 +160,7 @@ interface BlobCipher {
  * chunk that is being sealed or opened, which is then complete, and the stream it belongs to
  * gets no further chunk.
  */
-class DataCrypto(private val key: DataKey, private val random: SecureRandom = SecureRandom()) : BlobCipher, ChunkCipher {
+class DataCrypto(private val key: DataKey, private val random: SecureRandom = SecureRandom()) : DataCipher {
     private val lock = ReentrantReadWriteLock()
     private var destroyed = false
 

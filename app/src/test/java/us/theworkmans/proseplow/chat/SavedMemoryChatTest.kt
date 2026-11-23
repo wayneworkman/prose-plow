@@ -12,6 +12,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import us.theworkmans.proseplow.AppSession
 import us.theworkmans.proseplow.SessionFixture
+import us.theworkmans.proseplow.close
 import us.theworkmans.proseplow.core.chat.ChatMessage
 import us.theworkmans.proseplow.core.chat.ChatSession
 import us.theworkmans.proseplow.core.chat.MessageLifetime.Companion.DAY_MILLIS

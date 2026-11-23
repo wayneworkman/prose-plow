@@ -15,8 +15,10 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -25,6 +27,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import us.theworkmans.proseplow.chat.ChatController
+import us.theworkmans.proseplow.core.engine.MemorySaveResult
+import us.theworkmans.proseplow.core.engine.SavedMemory
+import us.theworkmans.proseplow.security.SealedStream
+import java.nio.ByteBuffer
 import us.theworkmans.proseplow.background.AnswerEvents
 import us.theworkmans.proseplow.background.AnswerWork
 import us.theworkmans.proseplow.background.KeepAliveEntry
@@ -50,12 +57,14 @@ import us.theworkmans.proseplow.security.AppFiles
 import us.theworkmans.proseplow.security.AppLock
 import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.BlobCipher
+import us.theworkmans.proseplow.security.DataCipher
 import us.theworkmans.proseplow.security.FakeScreenOffWatch
 import us.theworkmans.proseplow.security.KeyDestroyedException
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
 import us.theworkmans.proseplow.security.LockState
 import us.theworkmans.proseplow.security.ScreenshotAllowance
+import us.theworkmans.proseplow.security.SessionClose
 import us.theworkmans.proseplow.security.SoftwareKeyVault
 import us.theworkmans.proseplow.security.UnlockedSession
 import java.io.File
@@ -262,8 +271,9 @@ class AppSessionTest {
             real.clearScreens()
         }
 
-        override suspend fun close() {
-            real.close()
+        override suspend fun close(how: SessionClose) {
+            log += "close $how"
+            real.close(how)
             val usable = try {
                 cipher.seal("probe", byteArrayOf(1))
                 true
@@ -300,13 +310,23 @@ class AppSessionTest {
         /** What the session, the engine and the cipher did, in order. */
         val log = ArrayList<String>()
 
-        /** Called when the engine is told to forget, before it does. */
+        /** Called when the engine is told to forget at a lock, before it does. */
         var onForget: () -> Unit = {}
 
+        /**
+         * A lock makes the engine forget and keep what was saved of its memory; the forgetting
+         * that deletes it is for removed messages only, and is noted apart so that a lock that
+         * used it would show.
+         */
         private val engine = object : InferenceEngine by fake {
-            override suspend fun forget() {
+            override suspend fun forgetKeepingSavedMemory() {
                 onForget()
                 log += "forget, with ${fake.activeGenerations} generations running"
+                fake.forgetKeepingSavedMemory()
+            }
+
+            override suspend fun forget() {
+                log += "forget and delete what was saved"
                 fake.forget()
             }
         }
@@ -314,6 +334,12 @@ class AppSessionTest {
         /** The cipher the lock made for the latest unlock. */
         lateinit var cipher: BlobCipher
         private var unlocks = 0
+
+        /** For every unlock after the first: whether the key of the unlock before still worked when this one's session was opened. */
+        val previousKeyAliveAtOpen = ArrayList<Boolean>()
+
+        /** Runs on a save's writer thread before each sealed chunk of the model's memory is written: the disk of a save. */
+        @Volatile var beforeAppend: (ByteBuffer) -> Unit = {}
         private val lockClock = LockClock()
 
         /** How often the keep-alive was started and the "ready" notice shown and cleared, wired as the app wires them. */
@@ -466,19 +492,19 @@ class AppSessionTest {
             files = files,
             clock = lockClock,
             openSession = { unlocked, _ ->
+                if (unlocks > 0) previousKeyAliveAtOpen += keyAlive(cipher)
                 cipher = unlocked
-                val recording = object : BlobCipher {
+                val recording = object : DataCipher by unlocked {
                     override fun seal(purpose: String, plaintext: ByteArray): ByteArray {
                         val sealed = unlocked.seal(purpose, plaintext)
                         log += "sealed $purpose"
                         return sealed
                     }
-
-                    override fun open(purpose: String, blob: ByteArray): ByteArray = unlocked.open(purpose, blob)
                 }
                 val session = AppSession(
                     recording, layout, engine, ModelCatalog.bundled, dispatcher, dispatcher, FakeClock(), SequentialIds("u${++unlocks}-"),
                     answerEvents = events,
+                    memoryPlatform = testMemoryPlatform { beforeAppend(it) },
                 )
                 WatchedSession(session, unlocked, log)
             },
@@ -521,6 +547,20 @@ class AppSessionTest {
         fun leave() {
             answers.onInFront(false)
             lock.onBackground()
+        }
+
+        /** It leaves the screen as the activity does: an unlocked session is told first ([AppSession.leftScreen]). */
+        fun leaveAsTheActivityDoes() {
+            answers.onInFront(false)
+            (lock.state.value as? LockState.Unlocked)?.session?.real?.leftScreen()
+            lock.onBackground()
+        }
+
+        fun keyAlive(cipher: BlobCipher): Boolean = try {
+            cipher.seal("probe", byteArrayOf(1))
+            true
+        } catch (_: KeyDestroyedException) {
+            false
         }
 
         val session: AppSession get() = (lock.state.value as LockState.Unlocked).session.real
@@ -631,7 +671,7 @@ class AppSessionTest {
 
         assertEquals(LockState.SetupRequired, app.lock.state.value)
         assertEquals(0, app.fake.activeGenerations)
-        assertEquals(1, app.fake.forgetCount)
+        assertEquals(1, app.fake.forgetKeepingSavedCount)
         assertEquals("every file of the app is gone", emptyList<File>(), app.files.filesDir.walkTopDown().filter { it.isFile }.toList())
         advanceTimeBy(60_000)
         runCurrent()
@@ -655,12 +695,258 @@ class AppSessionTest {
 
         app.lock.lock()
         runCurrent()
-        assertEquals(1, app.fake.forgetCount)
+        assertEquals(1, app.fake.forgetKeepingSavedCount)
         assertEquals(0, app.fake.unloadCount)
         assertEquals(EngineState.Ready(ModelCatalog.default.id), app.fake.state.value)
 
         unlock(app)
         assertEquals("the unlock found the model ready and loaded nothing", listOf(ModelCatalog.default.id), app.fake.loads)
+    }
+
+    // --- The model's saved memory at a lock ----------------------------------------------------
+
+    /**
+     * What the real engine does with the vault it is given at a save: begins one, hands over
+     * [pieces] pieces of the vault's buffer (all full but the last), and commits. [before] runs
+     * before each piece and may suspend, or hang.
+     */
+    private suspend fun writeImage(vault: MemoryVault, key: String, pieces: Int = 1, before: suspend (piece: Int) -> Unit = {}): MemorySaveResult {
+        val capacity = SealedStream.CHUNK_SIZE
+        val memory = SavedMemory(key, ModelCatalog.default.id, contextTokens = 4_096, tokenCount = 500, readingSeconds = 60.0, imageBytes = (pieces - 1L) * capacity + 1_000)
+        vault.beginSave(memory).use { writer ->
+            val total = writer.firstPieceOffset + memory.imageBytes
+            var written = 0L
+            for (piece in 0 until pieces) {
+                before(piece)
+                val length = minOf(capacity.toLong(), total - written).toInt()
+                val last = written + length == total
+                if (!writer.write(length, last)) return MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.STOPPED)
+                written += length
+            }
+            writer.commit()
+        }
+        return MemorySaveResult.Saved(memory.tokenCount, memory.imageBytes)
+    }
+
+    private fun memoryFile(app: LockedApp, id: String) = File(app.layout.modelMemory, "$id.enc")
+
+    /**
+     * The order at a lock by itself, step by step: the reply is stopped, then the memory is saved
+     * (the lock's own save, of the conversation the engine holds, with the key alive and nothing
+     * generating), then the engine forgets without deleting it, then the close returns and only
+     * then is the key destroyed. Catches a save before the reply has stopped, after forgetting,
+     * or after the key; a forgetting that deletes the image; and a lock by itself without a save.
+     */
+    @Test
+    fun aLockByItselfStopsTheReplySavesTheMemoryForgetsKeepingItAndOnlyThenTheKeyGoes() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = setUp(app)
+        app.lock.setFinishAnswerAfterLocking(false)
+        app.lock.setLockTimeout(0)
+        val id = session.openSession.id
+        app.fake.enqueueReply(listOf("Half ", "way ", "there"), millisBetween = 500)
+        session.chat.send(id, "Say something long")
+        runCurrent()
+        advanceTimeBy(500)
+        runCurrent()
+        app.fake.onSave = { vault, key, trigger ->
+            app.log += "save $trigger of ${ChatController.chatIdOf(key)}, with ${app.fake.activeGenerations} generations running, " +
+                "the reply ${session.openSession.messages.last().status}, the key ${if (app.keyAlive(app.cipher)) "alive" else "gone"}"
+            writeImage(vault, key)
+        }
+        app.log.clear()
+
+        app.leave() // "Immediately": the app locks by itself now, and nothing finishes behind it.
+        runCurrent()
+
+        val steps = app.log.filter { it.startsWith("close") || it.startsWith("save") || it.startsWith("forget") || it.startsWith("closed") }
+        assertEquals(
+            listOf(
+                "close UNATTENDED",
+                "save LOCK of $id, with 0 generations running, the reply STOPPED, the key alive",
+                "forget, with 0 generations running",
+                "closed, the key still works",
+            ),
+            steps,
+        )
+        assertTrue("the memory is on disk for the next unlock", memoryFile(app, id).exists())
+        assertEquals("the forgetting that deletes was never used", 0, app.fake.forgetCount)
+        assertThrows(KeyDestroyedException::class.java) { app.cipher.seal("probe", byteArrayOf(1)) }
+    }
+
+    /**
+     * The bound. The save hangs, and the disk under it as well: the key is still alive one
+     * millisecond before the ten seconds and destroyed at them, the engine's side of the save is
+     * stopped, and the process is not ended while the save's writer thread is still in the disk,
+     * only once it has returned. Catches a lock that waits for the save without a bound, a bound
+     * other than ten seconds, a close that waits for the writer thread, and a process ended under
+     * a writer that has not returned (END-01).
+     */
+    @Test
+    fun aSaveThatHangsLosesTheKeyAtTheBoundAndTheProcessOutlivesItsWriter() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        app.fake.enqueueReply(listOf("Hi."))
+        session.chat.send(session.openSession.id, "Hello")
+        runCurrent()
+        val disk = CountDownLatch(1)
+        val inTheDisk = CountDownLatch(1)
+        app.beforeAppend = {
+            inTheDisk.countDown()
+            // Never longer than this, so that a failing test cannot leave the thread behind for ever.
+            disk.await(30, TimeUnit.SECONDS)
+        }
+        var engineSideStopped = false
+        app.fake.onSave = { vault, key, _ ->
+            try {
+                writeImage(vault, key, pieces = 3) { piece -> if (piece == 1) awaitCancellation() }
+            } finally {
+                engineSideStopped = true
+            }
+        }
+
+        app.leave()
+        runCurrent()
+        assertTrue("the first chunk reached the disk, which does not answer", inTheDisk.await(20, TimeUnit.SECONDS))
+        advanceTimeBy(9_999)
+        runCurrent()
+        assertTrue("the key lives while the save may still finish", app.keyAlive(app.cipher))
+
+        advanceTimeBy(1)
+        runCurrent()
+        assertFalse("at ten seconds the key is gone", app.keyAlive(app.cipher))
+        assertTrue("the engine's side of the save was stopped", engineSideStopped)
+        assertEquals(1, app.fake.forgetKeepingSavedCount)
+
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals("not ended while the writer thread is in the disk", 0, app.processEnds)
+
+        disk.countDown()
+        repeat(500) {
+            if (app.processEnds == 0) {
+                Thread.sleep(10)
+                advanceTimeBy(20)
+                runCurrent()
+            }
+        }
+        assertEquals("ended once the writer has returned", 1, app.processEnds)
+        assertEquals("and the abandoned save left nothing", emptyList<String>(), app.layout.modelMemory.list().orEmpty().toList())
+    }
+
+    /**
+     * "Lock now" is strict. Catches a "Lock now" that starts a save, waits for one, lets one in
+     * progress go on, or deletes the memory an earlier save committed.
+     */
+    @Test
+    fun lockNowStartsNoSaveStopsOneInProgressAndKeepsTheImageAlreadyCommitted() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = setUp(app)
+        app.fake.enqueueReply(listOf("Hi."))
+        session.chat.send(session.openSession.id, "Hello")
+        runCurrent()
+        val id = session.openSession.id
+        app.fake.onSave = { vault, key, trigger ->
+            app.log += "save $trigger"
+            writeImage(vault, key)
+        }
+        session.leftScreen()
+        runCurrent()
+        session.cameOnScreen()
+        assertTrue("an earlier save committed a memory", memoryFile(app, id).exists())
+        val committed = memoryFile(app, id).readBytes()
+
+        var inProgressStopped = false
+        app.fake.onSave = { vault, key, trigger ->
+            app.log += "save $trigger"
+            try {
+                writeImage(vault, key, pieces = 3) { piece -> if (piece == 1) awaitCancellation() }
+            } finally {
+                inProgressStopped = true
+            }
+        }
+        session.leftScreen()
+        runCurrent()
+        session.cameOnScreen()
+        app.log.clear()
+        val startedAt = currentTime
+
+        app.lock.lock()
+        runCurrent()
+
+        assertEquals("no time was spent waiting", startedAt, currentTime)
+        assertFalse("the key is gone at once", app.keyAlive(app.cipher))
+        assertTrue(app.log.contains("close IMMEDIATE"))
+        assertEquals("no save was started", emptyList<String>(), app.log.filter { it.startsWith("save") })
+        assertTrue("the save in progress was stopped", inProgressStopped)
+        assertArrayEquals("the memory committed before is on disk as it was", committed, memoryFile(app, id).readBytes())
+        assertEquals(0, app.fake.forgetCount)
+    }
+
+    /**
+     * The end of a lease saves the memory of the finished answer. Catches a lease end that does
+     * not save, saves before the answer is finished, or saves on leaving behind the lock (only
+     * the lock's own save belongs there).
+     */
+    @Test
+    fun theEndOfALeaseSavesTheMemoryOfTheFinishedAnswer() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = inTheMiddleOfAnAnswer(app)
+        val id = session.openSession.id
+        app.fake.onSave = { vault, key, trigger ->
+            val last = session.openSession.messages.last()
+            app.log += "save $trigger, the answer \"${last.text}\" ${last.status}"
+            writeImage(vault, key)
+        }
+
+        app.leave()
+        runCurrent()
+        assertEquals("nothing is saved while the answer is finished", emptyList<String>(), app.log.filter { it.startsWith("save") })
+        advanceTimeBy(5_000)
+        runCurrent()
+
+        val steps = app.log.filter { it.startsWith("close") || it.startsWith("save") || it.startsWith("forget") || it.startsWith("closed") }
+        assertEquals(
+            listOf("close UNATTENDED", "save LOCK, the answer \"Half way there\" COMPLETE", "forget, with 0 generations running", "closed, the key still works"),
+            steps,
+        )
+        assertTrue(memoryFile(app, id).exists())
+    }
+
+    /**
+     * An unlock while the session before is still saving at its lock: the lock's mutex makes the
+     * unlock wait until that close has ended and its key is destroyed, within the bound, and the
+     * new session opens only then. Catches a new session opened beside a close that still holds
+     * a key, and an unlock that waits for more than the close's bounds.
+     */
+    @Test
+    fun anUnlockWhileTheSessionBeforeIsStillSavingWaitsForItsCloseWithinTheBound() = runTest {
+        val app = LockedApp(temp.root, testScheduler)
+        val session = setUp(app)
+        app.lock.setLockTimeout(0)
+        app.fake.enqueueReply(listOf("Hi."))
+        session.chat.send(session.openSession.id, "Hello")
+        runCurrent()
+        app.fake.onSave = { _, _, _ -> awaitCancellation() }
+        val first = app.cipher
+
+        app.leave()
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+        assertTrue(app.keyAlive(first))
+        app.fake.onSave = null
+
+        app.lock.unlockWithPassphrase(passphrase.toCharArray())
+        runCurrent()
+        assertTrue("still locked: the close before holds the lock", app.lock.state.value is LockState.Locked)
+
+        advanceTimeBy(8_000)
+        runCurrent()
+        assertTrue("unlocked as soon as the close before has ended", app.lock.state.value is LockState.Unlocked)
+        assertFalse(app.keyAlive(first))
+        assertEquals("the new session was opened after the old key was gone", listOf(false), app.previousKeyAliveAtOpen)
     }
 
     // --- Finishing an answer behind the lock ---------------------------------------------------
@@ -694,7 +980,7 @@ class AppSessionTest {
         assertEquals(listOf("screens cleared", "finish only"), app.log)
         runCurrent()
         assertEquals("the answer goes on", 1, app.fake.activeGenerations)
-        assertEquals(0, app.fake.forgetCount)
+        assertEquals(0, app.fake.forgetKeepingSavedCount)
         assertTrue(app.lock.sessionEnding.value)
         assertEquals(0, app.processEnds)
 
@@ -991,7 +1277,7 @@ class AppSessionTest {
         assertEquals(MessageStatus.COMPLETE, reply.status)
         assertEquals(1, app.fake.startedGenerations)
         assertEquals(0, app.fake.cancelledGenerations)
-        assertEquals(0, app.fake.forgetCount)
+        assertEquals(0, app.fake.forgetKeepingSavedCount)
         assertFalse(app.answers.keepAliveWanted.value)
         assertEquals("the user is looking: no notification", 0, app.readyShown)
         assertEquals(0, app.processEnds)
@@ -1423,7 +1709,7 @@ class AppSessionTest {
                 ciphers += unlocked
                 // The cipher itself is untouched. The write "hangs" after its bytes were sealed,
                 // which is where the real code writes, syncs and renames.
-                val slowDisk = object : BlobCipher {
+                val slowDisk = object : DataCipher by unlocked {
                     override fun seal(purpose: String, plaintext: ByteArray): ByteArray {
                         val sealed = unlocked.seal(purpose, plaintext)
                         if (purpose == DataLayout.SETTINGS_PURPOSE && hangNextWrite.compareAndSet(true, false)) {
@@ -1433,8 +1719,6 @@ class AppSessionTest {
                         }
                         return sealed
                     }
-
-                    override fun open(purpose: String, blob: ByteArray): ByteArray = unlocked.open(purpose, blob)
                 }
                 AppSession(slowDisk, layout, FakeInferenceEngine(), ModelCatalog.bundled, main, io, FakeClock(), SequentialIds("u${ciphers.size}-"), WRITE_BOUND_MILLIS)
             },
