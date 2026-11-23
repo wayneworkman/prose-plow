@@ -505,7 +505,24 @@ class LlamaEngine(
             if (reply == null) asideBeforeReply += waited else asideDuringReply += waited
         }
 
+        /**
+         * Runs the generation and, however it ends (finished, stopped, failed or cancelled),
+         * overwrites the arrays of token ids it made on the way: the tokenised prompts and the
+         * tokeniser's cache. They spell out the conversation, and the garbage collector would
+         * otherwise leave them in the heap until it reuses the memory. The engine's own copy of
+         * the memory ([memory]) is not among them: it outlives the generation, and is wiped when
+         * the memory is cleared.
+         */
         suspend fun run() {
+            try {
+                runSteps()
+            } finally {
+                tokeniser?.wipe()
+                tokeniser = null
+            }
+        }
+
+        private suspend fun runSteps() {
             if (interrupted()) {
                 finish(FinishReason.CANCELLED, null)
                 return
@@ -762,6 +779,8 @@ class LlamaEngine(
             // A model trained without a system message gets no system text of any kind.
             val systemPrompt = request.systemPrompt.takeIf { model.supportsSystemPrompt }.nonBlank()
             val extraSystemText = request.extraSystemText.takeIf { model.supportsSystemPrompt }.nonBlank()
+            // Each round tokenises afresh; what the previous round's tokeniser made is not used again.
+            this.tokeniser?.wipe()
             val tokeniser = PromptTokeniser(native)
             this.tokeniser = tokeniser
             // A model that continues text is only ever given the latest message: there are no
@@ -789,6 +808,7 @@ class LlamaEngine(
             ) { start -> tokeniser.tokenise(rendering(start)) }
         }
 
+        /** The tokeniser of the latest round of fitting; [run] wipes it when the generation ends. */
         private var tokeniser: PromptTokeniser? = null
 
         private fun String?.nonBlank(): String? = this?.takeUnless(PromptWhitespace::isBlank)
@@ -850,8 +870,14 @@ class LlamaEngine(
                     standAside()
                     // A part that leaves a long conversation in memory is read in the model's deep chunk.
                     val chunk = if (stop >= settings.deepReadTokens) model.deepReadChunk else settings.evaluationChunk
-                    val evaluated = native.evaluate(part, chunk, PromptObserver(base, tokens.size))
-                    memory.addAll(part, evaluated)
+                    val evaluated: Int
+                    try {
+                        evaluated = native.evaluate(part, chunk, PromptObserver(base, tokens.size))
+                        memory.addAll(part, evaluated)
+                    } finally {
+                        // The native side and the engine's copy of the memory have what they need of it.
+                        part.fill(0)
+                    }
                     if (evaluated < part.size) {
                         if (interrupted()) return false
                         job.ensureActive()
@@ -965,7 +991,13 @@ class LlamaEngine(
                     break
                 }
                 single[0] = token
-                if (native.evaluate(single, 1, observer) == 1) {
+                val evaluated = try {
+                    native.evaluate(single, 1, observer)
+                } finally {
+                    // The id is in the native memory and, below, in the engine's copy; not left here as well.
+                    single[0] = 0
+                }
+                if (evaluated == 1) {
                     memory.add(token)
                 } else {
                     if (!interrupted()) {

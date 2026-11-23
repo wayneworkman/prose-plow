@@ -74,12 +74,31 @@ internal class TokenisedPrompt(
  * Turns [Prompt]s into tokens with the native tokenizer: one call per segment, results joined.
  * Lives for one generation. It remembers what it has tokenised, because the context budget may
  * render the conversation several times and most segments are the same every time.
+ *
+ * The token ids spell out the conversation, so this class keeps hold of every array of them it
+ * makes or is given, the cached ones and the joined prompts it hands out alike, until [wipe]
+ * overwrites them all. Whoever creates a tokeniser calls [wipe] when the generation ends, however
+ * it ends, and before it lets go of the tokeniser for another one. A cached entry is never
+ * replaced: a segment is tokenised once and its array kept until then. The bytes of each text are
+ * overwritten as soon as the native tokenizer has returned; the text itself is a [String], which
+ * cannot be overwritten.
  */
 internal class PromptTokeniser(private val native: NativeLlama) {
 
     private val cache = HashMap<PromptSegment, IntArray>()
 
+    /** Every array handed out by [tokenise] that is not in [cache], so that [wipe] can reach it. */
+    private val issued = ArrayList<IntArray>()
+
+    /** True once [wipe] has run; the tokeniser is not used again after that. */
+    private var wiped = false
+
+    /**
+     * The tokens of [prompt]. The arrays of the result belong to this tokeniser and are
+     * overwritten by [wipe]; the caller must not use them after that.
+     */
     fun tokenise(prompt: Prompt): TokenisedPrompt {
+        check(!wiped) { "The tokeniser was wiped" }
         val starts = IntArray(prompt.segments.size + 1)
         val parts = ArrayList<IntArray>(prompt.segments.size)
         var total = 0
@@ -92,7 +111,22 @@ internal class PromptTokeniser(private val native: NativeLlama) {
         starts[prompt.segments.size] = total
         val all = IntArray(total)
         parts.forEachIndexed { index, part -> part.copyInto(all, starts[index]) }
+        issued += all
+        issued += starts
         return TokenisedPrompt(prompt, all, starts)
+    }
+
+    /**
+     * Overwrites every array of token ids this tokeniser has made, cached or handed out, and
+     * forgets them. The positions of the segments are overwritten too, since they give the
+     * lengths of the messages. Safe to call more than once; nothing may be tokenised afterwards.
+     */
+    fun wipe() {
+        wiped = true
+        for (tokens in cache.values) tokens.fill(0)
+        cache.clear()
+        for (tokens in issued) tokens.fill(0)
+        issued.clear()
     }
 
     /**
@@ -154,7 +188,7 @@ internal class PromptTokeniser(private val native: NativeLlama) {
     }
 
     private fun tokens(segment: PromptSegment): IntArray = when (segment) {
-        is PromptSegment.TokenId -> intArrayOf(segment.id)
+        is PromptSegment.TokenId -> intArrayOf(segment.id).also { issued += it }
         is PromptSegment.Text -> tokenise(segment, segment.text, parseSpecial = false)
         is PromptSegment.Special -> tokenise(segment, segment.text, parseSpecial = true)
     }
@@ -162,7 +196,15 @@ internal class PromptTokeniser(private val native: NativeLlama) {
     private fun tokenise(segment: PromptSegment, text: String, parseSpecial: Boolean): IntArray {
         // Nothing encodes to nothing; the native call is spared.
         if (text.isEmpty()) return EMPTY
-        return cache.getOrPut(segment) { native.tokenize(text.toByteArray(Charsets.UTF_8), parseSpecial) }
+        return cache.getOrPut(segment) {
+            val utf8 = text.toByteArray(Charsets.UTF_8)
+            try {
+                native.tokenize(utf8, parseSpecial)
+            } finally {
+                // The native side has made its own copy; this one is not needed any more.
+                utf8.fill(0)
+            }
+        }
     }
 
     companion object {

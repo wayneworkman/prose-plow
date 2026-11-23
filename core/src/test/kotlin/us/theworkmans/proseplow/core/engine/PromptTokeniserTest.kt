@@ -3,6 +3,7 @@ package us.theworkmans.proseplow.core.engine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.theworkmans.proseplow.core.engine.FakeNativeLlama.Call
@@ -172,6 +173,29 @@ class PromptTokeniserTest {
         assertEquals(2_256, list.size)
         assertEquals(1, list[0])
         assertEquals(2_999, list[2_255])
+    }
+
+    @Test
+    fun `wiping overwrites every array the tokeniser made or was given, and it is not used again`() {
+        val prompt = Prompt(
+            segments = listOf(PromptSegment.TokenId(7), PromptSegment.Special("<|x|>one"), PromptSegment.Text("one two")),
+            boundaries = listOf(PromptBoundary(2, 4)),
+        )
+        val first = tokeniser.tokenise(prompt)
+        val second = tokeniser.tokenise(Prompt(listOf(PromptSegment.Text("one two"))))
+        // A boundary inside a text tokenises its head as well, into the cache.
+        assertEquals(listOf(9), tokeniser.boundaryPositions(first, after = 0, limit = 1))
+        val handedOut = listOf(first.tokens, first.segmentStarts, second.tokens, second.segmentStarts)
+        assertTrue(handedOut.all { array -> array.any { it != 0 } })
+
+        tokeniser.wipe()
+
+        for (array in handedOut) assertTrue("a handed-out array still holds ${array.toList()}", array.all { it == 0 })
+        assertEquals("the texts, the head among them", 3, fake.tokenArraysReturned.size)
+        for (array in fake.tokenArraysReturned) assertTrue("a cached array still holds ${array.toList()}", array.all { it == 0 })
+        for (bytes in fake.textArraysReceived) assertTrue("the bytes of a text are still there", bytes.all { it == 0.toByte() })
+        tokeniser.wipe()
+        assertThrows(IllegalStateException::class.java) { tokeniser.tokenise(prompt) }
     }
 
     @Test

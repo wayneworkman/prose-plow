@@ -2350,6 +2350,7 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 
 **Source:** `README.md` ("What stays in memory"), `native/README.md` ("Forgetting"),
 `security/Envelope.kt`, `security/Passphrase.kt`, `AppSession.kt`, `core/.../engine/LlamaEngine.kt`,
+`core/.../engine/PromptTokeniser.kt`,
 `native/session/tests/test_residue.cpp`.
 
 - **MEM-01** While the app is unlocked, the data key, the decrypted chats and settings, and the
@@ -2360,7 +2361,12 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   the lock has been saved), the data key's bytes are overwritten and the key refuses every
   further use; the engine overwrites its own copy of the conversation's tokens; and the native
   session overwrites its buffers and checkpoints before it frees them (NAT-13). The native
-  binding overwrites its copies of what it was handed.
+  binding overwrites its copies of what it was handed. Every array of token ids a generation
+  makes (the tokenised prompt, the tokenizer's results it keeps for the length of the
+  generation, the parts and single tokens it hands to the native side) and the bytes of every
+  text it hands to the tokenizer are overwritten when that generation ends, however it ends:
+  finished, stopped, failed or cancelled. Not reached: the texts, which are strings (MEM-05),
+  and the bytes of a reply's tokens, which become strings at once.
 - **MEM-03** The loaded model stays in memory for as long as the process lives. Its weights are
   public.
 - **MEM-04** Overwriting does not reach everything in the native library. llama.cpp makes copies
@@ -2370,10 +2376,11 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   of the four models and copies of the prompt's token ids for all four, some of them even after
   the model had been closed. The token ids of replies were not found.
 - **MEM-05** Nor does it reach what the language runtime holds: strings cannot be overwritten at
-  all, and chat text passes through strings in the text fields, the Markdown renderer and the
-  JSON codec; the cryptography classes keep copies of keys inside short-lived objects; the text
-  fields keep buffers of what was typed. All of that stays until the memory is reused or the
-  process ends.
+  all, and chat text passes through strings in the text fields, the Markdown renderer, the
+  JSON codec and the engine's prompt formats; the cryptography classes keep copies of keys
+  inside short-lived objects; the text fields keep buffers of what was typed; and the runtime's
+  garbage collector may move an array before it is overwritten, leaving the old copy behind.
+  All of that stays until the memory is reused or the process ends.
 - **MEM-06** A passphrase is kept out of strings as far as possible (PASS-14). Two residues
   remain: the buffers of the text field it was typed into, which is emptied but not the app's to
   overwrite; and, only for a passphrase that had to be normalised (PASS-03), one string that the

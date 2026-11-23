@@ -661,6 +661,13 @@ it or losing the phone loses the chats.
   measured with contexts of the starting size; a context that has grown has more to
   overwrite. Clearing also returns the context to its starting size, so the memory a long
   conversation took is given back to the phone.
+- The engine overwrites its own arrays of token numbers too: its copy of what the model's
+  memory holds, whenever that memory is cleared, and the arrays each answer makes on the way
+  (the tokenised prompt, the tokens of every text it tokenised, the parts it handed to the
+  native side, and the bytes of every text it handed to the tokenizer) as soon as that answer
+  ends, whether it was finished, stopped, failed or cancelled. The native binding overwrites
+  its copies of what it was handed. The texts themselves are Java strings, and the bytes of a
+  reply's tokens become strings straight away.
 - That does not reach everything. llama.cpp makes copies of its own while it works and frees
   them without overwriting them: measured on that phone after the native clear, copies of the
   prompt's text were still readable in the process for two of the four models that were
@@ -679,8 +686,9 @@ it or losing the phone loses the chats.
   had to be normalised also passes through one Java string, which cannot be wiped.
 - What cannot be wiped stays until the garbage collector reuses the memory or the process ends:
   the copies of keys inside the Java cryptography classes, the text fields' buffers just
-  mentioned, and the strings in which the text fields, the Markdown renderer and the JSON codec
-  held chat text.
+  mentioned, the strings in which the text fields, the Markdown renderer, the JSON codec and
+  the engine's prompt formats held chat text, and any copy of an array that Android's garbage
+  collector made when it moved the array in memory before it was overwritten.
 - While an answer is being finished behind the lock, everything of the first point is still in
   memory, the data key included: for at most ten minutes, and then for as long as the session
   takes to close (at most three waits of ten seconds each, see [The lock](#the-lock)).
@@ -1441,7 +1449,7 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 430 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
+| `core` (JVM, 439 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints, stop strings, cancellation | `./gradlew :core:test` |
 | `app` (JVM, 699 tests) | The lock and the encryption with software keys and virtual time: the envelope, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the chat controller and the view models over a scripted engine; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 12 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |

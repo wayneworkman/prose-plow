@@ -120,10 +120,26 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
     /** All tokens passed to [evaluate] so far, flattened, including those of generated replies. */
     val evaluatedTokens: List<Int> get() = recorded.filterIsInstance<Call.Evaluate>().flatMap { it.tokens }
 
+    private val tokenizeInputs = ArrayList<ByteArray>()
+    private val tokenizeOutputs = ArrayList<IntArray>()
+    private val evaluateInputs = ArrayList<IntArray>()
+
+    /**
+     * The very arrays the caller handed to [tokenize] and [evaluate], and those [tokenize] handed
+     * back, kept by reference (not copied, unlike [calls]) so that a test can see whether the
+     * caller overwrote them afterwards. Kept until [clearCalls].
+     */
+    val textArraysReceived: List<ByteArray> get() = tokenizeInputs
+    val tokenArraysReturned: List<IntArray> get() = tokenizeOutputs
+    val tokenArraysReceived: List<IntArray> get() = evaluateInputs
+
     /** Forgets the recorded calls (not the memory), to look only at what happens next. */
     fun clearCalls() {
         recorded.clear()
         evaluationsMade.clear()
+        tokenizeInputs.clear()
+        tokenizeOutputs.clear()
+        evaluateInputs.clear()
     }
 
     // --- Vocabulary ---
@@ -216,6 +232,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
     override fun tokenize(utf8: ByteArray, parseSpecial: Boolean): IntArray {
         enter(Call.Tokenize(String(utf8, Charsets.UTF_8), parseSpecial))
+        tokenizeInputs += utf8
         // As the native session: a text beyond the limit is refused before it is looked at.
         if (utf8.size > NativeLlama.MAX_TOKENIZE_BYTES) {
             throw NativeLlamaException(NativeLlamaException.TOKENIZE_FAILED, "Text of ${utf8.size} bytes is longer than ${NativeLlama.MAX_TOKENIZE_BYTES}")
@@ -232,7 +249,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
                 index++
             }
         }
-        return out.toIntArray()
+        return out.toIntArray().also { tokenizeOutputs += it }
     }
 
     private fun startsWith(data: ByteArray, at: Int, prefix: ByteArray): Boolean {
@@ -321,6 +338,7 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
     override fun evaluate(tokens: IntArray, chunkSize: Int, observer: EvaluationObserver): Int {
         enter(Call.Evaluate(tokens.toList()))
+        evaluateInputs += tokens
         require(tokens.isNotEmpty()) { "evaluate needs at least one token" }
         require(chunkSize >= 1) { "chunkSize must be at least 1" }
         evaluationsMade += Evaluation(chunkSize, memoryTokens.size, memoryTokens.size + tokens.size)
