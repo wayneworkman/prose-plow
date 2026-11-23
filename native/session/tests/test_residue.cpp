@@ -25,6 +25,27 @@
 //     the allocator did with those blocks since. The numbers are the measurement to quote; a
 //     session that claimed them to be zero would have to make this program require it.
 //
+// The memory written out and read back (pp_session_export_memory, pp_session_import_memory) is
+// measured the same way, and for it the program also looks for
+//   - 24 consecutive bytes of the key and value rows and of the recurrent state, taken from
+//     eight places of the state in the image.
+// The image is kept XOR-masked like everything else: the sink masks each piece as it takes it,
+// the source unmasks it into the buffer the session reads from, and that buffer is the
+// session's to overwrite. Required there:
+//   - after an export and pp_session_clear_memory: no rows and no token ids of the reply. An
+//     export copies the memory into the caller's buffer and nowhere else, and overwrites the
+//     buffer;
+//   - after an import that failed at its last step, when all of the image was in: no rows
+//     (the memory's buffers are overwritten), and no token ids of the reply;
+//   - after an import that succeeded and pp_session_clear_memory, and after pp_session_close:
+//     the same two.
+// The last two are where a model whose state carries the id of every token differs (Qwen3.5
+// and Boris-2: the program finds that out from the image and says so). llama.cpp reads those
+// ids into two lists of its own while it restores the cells, and upstream frees the lists as
+// they are, which leaves the reply's ids in freed blocks that no call of the session reaches:
+// all of its windows were found there. native/patches/0005 overwrites the two lists before
+// they are freed, and this is the test that holds it to that.
+//
 // A model can repeat its prompt, and Qwen3.5 does with this text: ten of its twelve reply
 // tokens are a stretch of the prompt. Windows of the reply that also occur in the prompt are
 // therefore not counted as the reply's: finding one says where the prompt is, which is the
@@ -56,6 +77,8 @@ constexpr uint32_t k_mask32 = 0x5A5A5A5Au;
 constexpr size_t k_text_window = 16;
 constexpr size_t k_prompt_window = 6;
 constexpr size_t k_reply_window = 4;
+constexpr size_t k_row_window = 24; // bytes of the memory's rows that are looked for as one stretch
+constexpr size_t k_row_places = 8;  // how many such stretches are taken from an image
 
 // A string literal stored masked, so that the program's own image never holds it in clear.
 template <size_t N> struct masked_literal {
@@ -83,6 +106,7 @@ struct found {
     int text = 0;       // windows of the text, in either form
     int prompt_ids = 0; // windows of the prompt's token ids
     int reply_ids = 0;  // windows of the reply's token ids
+    int rows = 0;       // stretches of the memory's key and value rows and recurrent state
 };
 
 // The patterns, all masked. A window is looked up through its first byte or id.
@@ -91,6 +115,10 @@ struct patterns {
     std::vector<unsigned char> normalised; // every space as U+2581
     std::vector<uint32_t> prompt;
     std::vector<uint32_t> reply;
+    // Stretches of the state in a memory image, each k_row_window bytes, masked; and which of
+    // them begin with a given (masked) byte.
+    std::vector<std::vector<unsigned char>> rows;
+    std::vector<uint8_t> row_starts[256];
 
     std::vector<uint16_t> text_starts[256];
     std::vector<uint16_t> normalised_starts[256];
@@ -105,6 +133,10 @@ struct patterns {
         for (int b = 0; b < 256; b++) {
             text_starts[b].clear();
             normalised_starts[b].clear();
+            row_starts[b].clear();
+        }
+        for (size_t i = 0; i < rows.size(); i++) {
+            row_starts[rows[i][0]].push_back((uint8_t) i);
         }
         for (size_t i = 0; i + k_text_window <= text.size(); i++) {
             text_starts[text[i]].push_back((uint16_t) i);
@@ -182,6 +214,15 @@ void scan_range(int mem, uintptr_t begin, uintptr_t end, const patterns & p, fou
                 is_text = is_text || bytes_match(bytes + i, p.normalised, start);
             }
             hits.text += is_text ? 1 : 0;
+            if (i + (ssize_t) k_row_window <= got) {
+                for (const uint8_t row : p.row_starts[first]) {
+                    bool same = true;
+                    for (size_t j = 0; j < k_row_window && same; j++) {
+                        same = (unsigned char) (bytes[i + (ssize_t) j] ^ k_mask) == p.rows[row][j];
+                    }
+                    hits.rows += same ? 1 : 0;
+                }
+            }
             if ((address & 3) != 0) {
                 continue;
             }
@@ -261,6 +302,79 @@ bool scan(const patterns & p, found & hits, const char ** why = nullptr) {
     wipe(g_block.data(), g_block.size());
     wipe(line, sizeof(line));
     return true;
+}
+
+// A memory image as the program keeps it: masked, with room made before the export for exactly
+// the bytes the session announced.
+struct masked_image {
+    std::vector<unsigned char> bytes;   // masked
+    std::vector<unsigned char> buffer;  // the piece buffer, which holds the image in clear during a call
+    size_t at = 0;
+    int calls = 0;
+    int fail_at = 0;                    // the call of the source (from 1) that returns -1; 0 for never
+    bool overflowed = false;
+
+    static bool take(size_t n, bool, void * user) {
+        masked_image & m = *(masked_image *) user;
+        if (n > m.buffer.size() || m.bytes.size() + n > m.bytes.capacity()) {
+            m.overflowed = true;
+            return false;
+        }
+        for (size_t i = 0; i < n; i++) {
+            m.bytes.push_back((unsigned char) (m.buffer[i] ^ k_mask));
+        }
+        return true;
+    }
+
+    static int64_t give(void * user) {
+        masked_image & m = *(masked_image *) user;
+        m.calls++;
+        if (m.fail_at != 0 && m.calls == m.fail_at) {
+            return -1;
+        }
+        const size_t n = std::min(m.buffer.size(), m.bytes.size() - m.at);
+        for (size_t i = 0; i < n; i++) {
+            m.buffer[i] = (unsigned char) (m.bytes[m.at + i] ^ k_mask);
+        }
+        m.at += n;
+        return (int64_t) n;
+    }
+
+    // The 32-bit number at a place of the image, in clear only in the register it is returned in.
+    uint32_t number_at(size_t offset) const {
+        unsigned char raw[4];
+        for (size_t i = 0; i < 4; i++) {
+            raw[i] = (unsigned char) (bytes[offset + i] ^ k_mask);
+        }
+        uint32_t value;
+        std::memcpy(&value, raw, 4);
+        wipe(raw, sizeof(raw));
+        return value;
+    }
+};
+
+// Whether the image holds the ids of the reply's tokens a second time, behind its own list of
+// them: at a constant distance from each other, as a state that records the id of every cell
+// has them. `reply` is masked. Nothing of the image's layout is assumed but that.
+bool state_carries_ids(const masked_image & image, const std::vector<uint32_t> & reply, size_t from) {
+    if (reply.size() < 4) {
+        return false;
+    }
+    for (size_t at = from; at + 4 <= image.bytes.size(); at += 4) {
+        if ((image.number_at(at) ^ k_mask32) != reply[0]) {
+            continue;
+        }
+        for (size_t stride = 8; stride <= 64; stride += 4) {
+            bool all = at + (reply.size() - 1) * stride + 4 <= image.bytes.size();
+            for (size_t i = 1; i < reply.size() && all; i++) {
+                all = (image.number_at(at + i * stride) ^ k_mask32) == reply[i];
+            }
+            if (all) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -427,10 +541,121 @@ int main(int argc, char ** argv) {
             "an empty memory and no window of the reply's token ids (%d found)", held, n_large, carried, n_small, after_resize.reply_ids);
     r.note("after that change of size: %d window(s) of the text and %d of the prompt's token ids are still readable", after_resize.text, after_resize.prompt_ids);
 
+    // --- The same conversation once more, written out as an image and read back ---
+    // The image goes through a buffer of this program's, which the session fills and reads
+    // and has to overwrite; the program keeps the image masked. What is looked for now
+    // includes stretches of the memory's own rows, taken from the image.
+    {
+        std::vector<llama_token> clear((size_t) n_tokens);
+        for (int32_t i = 0; i < n_tokens; i++) {
+            clear[(size_t) i] = (llama_token) (p.prompt[(size_t) i] ^ k_mask32);
+        }
+        status = pp_session_evaluate(s, clear.data(), n_tokens, 32, &observer, &in_memory);
+        wipe(clear.data(), clear.size() * sizeof(llama_token));
+        const int32_t mark = pp_session_save_checkpoint(s);
+        for (size_t i = 0; i < p.reply.size() && status == PP_STATUS_OK; i++) {
+            llama_token token = (llama_token) (p.reply[i] ^ k_mask32);
+            status = pp_session_evaluate(s, &token, 1, 1, &observer, &in_memory);
+            token = 0;
+        }
+        const int32_t in_image = pp_session_memory_token_count(s);
+        const int64_t bytes = pp_session_memory_state_bytes(s, &mark, 1);
+        if (status != PP_STATUS_OK || mark < 0 || bytes <= 0 || bytes > ((int64_t) 1 << 30)) {
+            pp_test::die(std::string("the conversation could not be evaluated again for its image: ") + pp_session_last_error(s));
+        }
+        // One piece for the whole image when it is written, so that the buffer holds all of it,
+        // the ids of the tokens at its beginning included, when the export returns.
+        masked_image image;
+        image.bytes.reserve((size_t) bytes);
+        image.buffer.assign((size_t) bytes, 0);
+        pp_memory_sink sink = {image.buffer.data(), image.buffer.size(), 0, masked_image::take, &image};
+        int64_t written = 0;
+        const int32_t exported = pp_session_export_memory(s, &mark, 1, &sink, &written);
+        const bool whole = exported == PP_STATUS_OK && written == bytes && image.bytes.size() == (size_t) bytes && !image.overflowed;
+        if (!whole) {
+            pp_test::die(std::string("the memory could not be written out: ") + pp_session_last_error(s));
+        }
+
+        // Stretches of the state, from the part of the image behind its token ids and behind
+        // what a state begins with (the positions of the cells): each with enough different
+        // bytes in it to be found nowhere by chance.
+        const size_t state_from = image.bytes.size() / 8;
+        for (size_t place = 0; place < k_row_places; place++) {
+            size_t at = state_from + (image.bytes.size() - state_from - 4096) / k_row_places * place;
+            for (; at + k_row_window <= image.bytes.size(); at += k_row_window) {
+                bool seen[256] = {};
+                int different = 0;
+                for (size_t j = 0; j < k_row_window; j++) {
+                    different += seen[image.bytes[at + j]] ? 0 : 1;
+                    seen[image.bytes[at + j]] = true;
+                }
+                if (different >= 12) {
+                    break;
+                }
+            }
+            if (at + k_row_window <= image.bytes.size()) {
+                p.rows.emplace_back(image.bytes.begin() + (ptrdiff_t) at, image.bytes.begin() + (ptrdiff_t) (at + k_row_window));
+            }
+        }
+        p.index();
+        const bool carries_ids = state_carries_ids(image, p.reply, (size_t) in_image * sizeof(llama_token) + 64);
+
+        found written_out;
+        scan(p, written_out);
+        r.check(written_out.rows >= (int) p.rows.size() && p.rows.size() == k_row_places && (written_out.reply_ids > 0 || p.reply_windows_own == 0),
+                "the conversation again (%d tokens) with a checkpoint, written out as an image of %" PRId64 " bytes: while it is in memory the scan finds its rows "
+                "(%d stretch(es) for the %zu looked for) and %d window(s) of the reply's token ids", in_image, bytes, written_out.rows, p.rows.size(), written_out.reply_ids);
+        r.note("the state in this model's image %s", carries_ids ? "carries the id of every token: llama.cpp reads them into lists of its own at an import, "
+                                                                   "which native/patches/0005 makes it overwrite before it frees them"
+                                                                 : "holds no token ids: they are in the session's record alone");
+
+        const int32_t forgotten = pp_session_clear_memory(s);
+        found after_export;
+        scan(p, after_export);
+        r.check(forgotten == PP_STATUS_OK && after_export.rows == 0 && after_export.reply_ids == 0,
+                "after the export and pp_session_clear_memory: no stretch of the memory's rows (%d found) and no window of the reply's token ids (%d found): "
+                "the export left nothing in the buffer it wrote through or anywhere else", after_export.rows, after_export.reply_ids);
+
+        // An import that fails at the very end, when the source is asked whether anything
+        // follows: all of the image is in by then, record, rows and checkpoint.
+        image.buffer.assign(256 * 1024, 0);
+        pp_memory_source source = {image.buffer.data(), image.buffer.size(), 0, masked_image::give, &image};
+        const int n_calls = (int) ((image.bytes.size() + image.buffer.size() - 1) / image.buffer.size()) + 1;
+        image.fail_at = n_calls;
+        pp_memory_checkpoint marks[PP_CHECKPOINTS_MAX];
+        int32_t n_marks = -1;
+        const int32_t failed = pp_session_import_memory(s, &source, marks, &n_marks);
+        found after_failure;
+        scan(p, after_failure);
+        r.check(failed == PP_STATUS_MEMORY_STOPPED && image.calls == n_calls && pp_session_memory_token_count(s) == 0 && n_marks == 0 && after_failure.rows == 0 &&
+                after_failure.reply_ids == 0,
+                "after an import that its source stopped at the last of its %d calls, with the whole image in: MEMORY_STOPPED (%d), an empty memory, no checkpoint, "
+                "no stretch of the memory's rows (%d found) and no window of the reply's token ids (%d found)", n_calls, failed, after_failure.rows, after_failure.reply_ids);
+
+        // The import again, to its end, and then forgotten.
+        image.at = 0;
+        image.calls = 0;
+        image.fail_at = 0;
+        const int32_t imported = pp_session_import_memory(s, &source, marks, &n_marks);
+        found read_back;
+        scan(p, read_back);
+        const int32_t forgotten_again = pp_session_clear_memory(s);
+        found after_import;
+        scan(p, after_import);
+        r.check(imported == PP_STATUS_OK && n_marks == 1 && read_back.rows >= (int) p.rows.size() && forgotten_again == PP_STATUS_OK && after_import.rows == 0 &&
+                after_import.reply_ids == 0,
+                "imported to its end (%d: %d stretch(es) of its rows in memory again), then pp_session_clear_memory: no stretch of the memory's rows (%d found) "
+                "and no window of the reply's token ids (%d found)", imported, read_back.rows, after_import.rows, after_import.reply_ids);
+        r.note("after the failed import: %d window(s) of the text, %d of the prompt's token ids and %d of the reply's are still readable; after the import and "
+               "pp_session_clear_memory: %d, %d and %d", after_failure.text, after_failure.prompt_ids, after_failure.reply_ids, after_import.text, after_import.prompt_ids,
+               after_import.reply_ids);
+    }
+
     pp_session_close(s);
     found after_close;
     scan(p, after_close);
-    r.check(after_close.reply_ids == 0, "after pp_session_close: no window of the reply's token ids (%d found)", after_close.reply_ids);
+    r.check(after_close.rows == 0 && after_close.reply_ids == 0,
+            "after pp_session_close: no stretch of the memory's rows (%d found) and no window of the reply's token ids (%d found)", after_close.rows, after_close.reply_ids);
     r.note("after pp_session_close: %d window(s) of the text and %d of the prompt's token ids are still readable", after_close.text, after_close.prompt_ids);
     return r.finish();
 }

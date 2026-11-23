@@ -70,6 +70,10 @@ enum pp_status {
                                      // computed cost above the budget, or its cost not known (see each function)
     PP_STATUS_CONTEXT_NOT_CREATED = 10, // a context of the asked size could not be created after the old one
                                      // was freed; pp_session_context_size says what the session has instead
+    PP_STATUS_MEMORY_STOPPED    = 11, // the caller's callback ended an export or an import of the memory: the
+                                     // sink returned false, or the source a negative number
+    PP_STATUS_MEMORY_FAILED     = 12, // a memory image could not be written out, or what was read is not an
+                                     // image this session accepts (see pp_session_import_memory)
 };
 
 // The limits on sizes that arrive from outside. llama.cpp takes a size as given and allocates
@@ -90,7 +94,7 @@ enum pp_status {
 #define PP_BATCH_TOKENS_MAX 32768
 
 // The most checkpoints a session holds at a time. One is megabytes for a model with recurrent
-// state (20 MB for Boris-2); the engine keeps four.
+// state (20 MB for Qwen3.5, 0.4 MB for Boris-2); the engine keeps four.
 #define PP_CHECKPOINTS_MAX 8
 
 // The longest text pp_session_tokenize accepts, in bytes (256 KiB). Tokenising cannot be
@@ -100,6 +104,12 @@ enum pp_status {
 // It is more text than the largest context holds at eight bytes per token, where ordinary text
 // has three to four.
 #define PP_TOKENIZE_BYTES_MAX 262144
+
+// The smallest buffer pp_session_export_memory and pp_session_import_memory take for the pieces
+// of a memory image, in bytes. A piece is one call of the caller's callback, so a buffer of a
+// few bytes would be millions of calls; there is no largest size, because the buffer is the
+// caller's and the session allocates nothing to match it.
+#define PP_MEMORY_PIECE_BYTES_MIN 4096
 
 //
 // The process
@@ -576,6 +586,196 @@ int64_t pp_session_checkpoint_size(const struct pp_session * session, int32_t ch
 // -1, false, 0 where there is no status), and without a sampler sampling fails, until another
 // pp_session_clear_memory has succeeded. Close the session when it does not.
 int32_t pp_session_clear_memory(struct pp_session * session);
+
+//
+// The memory written out and read back
+//
+
+// A memory image is everything a session needs to hold a conversation again exactly as it held
+// it, so that it does not have to be read again from its first token: the session's record of
+// the tokens in memory, the state of the sequence as llama.cpp writes it (every cell in use
+// with its key and value rows, and the recurrent state of a model that has one), and the
+// checkpoints the caller names, each with the length of memory it belongs to. Not in it: the
+// sampler, which is configured for every reply anyway and is left as it is by both functions,
+// and a prediction, which no state holds: after an import at least one token is evaluated
+// before the next is sampled, as after a restored checkpoint.
+//
+// An image is never one block of memory. It leaves a session and enters one in pieces, through
+// a buffer that the caller owns and a callback that is called once per piece: the key and value
+// rows are copied straight between llama.cpp's buffers and the caller's buffer, a piece at a
+// time. An export allocates nothing in this library and a few small lists in llama.cpp. An
+// import allocates the image's checkpoints, which stay as the session's checkpoints, and
+// llama.cpp its bookkeeping for the cells it restores (some tens of bytes per token); nothing
+// in either grows with the key and value rows. What the caller does with a piece is its own
+// affair (the app seals each one and writes the ciphertext to storage). No function of this
+// library writes any part of a memory to a file: llama.cpp's llama_state_seq_save_file and
+// llama_state_save_file, which write a state in clear, are called nowhere.
+//
+// The buffer holds model state in clear while a call runs: key and value rows, and the ids of
+// the tokens. Both functions overwrite all of it with zeros before they return, whatever the
+// result. They cannot overwrite what the caller's callback copied elsewhere.
+//
+// The callbacks are called on the calling thread, before the call returns, like every callback
+// of this library. A callback must not call a function of the session it is called for.
+//
+// An image is not a file format. It is written in the byte order and with the sizes of the
+// machine, and the state in it is llama.cpp's own, whose layout belongs to the pinned llama.cpp
+// and to the model. An image is only ever read by the build of this library that wrote it, on
+// the same model file: the caller records both beside the image and compares them before it
+// hands a single byte to pp_session_import_memory (see there for why that is not optional).
+// The size of the context is not part of that: an image goes into any context that has room
+// for its tokens.
+
+// Where the pieces of an exported image go.
+struct pp_memory_sink {
+    uint8_t * buffer;      // the caller's buffer, which the session fills; on Android the memory of a direct
+                           // ByteBuffer, so that no piece is ever copied into an array of the Java heap
+    size_t    buffer_size; // its size, which is the size of every piece but the last (and the first, see
+                           // below); at least PP_MEMORY_PIECE_BYTES_MIN
+    size_t    first_piece_offset; // this many bytes at the start of the buffer are the caller's own when the
+                           // call is made (a header of its own) and are left as they are: the image begins
+                           // behind them, and they go out as the beginning of the first piece. 0 for none;
+                           // below buffer_size
+    // Called with a piece ready in buffer[0 .. n_bytes): n_bytes is buffer_size for every piece but the
+    // last, which has from 1 byte to buffer_size, and it counts the caller's own first bytes in the
+    // first piece. last is true for the piece that ends the image, exactly once and only after every
+    // byte before it was handed over. Return true to go on, false to stop the export. The piece must
+    // be used or copied before the callback returns: the buffer is filled again afterwards.
+    bool    (*write)(size_t n_bytes, bool last, void * user_data);
+    void *    user_data;
+};
+
+// Where the pieces of an image to import come from.
+struct pp_memory_source {
+    uint8_t * buffer;      // the caller's buffer, which the callback fills
+    size_t    buffer_size; // its size; at least PP_MEMORY_PIECE_BYTES_MIN
+    size_t    first_piece_offset; // this many bytes at the start of the first piece are the caller's own and are
+                           // skipped: the image begins behind them. 0 for none; below buffer_size
+    // Called when the session needs more of the image: puts the next bytes at the start of the buffer
+    // and returns how many, from 1 to buffer_size (pieces need not be full, but they are the image's
+    // bytes in order, with none left out). Returns 0 when there are no more bytes, and a negative
+    // number when the bytes cannot be had or the import should stop. It is called once more after the
+    // image's last byte and must return 0 then: an image with anything behind it is not accepted.
+    int64_t (*read)(void * user_data);
+    void *    user_data;
+};
+
+// A checkpoint that pp_session_import_memory brought back: its handle in this session, and the
+// length of memory it belongs to (the memory's length when it was saved).
+struct pp_memory_checkpoint {
+    int32_t handle;
+    int32_t n_tokens;
+};
+
+// The size in bytes of the image that pp_session_export_memory would write now for the same
+// checkpoints, the caller's own first bytes (first_piece_offset) not counted: exactly what the
+// sink is handed. Nothing is copied to find it: llama.cpp walks the cells in use and their
+// sizes are added up. 0 for an empty memory and for a session without a context; -1 when a
+// checkpoint is named that the export would refuse.
+int64_t pp_session_memory_state_bytes(const struct pp_session * session, const int32_t * checkpoints, int32_t n_checkpoints);
+
+// The ids of the tokens in memory, in order: the session's own record of them, which the
+// penalties are computed from and which an image carries. For a caller that keeps a copy of its
+// own and has to set it after an import. Returns the number written, or the negative of the
+// number needed when n_tokens_max is too small (so (NULL, 0) measures); 0 for an empty memory.
+// The ids are the conversation: the caller overwrites its buffer when it is done with it.
+int32_t pp_session_memory_tokens(const struct pp_session * session, llama_token * tokens, int32_t n_tokens_max);
+
+// Writes the memory out as an image, piece by piece, through the sink.
+//
+// checkpoints names the checkpoints that go into the image, in the order in which
+// pp_session_import_memory will report them; NULL with n_checkpoints 0 for none. A model whose
+// memory cannot be cut back (recurrent state: Qwen3.5, Boris-2) can only go back through a
+// checkpoint, and nearly every request after an import needs a step back, so an image without
+// them is of little use for such a model. Each handle must be known, be named once, and belong
+// to a length that the memory still has: a checkpoint beyond the end of the memory is not a
+// checkpoint of the tokens the image holds.
+//
+// The memory is only read. Whatever the result, the memory, every checkpoint, the record of the
+// tokens, the sampler and a prediction that was ready are exactly as they were: a reply can go
+// on after an export, complete or not, as if there had been none. *n_written (when not NULL)
+// receives the number of bytes of the image that were in pieces the sink accepted.
+//
+// Returns PP_STATUS_OK when the whole image was handed over and the sink accepted the last
+// piece; what was handed over before any other result is not an image and must be discarded.
+// PP_STATUS_MEMORY_STOPPED when the sink returned false. PP_STATUS_INVALID_ARGUMENT, before the
+// sink is called at all, for an empty memory, a checkpoint as described above, more than
+// PP_CHECKPOINTS_MAX of them, or a sink without a buffer of at least PP_MEMORY_PIECE_BYTES_MIN
+// bytes, with a first_piece_offset that is not below buffer_size or without a callback.
+// PP_STATUS_OUT_OF_MEMORY for a session without a context. PP_STATUS_MEMORY_FAILED when
+// llama.cpp could not write the state or wrote another number of bytes than it announced.
+int32_t pp_session_export_memory(
+        struct pp_session * session,
+        const int32_t * checkpoints,
+        int32_t n_checkpoints,
+        const struct pp_memory_sink * sink,
+        int64_t * n_written);
+
+// Reads an image back: afterwards the memory holds the tokens it held when the image was
+// written, the record of them is the same, and the checkpoints of the image are checkpoints of
+// this session under new handles.
+//
+// The memory must be empty and the session must hold no checkpoint (as after
+// pp_session_clear_memory, and in a session that was just opened), and the context must have
+// room for the image's tokens: give it its size first (pp_session_resize_context), from the
+// number of tokens that the caller recorded beside the image. checkpoints must have room for
+// PP_CHECKPOINTS_MAX entries; *n_checkpoints receives how many the image held, and the entries
+// are in the order they were named in at the export.
+//
+// All or nothing. After PP_STATUS_OK the session is as described. After any other result, at
+// whatever byte the import ended, the memory is empty, its key-value and state buffers are
+// overwritten with zeros (llama_memory_clear(mem, true)), the record of the tokens is
+// overwritten and empty, no checkpoint is held (those already read are overwritten and freed),
+// *n_checkpoints is 0, and the session works as one whose memory was never filled: the caller
+// reads the conversation again. (An image that is refused before any of its state reached
+// llama.cpp, by what it says of itself, has put nothing into those buffers, and they are left
+// as they were.) llama.cpp keeps lists of its own while it reads. The two that hold the ids of
+// the tokens, for the models whose state carries them, it overwrites before it frees them
+// (native/patches/0005; upstream frees them as they are); the rest, the positions of the
+// cells, it frees as it is. The allocator is asked to give its free pages back before the
+// function returns.
+//
+// WHAT THE CALLER MUST GUARANTEE. The bytes handed over are, complete and in order, the bytes
+// that one pp_session_export_memory of this same build of the library wrote for this same model
+// file, and nobody could have changed them since: the app authenticates every piece before it
+// returns it from the source, and compares the build and the model it recorded beside the
+// image before it calls this function. That is a condition, not advice. llama.cpp reads a
+// state as its own writer left it: it checks the number of cells against the context, the
+// number of layers and the type and size of every row, and it believes the rest (the
+// positions and sequence ids of the cells, the token ids in them, the key and value rows
+// themselves). A state that was changed there can leave the memory in a condition that a later
+// call ends the process over, by one of the assertions llama.cpp checks its own bookkeeping
+// with, or one that gives wrong predictions without a sign. The same holds for a checkpoint of
+// the image, which llama.cpp only reads when it is restored.
+//
+// What the session checks itself, before any byte of the state reaches llama.cpp: that the
+// image begins as one of this library's and of this version of its layout; that it was written
+// for a model with the properties of this one (the sizes of the vocabulary, the trained
+// context, the embedding and the layers, the number of parameters, the size of the weights,
+// the kind of memory and the architecture's name, in one number); that its sizes add up; that
+// its tokens are at least 1 and at most what the context holds, each id inside the vocabulary
+// and none the token this model cannot take as input; that no checkpoint belongs to a length
+// beyond its tokens. While llama.cpp reads: that it never takes a byte more than the image
+// says its state has, and never names a range outside the tensor it is filling. Afterwards:
+// that it took exactly the bytes the state has, that the memory then has exactly the image's
+// number of tokens, that no checkpoint is larger than a checkpoint of the whole restored
+// memory would be (the limit that is checked before a checkpoint is allocated), and that
+// nothing follows the image. Each of these fails the import; none of them makes up for the
+// guarantee above.
+//
+// Returns PP_STATUS_OK; PP_STATUS_MEMORY_STOPPED when the source returned a negative number;
+// PP_STATUS_CONTEXT_FULL when the image holds more tokens than the context has room for;
+// PP_STATUS_MEMORY_FAILED when the image ended early, went on after its end or failed one of
+// the checks above, and when llama.cpp did not accept the state; PP_STATUS_OUT_OF_MEMORY for a
+// session without a context and when a checkpoint could not be allocated;
+// PP_STATUS_INVALID_ARGUMENT, with nothing touched and the source not called, when the memory
+// is not empty, a checkpoint is held, or an argument is missing or outside what
+// pp_memory_source states.
+int32_t pp_session_import_memory(
+        struct pp_session * session,
+        const struct pp_memory_source * source,
+        struct pp_memory_checkpoint * checkpoints,
+        int32_t * n_checkpoints);
 
 //
 // Sampling

@@ -2265,7 +2265,7 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 - **NAT-01** The native session is one loaded model with one context holding one conversation,
   driven call by call. It decides nothing: it never renders a prompt, looks for a stop string,
   shortens or shifts the context, chooses a sampling default or retries.
-- **NAT-02** It is built on llama.cpp at a pinned commit with four small patches, of which only
+- **NAT-02** It is built on llama.cpp at a pinned commit with five small patches, of which only
   the core library is built and linked (BUILD-02). The project adds three model architectures
   that llama.cpp does not have (`peacebell`, `boris2`, `shard2`) and, for the Peacebell
   tokeniser, a front-end that reproduces the model's reference tokeniser exactly and keeps the
@@ -2318,10 +2318,13 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   below one millionth selects the most-likely-token path.
 - **NAT-11** Boris-2 cannot be given its own end-of-text token as input (its computation would
   stop the process); the session refuses that token with a status and leaves the memory alone.
-- **NAT-12** A failure is one of ten status codes, shared with the engine and never
-  renumbered: 1 load failed, 2 load cancelled, 3 tokenising failed, 4 context full, 5 evaluation
-  failed, 6 sampling failed, 7 out of memory, 8 invalid argument, 9 context refused, 10 context
-  not created (ENG-37). A short technical description
+- **NAT-12** A failure is one of twelve status codes, never renumbered: 1 load failed, 2 load
+  cancelled, 3 tokenising failed, 4 context full, 5 evaluation failed, 6 sampling failed, 7 out
+  of memory, 8 invalid argument, 9 context refused, 10 context not created (ENG-37), 11 memory
+  export or import stopped by the caller, 12 memory image not written or not accepted. The
+  first ten are shared with the engine; the last two belong to writing the model's memory out
+  and reading it back, which the native session provides and nothing above it uses yet. A short
+  technical description
   goes with it and never contains text of a conversation.
 - **NAT-13** Forgetting a conversation frees the context, the token batch and the sampler and
   creates them again, the context at the size the model was opened with whatever it had grown

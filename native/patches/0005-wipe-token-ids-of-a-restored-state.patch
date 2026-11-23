@@ -1,0 +1,33 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2538,6 +2538,29 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+             exts.resize(cell_count);
+         }
+ 
++        // proseplow: the two lists above receive the token id of every restored cell, and both
++        // are freed when this function returns, by whichever of its ways out. They are
++        // overwritten first, so that reading a state back leaves the ids of a conversation in no
++        // freed block (through a volatile pointer: stores into memory that is freed next would
++        // otherwise be removed).
++        struct wipe_token_ids {
++            llama_ubatch                   & ubatch;
++            std::vector<llama_kv_cell_ext> & exts;
++            uint32_t                         n;
++
++            static void zero(void * data, size_t size) {
++                volatile unsigned char * p = (volatile unsigned char *) data;
++                while (size-- > 0) {
++                    *p++ = 0;
++                }
++            }
++
++            ~wipe_token_ids() {
++                zero(ubatch.token, (size_t) n * sizeof(llama_token));
++                zero(exts.data(), exts.size() * sizeof(llama_kv_cell_ext));
++            }
++        } wipe_token_ids_on_return { ubatch, exts, cell_count };
++
+         for (uint32_t i = 0; i < cell_count; ++i) {
+             llama_pos pos;
+             uint32_t n_seq_id;

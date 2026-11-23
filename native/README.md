@@ -60,7 +60,7 @@ What goes where:
   windowed layers the cache it needs.
   All architecture hooks live in this one patch because they sit on neighbouring lines of the
   same tables; an unrelated change (a kernel, a loader fix) gets a patch of its own. There are
-  three:
+  four:
   - `patches/0002-arm-f16-weights-kernel.patch` (23 added lines in two files) makes the CPU
     backend use tinyBLAS's batch kernel for 16-bit float weights times 32-bit activations on
     every ARM build. Upstream has the kernel but compiles it out of every build with half-float
@@ -89,6 +89,19 @@ What goes where:
     processor, 0.03 with the line gone. Tokenising cannot be interrupted, which is what made this matter. The line
     sits in a function that 0001 rewrites, so this patch is made on top of that one and has to
     be made again (`tools/make-hook-patch.sh`) when 0001 changes those lines.
+  - `patches/0005-wipe-token-ids-of-a-restored-state.patch` (23 added lines in one file) makes
+    llama.cpp overwrite two lists before it frees them. When it reads the state of a sequence
+    back (`llama_kv_cache::state_read_meta`, which an import of a memory and a change of
+    context size that carries the memory over both go through), it collects the cells to
+    restore in a batch of its own and in a list of what each cell recorded, and for a model
+    whose state carries the id of every token (Qwen3.5, Boris-2) both hold the ids of the
+    whole conversation, in order. Upstream frees them as they are, and `<model>.residue` then
+    found every window of the reply's ids in the freed blocks, for Qwen3.5 still after the
+    conversation was forgotten and the model closed. The patch is one object in that function
+    whose destructor zeroes the two lists on every way out of it, through a volatile pointer.
+    It is in the file in which 0001 makes a boris2 cell record its token id, 500 lines from
+    that line and independent of it, and has to be looked at again whenever upstream changes
+    `state_read_meta`: a list of token ids added there would be freed as it is.
 - Only `libllama` is built and linked. llama.cpp's helper library (`common`) contains an HTTP
   client and a downloader; the CMake project fails if that target even exists.
 
@@ -189,7 +202,8 @@ reported by ctest as skipped, never as failed.
 | `<model>.session` | The generation session against the file that ships, for each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2: what must fail when opening and how; tokenising equal to the committed vectors as plain text and with special tokens parsed; evaluation in chunks with progress; sampling only from a fresh prediction; greedy replies equal to the reference's, whatever the chunk size; shortening the memory (peacebell and Shard-2: the end is removed and the continuation equals a fresh evaluation; Boris-2 and Qwen3.5: the removal is refused, the memory is untouched by the refusal, and a checkpoint brings it back with an identical continuation, twice; Shard-2 further, on a text of 1,500 tokens: a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made); clearing; banned tokens never sampled, greedy or at temperature 2; cancelling between chunks and (peacebell) inside one; Boris-2: its end-of-text token refused as input; threads pinned one per CPU, re-pinned after the affinities were replaced from outside, and unpinned when a listed CPU is not available; memory given back on close; the model loaded by descriptor, offset and length from a larger file next to another model, read and mapped, with the mapping covering the model's bytes only; mapping refused at an unaligned offset; a context too small. And the limits on what comes from outside: a context or batch of 2,147,483,647 tokens, a context above the ceiling or above what the model was trained for, a text one byte too long, a ninth checkpoint, more banned tokens than the vocabulary has and a model cut short by less than its header are each refused with their status and without an allocation, a penalty window of 2,147,483,647 costs nothing, 256 KiB of line breaks, Chinese or emoji tokenise in time proportional to their length, every token banned gives `SAMPLING_FAILED` and a denormal temperature the greedy token, forgetting in the middle of a prompt works, and the threads are refitted when the affinities are replaced in the middle of one call |
 | `<model>.penalties` | For each bundled model (peacebell-v1-291m, boris-2-instruct, qwen3.5-0.8b) and for shard-2, what the sampling penalties cover. A second context on the same file, which the session does not know, scores the same memory, and the penalties' definitions are applied to its scores as the test writes them out: the session's greedy choice must be the token that comes out on top, step by step, for a repetition penalty over the whole memory (1.1 and 1.6), for presence and frequency penalties over the reply alone (Qwen3.5's 2.0 among them), after going back to the end of the prompt and into the middle of a reply without configuring the sampler again (by removing the end of the memory where the model allows it, and through a checkpoint), with every checkpoint dropped, after a clear, after a prompt whose evaluation was cancelled and finished by a second call, with a window, and for a reply that continues an answer already in memory, configured with `reply_start` at the end of the prompt (presence and frequency count the whole answer, told from counting where this sampling began, again after going back through a checkpoint; a value below -1 refused). Each check names the mistake it is there to catch (a penalty over the reply alone, one that counts the prompt too, a record that still holds tokens which left the memory or lacks tokens that are in it) and fails when no step would have exposed it. Boris-2 further, against `boris-2-instruct-penalty.bin`: six requests of a conversation served from one memory, greedy with the model's repetition penalty of 1.1, choose the tokens that transformers' `generate()` chooses (128 reply tokens; a reference choice with a lead below 0.1 is reported, not required); at the first position of each reply, where only the prompt can be penalised, the logits and the scores after the penalty are the reference's to within 0.05 and the session's first choices in order are the reference's; with the penalty off the first token is the reference's without a penalty |
 | `<model>.context` | For each bundled model and for shard-2, the size of a session's context. The model's `trained_context` and `context_bytes_per_token` of `models/manifest.json` are held to the file. What a session that knows two sizes says a context costs is at least what the allocator handed llama.cpp for contexts of 256, 512 and 1,024 tokens (less 0.01%, the count's own noise between two states of the process) and at most 1% more; at the model's largest context it is at least, and at most 3% more than, llama.cpp's own sizing of it from a model loaded without allocating, so nothing large is allocated; a session that knows one size costs a larger one at least at what is allocated. A session whose batch (512) is larger than a context it creates (256) costs a larger size exactly as before that context, and at least what llama.cpp allocates for it at that batch. Memory freed on another thread while a context is created (through llama.cpp's log, which the test hooks) does not lower any later cost. With llama.cpp's report made unreadable the same way, an opening with a budget is refused and one with a budget of `INT64_MAX` opens and refuses every change of size. A size above the model's largest or above the budget, also the present size with a budget below its cost, is refused with the memory, a checkpoint and a ready prediction untouched; a budget one byte below the peak of a carry-over comes back with an empty memory and one at the peak with the memory carried over, its checkpoint valid and its continuation the same as a fresh evaluation at that size; a reply carried over goes on with its penalties counting from where it began, told from a reply begun anew at the change; a size smaller than the memory empties it. With the address space of the test process limited (never by using memory up; at the moment the old context is freed for the last two), a larger size that cannot be mapped leaves the previous size with its memory carried over and the reply going on as before, a tighter limit leaves half of it with the memory carried into it, none at all leaves no context and no memory, and a clear repairs that; opening over the budget is refused, by the check after the allocation for a budget just below the cost and by the estimate before it for half the cost. The check of llama.cpp's report says in its own text what to do when the report's form changes |
-| `<model>.residue` | For the three bundled models and shard-2: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why) |
+| `<model>.memory` | For each bundled model and for shard-2, the memory written out as an image and read back (`pp_session_export_memory`, `pp_session_import_memory`). Two sessions do the same, call for call: a prompt with two checkpoints and the beginning of a reply; one has its memory written out, forgotten and read back, the other is never interrupted. `pp_session_memory_state_bytes` is exactly what the sink is handed, in pieces of the buffer's size and a last one, "last" said once; the image holds the token ids and then the state byte for byte as `llama_state_seq_get_data_ext` writes it into one block, and it grows with each token by exactly the model's `context_bytes_per_token` of `models/manifest.json` and 16 to 28 bytes more. After the import the state of the sequence, taken from llama.cpp in one block, is byte for byte what it was, the memory written out again gives the same image, the record of the tokens and both checkpoints are back, and no prediction is ready. The prediction after the next token is the control's bit for bit over the whole vocabulary, and so are the scores at each of 64 greedy steps; replies chosen with a repetition penalty over the whole memory and with presence and frequency penalties are the control's; going back through the checkpoints that came out of the image gives, bit for bit, what the control predicts after going back through its own. The image goes into a context twice the size and into one its tokens fill exactly, and one token too many is refused (`PP_STATUS_CONTEXT_FULL`) after one piece. An export stopped by its sink at every piece in turn leaves the memory, the checkpoints and the prediction that was ready as they were (the prediction is compared bit for bit after every one). An import whose source fails at every call in turn, the call after the last piece included, or whose image ends before every piece in turn, leaves no token, no record, no checkpoint and zeros in the caller's buffer, and the session then predicts bit for bit what a new session predicts. Refused with nothing left behind: a piece or a byte behind the image, a source that returns more than its buffer holds, each of the image's first 176 bytes changed in turn (but for a checkpoint's length changed into another length within the memory, which the test counts and names), a token id outside the vocabulary, a state one byte shorter or longer than llama.cpp needs (stopped at the state, not at the image's end), a state llama.cpp refuses, a checkpoint larger than one of the whole memory; and with nothing touched: an import into a memory that holds tokens or beside a checkpoint, an export of an empty memory, of an unknown or twice-named checkpoint or of one beyond the end of the memory, and every unusable sink or source. The caller's own bytes at the start of the first piece come through unchanged. With the address space of the process limited to 2 MiB more than is mapped, where a block of the state's size cannot be allocated, the export and the import of an image without checkpoints both succeed. Shard-2 further, with a memory of 600 tokens against its window of 256: after the import a cut far back is refused with the memory untouched, a cut of the last token is made, and the prediction is within 5e-3 of the control's. The test reads the scores and the state of the context a session works with, which a session does not show: it is linked with `--wrap=llama_init_from_model`, so that every context the session library creates passes through a function of the test |
+| `<model>.residue` | For the three bundled models and shard-2: after a text was tokenised and evaluated and a reply sampled, `pp_session_clear_memory` and `pp_session_close` leave no token ids of the reply anywhere in the writable memory of the process (a stretch of the reply that also occurs in the prompt is counted with the prompt). How much of the text and of the prompt's token ids is still there is reported, not required ("Forgetting" below says why). Then the conversation again with a checkpoint, written out as an image that the test keeps masked: after the export and a clear, after an import that its source stopped at the last call with the whole image in, after a complete import and a clear, and after closing, no stretch of the memory's key and value rows or recurrent state is found (24 bytes from each of eight places of the image) and no token ids of the reply. For the models whose state carries the id of every token (Qwen3.5, Boris-2, which the test finds out from the image) that last holds only with patch 0005, and this test is what holds the patch to it |
 | `qwen3.5-0.8b.load-generate` | The stock architecture's file loads with our build: architecture `qwen35`, tokenizer `gpt2` / `qwen35`, the ids of the end-of-sequence, padding, ChatML, thinking and tool markers; ChatML markers inside a message are plain characters while thinking and tool markers are still tokens; a greedy reply to a ChatML prompt is identical after a rewind through a checkpoint of the recurrent state, after clearing the memory and in a new context |
 
 What `logits-f32` and `logits-f16` check for boris2 beyond the list above, because its Canon
@@ -691,12 +705,14 @@ phone runs. The header is the reference for every function; this is the outline:
 | `pp_session_save_checkpoint`, `..._restore_checkpoint`, `..._drop_checkpoint` | The partial sequence state (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) kept in native memory with the token count it belongs to; restoring is the state, then the cut, in that order (see "Checkpoints" above) |
 | `pp_session_max_context_size`, `pp_session_context_bytes`, `pp_session_carry_bytes` | The context the model was trained for (`llama_model_n_ctx_train`); what a context of a given size costs, from llama.cpp's own report of the buffers it allocated for the contexts of this session (see "A context that grows with the conversation" below); the size of the sequence state a carry-over holds beside a context (`llama_state_seq_get_size_ext`) |
 | `pp_session_resize_context` | Another context size with the model still loaded, held to a budget in bytes before anything is touched: the sequence state written into one block (`llama_state_seq_get_data_ext`) when the budget covers it, the old context overwritten and freed as at a clear, the new one created, the block read into it (`llama_state_seq_set_data_ext`), overwritten and freed; otherwise an empty memory. A size that cannot be created falls back to the previous one, then to halves |
+| `pp_session_memory_state_bytes`, `pp_session_export_memory`, `pp_session_import_memory`, `pp_session_memory_tokens` | The memory as an image that leaves and enters the session in pieces, through a buffer and a callback of the caller's: the session's record of the tokens, the state of the sequence exactly as `llama_state_seq_get_data_ext` writes it but never as a block (llama.cpp's own `llama_io_write_i` and `llama_io_read_i`, implemented over the caller's buffer in `session/src/state_stream.cpp`, handed to `llama_memory_i::state_write` and `::state_read`), and the checkpoints the caller names. Nothing is written to a file. See "A memory that is written out and read back" below |
 | `pp_session_clear_memory` | The context goes back to the size the session was opened with. Every checkpoint zeroed and freed; the sampler chain, the batch and the context freed and created again, after `llama_memory_clear(mem, true)` and after overwriting what of them can be reached (the last prediction, the batch's tokens) and the session's own record of the tokens in memory; the allocator asked to give its free pages back. See "Forgetting" below for what this removes and what it does not |
 | `pp_session_configure_sampler`, `pp_session_sample_next` | A fixed order: the penalties, which the session computes itself from its record of the tokens in memory (see "Penalties that cover what their definitions cover" below), then a chain of banned tokens (logit bias of minus infinity) and, for a temperature of a millionth or more, temperature, top-k, top-p, min-p and the random choice, otherwise greedy; this is what `llama_sampler_sample` does (`llama_sampler_apply` on the scores, `llama_sampler_accept`), once per complete evaluation, on a candidate list of the session's own, with the sampler that chooses applied after the others and only when there is something to choose from |
 | `pp_session_close` | Everything freed, after the same overwriting as a clear |
 
 A failure is a status code, and the codes are the ones of the Kotlin `NativeLlamaException`,
-one for one. No function logs anything, and llama.cpp's own log is written nowhere: the session
+one for one (but for the two that only the export and import of a memory return, 11 and 12,
+which that class does not name yet: see below). No function logs anything, and llama.cpp's own log is written nowhere: the session
 takes from it only the name of the compute back end that was loaded, the description of a
 failure and the sizes of the buffers of a context. The buffers the session and the front-end allocate themselves for text, tokens,
 predictions or model state are overwritten before they are freed; llama.cpp's are not, which
@@ -754,6 +770,8 @@ wrong on a phone or for one of the models:
   | Penalty window | None | `PP_PENALTY_NO_WINDOW` (-1) is the whole memory, which is what the engine passes; 0 and other negative values are refused |
   | Reply start | None | `PP_REPLY_START_AT_SAMPLING` (-1) or a position from 0, which is what the engine passes (-1, or where a continued answer began); below -1 is `PP_STATUS_INVALID_ARGUMENT` |
   | Banned tokens | The size of the vocabulary | `PP_STATUS_INVALID_ARGUMENT` |
+  | Buffer for the pieces of a memory image | At least 4096 bytes (`PP_MEMORY_PIECE_BYTES_MIN`); no largest size, it is the caller's buffer and nothing is allocated to match it | `PP_STATUS_INVALID_ARGUMENT`, before a callback is called |
+  | What a memory image says of itself | Tokens: what the context holds. Checkpoints: 8, each no larger than a checkpoint of the whole restored memory, which llama.cpp is asked for before one is allocated. The state: llama.cpp is given the bytes the image says it has and not one more | `PP_STATUS_CONTEXT_FULL` for the tokens, `PP_STATUS_MEMORY_FAILED` for the rest, each with the memory left empty |
 
   The context has no fixed ceiling any more: what a model was trained for is its limit
   (2,048 tokens for Boris-2, 32,768 for peacebell, 262,144 for Qwen3.5), and because the
@@ -918,9 +936,8 @@ wrong on a phone or for one of the models:
   not fail at all: the process is ended while a buffer is zeroed. There the budget is the
   only protection, and deriving it from the memory the system has free is the caller's part.
 
-  Measured on a desktop (6 threads, a batch of 256, a busy machine; the phone is for the lead
-  to measure, see `ContextGrowthDeviceTest`), with 280 tokens in memory where a memory is
-  carried:
+  Measured on a desktop (6 threads, a batch of 256, a busy machine; for the phone see
+  `ContextGrowthDeviceTest`), with 280 tokens in memory where a memory is carried:
 
   | Model, context | Allocated | Resident beyond the context of 4,096 | Created, empty | Created, memory carried | Prompt, generation (tokens/s) | Forgotten (back to 4,096) |
   | --- | --- | --- | --- | --- | --- | --- |
@@ -945,16 +962,162 @@ wrong on a phone or for one of the models:
   17.8 MiB and 260 MiB for peacebell. Nothing above 1.1 GiB was allocated for these figures;
   the largest contexts are costed, not measured.
 
+- **A memory that is written out and read back.** A conversation that was read once need not
+  be read again after a lock if the state it left in the context is kept: the app means to
+  write that state out, sealed, when it leaves the screen, and to read it back at the next
+  unlock (that side is not in this directory, and not written yet). llama.cpp's public
+  interface moves the state of a sequence in two ways, and neither will do. One block
+  (`llama_state_seq_get_data_ext`, which a change of context size uses inside its budget) is
+  the whole state a second time beside the context, 578 MiB for peacebell at 9,100 tokens; a
+  file (`llama_state_seq_save_file`) is the state in clear on storage. Inside, llama.cpp
+  writes and reads every state through two small interfaces of its own, `llama_io_write_i`
+  and `llama_io_read_i` (`src/llama-io.h`): they are handed the scalars of a state one by one
+  and each stretch of key and value rows as "this tensor, from this offset, this many bytes".
+  `session/src/state_stream.cpp` implements the two over a buffer that the caller owns, and
+  calls the two virtual functions every state goes through (`llama_memory_i::state_write` and
+  `::state_read`, `src/llama-memory.h`) on the memory of the session's context. The rows go
+  straight between llama.cpp's buffers and the caller's buffer, as many bytes at a time as
+  the buffer has room for, and no block of the state's size exists at any moment. That file
+  is the only one of this project compiled against llama.cpp's internal headers (its entry in
+  `session/CMakeLists.txt` gives it, and no other file, the directory), and it needs no
+  symbol that `libllama` does not export: the functions are reached through the object's own
+  table of virtual functions. No patch to llama.cpp is involved in that; the one patch that
+  belongs to this (0005, above) only overwrites what llama.cpp frees after reading a state.
+
+  A **memory image** is what `pp_session_export_memory` hands to the caller's sink and what
+  `pp_session_import_memory` takes from the caller's source: 176 bytes that say what follows
+  and how large each part is, the session's record of the tokens in memory (4 bytes each),
+  the state of the sequence exactly as `llama_state_seq_get_data_ext` writes it behind its
+  first 8 bytes, and the checkpoints the caller named, each as it sits in native memory, with
+  the length of memory it belongs to. The checkpoints belong in it because a model with
+  recurrent state can only go back through one, and nearly every request after an import goes
+  back: the last token is read afresh, a reply is tokenised again, an answer is asked for
+  again. Not in it: the sampler, which both functions leave as it is, and a prediction (after
+  an import at least one token is evaluated before the next is sampled, as after a restored
+  checkpoint). An image is not a file format. It is written as the machine holds it, its
+  state is the pinned llama.cpp's for this model, and it is only ever read by the build that
+  wrote it, on the same model file; the size of the context is not part of that, an image
+  goes into any context that has room for its tokens. `pp_session_memory_state_bytes` says
+  beforehand, by walking the cells and copying nothing, exactly how many bytes an export
+  hands over, and `pp_session_memory_tokens` gives a caller that keeps its own copy of the
+  token ids the record to set it from after an import.
+
+  How it is driven. The caller gives a buffer and a callback (`pp_memory_sink`,
+  `pp_memory_source`). An export fills the buffer and calls the sink with every full piece
+  and with the last one, saying which is the last; the sink returns false to stop. An import
+  calls the source whenever it needs more; the source puts the next bytes at the start of the
+  buffer and says how many (0 for "no more", a negative number for "cannot" or "stop"), and
+  after the image's last byte it is asked once more and must answer 0. The size of the buffer
+  is the size of a piece and the caller's choice, from 4,096 bytes up. `first_piece_offset`
+  keeps room at the start of the first piece for bytes of the caller's own (a header), so
+  that every piece it seals has the same size, and makes the import skip as many. On Android
+  the buffer is meant to be the memory of a direct `ByteBuffer`, which a cipher reads and
+  writes in place: the state then crosses the binding without being copied into an array on
+  the Java heap. The binding is not written yet: `proseplow_jni.cpp` has no entry for these
+  functions, and `NativeLlamaException` no name for the two status codes that only they
+  return, `PP_STATUS_MEMORY_STOPPED` (11: the caller's callback ended it) and
+  `PP_STATUS_MEMORY_FAILED` (12).
+
+  What is promised. An export only reads: whatever becomes of it (complete, stopped by the
+  sink at any piece, failed), the memory, the checkpoints, the record of the tokens, the
+  sampler and a prediction that was ready are as they were, and a reply goes on as if there
+  had been no export. An import is all or nothing. It needs an empty memory and no checkpoint
+  (as after `pp_session_clear_memory`) and a context with room for the image's tokens, which
+  the caller gives its size first; after any result but `PP_STATUS_OK`, at whatever byte it
+  ended, the memory is empty with its buffers overwritten (`llama_memory_clear(mem, true)`),
+  the record is overwritten and empty, no checkpoint is held, and the session predicts as
+  one whose memory was never filled. Both overwrite the caller's buffer before they return.
+  Neither allocates with the state: an export nothing at all in this library; an import the
+  image's checkpoints, which stay as checkpoints of the session, and llama.cpp its
+  bookkeeping for the restored cells (some tens of bytes per token). A memory that was read
+  back continues exactly as the one that was written out: for the three bundled models the
+  predictions are the same bit for bit, in the context it came from and in one of another
+  size.
+
+  What the caller must guarantee, because the session cannot check it: the bytes handed to
+  `pp_session_import_memory` are, complete and in order, what one export of this same build
+  wrote for this same model file, and nobody could have changed them since. llama.cpp reads a
+  state as its own writer left it. It holds the number of cells to the context and the
+  number of layers and the type and size of every row to the model, and it believes the
+  positions and sequence ids of the cells, the token ids in them and the rows themselves. A
+  state changed there can leave the memory in a condition that a later call ends the process
+  over (the assertions llama.cpp checks its own bookkeeping with), or one that predicts
+  wrongly without a sign; the same holds for a checkpoint of an image, which llama.cpp only
+  reads when it is restored. So every piece is to be authenticated before the source returns
+  it, and the build and the model compared before the import is called. Short of that the
+  session refuses what it can tell: an image that does not begin as one of this layout; one
+  written for a model of another shape (the sizes of the vocabulary, the trained context, the
+  embedding and the layers, the number of parameters, the size of the weights, the kind of
+  memory and the architecture's name, as one number in the image); sizes that do not add up;
+  more tokens than the context holds (`PP_STATUS_CONTEXT_FULL`, from the image's first
+  piece); a token id outside the vocabulary, or the token this model cannot take as input;
+  a checkpoint that belongs to a length beyond the image's tokens, or is larger than a
+  checkpoint of the whole restored memory; a state for which llama.cpp asks for more bytes
+  than the image says it has, or leaves some; a range llama.cpp names outside the tensor it
+  is filling (ggml ends the process over that; here it fails the import); a memory that does
+  not hold the image's number of tokens afterwards; and anything behind the image. Of the
+  176 bytes an image begins with, a change to any one is refused but for one thing nothing in
+  an image can settle: the length a checkpoint belongs to, changed into another length
+  within the memory.
+
+  A model with windowed layers (Shard-2) writes of those layers only the window before the
+  end of the memory into a state. An image of a memory longer than the window is therefore
+  much smaller than the buffers it came from (71 MiB for 8,100 tokens), and the memory that
+  is read back is what a memory is after a checkpoint was restored: a cut is only right while
+  the windowed layers still hold the window before it, `pp_session_rewind_to` refuses any
+  other as it does there, and the predictions are the uninterrupted memory's to within
+  rounding (1.3e-4 at most where the test looks), not bit for bit, because the restored
+  cells lie in other places of the buffers. While the memory is no longer than the window it
+  comes back cell for cell, and bit for bit.
+
+  Measured on a desktop (6 threads, a batch of 256, pieces of 1 MiB, four checkpoints at the
+  quarters of the memory as the engine keeps four; not yet measured on the phone):
+
+  | Model, tokens in memory (context) | Image | Of which the four checkpoints | Export, the sink only takes the piece | Export, the sink copies each piece | Import, the source copies each piece | Reading the same tokens instead |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | Qwen3.5, 4,000 (4,096) | 143.3 MiB | 77.1 MiB | 9 ms | 21 ms | 39 ms | 11.7 s |
+  | Qwen3.5, 7,100 (7,168) | 179.7 MiB | 77.1 MiB | 12 ms | 25 ms | 46 ms | 24.7 s |
+  | Qwen3.5, 16,200 (16,384) | 286.6 MiB | 77.1 MiB | 18 ms | 39 ms | 60 ms | 95.4 s |
+  | peacebell, 4,000 (4,096) | 254.0 MiB | 32 bytes | 17 ms | 36 ms | 37 ms | 7.4 s |
+  | peacebell, 9,100 (9,216) | 577.8 MiB | 32 bytes | 38 ms | 83 ms | 80 ms | 26.0 s |
+  | Boris-2, 500 (512) | 32.1 MiB | 1.5 MiB | 2 ms | 5 ms | 5 ms | 0.4 s |
+  | Boris-2, 2,040 (2,048) | 125.4 MiB | 1.5 MiB | 8 ms | 17 ms | 18 ms | 2.1 s |
+  | Shard-2, 4,000 (4,096) | 71.3 MiB | 32.0 MiB | 4 ms | 10 ms | 17 ms | 2.2 s |
+  | Shard-2, 8,100 (8,192) | 103.4 MiB | 32.0 MiB | 7 ms | 15 ms | 24 ms | 4.5 s |
+
+  An image grows by the key-value bytes of a token (the table of "A context that grows with
+  the conversation"), the 12 or 24 bytes llama.cpp records of its cell and the 4 of its id:
+  12,316 bytes for Qwen3.5, 66,576 for peacebell, 63,516 for Boris-2; for Shard-2 40,988
+  up to its window and 8,208 beyond it, where only the layers without a window add rows. The
+  fixed part is the recurrent state (19.3 MiB for Qwen3.5, 0.36 MiB for Boris-2), and a
+  checkpoint is what it is in memory (19.3 MiB, 0.36 MiB, 8 bytes for peacebell, 8.0 MiB for
+  Shard-2 beyond its window). On this machine the copy itself is 15 GiB per second out of
+  the context and 3.6 to 7 into it (the lower figures where megabytes of checkpoints are
+  allocated on the way), so these times say only that the native part will not be what a
+  save or a restore waits for: sealing, storage and the phone's memory bandwidth are, and
+  none of them is in these figures. After an import the process holds the checkpoints again
+  and nothing else it did not hold before (77 MiB more resident for Qwen3.5, 1.5 MiB for
+  Boris-2). What an import allocates on the way was held to a limit on the address space of
+  the process: peacebell's 578 MiB went in with 256 KiB to spare, and Qwen3.5's 16,200 tokens
+  with 1 MiB to spare beyond the 77 MiB of the four checkpoints; with 256 KiB a checkpoint
+  could not be allocated, and the import answered `PP_STATUS_OUT_OF_MEMORY` with the memory
+  empty. So llama.cpp's bookkeeping for the restored cells is between 16 and 65 bytes per
+  token there. None of this has run on a phone. `test_memory` is built for one as
+  `test_residue` is (the commands under "Forgetting", with `--target test_memory`) and takes
+  the same `--gguf`; the checks with a limit on the address space are left out there, because
+  Android's allocator ends the process over a mapping that fails.
+
 What a caller must know beyond the header is little: one thread should make all the calls of a
 session, a prediction exists only between a complete evaluation and the next call that changes
 the memory (sampling at any other time is an error, not stale output), and after a restore at
 least one token has to be evaluated before sampling, because a checkpoint holds state, not
 scores.
 
-The tests are `session/tests/test_session.cpp`, registered as `<model>.session`, and
-`session/tests/test_penalties.cpp`, registered as `<model>.penalties` (a few seconds to half a
+The tests are `session/tests/test_session.cpp`, registered as `<model>.session`,
+`session/tests/test_penalties.cpp`, registered as `<model>.penalties`, and
+`session/tests/test_memory.cpp`, registered as `<model>.memory` (a few seconds to half a
 minute each), run with the rest by `ctest` and `tools/host-check.sh` (`ctest -R session` for
-the first alone, `ctest -R penalties` for the second). Each session test takes
+the first alone, `ctest -R penalties` for the second, `ctest -R memory` for the third). Each session test takes
 between ten seconds and two minutes, depending on the model and on what else the machine is
 doing, and writes up to 2.2 GB into the build directory while it runs, the file that holds the
 model next to another model, and deletes it afterwards. The checks that hand the session a
@@ -970,7 +1133,10 @@ context at the size the session was opened with; the model stays loaded and the 
 kept. `pp_session_resize_context` does the same overwriting and freeing for another size, and
 the block it carries the memory through is overwritten before it is freed; `<model>.residue`
 changes the size both ways (memory carried, memory emptied) and requires of the result what
-it requires of a clear. Before each is freed, what it holds of the
+it requires of a clear. `pp_session_export_memory` and `pp_session_import_memory` put the
+memory through a buffer of the caller's and overwrite it before they return; an import that
+does not succeed overwrites what it had taken in (the memory's buffers, the record of the
+tokens, the checkpoints it had read) and leaves the memory empty. Before each is freed, what it holds of the
 conversation and can be reached is overwritten: every checkpoint, the scores of the last
 prediction (which are also overwritten as soon as a token has been sampled from them, and when
 the next evaluation begins), the session's candidate list, the tokens in the batch, the
@@ -1020,6 +1186,22 @@ and another heap, finds no prompt ids for peacebell where this test finds 21, an
 build of this test found 21 for Qwen3.5. The zeros in the text and prompt columns are
 therefore the allocator's doing, not the session's, and nothing to rely on; the 705 and the
 162 are the copies of the first table, untouched.
+
+The same program then writes the conversation out as a memory image, which it keeps masked
+as it keeps everything, and looks for the memory itself as well: 24 consecutive bytes from
+each of eight places of the image's state, key and value rows and recurrent state. None is
+found after the export and a clear, after an import that its source stopped at the very last
+call (when the whole image was in), after a complete import and a clear, or after closing,
+for any of the four models; while the memory is there, all eight are. No window of the
+reply's token ids is found at any of those points either, and the test requires it. For
+Qwen3.5 and Boris-2 that is the work of patch 0005. Their state carries the id of every
+token, llama.cpp reads those ids into two lists of its own when it restores the cells, and
+without the patch the scan found, after the import that was stopped, all 9 windows of the
+reply's ids and 64 of the prompt's (Boris-2) or 9 and 45 (Qwen3.5) in the freed lists, and
+for Qwen3.5 the same 9 and 45 after the complete import, a clear and closing; with it, none
+of either. A change of context size that carries the memory over goes through the same
+reader: straight after one, without the patch, the scan found the reply's ids of Boris-2
+twice, once in the session's record and once in a freed list.
 
 A window of the reply that also occurs in the prompt is counted with the prompt and not as the
 reply's: Qwen3.5 answers this text by repeating part of it, ten of its twelve reply tokens are
@@ -1611,7 +1793,24 @@ converter writes over a constant in C++.
    attention-only memory again, on the abort callback being called on the calling thread, on
    `ggml_threadpool_new` pinning the creating thread to the last CPU of a strict mask, and on
    the CPU backend pausing the pool it used before when it is given another; the session
-   tests cover each of these.
+   tests cover each of these. The export and import of a memory rely on two internal
+   headers, which no other code of this project includes: `llama_io_write_i` (`write`,
+   `write_tensor`, `n_bytes`) and `llama_io_read_i` (`read`, `read_tensor`, `discard`,
+   `n_bytes`) in `src/llama-io.h`, and the virtual functions `state_write` and `state_read`
+   of `llama_memory_i` in `src/llama-memory.h`, called with a sequence id and
+   `LLAMA_STATE_SEQ_FLAGS_NONE`. They are all that `llama_context::state_seq_write_data` and
+   `::state_seq_read_data` do; the public calls put a mark and the sequence id in front,
+   eight bytes that an image does not carry. A member added to either interface stops
+   `session/src/state_stream.cpp` compiling, and `session/CMakeLists.txt` stops the
+   configuration when either header is gone. What the compiler cannot see, `<model>.memory`
+   does: it compares the state in an image with the block of the public call byte for byte,
+   and a memory that was read back with one that never left, bit for bit. That test relies
+   on a state beginning with the number of streams and the number of cells of a key-value
+   cache (it sets the second beyond any context, to see llama.cpp refuse a state), and on
+   `llama_init_from_model` being the one function a session creates a context with (the
+   linker routes it through the test). Should the interfaces ever go, what remains is the
+   one block that a change of context size uses, for memories that fit a budget beside the
+   context: `llama_state_seq_get_data_ext` handed to the sink in pieces.
 4. Convert the models again: their records name the converter sources, so every GGUF is
    rebuilt, and the determinism test tells whether the bytes changed.
 

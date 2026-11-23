@@ -14,8 +14,15 @@
 //   that leaves behind.
 // - No size from outside reaches llama.cpp unchecked: llama.cpp allocates for whatever it is
 //   given, and an allocation that cannot be met ends the process on a phone instead of failing.
+// - No state of the model is ever written to a file from here, and none is ever held in a block
+//   of its whole size except where pp_session_resize_context carries a memory to another
+//   context inside its budget: llama_state_seq_save_file and llama_state_save_file write a
+//   state in clear and are called nowhere, and a memory that leaves the process leaves it
+//   through the caller's buffer, a piece at a time (state_stream.h).
 
 #include "proseplow_session.h"
+
+#include "state_stream.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1268,6 +1275,47 @@ std::string meta(const llama_model * model, const char * key) {
     return n < 0 ? std::string() : std::string(buffer);
 }
 
+// The number a memory image is bound to its model by: the properties of the model that decide
+// how llama.cpp lays out the state of a sequence (how many layers, how wide, which kind of
+// memory), and those that tell one model of the same shape from another as far as they can
+// (the vocabulary, the number of parameters, the size of the weights), with the version of the
+// image's own layout. An image carries the number of the session that wrote it and is only
+// read by a session that has the same. It is a check against a mistake, an image handed to a
+// session of another model, and not a proof of where an image comes from: the caller binds an
+// image to the model file and to the build (see pp_session_import_memory in the header).
+// FNV-1a, because a wrong model should give another number, not because anything has to be
+// hidden. Computed when it is asked for, from the model alone, and without an allocation.
+constexpr uint32_t k_image_version = 1;
+
+uint64_t model_mark_of(const pp_session * s) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    const auto mix = [&hash](const void * data, size_t size) {
+        for (size_t i = 0; i < size; i++) {
+            hash = (hash ^ ((const uint8_t *) data)[i]) * 0x100000001b3ull;
+        }
+    };
+    const uint64_t numbers[] = {
+        (uint64_t) k_image_version,
+        (uint64_t) sizeof(llama_token),
+        (uint64_t) s->n_vocab,
+        (uint64_t) s->n_ctx_max,
+        (uint64_t) llama_model_n_embd(s->model),
+        (uint64_t) llama_model_n_layer(s->model),
+        (uint64_t) llama_model_n_head(s->model),
+        (uint64_t) s->n_window,
+        (uint64_t) (llama_model_is_hybrid(s->model) ? 1 : 0),
+        (uint64_t) (llama_model_is_recurrent(s->model) ? 1 : 0),
+        (uint64_t) llama_model_n_params(s->model),
+        (uint64_t) llama_model_size(s->model),
+    };
+    mix(numbers, sizeof(numbers));
+    char architecture[128] = "";
+    if (llama_model_meta_val_str(s->model, "general.architecture", architecture, sizeof(architecture)) > 0) {
+        mix(architecture, std::strlen(architecture));
+    }
+    return hash;
+}
+
 struct session_closer {
     void operator()(pp_session * s) const { pp_session_close(s); }
 };
@@ -1476,6 +1524,157 @@ const char * model_extent_problem(FILE * file, int64_t offset, int64_t length) {
 
 bool finite(float value) {
     return std::isfinite(value);
+}
+
+//
+// A memory image
+//
+
+// How an image begins: what it holds and how large each part is, so that every size is known,
+// and held to its limit, before the part it belongs to is read. The parts follow in this
+// order: the ids of the tokens in memory (n_tokens of them), the state of the sequence
+// (state_bytes, exactly what llama.cpp writes), and the state of each checkpoint in the order
+// of the table. The header is written as the machine holds it. That is enough, because an
+// image is only read by the build that wrote it (see the header): this is not a format that
+// anything has to stay compatible with, and the version exists so that a change of this layout
+// makes an older image fail the first check instead of being misread.
+struct image_checkpoint {
+    uint64_t size;     // the bytes of its state
+    uint32_t n_tokens; // the length of memory it belongs to
+    uint32_t zero;     // nothing: written as 0, and held to it
+};
+
+struct image_header {
+    uint8_t  magic[8];
+    uint32_t version;       // k_image_version
+    uint32_t header_bytes;  // sizeof(image_header)
+    uint64_t model;         // model_mark_of the session that wrote it
+    uint64_t total_bytes;   // of the whole image, this header included
+    uint64_t state_bytes;   // of the state of the sequence
+    uint32_t n_tokens;      // the tokens in memory
+    uint32_t n_checkpoints; // how many entries of the table are used; the others are zeros
+    image_checkpoint checkpoints[PP_CHECKPOINTS_MAX];
+};
+// Every field lies where the one before it ends: no padding, so no byte of the header is
+// anything but what was put there.
+static_assert(sizeof(image_checkpoint) == 16 && sizeof(image_header) == 48 + 16 * PP_CHECKPOINTS_MAX, "the header of a memory image has padding");
+
+constexpr uint8_t k_image_magic[8] = {'P', 'P', 'M', 'E', 'M', 'O', 'R', 'Y'};
+
+// No part of an image is this large; a size at or above it is refused before it is added to
+// another, so that no sum of the sizes of an image can wrap.
+constexpr uint64_t k_image_part_limit = (uint64_t) 1 << 56;
+
+bool usable(const pp_memory_sink * sink) {
+    return sink != nullptr && sink->buffer != nullptr && sink->buffer_size >= PP_MEMORY_PIECE_BYTES_MIN &&
+           sink->first_piece_offset < sink->buffer_size && sink->write != nullptr;
+}
+
+bool usable(const pp_memory_source * source) {
+    return source != nullptr && source->buffer != nullptr && source->buffer_size >= PP_MEMORY_PIECE_BYTES_MIN &&
+           source->first_piece_offset < source->buffer_size && source->read != nullptr;
+}
+
+// The header of the image that the memory would be written as now, with the named checkpoints,
+// and those checkpoints in the order they were named in. Nothing is changed and nothing is
+// copied: the size of the state is llama.cpp's walk over the cells in use. Returns
+// PP_STATUS_OK, or the status an export answers with and, in *problem, why. Throws what
+// llama.cpp throws while it measures. The session must have a context.
+int32_t plan_image(const pp_session * s, const int32_t * checkpoints, int32_t n_checkpoints, image_header & header,
+                   const pp_checkpoint * blobs[PP_CHECKPOINTS_MAX], const char ** problem) {
+    std::memset(&header, 0, sizeof(header));
+    if (n_checkpoints < 0 || n_checkpoints > PP_CHECKPOINTS_MAX || (checkpoints == nullptr && n_checkpoints > 0)) {
+        *problem = "the checkpoints for a memory image are missing, or more than " PP_STRINGIFY(PP_CHECKPOINTS_MAX);
+        return PP_STATUS_INVALID_ARGUMENT;
+    }
+    const int32_t count = memory_count(s);
+    if (count < 1) {
+        *problem = "the memory is empty: there is nothing to write out";
+        return PP_STATUS_INVALID_ARGUMENT;
+    }
+    // Every call that changes the memory keeps the record in step with it. An image whose
+    // record is not the memory's would be believed when it is read back, so this is asked.
+    if ((int32_t) s->history.size() != count) {
+        *problem = "the record of the tokens in memory does not have the memory's length";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    std::memcpy(header.magic, k_image_magic, sizeof(header.magic));
+    header.version = k_image_version;
+    header.header_bytes = (uint32_t) sizeof(header);
+    header.model = model_mark_of(s);
+    header.n_tokens = (uint32_t) count;
+    header.n_checkpoints = (uint32_t) n_checkpoints;
+    uint64_t total = sizeof(header) + (uint64_t) count * sizeof(llama_token);
+    for (int32_t i = 0; i < n_checkpoints; i++) {
+        for (int32_t j = 0; j < i; j++) {
+            if (checkpoints[j] == checkpoints[i]) {
+                *problem = "a checkpoint is named twice for a memory image";
+                return PP_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        const auto it = s->checkpoints.find(checkpoints[i]);
+        if (it == s->checkpoints.end()) {
+            *problem = "an unknown checkpoint is named for a memory image";
+            return PP_STATUS_INVALID_ARGUMENT;
+        }
+        // A checkpoint is valid while the memory still begins with the tokens it was saved at.
+        // The image holds the tokens in memory and no others, so a checkpoint beyond them
+        // would come back as one that nothing vouches for.
+        if (it->second.n_tokens < 0 || it->second.n_tokens > count) {
+            *problem = "a checkpoint named for a memory image belongs to a length the memory no longer has";
+            return PP_STATUS_INVALID_ARGUMENT;
+        }
+        blobs[i] = &it->second;
+        header.checkpoints[i].size = (uint64_t) it->second.size;
+        header.checkpoints[i].n_tokens = (uint32_t) it->second.n_tokens;
+        total += (uint64_t) it->second.size;
+    }
+    header.state_bytes = pp_stream::state_bytes(s->ctx, k_seq);
+    header.total_bytes = total + header.state_bytes;
+    if (header.state_bytes < 1 || header.total_bytes >= k_image_part_limit) {
+        *problem = "llama.cpp gave no usable size for the state of the memory";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    return PP_STATUS_OK;
+}
+
+// Holds the header of an image that is to be read to everything the session can know before it
+// reads further: PP_STATUS_OK, or the status the import answers with and, in *problem, why.
+// The sizes are added up in a way that cannot wrap, and nothing is allocated for any of them
+// here.
+int32_t check_image(const pp_session * s, const image_header & header, const char ** problem) {
+    if (std::memcmp(header.magic, k_image_magic, sizeof(header.magic)) != 0 || header.version != k_image_version || header.header_bytes != sizeof(header)) {
+        *problem = "the bytes are not a memory image of this library, or one of another version of its layout";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    if (header.model != model_mark_of(s)) {
+        *problem = "the memory image was written for another model";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    if (header.n_tokens < 1 || header.n_checkpoints > PP_CHECKPOINTS_MAX || header.state_bytes < 1 || header.state_bytes >= k_image_part_limit) {
+        *problem = "a count or a size in the memory image is outside its limit";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    uint64_t total = sizeof(header) + (uint64_t) header.n_tokens * sizeof(llama_token) + header.state_bytes;
+    for (uint32_t i = 0; i < PP_CHECKPOINTS_MAX; i++) {
+        const image_checkpoint & entry = header.checkpoints[i];
+        const bool used = i < header.n_checkpoints;
+        if (used ? (entry.size < 1 || entry.size >= k_image_part_limit || entry.n_tokens > header.n_tokens || entry.zero != 0)
+                 : (entry.size != 0 || entry.n_tokens != 0 || entry.zero != 0)) {
+            *problem = "a checkpoint in the memory image has no size, a size outside its limit or a length beyond the image's tokens";
+            return PP_STATUS_MEMORY_FAILED;
+        }
+        total += entry.size;
+    }
+    if (total != header.total_bytes) {
+        *problem = "the sizes in the memory image do not add up to its size";
+        return PP_STATUS_MEMORY_FAILED;
+    }
+    if (header.n_tokens > (uint32_t) llama_n_ctx(s->ctx)) {
+        *problem = "the memory image holds more tokens than the context has room for";
+        return PP_STATUS_CONTEXT_FULL;
+    }
+    return PP_STATUS_OK;
 }
 
 } // namespace
@@ -2170,6 +2369,268 @@ int32_t pp_session_resize_context(struct pp_session * session, int32_t n_ctx, in
         }
     }
     return PP_STATUS_OK;
+}
+
+//
+// The memory written out and read back
+//
+
+int64_t pp_session_memory_state_bytes(const struct pp_session * session, const int32_t * checkpoints, int32_t n_checkpoints) {
+    try {
+        if (session == nullptr || session->ctx == nullptr || memory_count(session) < 1) {
+            return 0;
+        }
+        image_header header;
+        const pp_checkpoint * blobs[PP_CHECKPOINTS_MAX] = {};
+        const char * problem = nullptr;
+        const int32_t status = plan_image(session, checkpoints, n_checkpoints, header, blobs, &problem);
+        return status == PP_STATUS_OK ? (int64_t) header.total_bytes : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int32_t pp_session_memory_tokens(const struct pp_session * session, llama_token * tokens, int32_t n_tokens_max) {
+    if (session == nullptr || n_tokens_max < 0 || (tokens == nullptr && n_tokens_max > 0)) {
+        return PP_ERROR;
+    }
+    const size_t n = session->history.size();
+    if (n > (size_t) n_tokens_max) {
+        return -(int32_t) n;
+    }
+    if (n > 0) {
+        std::memcpy(tokens, session->history.data(), n * sizeof(llama_token));
+    }
+    return (int32_t) n;
+}
+
+int32_t pp_session_export_memory(struct pp_session * session, const int32_t * checkpoints, int32_t n_checkpoints,
+                                 const struct pp_memory_sink * sink, int64_t * n_written) {
+    if (session == nullptr) {
+        return PP_STATUS_INVALID_ARGUMENT;
+    }
+    pp_session * s = session;
+    if (n_written != nullptr) {
+        *n_written = 0;
+    }
+    if (!usable(sink)) {
+        return fail(s, PP_STATUS_INVALID_ARGUMENT, "pp_session_export_memory needs a sink with a buffer of at least " PP_STRINGIFY(PP_MEMORY_PIECE_BYTES_MIN)
+                                                   " bytes, a first piece offset below its size and a callback");
+    }
+    if (s->ctx == nullptr) {
+        return fail_no_context(s);
+    }
+
+    // --- What is refused is refused here, before the sink is called ---
+    image_header header;
+    const pp_checkpoint * blobs[PP_CHECKPOINTS_MAX] = {};
+    const char * problem = nullptr;
+    int32_t status = PP_STATUS_OK;
+    try {
+        status = plan_image(s, checkpoints, n_checkpoints, header, blobs, &problem);
+    } catch (...) {
+        status = PP_STATUS_MEMORY_FAILED;
+        problem = "llama.cpp could not measure the state of the memory";
+    }
+    if (status != PP_STATUS_OK) {
+        return fail(s, status, problem);
+    }
+
+    // --- The image, in the order its header states. Nothing below changes the session: the
+    // memory, the record, the checkpoints and a prediction that is ready are only read, so a
+    // reply goes on after this as if it had not happened, whatever becomes of it ---
+    pp_stream::piece_writer out(*sink, header.total_bytes);
+    bool threw = false;
+    try {
+        // What the public state calls of llama.cpp do first: nothing is left computing.
+        llama_synchronize(s->ctx);
+        out.write(&header, sizeof(header));
+        out.write(s->history.data(), s->history.size() * sizeof(llama_token));
+        pp_stream::write_state(s->ctx, k_seq, out);
+        for (int32_t i = 0; i < n_checkpoints; i++) {
+            out.write(blobs[i]->data, blobs[i]->size);
+        }
+    } catch (...) {
+        threw = true;
+    }
+    // The caller's buffer held rows of the memory and ids of its tokens: the last piece, or
+    // what was being put together when the export ended.
+    wipe(sink->buffer, sink->buffer_size);
+    wipe(&header, sizeof(header));
+    if (n_written != nullptr) {
+        *n_written = (int64_t) out.n_delivered();
+    }
+    if (out.stopped()) {
+        return fail(s, PP_STATUS_MEMORY_STOPPED, "the sink stopped the export of the memory");
+    }
+    if (threw) {
+        return fail(s, PP_STATUS_MEMORY_FAILED, "llama.cpp could not write the state of the memory");
+    }
+    if (!out.complete()) {
+        return fail(s, PP_STATUS_MEMORY_FAILED, out.problem() != nullptr ? out.problem() : "the memory had fewer bytes to write than were announced for it");
+    }
+    return PP_STATUS_OK;
+}
+
+int32_t pp_session_import_memory(struct pp_session * session, const struct pp_memory_source * source,
+                                 struct pp_memory_checkpoint * checkpoints, int32_t * n_checkpoints) {
+    if (session == nullptr) {
+        return PP_STATUS_INVALID_ARGUMENT;
+    }
+    pp_session * s = session;
+    if (n_checkpoints != nullptr) {
+        *n_checkpoints = 0;
+    }
+    if (!usable(source) || checkpoints == nullptr || n_checkpoints == nullptr) {
+        return fail(s, PP_STATUS_INVALID_ARGUMENT, "pp_session_import_memory needs a source with a buffer of at least " PP_STRINGIFY(PP_MEMORY_PIECE_BYTES_MIN)
+                                                   " bytes, a first piece offset below its size and a callback, and room for " PP_STRINGIFY(PP_CHECKPOINTS_MAX) " checkpoints");
+    }
+    if (s->ctx == nullptr) {
+        return fail_no_context(s);
+    }
+    // An image replaces nothing: it goes into an empty memory. A memory that holds tokens, or
+    // a checkpoint of tokens that are gone, is the caller's to forget first, knowingly.
+    try {
+        if (memory_count(s) != 0 || !s->history.empty() || !s->checkpoints.empty()) {
+            return fail(s, PP_STATUS_INVALID_ARGUMENT, "pp_session_import_memory needs an empty memory and no checkpoint: forget the conversation first");
+        }
+    } catch (...) {
+        return fail(s, PP_STATUS_INVALID_ARGUMENT, "the memory could not be asked for its length");
+    }
+    for (int32_t i = 0; i < PP_CHECKPOINTS_MAX; i++) {
+        checkpoints[i] = pp_memory_checkpoint{-1, 0};
+    }
+
+    // --- From here on the result is the whole image or an empty memory ---
+    s->prediction_ready = false;
+    pp_stream::piece_reader in(*source);
+    image_header header;
+    std::memset(&header, 0, sizeof(header));
+    int32_t status = PP_STATUS_OK;
+    const char * problem = nullptr;
+    int32_t n_restored = 0;
+    bool memory_touched = false; // llama.cpp was handed the first byte of the state, or is about to be
+    const auto refuse = [&](int32_t code, const char * why) {
+        status = code;
+        problem = why;
+    };
+    try {
+        wipe_prediction(s);
+        in.allow(sizeof(header));
+        in.read(&header, sizeof(header));
+        status = check_image(s, header, &problem);
+
+        // The record of the tokens, read straight into its place: the context made room for a
+        // full memory when it was created, and the image has at most that many.
+        if (status == PP_STATUS_OK) {
+            const size_t n = header.n_tokens;
+            reserve_history(s, n);
+            s->history.resize(n);
+            in.allow((uint64_t) n * sizeof(llama_token));
+            in.read(s->history.data(), n * sizeof(llama_token));
+            for (const llama_token id : s->history) {
+                if (id < 0 || id >= s->n_vocab || id == s->refused_input) {
+                    refuse(PP_STATUS_MEMORY_FAILED, "a token of the memory image is outside the vocabulary, or one this model cannot take");
+                    break;
+                }
+            }
+        }
+
+        // The state, which llama.cpp reads as its own writer left it. It gets the bytes the
+        // image says the state has and not one more, and must have taken all of them.
+        if (status == PP_STATUS_OK) {
+            in.allow(header.state_bytes);
+            llama_synchronize(s->ctx);
+            memory_touched = true;
+            pp_stream::read_state(s->ctx, k_seq, in);
+            if (!in.used_up()) {
+                refuse(PP_STATUS_MEMORY_FAILED, "llama.cpp read fewer bytes of the state than the memory image has");
+            } else if (memory_count(s) != (int32_t) header.n_tokens) {
+                refuse(PP_STATUS_MEMORY_FAILED, "the state in the memory image holds another number of tokens than the image says");
+            }
+        }
+
+        // The checkpoints. Each is a part of the state of a memory that was a beginning of
+        // this one, so none is larger than a checkpoint of the whole memory, which llama.cpp
+        // can be asked for now that the memory is there: the limit a size is held to before
+        // anything is allocated for it.
+        if (status == PP_STATUS_OK && header.n_checkpoints > 0) {
+            const size_t limit = llama_state_seq_get_size_ext(s->ctx, k_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            for (uint32_t i = 0; i < header.n_checkpoints && status == PP_STATUS_OK; i++) {
+                const image_checkpoint & entry = header.checkpoints[i];
+                if (entry.size > (uint64_t) limit || s->next_checkpoint == std::numeric_limits<int32_t>::max()) {
+                    refuse(PP_STATUS_MEMORY_FAILED, "a checkpoint in the memory image is larger than a checkpoint of the whole memory");
+                    break;
+                }
+                pp_checkpoint checkpoint;
+                checkpoint.size = (size_t) entry.size;
+                checkpoint.n_tokens = (int32_t) entry.n_tokens;
+                checkpoint.data = (uint8_t *) std::malloc(checkpoint.size);
+                if (checkpoint.data == nullptr) {
+                    refuse(PP_STATUS_OUT_OF_MEMORY, "out of memory for a checkpoint of the memory image");
+                    break;
+                }
+                // Into the table before it is filled: whatever ends the import from here on,
+                // the table is what gets overwritten and freed.
+                const int32_t handle = s->next_checkpoint;
+                try {
+                    s->checkpoints.emplace(handle, checkpoint);
+                } catch (...) {
+                    std::free(checkpoint.data);
+                    throw;
+                }
+                s->next_checkpoint++;
+                in.allow(entry.size);
+                in.read(checkpoint.data, checkpoint.size);
+                checkpoints[i] = pp_memory_checkpoint{handle, checkpoint.n_tokens};
+                n_restored++;
+            }
+        }
+
+        // Nothing may follow: an image that goes on is not the image that was written.
+        if (status == PP_STATUS_OK && !in.at_end()) {
+            refuse(in.stopped() ? PP_STATUS_MEMORY_STOPPED : PP_STATUS_MEMORY_FAILED,
+                   in.stopped() ? "the source stopped the import of the memory" : in.problem() != nullptr ? in.problem() : "bytes follow the memory image");
+        }
+    } catch (const std::bad_alloc &) {
+        refuse(PP_STATUS_OUT_OF_MEMORY, "out of memory while reading the memory image");
+    } catch (...) {
+        if (in.stopped()) {
+            refuse(PP_STATUS_MEMORY_STOPPED, "the source stopped the import of the memory");
+        } else {
+            refuse(PP_STATUS_MEMORY_FAILED, in.problem() != nullptr ? in.problem() : "llama.cpp did not accept the state in the memory image");
+        }
+    }
+    wipe(&header, sizeof(header));
+
+    if (status != PP_STATUS_OK) {
+        // Whatever of the image got in goes: the rows and the state that llama.cpp had taken
+        // (it empties the sequence itself where it notices a failure, but a failure after the
+        // state, in a checkpoint or at the end, is none of its own), the checkpoints read so
+        // far, and the record. An image that was refused before llama.cpp saw any of it has
+        // left the memory as it was, empty with nothing in its buffers that this call put
+        // there, and overwriting those buffers would only cost their size.
+        if (memory_touched) {
+            try {
+                llama_memory_clear(llama_get_memory(s->ctx), true);
+            } catch (...) {
+            }
+        }
+        free_all_checkpoints(s);
+        cut_history(s, 0);
+        for (int32_t i = 0; i < PP_CHECKPOINTS_MAX; i++) {
+            checkpoints[i] = pp_memory_checkpoint{-1, 0};
+        }
+    } else {
+        *n_checkpoints = n_restored;
+    }
+    // The caller's buffer held rows of the memory and ids of its tokens.
+    wipe(source->buffer, source->buffer_size);
+    // llama.cpp built its bookkeeping for the restored cells in blocks of its own and freed
+    // them (the ids of the tokens, for a model whose state carries them, overwritten first:
+    // native/patches/0005): the pages that are free as a whole go back to the system now.
+    release_free_pages();
+    return status == PP_STATUS_OK ? PP_STATUS_OK : fail(s, status, problem);
 }
 
 //

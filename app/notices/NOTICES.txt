@@ -141,7 +141,7 @@ The following components are used under the MIT License. Each has its own copyri
 
   - llama.cpp and ggml (commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c of https://github.com/ggml-org/llama.cpp)
     Copyright (c) 2023-2026 The ggml authors
-    Built from a patched copy: four patches (architecture hooks; an ARM kernel for 16-bit float weights in tinyBLAS; a memory-mapping window for models embedded in an APK; a linear byte fallback in the SentencePiece tokenizer) and three architectures added by the Prose Plow project (peacebell, boris2, shard2). Only the targets llama, ggml, ggml-base and the seven ggml-cpu variants are built.
+    Built from a patched copy: five patches (architecture hooks; an ARM kernel for 16-bit float weights in tinyBLAS; a memory-mapping window for models embedded in an APK; a linear byte fallback in the SentencePiece tokenizer; overwriting the token ids of a restored state before they are freed) and three architectures added by the Prose Plow project (peacebell, boris2, shard2). Only the targets llama, ggml, ggml-base and the seven ggml-cpu variants are built.
 
   - tinyBLAS, part of ggml
     Copyright 2024 Mozilla Foundation

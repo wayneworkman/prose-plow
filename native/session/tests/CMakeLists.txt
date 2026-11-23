@@ -82,6 +82,49 @@ proseplow_add_context_test(boris-2-instruct)
 proseplow_add_context_test(qwen3.5-0.8b)
 proseplow_add_context_test(shard-2)
 
+# No native code of this project hands the state of a model to a file: the two calls of llama.cpp
+# that write one in clear are referred to by neither library as built, and called in no source,
+# the JNI binding included (which the host does not build).
+add_test(NAME session.state-never-to-file
+    COMMAND "${PROSEPLOW_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/check_state_files.py"
+            --nm "${CMAKE_NM}"
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/../../lib/src"
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/../../../llama/src/main/cpp"
+            "$<TARGET_FILE:proseplow_session>" "$<TARGET_FILE:proseplow_native>")
+set_tests_properties(session.state-never-to-file PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+# The memory written out as an image and read back: a session whose memory went out and came
+# back against one that was never interrupted, and what an export or an import that ends early
+# leaves behind. The test reads the scores and the state of the context a session works with,
+# which a session does not show: every context the session library creates is made to pass
+# through a function of the test (see the top of test_memory.cpp), by the linker and without a
+# line of the session's code knowing.
+add_executable(test_memory test_memory.cpp)
+target_include_directories(test_memory PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
+target_link_libraries(test_memory PRIVATE proseplow_session)
+target_link_options(test_memory PRIVATE "-Wl,--wrap=llama_init_from_model")
+target_compile_options(test_memory PRIVATE -Wall -Wextra -Wpedantic)
+
+function(proseplow_add_memory_test model)
+    add_test(NAME ${model}.memory
+        COMMAND "${PROSEPLOW_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/run_session.py"
+                --bin-dir "$<TARGET_FILE_DIR:test_memory>"
+                --work-dir "${CMAKE_BINARY_DIR}/test-work"
+                --llama-src "${PROSEPLOW_LLAMA_SRC}"
+                --memory
+                ${model})
+    set_tests_properties(${model}.memory PROPERTIES
+        SKIP_RETURN_CODE 77
+        RESOURCE_LOCK proseplow_cpu
+        TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;CUDA_VISIBLE_DEVICES=")
+endfunction()
+proseplow_add_memory_test(peacebell-v1-291m)
+proseplow_add_memory_test(boris-2-instruct)
+proseplow_add_memory_test(qwen3.5-0.8b)
+proseplow_add_memory_test(shard-2)
+
 # One residue entry per bundled model: they are what the app forgets.
 function(proseplow_add_residue_test model)
     add_test(NAME ${model}.residue

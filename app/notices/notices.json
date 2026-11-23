@@ -1628,7 +1628,7 @@
       ],
       "notice": null,
       "source": "LICENSE at the pinned commit of the submodule third_party/llama.cpp. The MIT notice is the notice. The repository has no NOTICE file.",
-      "changes": "Built from a patched copy: four patches (architecture hooks; an ARM kernel for 16-bit float weights in tinyBLAS; a memory-mapping window for models embedded in an APK; a linear byte fallback in the SentencePiece tokenizer) and three architectures added by the Prose Plow project (peacebell, boris2, shard2). Only the targets llama, ggml, ggml-base and the seven ggml-cpu variants are built.",
+      "changes": "Built from a patched copy: five patches (architecture hooks; an ARM kernel for 16-bit float weights in tinyBLAS; a memory-mapping window for models embedded in an APK; a linear byte fallback in the SentencePiece tokenizer; overwriting the token ids of a restored state before they are freed) and three architectures added by the Prose Plow project (peacebell, boris2, shard2). Only the targets llama, ggml, ggml-base and the seven ggml-cpu variants are built.",
       "in_apk": "libllama.so, libggml.so, libggml-base.so and seven libggml-cpu-android_*.so"
     },
     {
