@@ -2,6 +2,9 @@ package us.theworkmans.proseplow.llama
 
 import us.theworkmans.proseplow.core.engine.EvaluationObserver
 import us.theworkmans.proseplow.core.engine.LoadProgress
+import us.theworkmans.proseplow.core.engine.MemorySink
+import us.theworkmans.proseplow.core.engine.MemorySource
+import java.nio.ByteBuffer
 
 /**
  * The native methods, one for each function of the session's C interface
@@ -18,8 +21,11 @@ import us.theworkmans.proseplow.core.engine.LoadProgress
  * - Text and tokens cross as primitive arrays that the native side copies. Text is real UTF-8 in
  *   a byte array, never a string (see `NativeLlama.tokenize` for the reason).
  * - A failure is thrown as `NativeLlamaException` with the native status as its code.
- * - Nothing is called from another thread: the callbacks [LoadProgress] and
- *   [EvaluationObserver] run on the calling thread before the call returns.
+ * - The model's state (a memory image) crosses only through the memory of a direct
+ *   [ByteBuffer] that the caller owns, never through an array of the Java heap.
+ * - Nothing is called from another thread: the callbacks [LoadProgress],
+ *   [EvaluationObserver], [MemorySink] and [MemorySource] run on the calling thread before the
+ *   call returns.
  */
 internal object LlamaJni {
 
@@ -118,6 +124,35 @@ internal object LlamaJni {
      */
     @JvmStatic
     external fun clearMemory(handle: Long)
+
+    /** `pp_session_memory_tokens`: the session's record of the tokens in memory, copied once. */
+    @JvmStatic
+    external fun memoryTokens(handle: Long): IntArray
+
+    /**
+     * `pp_session_memory_state_bytes`. Throws `NativeLlamaException` with `INVALID_ARGUMENT` for
+     * a checkpoint the export would refuse, and for more than `PP_CHECKPOINTS_MAX` of them.
+     */
+    @JvmStatic
+    external fun memoryStateBytes(handle: Long, checkpoints: IntArray): Long
+
+    /**
+     * `pp_session_export_memory` into the memory of [buffer], which must be direct; its capacity
+     * is the piece size, and its position and limit are ignored. Returns the bytes of the image
+     * handed to [sink]. An exception thrown by [sink] stops the export and is thrown from here,
+     * as itself, after the session has returned.
+     */
+    @JvmStatic
+    external fun exportMemory(handle: Long, checkpoints: IntArray, buffer: ByteBuffer, firstPieceOffset: Int, sink: MemorySink): Long
+
+    /**
+     * `pp_session_import_memory` from the memory of [buffer], which must be direct. [restored]
+     * has room for `2 * PP_CHECKPOINTS_MAX` ints and receives the image's checkpoints as pairs
+     * (handle, length of memory); the result is how many pairs. An exception thrown by [source]
+     * stops the import and is thrown from here, as itself, after the session has returned.
+     */
+    @JvmStatic
+    external fun importMemory(handle: Long, buffer: ByteBuffer, firstPieceOffset: Int, source: MemorySource, restored: IntArray): Int
 
     /**
      * `pp_session_configure_sampler`. The arguments are the fields of `SamplerConfig`, with

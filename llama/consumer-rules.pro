@@ -10,7 +10,10 @@
     <init>(int, java.lang.String);
 }
 
-# Called back by native code during a load and an evaluation. Keeping the interface methods
-# keeps the names of every implementation's overrides with them.
+# Called back by native code during a load, an evaluation, and an export or an import of the
+# memory. Keeping the interface methods keeps the names of every implementation's overrides
+# with them.
 -keep interface us.theworkmans.proseplow.core.engine.EvaluationObserver { *; }
 -keep interface us.theworkmans.proseplow.core.engine.LoadProgress { *; }
+-keep interface us.theworkmans.proseplow.core.engine.MemorySink { *; }
+-keep interface us.theworkmans.proseplow.core.engine.MemorySource { *; }

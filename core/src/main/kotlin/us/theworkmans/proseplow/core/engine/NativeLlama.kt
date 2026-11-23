@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.engine
 
 import us.theworkmans.proseplow.core.model.ModelSpec
+import java.nio.ByteBuffer
 
 /**
  * The low-level seam between the Kotlin engine and llama.cpp: one loaded model with one context,
@@ -282,6 +283,110 @@ interface NativeLlama {
     fun sampleNext(): Int
 
     /**
+     * The ids of the tokens in memory, in order: the native session's own record of them
+     * (`pp_session_memory_tokens`), which the penalties are computed from and which a memory
+     * image carries. For a caller that keeps its own copy and has to set it after
+     * [importMemory]. An empty array for an empty memory.
+     *
+     * The ids are the conversation: the caller overwrites the array when it is done with it.
+     */
+    fun memoryTokens(): IntArray
+
+    /**
+     * The size in bytes of the memory image that [exportMemory] would hand to its sink now with
+     * the same [checkpoints], the caller's own first bytes not counted
+     * (`pp_session_memory_state_bytes`). Nothing is copied to find it. 0 for an empty memory.
+     *
+     * @throws NativeLlamaException with [NativeLlamaException.INVALID_ARGUMENT] when a checkpoint
+     *   is named that [exportMemory] would refuse.
+     */
+    fun memoryStateBytes(checkpoints: IntArray): Long
+
+    /**
+     * Writes the memory out as a memory image, piece by piece, through [buffer] and [sink]
+     * (`pp_session_export_memory`). An image holds the record of the tokens in memory, the state
+     * of the sequence as llama.cpp writes it, and the [checkpoints] named, each with the length
+     * of memory it belongs to; not the sampler and not a prediction. It is only ever read back
+     * by the same build on the same model file, which is the caller's to record and compare.
+     *
+     * **The buffer.** [buffer] is the caller's and must be a direct, writable [ByteBuffer] of at
+     * least [MEMORY_PIECE_BYTES_MIN] bytes: its memory is handed to the native session as it is,
+     * so that no byte of the state is ever copied into an array of the Java heap. The whole
+     * capacity is used, from index 0, whatever the buffer's position and limit, and these are
+     * neither read nor changed. A piece is the capacity, except the last, which has from 1 byte
+     * up to it.
+     *
+     * **The caller's own first bytes.** The first [firstPieceOffset] bytes of the buffer are the
+     * caller's when the call is made (a header of its own) and are left as they are; the image
+     * begins behind them and they go out as the start of the first piece, so that every piece
+     * the caller seals has the same size. 0 for none, and below the capacity.
+     *
+     * **The sink** is called once for every piece, on the calling thread, before this returns:
+     * see [MemorySink.write]. Returning false stops the export, which then throws
+     * [NativeLlamaException.MEMORY_STOPPED]. An exception thrown by the sink stops it the same
+     * way and comes out of this call as itself, after the native side has finished.
+     *
+     * **What is left behind.** The memory is only read: whatever the outcome, the memory, every
+     * checkpoint, the record of the tokens, the sampler and a prediction that was ready are as
+     * they were. The whole buffer, the caller's own first bytes included, has been overwritten
+     * with zeros when this returns or throws, so the caller writes its header again for the next
+     * export. What the sink copied elsewhere is the caller's to wipe.
+     *
+     * Each of [checkpoints] must be known, named once and belong to a length the memory still
+     * has; at most [MAX_MEMORY_CHECKPOINTS] of them, in the order [importMemory] will report them.
+     *
+     * Returns the bytes of the image handed over, which is [memoryStateBytes] for the same
+     * checkpoints. What was handed over before an exception is not an image and is discarded.
+     *
+     * @throws NativeLlamaException with [NativeLlamaException.MEMORY_STOPPED] when the sink
+     *   returned false, [NativeLlamaException.INVALID_ARGUMENT] before the sink is called for an
+     *   empty memory, a checkpoint as above or a buffer as above,
+     *   [NativeLlamaException.OUT_OF_MEMORY] when the session has no context, and
+     *   [NativeLlamaException.MEMORY_FAILED] when the state could not be written.
+     */
+    fun exportMemory(checkpoints: IntArray, buffer: ByteBuffer, firstPieceOffset: Int, sink: MemorySink): Long
+
+    /**
+     * Reads a memory image back (`pp_session_import_memory`): afterwards the memory holds the
+     * tokens it held when the image was written, the record of them is the same, and the image's
+     * checkpoints are checkpoints of this session under new handles, returned in the order they
+     * were named in at the export. No prediction is ready: evaluate at least one token before
+     * sampling, as after a restored checkpoint.
+     *
+     * [buffer] and [firstPieceOffset] are as for [exportMemory]: the [source] fills the buffer
+     * from index 0 (see [MemorySource.read]), and the first [firstPieceOffset] bytes of the first
+     * piece are the caller's own and skipped. The whole buffer has been overwritten with zeros
+     * when this returns or throws.
+     *
+     * The memory must be empty and no checkpoint held (as after [clearMemory]), and the context
+     * must have room for the image's tokens: give it its size with [resizeContext] first, from
+     * the number of tokens recorded beside the image.
+     *
+     * **What the caller guarantees.** The bytes are, complete and in order, what one
+     * [exportMemory] of this same build wrote for this same model file, and nobody could have
+     * changed them since: every piece is authenticated before the source returns it, and the
+     * build and the model are compared before this is called. llama.cpp believes much of what a
+     * state says, and a changed state can end the process at a later call. That is a condition,
+     * not advice.
+     *
+     * **All or nothing.** After any exception, at whatever byte the import ended, the memory is
+     * empty with its buffers overwritten, the record of the tokens is empty, and no checkpoint is
+     * held: the caller reads the conversation again. An exception thrown by the source stops the
+     * import the same way as a negative answer and comes out of this call as itself, after the
+     * native side has wound down.
+     *
+     * @throws NativeLlamaException with [NativeLlamaException.MEMORY_STOPPED] when the source
+     *   returned a negative number, [NativeLlamaException.CONTEXT_FULL] when the image holds more
+     *   tokens than the context has room for, [NativeLlamaException.MEMORY_FAILED] when the
+     *   image ended early, went on after its end or is not one this session accepts,
+     *   [NativeLlamaException.OUT_OF_MEMORY] when the session has no context or a checkpoint
+     *   could not be allocated, and [NativeLlamaException.INVALID_ARGUMENT], with nothing touched
+     *   and the source never called, when the memory is not empty, a checkpoint is held, or the
+     *   buffer or the offset is outside what is stated above.
+     */
+    fun importMemory(buffer: ByteBuffer, firstPieceOffset: Int, source: MemorySource): List<MemoryCheckpoint>
+
+    /**
      * Frees everything: the sampler, the checkpoints (zeroed first), the context and the model.
      * Calling it twice is harmless.
      */
@@ -290,6 +395,19 @@ interface NativeLlama {
     companion object {
         /** What [saveCheckpoint] returns when no checkpoint could be saved. */
         const val NO_CHECKPOINT: Int = -1
+
+        /**
+         * The smallest buffer [exportMemory] and [importMemory] take for the pieces of a memory
+         * image, in bytes: `PP_MEMORY_PIECE_BYTES_MIN` of the native session. There is no
+         * largest: the buffer is the caller's and nothing is allocated to match it.
+         */
+        const val MEMORY_PIECE_BYTES_MIN: Int = 4096
+
+        /**
+         * The most checkpoints a session holds, and so the most a memory image carries:
+         * `PP_CHECKPOINTS_MAX` of the native session.
+         */
+        const val MAX_MEMORY_CHECKPOINTS: Int = 8
 
         /**
          * The longest text [tokenize] accepts, in bytes: `PP_TOKENIZE_BYTES_MAX` of the native
@@ -363,6 +481,55 @@ data class SamplerConfig(
         const val REPLY_START_AT_SAMPLING: Int = -1
     }
 }
+
+/**
+ * Where the pieces of an exported memory image go ([NativeLlama.exportMemory]). Called on the
+ * thread that called the export, before it returns.
+ */
+fun interface MemorySink {
+
+    /**
+     * A piece is ready in the export's buffer at indices 0 until [bytes]. [bytes] is the buffer's
+     * capacity for every piece but the last, which has from 1 byte up to it, and it counts the
+     * caller's own first bytes in the first piece. [last] is true for the piece that ends the
+     * image, exactly once and only after every byte before it was handed over.
+     *
+     * The piece must be used (sealed and written, for instance) before this returns: the buffer
+     * is filled again afterwards. The callback may set the buffer's position and limit to do so;
+     * it must not call the [NativeLlama] it was called for. Return true to go on, false to stop
+     * the export.
+     */
+    fun write(bytes: Int, last: Boolean): Boolean
+}
+
+/**
+ * Where the pieces of a memory image to import come from ([NativeLlama.importMemory]). Called
+ * on the thread that called the import, before it returns.
+ */
+fun interface MemorySource {
+
+    /**
+     * Puts the next bytes of the image at the start of the import's buffer (index 0 on) and
+     * returns how many: from 1 up to the buffer's capacity. Pieces need not be full, but they are
+     * the image's bytes in order with none left out, the caller's own first bytes at the start of
+     * the first. Returns 0 when there are no more bytes, and a negative number when the bytes
+     * cannot be had or the import should stop. It is called once more after the image's last
+     * byte and must return 0 then: an image with anything behind it is not accepted.
+     *
+     * The callback may set the buffer's position and limit to fill it; it must not call the
+     * [NativeLlama] it was called for.
+     */
+    fun read(): Int
+}
+
+/**
+ * A checkpoint that [NativeLlama.importMemory] brought back.
+ *
+ * @property handle its handle in this session, as [NativeLlama.saveCheckpoint] returns them.
+ * @property tokenCount the length of memory it belongs to: what [NativeLlama.memoryTokenCount]
+ *   was when it was saved.
+ */
+data class MemoryCheckpoint(val handle: Int, val tokenCount: Int)
 
 /** Receives the progress of a model load. */
 fun interface LoadProgress {
@@ -439,5 +606,19 @@ class NativeLlamaException(val code: Int, message: String) : RuntimeException(me
 
         /** The context could not be given its new size after the old one was given up; see [NativeLlama.resizeContext]. */
         const val CONTEXT_NOT_CREATED: Int = 10
+
+        /**
+         * The caller's callback ended an export or an import of the memory: the [MemorySink]
+         * returned false, or the [MemorySource] a negative number. See [NativeLlama.exportMemory]
+         * and [NativeLlama.importMemory].
+         */
+        const val MEMORY_STOPPED: Int = 11
+
+        /**
+         * A memory image could not be written out, or what was read is not an image this
+         * session accepts: it ended early, went on after its end or failed one of the native
+         * session's checks. See [NativeLlama.importMemory].
+         */
+        const val MEMORY_FAILED: Int = 12
     }
 }

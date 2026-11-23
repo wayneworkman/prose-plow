@@ -713,8 +713,8 @@ phone runs. The header is the reference for every function; this is the outline:
 | `pp_session_close` | Everything freed, after the same overwriting as a clear |
 
 A failure is a status code, and the codes are the ones of the Kotlin `NativeLlamaException`,
-one for one (but for the two that only the export and import of a memory return, 11 and 12,
-which that class does not name yet: see below). No function logs anything, and llama.cpp's own log is written nowhere: the session
+one for one (11 and 12, which only the export and import of a memory return, are its
+`MEMORY_STOPPED` and `MEMORY_FAILED`). No function logs anything, and llama.cpp's own log is written nowhere: the session
 takes from it only the name of the compute back end that was loaded, the description of a
 failure and the sizes of the buffers of a context. The buffers the session and the front-end allocate themselves for text, tokens,
 predictions or model state are overwritten before they are freed; llama.cpp's are not, which
@@ -967,7 +967,8 @@ wrong on a phone or for one of the models:
 - **A memory that is written out and read back.** A conversation that was read once need not
   be read again after a lock if the state it left in the context is kept: the app means to
   write that state out, sealed, when it leaves the screen, and to read it back at the next
-  unlock (that side is not in this directory, and not written yet). llama.cpp's public
+  unlock (that side is not in this directory; the JNI binding and the engine's seam carry the
+  pieces, and nothing above them is written yet). llama.cpp's public
   interface moves the state of a sequence in two ways, and neither will do. One block
   (`llama_state_seq_get_data_ext`, which a change of context size uses inside its budget) is
   the whole state a second time beside the context, 578 MiB for peacebell at 9,100 tokens; a
@@ -1015,10 +1016,35 @@ wrong on a phone or for one of the models:
   that every piece it seals has the same size, and makes the import skip as many. On Android
   the buffer is meant to be the memory of a direct `ByteBuffer`, which a cipher reads and
   writes in place: the state then crosses the binding without being copied into an array on
-  the Java heap. The binding is not written yet: `proseplow_jni.cpp` has no entry for these
-  functions, and `NativeLlamaException` no name for the two status codes that only they
-  return, `PP_STATUS_MEMORY_STOPPED` (11: the caller's callback ended it) and
-  `PP_STATUS_MEMORY_FAILED` (12).
+  the Java heap. That is what the binding does (next paragraph). `NativeLlamaException` names
+  the two status codes that only these functions return: `MEMORY_STOPPED` (11, the caller's
+  callback ended it) and `MEMORY_FAILED` (12).
+
+  What the JNI binding does with it (`../llama/src/main/cpp/proseplow_jni.cpp`, and
+  `NativeLlama.exportMemory`, `importMemory`, `memoryStateBytes` and `memoryTokens` in
+  `../core`). The Kotlin caller owns the buffer, a direct `ByteBuffer` of at least 4,096
+  bytes; the binding hands the session its memory and capacity as they are
+  (`GetDirectBufferAddress`), so the state goes between llama.cpp's buffers and that memory and
+  through nothing else: no array of the Java heap, no copy in the binding. The buffer's
+  position and limit are neither read nor changed: a piece is always at index 0. A buffer that
+  is not direct or is read-only, is below 4,096 bytes or does not contain the caller's offset,
+  and more than eight checkpoints, are refused in Kotlin before native code is reached
+  (`INVALID_ARGUMENT`). The sink and the source are one Kotlin call per piece, on the calling
+  thread: `MemorySink.write(bytes, last)` answers whether to go on, `MemorySource.read()` how
+  many bytes it put in the buffer (0 for the end, negative to stop). An exception thrown by
+  either is taken off the thread at once (`ExceptionOccurred`, `ExceptionClear`) and answered
+  with "stop" (false, or -1); the session then winds the call down with no exception pending in
+  the VM (a source that throws in the middle of the state is carried out of llama.cpp's
+  reading as a C++ exception, between this library and `libllama.so`, and the import ends as
+  any stopped import does, with an empty memory), and the binding throws the Kotlin exception
+  again once the session has returned, so the caller gets it as itself rather than code 11. A
+  call from another thread, which the session never makes, is answered with "stop" without
+  touching the VM. Nothing on the binding's side holds a byte of the state, before, during or
+  after the call: the only copy outside llama.cpp is the caller's buffer, which the session
+  overwrites. The record of the tokens (`memoryTokens`) is copied once into a buffer of the
+  binding's that is overwritten before it is freed, and then into the array returned, which
+  is the caller's to overwrite. Of the image's checkpoints the binding passes on only handles
+  and lengths.
 
   What is promised. An export only reads: whatever becomes of it (complete, stopped by the
   sink at any piece, failed), the memory, the checkpoints, the record of the tokens, the
@@ -1362,7 +1388,7 @@ devices with 16 KB pages; the build checks that for each APK it writes (next sec
 the Kotlin object `LlamaJni` from a table. The table and the Kotlin declarations must change
 together; when they disagree, loading the library fails, not the first call. Everything the
 native code looks up by name in Kotlin (that object, the constructor of `NativeLlamaException`,
-the two callback interfaces) is listed in `../llama/consumer-rules.pro`, so an app that
+the four callback interfaces) is listed in `../llama/consumer-rules.pro`, so an app that
 switches minification on cannot rename it.
 
 ### Reproducibility
@@ -1554,6 +1580,7 @@ What is checked, for each model that is present:
 | `QwenDeviceTest` | A greedy reply to a ChatML prompt is sane and the same twice; the ChatML markers are single tokens when the app writes them and text inside a message; the removal of the end of the memory is refused and a checkpoint brings it back with an identical continuation, twice; cancelling; load time and memory, mapped and read; speed with pinned and unpinned threads, in front and not |
 | `ShardDeviceTest` | Tokenising the 8,139 committed texts gives the host's token ids, as plain text and with special tokens parsed; the greedy continuations of the committed beginnings equal the reference's token for token, deletion tokens included; within the window the end of the memory is removed and the continuation equals a fresh evaluation; on the committed text of 1,500 tokens a cut many windows back is exact, a checkpoint brings the memory back exactly, and after that restore a cut below what the restored window reaches is refused with the memory untouched while a cut within it is made; a cancellation interrupts a chunk; load time, memory and speed are reported |
 | the three chat models | The engine of `core` (`LlamaEngine`) holds a chat of two turns on the real native layer and reuses its memory for the second |
+| `MemoryImageDeviceTest` | For each model present: a prompt of up to 240 tokens with two checkpoints is written out through the binding in pieces of 4 MiB, with 64 bytes of the caller's own at the start of the first piece, which come through unchanged; exactly the announced bytes arrive, "last" is said once, and the buffer is zeros afterwards. An export stopped by the sink, by false and by an exception, leaves the memory as it was. After the memory is forgotten, an import whose source throws in the middle of the state (crossing from llama.cpp's reading of the state back out as a C++ exception) ends in that same exception, one whose source stops ends in code 11 and one whose image ends early in code 12, each with no token, no record and no checkpoint left and the buffer zeros. The image then goes back in: the record of the tokens and both checkpoints come back, no prediction is ready, and the next token and 16 greedy tokens equal those of the uninterrupted control, also after going back through a restored checkpoint. The size of the image and the time of the export and of the import (to and from a direct buffer, without encryption or storage) are reported |
 | `JniBoundaryDeviceTest` | With the smallest model present: a mistake of the caller arrives as `NativeLlamaException` with its code and leaves the session usable; an exception thrown by a progress or cancel callback during a native call comes back out as itself; a load can be abandoned, and an abandoned or failed load leaves nothing allocated; a closed session never reaches native code; a size beyond its limit (a context beyond its budget, a text, a number of tokens or of banned tokens) arrives as an exception with its code and allocates nothing, what a context costs is known, a change to a size above the model's largest or above the budget is refused with the context as it was, a penalty window beyond the context costs nothing, the ninth checkpoint is refused, and forgetting a conversation leaves a session that is whole |
 | `ThreadMoveDeviceTest` | With the smallest model present: the test's activity leaves the front while one long prompt is being evaluated, and when that same call returns the session runs the plan's free threads and no longer claims to be pinned; the time of each chunk before and after the move is reported |
 | `BackgroundSpeedDeviceTest` | Nothing is required: for Qwen3.5 and peacebell, the speed of a prompt and of generation with the test's activity in front and then with nothing of the test in front, each line with the set of cores the process was in |

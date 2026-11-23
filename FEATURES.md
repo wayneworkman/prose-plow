@@ -2336,10 +2336,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   of memory, 8 invalid argument, 9 context refused, 10 context not created (ENG-37), 11 memory
   export or import stopped by the caller, 12 memory image not written or not accepted. The
   first ten are shared with the engine; the last two belong to writing the model's memory out
-  and reading it back (NAT-17), which the native session provides and nothing above it uses
-  yet. A short
-  technical description
-  goes with it and never contains text of a conversation.
+  and reading it back (NAT-17), and reach the engine's seam with the same numbers. A short
+  technical description goes with it and never contains text of a conversation.
 - **NAT-13** Forgetting a conversation frees the context, the token batch and the sampler and
   creates them again, the context at the size the model was opened with whatever it had grown
   to, after overwriting what the session can reach of the conversation: every checkpoint, the
@@ -2394,8 +2392,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   exactly how many bytes it would hand over, and gives the record of the tokens to a caller
   that keeps a copy of its own.
 
-  Nothing above the session uses this yet: the binding has no entry for it, the engine does not
-  know it, and the app writes no model's memory to storage.
+  The binding carries it to the engine's seam (NAT-21). Nothing above the seam uses it yet:
+  the engine does not call it, and the app writes no model's memory to storage.
   - **Parity note:** an image is not a stored form to adopt. It is written as the machine holds
     it, its state is that of the pinned llama.cpp for this model, and it is only ever read by
     the build that wrote it, on the same model file; the size of the context is not part of
@@ -2456,6 +2454,27 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   after a change of size; with it none, and the test of what is left behind requires that for
   every model. The positions of the cells, which llama.cpp gathers as well, are freed as they
   are.
+- **NAT-21** The Android binding moves a memory image without a copy on the Java heap. The
+  caller owns the buffer, a direct buffer of at least 4,096 bytes, and the binding hands the
+  native session its memory as it is: the image goes between the model's buffers and that
+  memory and through nothing else, and the session overwrites the whole buffer, the caller's
+  own first bytes included, before the call returns, whatever the outcome. A piece is always at
+  the start of the buffer, whatever its position and limit say. The caller's function for a
+  piece runs on the calling thread, once per piece; one that writes says whether to go on, one
+  that reads says how many bytes it put there, none at the end, a negative number to stop.
+  When such a function throws, the export or import stops as if it had said "stop", the native
+  session winds the call down with nothing pending in the Java machine (an import that throws
+  in the middle of the state leaves an empty memory, as any stopped import does), and the
+  caller then receives the very exception that was thrown rather than code 11. A buffer that
+  is not direct, is read-only, is below 4,096 bytes or does not contain the caller's offset, and
+  more than eight checkpoints, are refused (code 8) before native code is reached. The binding
+  holds no byte of the state at any moment. The list of the tokens in memory is handed out as
+  a new array, which the caller overwrites when done; the binding's own copy of it is
+  overwritten before it is freed. The engine's seam has the same four operations (the size of
+  an image for given checkpoints, writing out, reading back with the checkpoints it brought
+  back, the tokens in memory), and the test double of the engine's tests keeps their contract:
+  pieces, the caller's first bytes, the overwritten buffer, the refusals, and an import that
+  leaves nothing behind when it fails at any piece.
 
 ## 21. What stays in memory (MEM)
 

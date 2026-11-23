@@ -2,6 +2,7 @@ package us.theworkmans.proseplow.core.engine
 
 import us.theworkmans.proseplow.core.model.ModelSpec
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 
 /**
  * A [NativeLlama] without a model, for testing everything above the native seam. It follows the
@@ -20,6 +21,17 @@ import java.io.ByteArrayOutputStream
  * contain tokens made with [addPiece], which stand for multi-byte tokens of a real vocabulary:
  * the tokenizer never produces them, so a reply written with them does not re-tokenise to the
  * same ids. That is the situation in which prefix reuse has to rewind.
+ *
+ * **Memory images.** [exportMemory] and [importMemory] move an image of the fake's own layout
+ * (the tokens, a state made from them of [stateBytesPerToken] bytes a token, and the named
+ * checkpoints with their lengths) through the caller's direct buffer, in pieces of its capacity,
+ * behind the caller's own first bytes, and overwrite the buffer afterwards, with the refusals and
+ * status codes of the native session. An import changes nothing until the whole image has
+ * arrived and checked out, so one that fails at any piece leaves the memory empty and no
+ * checkpoint, as the native session promises. Unlike the native session, the fake notices any
+ * changed byte of the state ([NativeLlamaException.MEMORY_FAILED]); the real one believes most of
+ * it, which is why the caller authenticates every piece. [exportFailsAtPiece] and
+ * [importFailsAtPiece] make a chosen piece fail; a test stops one through its own sink or source.
  *
  * **Recording.** Every call that changes state is appended to [calls], and [threads] collects the
  * threads the calls came from.
@@ -42,6 +54,8 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         data object ClearMemory : Call
         data class ConfigureSampler(val config: SamplerConfig) : Call
         data object SampleNext : Call
+        data class ExportMemory(val checkpoints: List<Int>) : Call
+        data object ImportMemory : Call
         data object Close : Call
     }
 
@@ -438,6 +452,239 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
         }
     }
 
+    // --- Memory images ---
+
+    /**
+     * The bytes of state the fake writes into an image for every token in memory, standing for
+     * the key and value rows of a real model; enough by default for a few hundred tokens to
+     * span several pieces of the smallest size.
+     */
+    var stateBytesPerToken: Int = 64
+
+    /** The bytes of state an image carries for every checkpoint in it, standing for a recurrent state. */
+    var checkpointStateBytes: Int = 24
+
+    /**
+     * When set, [exportMemory] fails with [NativeLlamaException.MEMORY_FAILED] before it hands
+     * over the piece with this index (0 for the first), as when llama.cpp cannot write the state.
+     */
+    var exportFailsAtPiece: Int? = null
+
+    /**
+     * When set, [importMemory] fails with [NativeLlamaException.MEMORY_FAILED] when the piece with
+     * this index (0 for the first) arrives, as when llama.cpp does not accept the state there.
+     */
+    var importFailsAtPiece: Int? = null
+
+    private val memoryTokenArrays = ArrayList<IntArray>()
+
+    /** The very arrays [memoryTokens] handed out, kept by reference, so that a test can see whether the caller overwrote them. */
+    val memoryTokenArraysReturned: List<IntArray> get() = memoryTokenArrays
+
+    override fun memoryTokens(): IntArray {
+        check(!closed) { "memoryTokens after close" }
+        return memoryTokens.toIntArray().also { memoryTokenArrays += it }
+    }
+
+    override fun memoryStateBytes(checkpoints: IntArray): Long {
+        check(!closed) { "memoryStateBytes after close" }
+        if (memoryTokens.isEmpty()) return 0
+        checkImageCheckpoints(checkpoints)
+        return imageBytes(memoryTokens.size, checkpoints.size, stateBytesPerToken, checkpointStateBytes)
+    }
+
+    /**
+     * Writes an image of its own layout, which nothing outside this class reads: a fixed header
+     * (a magic, the number of tokens and of checkpoints, the size of the state, and for every
+     * checkpoint its length of memory and the size of its state), the tokens, a state that is a
+     * function of the tokens, and the checkpoints' states. Pieces, the caller's own first bytes,
+     * the overwritten buffer and the refusals are those of the native session.
+     */
+    override fun exportMemory(checkpoints: IntArray, buffer: ByteBuffer, firstPieceOffset: Int, sink: MemorySink): Long {
+        enter(Call.ExportMemory(checkpoints.toList()))
+        checkPieceBuffer(buffer, firstPieceOffset)
+        if (memoryTokens.isEmpty()) throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "an empty memory has no image")
+        checkImageCheckpoints(checkpoints)
+        val image = imageOf(checkpoints)
+        try {
+            val capacity = buffer.capacity()
+            var fill = firstPieceOffset
+            var produced = 0
+            var piece = 0
+            while (true) {
+                val n = minOf(capacity - fill, image.size - produced)
+                for (index in 0 until n) buffer.put(fill + index, image[produced + index])
+                fill += n
+                produced += n
+                if (fill == capacity || produced == image.size) {
+                    if (exportFailsAtPiece == piece) {
+                        throw NativeLlamaException(NativeLlamaException.MEMORY_FAILED, "the state could not be written at piece $piece")
+                    }
+                    val last = produced == image.size
+                    if (!sink.write(fill, last)) {
+                        throw NativeLlamaException(NativeLlamaException.MEMORY_STOPPED, "the sink stopped the export at piece $piece")
+                    }
+                    if (last) return image.size.toLong()
+                    piece++
+                    fill = 0
+                }
+            }
+        } finally {
+            image.fill(0)
+            wipe(buffer)
+        }
+    }
+
+    override fun importMemory(buffer: ByteBuffer, firstPieceOffset: Int, source: MemorySource): List<MemoryCheckpoint> {
+        enter(Call.ImportMemory)
+        checkPieceBuffer(buffer, firstPieceOffset)
+        if (memoryTokens.isNotEmpty() || savedCheckpoints.isNotEmpty()) {
+            throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "an image is read into an empty memory without checkpoints only")
+        }
+        // Nothing of the session changes until the whole image has been read and checked, so a
+        // failure at any byte leaves it as it was: empty, without a checkpoint. A prediction is
+        // gone whatever the outcome, as in the native session.
+        predictionReady = false
+        try {
+            val reader = PieceReader(buffer, firstPieceOffset, source)
+            val header = ByteBuffer.wrap(reader.take(IMAGE_FIXED_BYTES))
+            val magic = ByteArray(IMAGE_MAGIC.size).also { header.get(it) }
+            if (!magic.contentEquals(IMAGE_MAGIC)) failImage("the image does not begin as one of the fake's")
+            val tokenCount = header.int
+            val checkpointCount = header.int
+            val stateBytes = header.long
+            if (tokenCount < 1 || checkpointCount !in 0..NativeLlama.MAX_MEMORY_CHECKPOINTS || stateBytes < 0 || stateBytes > Int.MAX_VALUE) {
+                failImage("the sizes of the image do not add up")
+            }
+            if (tokenCount > contextTokens) {
+                throw NativeLlamaException(NativeLlamaException.CONTEXT_FULL, "an image of $tokenCount tokens in a context of $contextTokens")
+            }
+            val checkpointHeader = ByteBuffer.wrap(reader.take(IMAGE_CHECKPOINT_BYTES * checkpointCount))
+            val lengths = IntArray(checkpointCount)
+            val checkpointSizes = IntArray(checkpointCount)
+            for (index in 0 until checkpointCount) {
+                lengths[index] = checkpointHeader.int
+                checkpointSizes[index] = checkpointHeader.int
+                if (lengths[index] !in 0..tokenCount || checkpointSizes[index] < 0) failImage("a checkpoint belongs to a length beyond the image's tokens")
+            }
+            val tokenBytes = ByteBuffer.wrap(reader.take(4 * tokenCount))
+            val tokens = IntArray(tokenCount) { tokenBytes.int }
+            val state = reader.take(stateBytes.toInt())
+            if (!state.contentEquals(stateOf(tokens, stateBytes.toInt()))) failImage("the state was not accepted")
+            for (index in 0 until checkpointCount) {
+                val checkpointState = reader.take(checkpointSizes[index])
+                if (!checkpointState.contentEquals(checkpointStateOf(lengths[index], checkpointSizes[index]))) failImage("a checkpoint's state was not accepted")
+            }
+            reader.finish()
+
+            memoryTokens.addAll(tokens.toList())
+            val restored = lengths.map { length ->
+                val handle = nextCheckpoint++
+                savedCheckpoints[handle] = memoryTokens.subList(0, length).toList()
+                MemoryCheckpoint(handle, length)
+            }
+            return restored
+        } finally {
+            wipe(buffer)
+        }
+    }
+
+    /** The pieces of an import, read as the native session reads them. */
+    private inner class PieceReader(private val buffer: ByteBuffer, private val firstPieceOffset: Int, private val source: MemorySource) {
+        private var have = 0
+        private var at = 0
+        private var piece = -1
+
+        /** The next [count] bytes of the image, from as many pieces as it takes. */
+        fun take(count: Int): ByteArray {
+            val out = ByteArray(count)
+            var filled = 0
+            while (filled < count) {
+                if (at == have) next()
+                val n = minOf(count - filled, have - at)
+                for (index in 0 until n) out[filled + index] = buffer.get(at + index)
+                at += n
+                filled += n
+            }
+            return out
+        }
+
+        /** Requires the image to end with the last byte taken and the source to say so. */
+        fun finish() {
+            if (piece < 0 || at != have) failImage("bytes follow the memory image in its last piece")
+            val n = source.read()
+            if (n < 0) throw NativeLlamaException(NativeLlamaException.MEMORY_STOPPED, "the source stopped the import")
+            if (n > 0) failImage("another piece follows the memory image")
+        }
+
+        private fun next() {
+            val n = source.read()
+            if (n < 0) throw NativeLlamaException(NativeLlamaException.MEMORY_STOPPED, "the source stopped the import")
+            if (n == 0) failImage("the memory image ended before its last byte")
+            if (n > buffer.capacity()) failImage("the source returned more bytes than its buffer holds")
+            piece++
+            if (importFailsAtPiece == piece) failImage("the state was not accepted at piece $piece")
+            have = n
+            at = 0
+            if (piece == 0) {
+                if (have < firstPieceOffset) failImage("the first piece is shorter than the caller's own bytes in it")
+                at = firstPieceOffset
+            }
+        }
+    }
+
+    private fun failImage(why: String): Nothing = throw NativeLlamaException(NativeLlamaException.MEMORY_FAILED, why)
+
+    /** The refusals of the buffer that the binding and the native session make, in the binding's words. */
+    private fun checkPieceBuffer(buffer: ByteBuffer, firstPieceOffset: Int) {
+        val fine = buffer.isDirect && !buffer.isReadOnly && buffer.capacity() >= NativeLlama.MEMORY_PIECE_BYTES_MIN &&
+            firstPieceOffset >= 0 && firstPieceOffset < buffer.capacity()
+        if (!fine) throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "the buffer or its offset is not one an image moves through")
+    }
+
+    /**
+     * The refusals of the checkpoints named for an image: too many, unknown, named twice, or
+     * beyond the end of the memory. A checkpoint whose tokens are no longer the beginning of the
+     * memory is the engine's mistake, not a refusal, and fails loudly.
+     */
+    private fun checkImageCheckpoints(checkpoints: IntArray) {
+        val fine = checkpoints.size <= NativeLlama.MAX_MEMORY_CHECKPOINTS && checkpoints.distinct().size == checkpoints.size &&
+            checkpoints.all { (savedCheckpoints[it]?.size ?: Int.MAX_VALUE) <= memoryTokens.size }
+        if (!fine) throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "a checkpoint is named that an image cannot carry")
+        for (handle in checkpoints) {
+            val saved = savedCheckpoints.getValue(handle)
+            check(memoryTokens.subList(0, saved.size) == saved) {
+                "Checkpoint $handle put into an image of a memory that no longer begins with the tokens it was saved at"
+            }
+        }
+    }
+
+    private fun imageOf(checkpoints: IntArray): ByteArray {
+        val lengths = checkpoints.map { savedCheckpoints.getValue(it).size }
+        val tokens = memoryTokens.toIntArray()
+        val stateBytes = tokens.size * stateBytesPerToken
+        val image = ByteBuffer.allocate(imageBytes(tokens.size, lengths.size, stateBytesPerToken, checkpointStateBytes).toInt())
+        image.put(IMAGE_MAGIC).putInt(tokens.size).putInt(lengths.size).putLong(stateBytes.toLong())
+        for (length in lengths) image.putInt(length).putInt(checkpointStateBytes)
+        for (token in tokens) image.putInt(token)
+        image.put(stateOf(tokens, stateBytes))
+        for (length in lengths) image.put(checkpointStateOf(length, checkpointStateBytes))
+        tokens.fill(0)
+        return image.array()
+    }
+
+    private fun stateOf(tokens: IntArray, bytes: Int): ByteArray {
+        if (bytes == 0) return ByteArray(0)
+        val perToken = maxOf(1, bytes / tokens.size)
+        return ByteArray(bytes) { index -> (tokens[minOf(index / perToken, tokens.size - 1)] * 31 + index).toByte() }
+    }
+
+    private fun checkpointStateOf(length: Int, bytes: Int): ByteArray = ByteArray(bytes) { index -> (length * 7 + index).toByte() }
+
+    private fun wipe(buffer: ByteBuffer) {
+        for (index in 0 until buffer.capacity()) buffer.put(index, 0)
+    }
+
     override fun close() {
         if (closed) return
         recorded += Call.Close
@@ -453,6 +700,22 @@ class FakeNativeLlama(var contextTokens: Int = 4096) : NativeLlama {
 
         /** Ids from here on are handed out by [addControl] and [addPiece]. */
         const val FIRST_FREE_ID: Int = 1000
+
+        private val IMAGE_MAGIC: ByteArray = "FAKEMEM1".toByteArray(Charsets.US_ASCII)
+
+        /** The magic, the number of tokens and of checkpoints, and the size of the state. */
+        private const val IMAGE_FIXED_BYTES: Int = 8 + 4 + 4 + 8
+
+        /** A checkpoint's entry in the header: its length of memory and the size of its state. */
+        private const val IMAGE_CHECKPOINT_BYTES: Int = 4 + 4
+
+        /**
+         * The size of the fake's image of [tokens] tokens with [checkpoints] checkpoints: what
+         * [FakeNativeLlama.memoryStateBytes] reports and [FakeNativeLlama.exportMemory] hands over.
+         */
+        fun imageBytes(tokens: Int, checkpoints: Int, stateBytesPerToken: Int, checkpointStateBytes: Int): Long =
+            IMAGE_FIXED_BYTES + IMAGE_CHECKPOINT_BYTES.toLong() * checkpoints + 4L * tokens +
+                stateBytesPerToken.toLong() * tokens + checkpointStateBytes.toLong() * checkpoints
     }
 }
 

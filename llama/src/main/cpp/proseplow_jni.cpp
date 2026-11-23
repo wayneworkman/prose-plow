@@ -12,8 +12,18 @@
 // - A native method that fails throws NativeLlamaException with the session's status as its
 //   code. It never calls a JNI function while an exception is pending: after a callback into
 //   Kotlin threw, the work is wound down without further calls into the VM and the method
-//   returns, so that the Kotlin exception is the one the caller sees.
-// - No local reference is created inside a loop: the callbacks pass and return primitives only.
+//   returns, so that the Kotlin exception is the one the caller sees. The callbacks of an export
+//   or an import of the memory go one step further: the exception is taken off the thread at
+//   once and thrown again when the session has returned (memory_upcall), so that none is
+//   pending while the session winds the call down.
+// - The state of a model (the memory image of pp_session_export_memory and
+//   pp_session_import_memory) crosses only through the memory of a direct ByteBuffer that the
+//   Kotlin caller owns: never through a primitive array, and never through a copy in this file.
+//   The session overwrites that memory before it returns. No state is ever written to a file:
+//   llama.cpp's two functions that write one in clear are called nowhere (a host test reads
+//   this file for them).
+// - No local reference is created inside a loop: the callbacks pass and return primitives only
+//   (the one exception a memory callback may throw is kept as a single local reference).
 // - The copies of text and tokens that this file makes are overwritten before they are freed,
 //   also when the call fails. That is this file's copies only: llama.cpp makes its own of what
 //   it is handed and frees them as they are (see pp_session_clear_memory in the header).
@@ -43,6 +53,8 @@ const char * const k_jni_class       = "us/theworkmans/proseplow/llama/LlamaJni"
 const char * const k_exception_class = "us/theworkmans/proseplow/core/engine/NativeLlamaException";
 const char * const k_observer_class  = "us/theworkmans/proseplow/core/engine/EvaluationObserver";
 const char * const k_progress_class  = "us/theworkmans/proseplow/core/engine/LoadProgress";
+const char * const k_sink_class      = "us/theworkmans/proseplow/core/engine/MemorySink";
+const char * const k_source_class    = "us/theworkmans/proseplow/core/engine/MemorySource";
 
 // Global references, held for the life of the process: a method id is only valid while its
 // class is loaded.
@@ -53,6 +65,10 @@ jmethodID g_exception_init     = nullptr; // NativeLlamaException(int, String)
 jmethodID g_observer_progress  = nullptr; // EvaluationObserver.onProgress(int)
 jmethodID g_observer_cancelled = nullptr; // EvaluationObserver.isCancelled(): boolean
 jmethodID g_load_progress      = nullptr; // LoadProgress.onProgress(float): boolean
+jclass    g_sink_class         = nullptr;
+jclass    g_source_class       = nullptr;
+jmethodID g_sink_write         = nullptr; // MemorySink.write(int, boolean): boolean
+jmethodID g_source_read        = nullptr; // MemorySource.read(): int
 
 void wipe(void * data, size_t size) {
     if (data == nullptr || size == 0) {
@@ -172,6 +188,98 @@ bool load_on_progress(float fraction, void * data) {
         return false;
     }
     return go_on == JNI_TRUE;
+}
+
+// A callback into Kotlin during an export or an import of the memory. Unlike upcall, an
+// exception thrown by the callback is taken off the thread at once (ExceptionOccurred, then
+// ExceptionClear) and kept as a local reference: the session goes on to wind the call down
+// (overwriting the buffer, clearing a half-read memory, freeing checkpoints, the C++ exception
+// that carries a stopped read out through llama.cpp's frames), and no exception is pending in
+// the VM while it does. The method throws it again once the session has returned.
+struct memory_upcall {
+    JNIEnv *   env;
+    jobject    target;
+    pthread_t  thread = pthread_self();
+    jthrowable caught = nullptr; // the callback's exception, to be thrown when the session returns
+    bool       threw = false;    // a callback threw: make no more calls into the VM during this call
+
+    bool usable() const { return !threw && pthread_equal(thread, pthread_self()) != 0; }
+
+    // True when the callback that just returned threw; the exception is then kept, not pending.
+    bool took_exception() {
+        if (!env->ExceptionCheck()) {
+            return false;
+        }
+        threw = true;
+        caught = env->ExceptionOccurred();
+        env->ExceptionClear();
+        return true;
+    }
+
+    // After the session returned: throws the kept exception. Returns false when there was none.
+    bool rethrow() {
+        if (caught == nullptr) {
+            return false;
+        }
+        env->Throw(caught);
+        return true;
+    }
+};
+
+// The Kotlin MemorySink.write(int, boolean): boolean. Stops the export after an exception, and
+// on a thread that is not the caller's, where it could not reach the VM.
+bool memory_sink_write(size_t n_bytes, bool last, void * data) {
+    memory_upcall * call = (memory_upcall *) data;
+    if (!call->usable()) {
+        return false;
+    }
+    const jboolean go_on = call->env->CallBooleanMethod(call->target, g_sink_write, (jint) n_bytes, last ? JNI_TRUE : JNI_FALSE);
+    if (call->took_exception()) {
+        return false;
+    }
+    return go_on == JNI_TRUE;
+}
+
+// The Kotlin MemorySource.read(): int. A negative answer, an exception and a call from another
+// thread all stop the import.
+int64_t memory_source_read(void * data) {
+    memory_upcall * call = (memory_upcall *) data;
+    if (!call->usable()) {
+        return -1;
+    }
+    const jint n = call->env->CallIntMethod(call->target, g_source_read);
+    if (call->took_exception()) {
+        return -1;
+    }
+    return (int64_t) n;
+}
+
+// The memory of a direct ByteBuffer and its capacity. Returns false, with a NativeLlamaException
+// thrown, for a buffer that is not direct; the sizes themselves are the session's to check.
+bool direct_buffer(JNIEnv * env, jobject buffer, uint8_t *& address, size_t & capacity) {
+    address = buffer != nullptr ? (uint8_t *) env->GetDirectBufferAddress(buffer) : nullptr;
+    const jlong size = buffer != nullptr ? env->GetDirectBufferCapacity(buffer) : -1;
+    if (address == nullptr || size < 0) {
+        throw_native(env, PP_STATUS_INVALID_ARGUMENT, "the memory is moved through a direct buffer only");
+        return false;
+    }
+    capacity = (size_t) size;
+    return true;
+}
+
+// Checkpoint handles from an int array, at most PP_CHECKPOINTS_MAX of them (refused before they
+// are copied). Returns false with a NativeLlamaException thrown.
+bool checkpoint_handles(JNIEnv * env, jintArray handles, std::vector<int32_t> & out) {
+    const jsize n = handles != nullptr ? env->GetArrayLength(handles) : 0;
+    if (n > PP_CHECKPOINTS_MAX) {
+        throw_native(env, PP_STATUS_INVALID_ARGUMENT, "more checkpoints than a session holds");
+        return false;
+    }
+    out.resize((size_t) n);
+    if (n > 0) {
+        env->GetIntArrayRegion(handles, 0, n, (jint *) out.data());
+    }
+    return !env->ExceptionCheck();
 }
 
 // A byte array as a std::string. Returns false when a Java exception is pending.
@@ -480,6 +588,125 @@ void clear_memory(JNIEnv * env, jclass, jlong handle) {
 }
 
 //
+// The memory written out and read back
+//
+
+jintArray memory_tokens(JNIEnv * env, jclass, jlong handle) {
+    return guarded(env, PP_STATUS_OUT_OF_MEMORY, (jintArray) nullptr, [&]() -> jintArray {
+        pp_session * s = session_of(env, handle);
+        if (s == nullptr) {
+            return nullptr;
+        }
+        // Measured first, then copied once into a buffer of exactly that size, which is
+        // overwritten when it goes out of scope: the ids are the conversation.
+        const int32_t needed = pp_session_memory_tokens(s, nullptr, 0);
+        const size_t count = needed < 0 ? (size_t) -needed : 0;
+        wiped<llama_token> tokens(count);
+        if (count > 0 && pp_session_memory_tokens(s, tokens.data(), (int32_t) count) != (int32_t) count) {
+            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "the record of the tokens changed while it was read");
+            return nullptr;
+        }
+        jintArray out = env->NewIntArray((jsize) count);
+        if (out != nullptr && count > 0) {
+            env->SetIntArrayRegion(out, 0, (jsize) count, (const jint *) tokens.data());
+        }
+        return out;
+    });
+}
+
+jlong memory_state_bytes(JNIEnv * env, jclass, jlong handle, jintArray checkpoints) {
+    return guarded(env, PP_STATUS_INVALID_ARGUMENT, (jlong) 0, [&]() -> jlong {
+        pp_session * s = session_of(env, handle);
+        std::vector<int32_t> handles;
+        if (s == nullptr || !checkpoint_handles(env, checkpoints, handles)) {
+            return 0;
+        }
+        const int64_t bytes = pp_session_memory_state_bytes(s, handles.empty() ? nullptr : handles.data(), (int32_t) handles.size());
+        if (bytes < 0) {
+            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "a checkpoint is named that an export would refuse");
+            return 0;
+        }
+        return (jlong) bytes;
+    });
+}
+
+// The state never passes through this function: the session copies it between llama.cpp's
+// buffers and the memory of the caller's direct buffer, and overwrites that memory before it
+// returns. Nothing here holds a byte of it, before, during or after the call.
+jlong export_memory(JNIEnv * env, jclass, jlong handle, jintArray checkpoints, jobject buffer, jint first_piece_offset, jobject sink) {
+    return guarded(env, PP_STATUS_MEMORY_FAILED, (jlong) 0, [&]() -> jlong {
+        pp_session * s = session_of(env, handle);
+        if (s == nullptr) {
+            return 0;
+        }
+        if (sink == nullptr || first_piece_offset < 0) {
+            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "an export needs a sink and an offset of at least 0");
+            return 0;
+        }
+        std::vector<int32_t> handles;
+        uint8_t * address = nullptr;
+        size_t capacity = 0;
+        if (!checkpoint_handles(env, checkpoints, handles) || !direct_buffer(env, buffer, address, capacity)) {
+            return 0;
+        }
+        memory_upcall call{env, sink};
+        const pp_memory_sink target = {address, capacity, (size_t) first_piece_offset, memory_sink_write, &call};
+        int64_t written = 0;
+        const int32_t status = pp_session_export_memory(s, handles.empty() ? nullptr : handles.data(), (int32_t) handles.size(), &target, &written);
+        if (call.rethrow()) {
+            return 0; // the sink's exception, now that the session has returned, is what the caller gets
+        }
+        if (status != PP_STATUS_OK) {
+            throw_native(env, status, pp_session_last_error(s));
+            return 0;
+        }
+        return (jlong) written;
+    });
+}
+
+// restored receives the checkpoints of the image as pairs (handle, length of memory), room for
+// PP_CHECKPOINTS_MAX of them; the result is how many there are. As for an export, the state only
+// ever passes through the memory of the caller's buffer, which the session overwrites.
+jint import_memory(JNIEnv * env, jclass, jlong handle, jobject buffer, jint first_piece_offset, jobject source, jintArray restored) {
+    return guarded(env, PP_STATUS_MEMORY_FAILED, (jint) 0, [&]() -> jint {
+        pp_session * s = session_of(env, handle);
+        if (s == nullptr) {
+            return 0;
+        }
+        if (source == nullptr || first_piece_offset < 0 || restored == nullptr || env->GetArrayLength(restored) < 2 * PP_CHECKPOINTS_MAX) {
+            throw_native(env, PP_STATUS_INVALID_ARGUMENT, "an import needs a source, an offset of at least 0 and room for every checkpoint");
+            return 0;
+        }
+        uint8_t * address = nullptr;
+        size_t capacity = 0;
+        if (!direct_buffer(env, buffer, address, capacity)) {
+            return 0;
+        }
+        memory_upcall call{env, source};
+        const pp_memory_source origin = {address, capacity, (size_t) first_piece_offset, memory_source_read, &call};
+        pp_memory_checkpoint checkpoints[PP_CHECKPOINTS_MAX] = {};
+        int32_t n_checkpoints = 0;
+        const int32_t status = pp_session_import_memory(s, &origin, checkpoints, &n_checkpoints);
+        if (call.rethrow()) {
+            return 0; // the session has emptied the memory; the source's exception is what the caller gets
+        }
+        if (status != PP_STATUS_OK) {
+            throw_native(env, status, pp_session_last_error(s));
+            return 0;
+        }
+        jint pairs[2 * PP_CHECKPOINTS_MAX] = {};
+        for (int32_t i = 0; i < n_checkpoints; i++) {
+            pairs[2 * i]     = checkpoints[i].handle;
+            pairs[2 * i + 1] = checkpoints[i].n_tokens;
+        }
+        if (n_checkpoints > 0) {
+            env->SetIntArrayRegion(restored, 0, 2 * n_checkpoints, pairs);
+        }
+        return n_checkpoints;
+    });
+}
+
+//
 // Sampling
 //
 
@@ -566,6 +793,10 @@ const JNINativeMethod k_methods[] = {
     {"restoreCheckpoint",  "(JI)Z",                                                             (void *) restore_checkpoint},
     {"dropCheckpoint",     "(JI)V",                                                             (void *) drop_checkpoint},
     {"clearMemory",        "(J)V",                                                              (void *) clear_memory},
+    {"memoryTokens",       "(J)[I",                                                             (void *) memory_tokens},
+    {"memoryStateBytes",   "(J[I)J",                                                            (void *) memory_state_bytes},
+    {"exportMemory",       "(J[ILjava/nio/ByteBuffer;ILus/theworkmans/proseplow/core/engine/MemorySink;)J",   (void *) export_memory},
+    {"importMemory",       "(JLjava/nio/ByteBuffer;ILus/theworkmans/proseplow/core/engine/MemorySource;[I)I", (void *) import_memory},
     {"configureSampler",   "(JFIFFFFFIII[I)V",                                                  (void *) configure_sampler},
     {"sampleNext",         "(J)I",                                                              (void *) sample_next},
     {"threadSetup",        "(J)I",                                                              (void *) thread_setup},
@@ -583,18 +814,25 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
     jclass exception = env->FindClass(k_exception_class);
     jclass observer  = exception != nullptr ? env->FindClass(k_observer_class) : nullptr;
     jclass progress  = observer != nullptr ? env->FindClass(k_progress_class) : nullptr;
-    jclass natives   = progress != nullptr ? env->FindClass(k_jni_class) : nullptr;
+    jclass sink      = progress != nullptr ? env->FindClass(k_sink_class) : nullptr;
+    jclass source    = sink != nullptr ? env->FindClass(k_source_class) : nullptr;
+    jclass natives   = source != nullptr ? env->FindClass(k_jni_class) : nullptr;
     if (natives == nullptr) {
         return JNI_ERR; // with the VM's own exception pending, which names the missing class
     }
     g_exception_class    = (jclass) env->NewGlobalRef(exception);
     g_observer_class     = (jclass) env->NewGlobalRef(observer);
     g_progress_class     = (jclass) env->NewGlobalRef(progress);
+    g_sink_class         = (jclass) env->NewGlobalRef(sink);
+    g_source_class       = (jclass) env->NewGlobalRef(source);
     g_exception_init     = env->GetMethodID(exception, "<init>", "(ILjava/lang/String;)V");
     g_observer_progress  = g_exception_init != nullptr ? env->GetMethodID(observer, "onProgress", "(I)V") : nullptr;
     g_observer_cancelled = g_observer_progress != nullptr ? env->GetMethodID(observer, "isCancelled", "()Z") : nullptr;
     g_load_progress      = g_observer_cancelled != nullptr ? env->GetMethodID(progress, "onProgress", "(F)Z") : nullptr;
-    if (g_exception_class == nullptr || g_observer_class == nullptr || g_progress_class == nullptr || g_load_progress == nullptr) {
+    g_sink_write         = g_load_progress != nullptr ? env->GetMethodID(sink, "write", "(IZ)Z") : nullptr;
+    g_source_read        = g_sink_write != nullptr ? env->GetMethodID(source, "read", "()I") : nullptr;
+    if (g_exception_class == nullptr || g_observer_class == nullptr || g_progress_class == nullptr || g_sink_class == nullptr ||
+        g_source_class == nullptr || g_source_read == nullptr) {
         return JNI_ERR;
     }
     if (env->RegisterNatives(natives, k_methods, (jint) (sizeof(k_methods) / sizeof(k_methods[0]))) != JNI_OK) {

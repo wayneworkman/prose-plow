@@ -1,8 +1,13 @@
 package us.theworkmans.proseplow.llama
 
 import us.theworkmans.proseplow.core.engine.EvaluationObserver
+import us.theworkmans.proseplow.core.engine.MemoryCheckpoint
+import us.theworkmans.proseplow.core.engine.MemorySink
+import us.theworkmans.proseplow.core.engine.MemorySource
 import us.theworkmans.proseplow.core.engine.NativeLlama
+import us.theworkmans.proseplow.core.engine.NativeLlamaException
 import us.theworkmans.proseplow.core.engine.SamplerConfig
+import java.nio.ByteBuffer
 
 /**
  * A loaded model: [NativeLlama] over one native session.
@@ -27,6 +32,14 @@ import us.theworkmans.proseplow.core.engine.SamplerConfig
  *   memory comes back empty. A size the address space has no room for is reported, but an
  *   allocation that Android grants and cannot back ends the process: the budget, which the
  *   caller derives from the memory the system has free, is what protects against that.
+ * - [exportMemory] and [importMemory] hand the native session the memory of the caller's direct
+ *   buffer as it is: the state goes between llama.cpp's buffers and that memory and through
+ *   nothing else, neither an array of the Java heap nor a copy in the binding, and the session
+ *   overwrites the whole buffer before it returns. A buffer that is not direct, is read-only, is
+ *   below the smallest piece or does not contain the offset is refused here, before native code
+ *   is reached. An exception thrown by the sink or the source stops the native call; the
+ *   binding keeps it while the session winds down (an import then leaves an empty memory) and
+ *   throws it from here, as itself, afterwards.
  *
  * Invariant: [handle] is the native session until [close] and 0 afterwards. A call after
  * [close] is a bug in the caller and fails with [IllegalStateException] rather than reaching
@@ -85,6 +98,29 @@ internal class LlamaSession(private var handle: Long) : NativeLlama {
 
     override fun sampleNext(): Int = LlamaJni.sampleNext(session())
 
+    override fun memoryTokens(): IntArray = LlamaJni.memoryTokens(session())
+
+    override fun memoryStateBytes(checkpoints: IntArray): Long {
+        val session = session()
+        checkCheckpointCount(checkpoints)
+        return LlamaJni.memoryStateBytes(session, checkpoints)
+    }
+
+    override fun exportMemory(checkpoints: IntArray, buffer: ByteBuffer, firstPieceOffset: Int, sink: MemorySink): Long {
+        val session = session()
+        checkCheckpointCount(checkpoints)
+        checkPieceBuffer(buffer, firstPieceOffset)
+        return LlamaJni.exportMemory(session, checkpoints, buffer, firstPieceOffset, sink)
+    }
+
+    override fun importMemory(buffer: ByteBuffer, firstPieceOffset: Int, source: MemorySource): List<MemoryCheckpoint> {
+        val session = session()
+        checkPieceBuffer(buffer, firstPieceOffset)
+        val pairs = IntArray(2 * NativeLlama.MAX_MEMORY_CHECKPOINTS)
+        val count = LlamaJni.importMemory(session, buffer, firstPieceOffset, source, pairs)
+        return List(count) { MemoryCheckpoint(handle = pairs[2 * it], tokenCount = pairs[2 * it + 1]) }
+    }
+
     override fun close() {
         val session = handle
         handle = 0
@@ -102,4 +138,40 @@ internal class LlamaSession(private var handle: Long) : NativeLlama {
 
     /** @property pinned true when each of the [count] threads runs on a CPU of its own. */
     data class ThreadSetup(val count: Int, val pinned: Boolean)
+
+    internal companion object {
+
+        /**
+         * Refuses, before native code is reached, a buffer the native side must not be handed:
+         * one that is not direct has no native memory to give it; a read-only one would be
+         * written to all the same (the session fills it and overwrites it), behind the back of
+         * the Java object that promises otherwise; one below
+         * [NativeLlama.MEMORY_PIECE_BYTES_MIN] bytes, and an offset outside 0 until its
+         * capacity, the session would refuse anyway. The native side checks the last two again.
+         *
+         * @throws NativeLlamaException with [NativeLlamaException.INVALID_ARGUMENT].
+         */
+        fun checkPieceBuffer(buffer: ByteBuffer, firstPieceOffset: Int) {
+            val problem = when {
+                !buffer.isDirect -> "the memory is moved through a direct buffer only"
+                buffer.isReadOnly -> "the buffer of a memory image is written to, and this one is read-only"
+                buffer.capacity() < NativeLlama.MEMORY_PIECE_BYTES_MIN -> "a buffer of ${buffer.capacity()} bytes is below the smallest piece"
+                firstPieceOffset < 0 || firstPieceOffset >= buffer.capacity() -> "an offset of $firstPieceOffset is outside a buffer of ${buffer.capacity()} bytes"
+                else -> null
+            }
+            if (problem != null) throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, problem)
+        }
+
+        /**
+         * Refuses more checkpoints than a session holds before the array is handed to native
+         * code, which refuses them too.
+         *
+         * @throws NativeLlamaException with [NativeLlamaException.INVALID_ARGUMENT].
+         */
+        fun checkCheckpointCount(checkpoints: IntArray) {
+            if (checkpoints.size > NativeLlama.MAX_MEMORY_CHECKPOINTS) {
+                throw NativeLlamaException(NativeLlamaException.INVALID_ARGUMENT, "${checkpoints.size} checkpoints are more than a session holds")
+            }
+        }
+    }
 }
