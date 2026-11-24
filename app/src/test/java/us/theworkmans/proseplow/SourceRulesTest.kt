@@ -28,6 +28,9 @@ class SourceRulesTest {
     private fun imports(file: File): List<String> = file.readLines().filter { it.startsWith("import ") }.map { it.removePrefix("import ").trim() }
 
     private val main = "src/main/java/us/theworkmans/proseplow"
+
+    /** The instrumented test that drives the whole app and resets the debug app's data, on request only. */
+    private val smokeTest = "SmokeOnDeviceTest.kt"
     private val app = "us.theworkmans.proseplow"
 
     /** The lines of [file] that are code, trimmed: comments are left out, so that a rule is not met (or broken) by one. */
@@ -267,7 +270,11 @@ class SourceRulesTest {
      * to touch the keys or the data of the app they run inside: every vault they use comes from
      * DeviceTests.vault(), which puts the tests' own namespace in front of every alias and
      * refuses to run outside a debug build, and none of them goes near the app's own files, its
-     * reset or its lock.
+     * reset or its lock. The one exception is the smoke test ([smokeTest]), whose purpose is to
+     * use the whole debug app from a clean start: it reaches the application object and through
+     * it the lock, the reset and the app's state, but it must refuse to run outside a debug build
+     * and unless its instrumentation argument asks for it, and it still makes no vault and names
+     * no other part of the list.
      */
     @Test
     fun instrumentedTestsOnlyEverUseTheirOwnKeysAndFiles() {
@@ -288,7 +295,16 @@ class SourceRulesTest {
                 else -> emptyList()
             }
             assertEquals("${file.name} makes a vault of its own", expected, made)
-            for (forbidden in listOf("DataReset", "AppContainer", "ProsePlowApp", "MainActivity", "filesDir", "AppLock(")) {
+            // The one exception is the smoke test, which drives the whole app and resets its data
+            // on purpose: it may reach the application object, and through it the lock and the
+            // app's state, but only in a run that asks for it and only inside a debug build.
+            val smoke = file.name == smokeTest
+            if (smoke) {
+                assertTrue("$smokeTest runs only inside a debug build", text.contains("DeviceTests.requireDevelopmentPackage()"))
+                assertTrue("$smokeTest runs only when asked for", text.contains("assumeTrue(") && text.contains("getString(SMOKE_ARGUMENT) == \"true\""))
+            }
+            val forbiddenNames = listOf("DataReset", "AppContainer", "ProsePlowApp", "MainActivity", "filesDir", "AppLock(")
+            for (forbidden in if (smoke) forbiddenNames - "ProsePlowApp" else forbiddenNames) {
                 assertTrue("${file.name} reaches for $forbidden", !text.contains(forbidden))
             }
             if (file != support && text.contains("@RunWith")) {

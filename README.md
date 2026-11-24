@@ -1734,6 +1734,7 @@ None of it has been tried.
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` (needs no model) |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark, the sealed stream's frozen vectors and a stream of three 4 MiB chunks through the phone's own AES-GCM, and the screens of the terms (the two buttons alike, the second without response, the way through statement by statement and the typed confirmation) | `./gradlew :app:connectedDebugAndroidTest` |
+| `app` smoke test, on a phone | The whole debug app from a clean start, with all four models: terms, passphrase, an answer from each model, "Information", lock and unlock, and the saved memory restored instead of read again. Resets the debug app's data; runs only when asked for | See [The smoke test](#the-smoke-test) |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model; what the next message reads after a read-ahead, and "Continue" after a stop (`RereadDiagnosisDeviceTest`) | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
 The test counts are those of the commit named above. The two suites that need a phone are not
@@ -1742,10 +1743,64 @@ part of `check`. They need a phone that is connected with USB debugging, awake a
 - The tests of `app` use Keystore keys and files of their own, never the app's. One of them
   needs an enrolled fingerprint and is skipped without one. They run inside the debug build,
   which Gradle installs and **removes again when the tests are done, with the data of a debug
-  build that was installed before**.
+  build that was installed before**. The smoke test (below) is the one exception to "never the
+  app's"; it is skipped unless it is asked for.
 - The tests of `llama` need the models, either inside the test APK or copied to the phone;
   `native/README.md` has the commands. Building their APK was part of the clean-machine check;
   running them was not.
+
+### The smoke test
+
+`SmokeOnDeviceTest` (in `app/src/androidTest`) uses the whole app on your phone the way a person
+would, with every model, before you start using your own build. **It resets the data of the
+debug app** (`us.theworkmans.proseplow.debug`: every chat, setting and key in it) through the
+app's own "Reset app data". The release app is a separate app with its own data and keys, and
+the test cannot reach it. In one run it:
+
+1. opens the debug app and resets its data; the terms must then come before the set-up;
+2. goes through the terms: a press on "I agree" in the first second is ignored, then every
+   statement is agreed to, "I agree" is typed and "Agree and continue" pressed;
+3. creates a passphrase and declines fingerprint unlock if it is offered;
+4. sends one message to each of the four models, each in a chat of its own (Shard-2 the
+   beginning of a text, Peacebell and Boris-2 a short question, Qwen3.5 a long text of about
+   3,000 tokens with a question about it), with each model's longest reply set short first;
+   every answer must end and must not be empty;
+5. opens "Information" and checks that it shows the version of the terms agreed to and the date
+   and time of the agreement;
+6. leaves the app with Home and comes back within a minute: the model's memory of the Qwen3.5
+   chat must have been saved meanwhile (it is saved when the app leaves the screen, and only
+   when reading the conversation again would take about 20 seconds or more, hence the long
+   message; "Lock now" itself saves nothing);
+7. locks with "Lock now" from the chat menu, and unlocks with the passphrase into the Qwen3.5
+   chat;
+8. sends one more short message there: the reading of its prompt must begin with the earlier
+   conversation already in memory (restored, not read again) and take a fraction of the time the
+   first message took;
+9. locks with "Lock now" again and leaves the app locked.
+
+It needs the four models in the installed debug app, the default build. The test APK carries no
+model, so the debug app is installed once and stays installed; only the small test APK is
+installed beside it. With the phone connected over USB or wireless debugging (see
+[Connecting a phone](#connecting-a-phone)), unlocked and with its screen on:
+
+```sh
+./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb shell am instrument -w -e smoke true -e class us.theworkmans.proseplow.SmokeOnDeviceTest \
+    us.theworkmans.proseplow.debug.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Without `-e smoke true` the test is skipped, so it never runs as part of
+`./gradlew :app:connectedDebugAndroidTest`. Each step prints a line that begins with
+`PROSEPLOW smoke`, with its time; a failure names the step and says what was waited for or what
+was found instead. No prompt or answer text is printed. While it runs, the test sends a bare
+Shift key every 40 seconds so that the screen does not time out; do not use the phone meanwhile.
+The run should take a few minutes, most of it Qwen3.5 reading the long message (about 45
+seconds on the tested phone) and the four models loading. When it is done the debug app is
+locked with the passphrase `smoke test passphrase`; use "Reset app data" on its lock screen, or
+`adb shell pm clear us.theworkmans.proseplow.debug`, to start it afresh. The test APK can be
+removed with `adb uninstall us.theworkmans.proseplow.debug.test`.
 
 ## Adding and removing a model
 
