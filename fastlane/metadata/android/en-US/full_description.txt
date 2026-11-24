@@ -8,7 +8,7 @@ Prose Plow runs small language models entirely on the phone. The models are pack
 * In Settings, a page for each model: a temperature from 0 to 2, the longest reply, how far its context may grow, and a system prompt for each model that was trained with one.
 * Answers are shown as Markdown, with a copy button on every message. Images are never loaded, and a link is handed to another app only after you have confirmed it.
 
-<b>Privacy</b>
+<b>Lock and encryption</b>
 * The permissions in the APK are for fingerprint unlock and for finishing an answer out of sight: a foreground service, its two notifications, which never show a word of a chat, and keeping the processor awake.
 * Chats, drafts, the list of chats and the settings are only ever written to the phone encrypted (AES-256-GCM).
 * The lock is mandatory. The first start asks for a passphrase of at least 10 characters that is not only digits, so a PIN is refused, and no setting turns the lock off.
@@ -33,4 +33,4 @@ Small models are often wrong. The chat screen says so at all times, under its ti
 
 Speed depends on the phone. On the one phone it was tested on, a Samsung Galaxy XCover7 Pro with Android 17, Qwen3.5 0.8B wrote about 9 tokens per second and Boris-2-Instruct about 52; other phones will differ. A model's context grows with the conversation as far as the model and the phone's memory allow; beyond that, the oldest messages are left out of the latest answer and the app says how many.
 
-The lock protects what is stored on the phone. It does not protect against someone who knows the passphrase, against whoever holds the phone while the app is unlocked, or against a compromised phone. The code has had no independent security review.
+The lock does not protect against someone who knows the passphrase, against whoever holds the phone while the app is unlocked, or against a compromised phone. The code has had no independent security review.

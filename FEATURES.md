@@ -3,9 +3,10 @@
 This file lists everything the Android app does that a user or a tester can observe, so that a
 version for another platform (iOS first) can be held to the same behaviour item by item. It
 describes the app as it is built from this repository: every statement was taken from the code,
-the tests and the resources, and where a behaviour matters only because of what it protects, the
-reason is given with it. One part, [Planned tools](#27-planned-tools-design-considerations-tool),
-is about things that are **not** built and is kept apart from everything else.
+the tests and the resources, and where a behaviour matters only because of what it guards
+against, the reason is given with it. One part,
+[Planned tools](#27-planned-tools-design-considerations-tool), is about things that are **not**
+built and is kept apart from everything else.
 
 ## How to use this document
 
@@ -63,7 +64,7 @@ is about things that are **not** built and is kept apart from everything else.
 21. [What stays in memory (MEM)](#21-what-stays-in-memory-mem)
 22. [About, licences and notices (ABOUT)](#22-about-licences-and-notices-about)
 23. [Accessibility (A11Y)](#23-accessibility-a11y)
-24. [Guarantees of the build (BUILD)](#24-guarantees-of-the-build-build)
+24. [Properties of the build (BUILD)](#24-properties-of-the-build-build)
 25. [Exact formats and rules (FMT)](#25-exact-formats-and-rules-fmt)
 26. [Security model (THREAT, DEC)](#26-security-model-threat-dec)
 27. [Planned tools: design considerations (TOOL)](#27-planned-tools-design-considerations-tool)
@@ -155,8 +156,8 @@ is about things that are **not** built and is kept apart from everything else.
   the set-up screen only after it; there is no way past the set-up screen without creating a
   passphrase. It shows, in this order:
   - the title "Create your passphrase";
-  - "Prose Plow encrypts everything it stores on this phone. Your passphrase unlocks it each
-    time you open the app; without it nothing can be read.";
+  - "Prose Plow encrypts everything it stores on this phone, with a key that your passphrase
+    unlocks each time you open the app.";
   - in the colour for errors: "A forgotten passphrase cannot be recovered. There is no reset
     link and no recovery key: the only way back in is to reset the app, which deletes all of
     its data.";
@@ -178,7 +179,8 @@ is about things that are **not** built and is kept apart from everything else.
 - **SETUP-04** Submitting empties both fields whatever the outcome: after a refusal both
   entries are typed again.
 - **SETUP-05** While the key is being made, the fields and the button are disabled and a
-  spinner shows with "Securing the key…". A second submission during that time is ignored.
+  spinner shows with "Deriving the key from your passphrase…". A second submission during that
+  time is ignored.
 - **SETUP-06** Until a passphrase that meets the rules has been submitted, nothing exists: no
   data key, no key in the device's key store, no configuration file, no data file.
 - **SETUP-07** On success the data key is made (32 bytes from the system's random generator),
@@ -290,13 +292,13 @@ is about things that are **not** built and is kept apart from everything else.
   the moment the unlock completed. With "Immediately" such a session is locked again before
   anything of it is shown.
 - **LOCK-16** "Lock now" locks at once, without a confirmation. It is offered in the menu of the
-  chat screen and in the security settings. It is the strongest way to lock: a reply that is
-  being written is stopped, and nothing is left alive behind the lock whatever the settings say
-  (LEASE-08). It never waits for the model's memory to be saved and never begins a save; a save
-  that is under way is stopped before anything else of the closing (LOCK-17, steps 3 and 4), so
-  that a save stuck on a storage that does not answer cannot make the lock wait. It needs
-  nothing kept running for its closing, and asks for nothing (BG-16). A memory that an earlier
-  save completed stays on disk and is used at the next unlock as far as it goes (STORE-31).
+  chat screen and in the security settings. Of the ways to lock, it leaves the least behind: a reply
+  that is being written is stopped, and nothing is left alive behind the lock whatever the settings
+  say (LEASE-08). It never waits for the model's memory to be saved and never begins a save; a save
+  that is under way is stopped before anything else of the closing (LOCK-17, steps 3 and 4), so that
+  a save stuck on a storage that does not answer cannot make the lock wait. It needs nothing kept
+  running for its closing, and asks for nothing (BG-16). A memory that an earlier save completed
+  stays on disk and is used at the next unlock as far as it goes (STORE-31).
 - **LOCK-17** What a lock does, in this order:
   1. The state changes and every unlocked screen is torn down within the same call, not at the
      next frame, so that nothing of a chat or a setting stays referenced by the interface. The
@@ -465,7 +467,8 @@ is about things that are **not** built and is kept apart from everything else.
      and the buttons "Continue" and "Cancel". While it is checked: "Checking the passphrase…".
   2. "New passphrase": the line "Use at least 10 characters, and not only digits. A forgotten
      passphrase cannot be recovered.", the fields "New passphrase" and "Repeat the passphrase",
-     and the buttons "Save" and "Cancel". While it is stored: "Securing the key…".
+     and the buttons "Save" and "Cancel". While it is stored: "Deriving the key from your
+     passphrase…".
 
   The new passphrase is checked as in SETUP-03, with the message under the second field. On
   success the dialog closes and the security section says, once: "The passphrase was changed."
@@ -1006,7 +1009,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   - **On Android:** `allowBackup="false"`, `fullBackupContent="false"`, and data extraction
     rules that exclude every domain from cloud backup and from device transfer.
 - **STORE-20** Nothing in the storage layer is specific to chats: an encrypted file is a blob
-  sealed with a namespaced purpose, written atomically and protected by the rule of STORE-09
+  sealed with a namespaced purpose, written atomically and subject to the rule of STORE-09
   (TOOL-07). The storage layer can also write and read the second form of an encrypted file,
   the stream of FMT-21, which is as little specific to chats; the store of the model's saved
   memory (STORE-24) uses it.
@@ -1914,7 +1917,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **SECSET-12** Right after it, the choice "Fingerprint works for": "15 minutes", "1 hour" (the
   default), "8 hours" or "24 hours" (BIO-18), with the line "The fingerprint unlocks the app
   for this long after it locks. After that, or after the phone restarts, the passphrase is
-  needed." It is shown whether or not fingerprint unlock is on, and is built and protected as
+  needed." It is shown whether or not fingerprint unlock is on, and is built and handled as
   SECSET-04 is: the choice needs no passphrase and is stored in the lock configuration, because
   it is needed while the app is locked; if it cannot be stored, the choice shows the stored
   value again and the group says "That did not work: the phone's key store or storage reported
@@ -1990,8 +1993,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   - off: "Screenshots and screen recordings are blocked.";
   - on: "On until {time}. It also ends when the screen turns off or the app is closed. While it
     is on, screenshots and screen recordings can capture your chats; the preview in the app
-    switcher stays hidden. The lock screen and anything that asks for your passphrase are never
-    captured.", with the time as a time of day in the user's own format;
+    switcher stays hidden. The lock screen and anything that asks for your passphrase always
+    block screenshots and screen recordings.", with the time as a time of day in the user's own
+    format;
   - where it cannot be offered (PRIV-07), with the switch disabled: "Needs Android 13 or later.
     On this version of Android the preview in the app switcher cannot be hidden by itself, so
     screenshots stay blocked."
@@ -3110,7 +3114,7 @@ tests `settings/ThirdPartyNoticesTextTest.kt`, `ThirdPartyNoticesTest.kt`.
 - **ABOUT-07** How the app describes itself where it is listed: the name "Prose Plow"; the line
   "Small language models that run on the phone, offline, with encrypted chats"; and a longer
   description in `fastlane/metadata/android/en-US/full_description.txt`, which names the models
-  with their licences, the size of the package, and the limits of what the lock protects.
+  with their licences, the size of the package, and the limits of the lock.
 
 ## 23. Accessibility (A11Y)
 
@@ -3160,7 +3164,7 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
   its cost, is one radio button that reports whether it is selected, and the whole row is the touch
   target.
 
-## 24. Guarantees of the build (BUILD)
+## 24. Properties of the build (BUILD)
 
 **Source:** `app/build.gradle.kts`, `llama/build.gradle.kts`, `llama/apk-checks.gradle.kts`,
 `llama/src/main/cpp/CMakeLists.txt`, `native/CMakeLists.txt`, `models/manifest.json`,
@@ -3483,7 +3487,8 @@ This section is exact where the others describe. Each item carries one of three 
     authenticated data of each form begins with its own magic, and the two differ in their third
     byte.
   - Every chunk is one use of the data key with a random nonce, as every blob is. Random nonces
-    are safe for 2^32 uses of one key, which in chunks alone is 2^54 bytes of streams.
+    are within the limit of NIST SP 800-38D for 2^32 uses of one key, which in chunks alone is
+    2^54 bytes of streams.
 
   The magic, the version byte, the prefix `proseplow:`, the order of the additional
   authenticated data and the chunk size of version 1 are permanent. `security/SealedStreamTest.kt`
@@ -3786,37 +3791,37 @@ This section is exact where the others describe. Each item carries one of three 
 `MainActivity.kt`, `ScreenSecurity.kt`, the tests named in sections 3 to 10 and 17, and
 `SourceRulesTest.kt`. The reasons below are the ones the code, its tests and the README give.
 
-Security is not one feature of this app but the reason for many of them. This section states
-what the lock is meant to protect, what it does not protect, and each decision with its reason
+Many features of this app exist for the lock and the encryption. This section states the
+threats they are designed for, those they do not address, and each decision with its reason
 as a property a port has to preserve. A port that provides the screens of sections 2 to 8
 without these properties has not reached parity.
 
-### What the app protects against
+### The threats the app is designed for
 
 - **THREAT-01** Someone who holds the device, or a copy of its storage, without the passphrase
-  and without an enrolled finger cannot read any chat, draft, title, setting or system prompt:
-  they exist on disk only encrypted (STORE-04). The passphrase cannot be guessed away from the
-  device, because every guess needs the device's own key store (KEY-03), and guesses on the
-  device through the app are slowed down (PASS-06).
+  and without an enrolled finger. Every chat, draft, title, setting and system prompt is on
+  disk only encrypted (STORE-04). Every guess at the passphrase needs the device's own key
+  store (KEY-03), so a copy of the storage cannot be used to guess away from the device, and
+  guesses on the device through the app are slowed down (PASS-06).
 - **THREAT-02** Someone who looks at the device while the app is locked, at the list of recent
-  apps, or at the notifications sees nothing of a conversation: the lock screen shows none, the
-  preview is always hidden (PRIV-07), and the notifications are fixed sentences (BG-07).
+  apps, or at the notifications. The lock screen shows nothing of a conversation, the preview
+  is always hidden (PRIV-07), and the notifications are fixed sentences (BG-07).
 - **THREAT-03** Other software that captures the screen (screenshots, recordings, screen
-  sharing) gets nothing unless the user has allowed it for at most 10 minutes, and never gets a
-  screen on which a passphrase is typed (PRIV-01 to PRIV-06).
-- **THREAT-04** Other apps get no way in and nothing handed to them: the app has one entry
-  point, takes no taps through overlays, gives no text to autofill, to the keyboard's learning,
-  to the text classifier or to entries other apps put into the selection menu, hides what is
-  copied from the clipboard preview, takes part in no backup and uses no network (PRIV-09 to
-  PRIV-16, STORE-19).
-- **THREAT-05** What a model writes cannot reach out by itself: images are never loaded, a link
-  is only handed on after the user has seen its full address and confirmed it, and text that
-  spells a chat marker cannot close or open a turn (MD-03, MD-05, FMT-09).
-- **THREAT-06** After a lock the key is gone from memory, the model's memory of the conversation
-  is cleared, and once the app is out of sight its process is ended, which releases every copy
-  that could not be overwritten (LOCK-17, END-01).
-- **THREAT-07** A build cannot quietly gain a network permission, a network client or a model
-  that is not the pinned one (BUILD-01 to BUILD-03).
+  sharing). The window is marked secure unless the user has allowed capture, for at most 10
+  minutes, and a screen on which a passphrase is typed is marked secure whatever was allowed
+  (PRIV-01 to PRIV-06).
+- **THREAT-04** Other apps. The app has one entry point, takes no taps through overlays,
+  gives no text to autofill, to the keyboard's learning, to the text classifier or to entries
+  other apps put into the selection menu, hides what is copied from the clipboard preview, takes
+  part in no backup and uses no network (PRIV-09 to PRIV-16, STORE-19).
+- **THREAT-05** What a model writes. Images are never loaded, a link is only handed on after
+  the user has seen its full address and confirmed it, and text that spells a chat marker does
+  not close or open a turn (MD-03, MD-05, FMT-09).
+- **THREAT-06** What stays in memory after a lock. The key is erased from memory, the model's
+  memory of the conversation is cleared, and once the app is out of sight its process is
+  ended, which releases every copy that could not be overwritten (LOCK-17, END-01).
+- **THREAT-07** A build that gains a network permission, a network client or a model that is
+  not the pinned one. The build checks for each of these and fails (BUILD-01 to BUILD-03).
 
 ### What the app does not protect against
 
@@ -3838,11 +3843,11 @@ without these properties has not reached parity.
   capture the screen whatever the app asks for. The app relies on the platform's separation of
   apps.
 - **THREAT-11** Guessing on the device itself by someone with root access. The count of wrong
-  attempts is in a plain file and can be reset, and code that runs as the app can use the
-  binding key; the 600,000 iterations can then be computed elsewhere in advance, so that a guess
-  costs one operation of the key store. If the key store can be made to give up the binding key,
-  the passphrase key is only as strong as PBKDF2 with 600,000 iterations. In both cases only the
-  strength of the passphrase protects the data.
+  attempts is in a plain file and can be reset, and code that runs as the app can use the binding
+  key; the 600,000 iterations can then be computed elsewhere in advance, so that a guess costs one
+  operation of the key store. If the key store can be made to give up the binding key, the
+  passphrase key is only as strong as PBKDF2 with 600,000 iterations. In both cases the strength of
+  the passphrase alone decides how long guessing takes.
 - **THREAT-12** The keyboard, the clipboard and accessibility services. A keyboard sees
   everything typed into it and may ignore the request not to learn. Text the user copies leaves
   the app and can be read by the keyboard and by the app it is pasted into. An accessibility
@@ -3937,11 +3942,11 @@ only state a rule, the item says so and states its effect instead of inventing a
   passphrase or an authorised biometric.
 - **DEC-02** *A passphrase of the app's own, never a PIN, and never the device's PIN, pattern or
   password* (PASS-01, BIO-01). Reason for the passphrase: in the cases the lock cannot rule out
-  (THREAT-11), only the strength of the passphrase protects the data. The exclusion of the
-  device credential is stated as a rule, in three places: the rules refuse digits alone, the
+  (THREAT-11), the strength of the passphrase alone decides how long guessing takes. The exclusion
+  of the device credential is stated as a rule, in three places: the rules refuse digits alone, the
   biometric prompt cannot fall back to the device credential, and no key of the app can be
-  authorised by it. Its effect is that whoever can unlock the device cannot, by that alone,
-  open the app. Preserve: all three.
+  authorised by it. Its effect is that whoever can unlock the device cannot, by that alone, open the
+  app. Preserve: all three.
 - **DEC-03** *The passphrase key depends on a key that cannot leave the device* (KEY-03).
   Reason: a copy of the lock configuration cannot then be attacked away from the device; every
   guess needs this device's key store. A new binding key for every new passphrase means that an
@@ -3959,11 +3964,11 @@ only state a rule, the item says so and states its effect instead of inventing a
   Preserve: the normal form and the encoding, for ever.
 - **DEC-06** *An attempt is counted on disk before it is checked* (PASS-05). Reason: ending the
   app in the middle of a check must not avoid the count. Preserve: the order.
-- **DEC-07** *Waits are timed on the device clock and never on the date and time* (PASS-08).
-  Reason: the device clock never runs ahead of real time, so the date could not make a wait any
-  safer, while the date can be set by anyone holding the device, or corrected by the network, in
-  either direction. A wait that followed it could be cut short by setting the date ahead or,
-  worse in an app without any recovery, held for as long as the date was set back: the right
+- **DEC-07** *Waits are timed on the device clock and never on the date and time* (PASS-08). Reason:
+  the device clock never runs ahead of real time, so following the date would make no wait any
+  harder to cut short, while the date can be set by anyone holding the device, or corrected by the
+  network, in either direction. A wait that followed it could be cut short by setting the date ahead
+  or, worse in an app without any recovery, held for as long as the date was set back: the right
   passphrase refused for days because a clock was corrected. Preserve: nothing a holder of the
   device can set shortens a wait or stretches it beyond one full delay.
 - **DEC-08** *Nothing is deleted after wrong attempts* (PASS-10). Stated as a rule. Its effect,
@@ -3978,7 +3983,8 @@ only state a rule, the item says so and states its effect instead of inventing a
 - **DEC-10** *Changing how the app unlocks needs the passphrase, entered within the last 2
   minutes; a fingerprint unlock gives no such proof* (PASS-12). Stated as a rule. Its effect:
   neither an enrolled finger nor a moment with the unlocked app is enough to replace the
-  passphrase or to add or remove a way in. Preserve: the three protected actions and the limit.
+  passphrase or to add or remove a way in. Preserve: the three actions that need the passphrase,
+  and the limit.
 - **DEC-11** *A fingerprint unlock ends a streak of wrong passphrases* (BIO-09). Reason: someone
   who only ever unlocks by fingerprint would otherwise carry failures from months ago, and one
   more wrong passphrase would start at the long waits.
@@ -4384,7 +4390,7 @@ the fixtures under `core/src/test/resources/golden/`.
   stored encrypted like everything else, and can be searched.
   - Provided today: storage is not specific to chats. An encrypted file is a blob sealed with a
     namespaced purpose (`SealedFile`, `SealedDirectory`, `Purposes`), written atomically,
-    protected by the rule that unread content is never written over, and written through the
+    subject to the rule that unread content is never written over, and written through the
     one background writer. A new store needs a name space of its own and three rules it must
     follow, which is all the lock relies on: its files end in `.enc` and lie under the private
     files directory outside `security/`; every blob is sealed with a purpose; and a reset

@@ -119,7 +119,7 @@ Chats:
   and slower processor cores: on the one phone that was tested, reading the conversation into
   the model was about a quarter slower, and writing the answer was as fast as in front.
 
-Privacy:
+The lock and the encryption:
 
 - **Encrypted storage.** Chats, drafts, the list of chats, the settings and the model's saved
   memory of a conversation are only ever written to the phone encrypted (AES-256-GCM).
@@ -321,7 +321,7 @@ needs more.
   has is the limit for that model until it is loaded again. "As far as it can" is not only the
   step before: it is the largest size, in whole 256 tokens, that the model itself says fits
   the memory. That matters at the largest sizes. The model counts a size it has not created
-  yet about 2% higher than its line through the sizes it has, to be safe, while the limit
+  yet about 2% higher than its line through the sizes it has, as a margin, while the limit
   above is reckoned at the model's bytes for each token. A limit at the very edge of the
   memory (Qwen3.5's 111,616 tokens on the tested phone) can therefore cost the model just
   more than the memory allows; the context then grows to the largest size below it that
@@ -394,7 +394,7 @@ needs more.
 
 This is no promise that the app never runs out of memory. Every check is made with what
 Android reports at that moment; another app can take the memory a moment later, and Android
-then ends apps without asking. If it ends this one, the chats are safe: a message is written
+then ends apps without asking. If it ends this one, the chats are on disk: a message is written
 to disk, encrypted, when it is sent, and an answer while it is being written, so at most the
 last words of the answer under way are lost.
 
@@ -476,7 +476,7 @@ precise statement of every rule below.
 
 Everything is in the app's private storage.
 
-| File | Content | Protection |
+| File | Content | Form |
 | --- | --- | --- |
 | `files/sessions/<id>.enc` | One chat: its messages, its draft, its model and title. The file's last-modified time is set to the date of its newest message | Encrypted |
 | `files/session-index.enc` | The list of chats: the title, dates, model and number of messages of each, and the date of its oldest message | Encrypted |
@@ -527,9 +527,9 @@ optionally a second time by a fingerprint key.
   exported and needs no user authentication. Because the passphrase key depends on it, a copy of
   `lock.json` cannot be attacked away from the phone: every guess needs this phone's Keystore.
   A new binding key is made for every new passphrase and the old one is deleted once the new
-  configuration is safely on disk, so an older copy of `lock.json` with an older passphrase no
-  longer opens. StrongBox is not requested; the key lives in the trusted execution environment
-  where the phone has one.
+  configuration has been written and flushed to disk, so an older copy of `lock.json` with an
+  older passphrase no longer opens. StrongBox is not requested; the key lives in the trusted
+  execution environment where the phone has one.
 - **PBKDF2** is implemented in the app over `javax.crypto.Mac`, so that the passphrase is turned
   into bytes in an array that is zeroed afterwards; it is checked against the RFC test vectors
   and the JDK's implementation. The iteration count and the salt are read from `lock.json`; an
@@ -939,7 +939,8 @@ it or losing the phone loses the chats.
 - **Guessing on the phone itself by someone with root access.** The count of wrong attempts is
   in a plain file and can be reset, and code that runs as the app can use the binding key. The
   600,000 iterations can then be computed elsewhere in advance, so that a guess costs one
-  Keystore operation. In that situation only the strength of the passphrase protects the data.
+  Keystore operation. In that situation the strength of the passphrase alone decides how long
+  guessing takes.
   The time limit of fingerprint unlock is a check the app makes, not a property of the key: with
   root access it can be got around by editing `lock.json`, and the fingerprint then opens the
   app as it would without the limit.
