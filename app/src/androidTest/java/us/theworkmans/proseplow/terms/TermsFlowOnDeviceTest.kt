@@ -43,11 +43,17 @@ class TermsFlowOnDeviceTest {
 
     private fun all(): List<AccessibilityNodeInfo> = automation.rootInActiveWindow?.let(::nodes).orEmpty()
 
-    /** The node that shows [text] (or is described by it), once it is on screen; null after 10 seconds. */
+    /**
+     * The node that shows [text] (or is described by it), once it is on screen; null after 10
+     * seconds. What is scrolled out of sight is not in the accessibility tree, so while nothing
+     * matches, a scrollable container is scrolled on by one step before looking again.
+     */
     private fun find(text: String): AccessibilityNodeInfo? {
         val deadline = SystemClock.uptimeMillis() + 10_000
         while (SystemClock.uptimeMillis() < deadline) {
-            all().firstOrNull { it.text?.toString() == text || it.contentDescription?.toString() == text }?.let { return it }
+            val shown = all()
+            shown.firstOrNull { it.text?.toString() == text || it.contentDescription?.toString() == text }?.let { return it }
+            shown.firstOrNull { it.isScrollable }?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
             SystemClock.sleep(100)
         }
         return null
@@ -57,7 +63,10 @@ class TermsFlowOnDeviceTest {
     private fun button(text: String): AccessibilityNodeInfo {
         var node = find(text)
         assertNotNull("\"$text\" is on screen", node)
-        while (node != null && node.actionList.none { it.id == AccessibilityNodeInfo.ACTION_CLICK } && node.className?.toString() != "android.widget.Button") {
+        // A disabled button offers no click action, so it is also known by being clickable at all or disabled.
+        while (node != null && node.actionList.none { it.id == AccessibilityNodeInfo.ACTION_CLICK } && node.className?.toString() != "android.widget.Button" &&
+            !node.isClickable && node.isEnabled
+        ) {
             node = node.parent
         }
         assertNotNull("\"$text\" is a button", node)
@@ -140,16 +149,21 @@ class TermsFlowOnDeviceTest {
             assertTrue(flow.progress.value.confirming)
             assertNotNull(find("I do not agree"))
             assertFalse("not before the words are typed", button("Agree and continue").isEnabled)
+            find("Type the words I agree")
             val field = all().first { it.isEditable }
             field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "I agree.") })
             SystemClock.sleep(300)
             assertFalse("a full stop is too much", button("Agree and continue").isEnabled)
-            all().first { it.isEditable }.performAction(
-                AccessibilityNodeInfo.ACTION_SET_TEXT,
-                Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "  I   AGREE  ") },
+            assertTrue(
+                "the field takes the words",
+                all().first { it.isEditable }.performAction(
+                    AccessibilityNodeInfo.ACTION_SET_TEXT,
+                    Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "  I   AGREE  ") },
+                ),
             )
-            SystemClock.sleep(300)
-            assertTrue(button("Agree and continue").isEnabled)
+            val enabledBy = SystemClock.uptimeMillis() + 3_000
+            while (!button("Agree and continue").isEnabled && SystemClock.uptimeMillis() < enabledBy) SystemClock.sleep(100)
+            assertTrue("the words in any case and spacing enable the button (typed: ${flow.progress.value.typed})", button("Agree and continue").isEnabled)
             assertEquals(0, confirmed.get())
             click("Agree and continue")
             SystemClock.sleep(300)
