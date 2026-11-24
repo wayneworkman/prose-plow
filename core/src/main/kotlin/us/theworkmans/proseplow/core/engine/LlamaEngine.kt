@@ -367,6 +367,23 @@ class LlamaEngine(
      */
     private val readAheadsEnded = MutableStateFlow(0L)
 
+    /**
+     * Held by a read-ahead from before it asks for the engine until it has let go of it, so that
+     * read-aheads never overlap: one asked for while another holds the engine waits here for that
+     * one to end, and then does what is left of its own ([readAhead]).
+     */
+    private val readAheadTurn = Mutex()
+
+    /**
+     * The length of the memory where a read-ahead was stopped part-way, or -1. The memory is
+     * then a true beginning of a conversation's history form, short of where the next message
+     * begins, and the next read-ahead of that conversation reads on from there. Set by that
+     * read-ahead; set back to -1 by every operation that may change the memory (a request, a
+     * restore, forgetting, a load or an unload) as it gets the mutex, and by a read-ahead that
+     * changed the memory and was not stopped. A save changes nothing and leaves it.
+     */
+    private var stoppedReadAheadAt = -1
+
     private val _memoryRestore = MutableStateFlow<MemoryRestoreState>(MemoryRestoreState.Idle)
     override val memoryRestore: StateFlow<MemoryRestoreState> = _memoryRestore.asStateFlow()
 
@@ -674,13 +691,15 @@ class LlamaEngine(
     /**
      * Runs [block] with the mutex held, as an operation a read-ahead gives way to: counted among
      * the [contenders] from the moment it is asked for until it has ended, and moving
-     * [operations] on once it has the mutex.
+     * [operations] on once it has the mutex. It may change the memory, so a read-ahead stopped
+     * before it is no longer taken up again ([stoppedReadAheadAt]).
      */
     private suspend inline fun <T> turn(block: () -> T): T {
         contenders.incrementAndGet()
         try {
             return mutex.withLock {
                 operations.incrementAndGet()
+                stoppedReadAheadAt = -1
                 block()
             }
         } finally {
@@ -1018,6 +1037,8 @@ class LlamaEngine(
                     channelFlow {
                         mutex.withLock {
                             operations.incrementAndGet()
+                            // A request changes the memory: a read-ahead stopped before it is not taken up again.
+                            stoppedReadAheadAt = -1
                             generate(request, startEpoch, marksBefore)
                         }
                     }
@@ -1095,13 +1116,18 @@ class LlamaEngine(
         // Whatever has asked for the engine goes first, and a closed gate means that someone
         // needs the processor: neither waits for a read-ahead, which is never needed.
         if (contenders.get() > 0 || gate.isClosed) return ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.BUSY)
-        mutex.lock(READ_AHEAD)
-        try {
-            return withContext(nativeDispatcher) { ReadAhead(request, startEpoch, startOperations, coroutineContext.job).run() }
-        } finally {
-            mutex.unlock(READ_AHEAD)
-            // After letting go: a save on leaving the screen that waits for this asks for the mutex now.
-            readAheadsEnded.update { it + 1 }
+        // One at a time: a read-ahead that holds the engine is waited for (it ends within a chunk
+        // when it was stopped), and this one then does what is left. Both hold the mutex as the
+        // same owner, which a mutex refuses to be locked by twice.
+        return readAheadTurn.withLock {
+            mutex.lock(READ_AHEAD)
+            try {
+                withContext(nativeDispatcher) { ReadAhead(request, startEpoch, startOperations, coroutineContext.job).run() }
+            } finally {
+                mutex.unlock(READ_AHEAD)
+                // After letting go: a save on leaving the screen that waits for this asks for the mutex now.
+                readAheadsEnded.update { it + 1 }
+            }
         }
     }
 
@@ -1112,14 +1138,22 @@ class LlamaEngine(
      * earlier and nothing more:
      * - It keeps of the memory exactly what a request for the same prompt would keep, and does
      *   nothing at all when that is the whole memory: the next request would read nothing again.
+     *   The one exception is a memory that a read-ahead stopped part-way left
+     *   ([stoppedReadAheadAt]): it is the conversation's history form up to that point, so the
+     *   next request would keep all of it and read on, and so does this, up to where the next
+     *   message begins.
      * - It does nothing where a request would clear the memory, grow the context or leave turns
      *   out: those are a request's decisions, made with the message it carries.
-     * - It stops between and inside chunks the moment anything else asks for the engine
-     *   ([contenders]), the engine moves to another epoch, the [gate] closes or its caller is
-     *   cancelled, and does nothing when an operation had the engine since it was asked for.
-     *   The memory then holds what it read, a true state and the beginning of the next prompt.
+     * - It stops the moment anything else asks for the engine ([contenders]), the engine moves
+     *   to another epoch, the [gate] closes or its caller is cancelled: it asks between chunks,
+     *   and the native side may ask inside one, but a chunk under way is finished first. It does
+     *   nothing when an operation had the engine since it was asked for. The memory then holds
+     *   what it read, a true state and the beginning of the next prompt. Once the native side
+     *   was told to stop it is taken as stopped, even when the reason has gone away again by the
+     *   time the evaluation returns (the gate opened again, or a contender gave up).
      * - The only time it empties the memory is a failure of the native side once it had begun
-     *   to change it, when the memory can no longer be trusted, exactly as a request does.
+     *   to change it, when the memory can no longer be trusted, exactly as a request does; the
+     *   result is then [ReadAheadResult.Failed].
      *
      * @param startOperations [operations] when the read-ahead was asked for.
      */
@@ -1154,9 +1188,12 @@ class LlamaEngine(
             }
         }
 
+        /** A failure of the native side: before the memory was touched nothing is changed, after it the memory is emptied. */
         private fun failed(native: NativeLlama): ReadAheadResult {
-            if (touched) clearMemory(native)
-            return skipped(ReadAheadResult.Skipped.Reason.FAILED)
+            if (!touched) return skipped(ReadAheadResult.Skipped.Reason.FAILED)
+            stoppedReadAheadAt = -1
+            clearMemory(native)
+            return ReadAheadResult.Failed
         }
 
         private fun steps(native: NativeLlama): ReadAheadResult {
@@ -1193,7 +1230,14 @@ class LlamaEngine(
             if (tokens.size + minOf(requested, ReplyLength.maxTokens(room)) > room) return skipped(ReadAheadResult.Skipped.Reason.NO_ROOM)
 
             val common = memory.commonPrefixWith(tokens)
-            if (common >= memory.size) return skipped(ReadAheadResult.Skipped.Reason.NOTHING_TO_READ)
+            if (common >= memory.size) {
+                // The next request would keep the whole memory. When a read-ahead stopped short of
+                // the next message left it, reading on to there is exactly what that request would
+                // read first; any other memory is left as it is (a model whose history form is
+                // what it wrote, a conversation already read ahead).
+                if (stoppedReadAheadAt != memory.size || memory.size >= target) return skipped(ReadAheadResult.Skipped.Reason.NOTHING_TO_READ)
+                return read(native, model, tokenised, target, memory.size)
+            }
             if (!goBack(native, minOf(common, target))) return skipped(ReadAheadResult.Skipped.Reason.WOULD_CLEAR)
             val kept = memory.size
             return read(native, model, tokenised, target, kept)
@@ -1227,9 +1271,11 @@ class LlamaEngine(
          * Reads the prompt from the memory's end up to [target], taking the checkpoints a request
          * would take at the boundaries on the way, and at [target] one that follows the reply
          * (for a model that cannot cut its memory back; the next request takes it over as its
-         * own, see [Generation]). A stop leaves what was read.
+         * own, see [Generation]). A stop leaves what was read, and is remembered
+         * ([stoppedReadAheadAt]) so that the next read-ahead reads on from there.
          */
         private fun read(native: NativeLlama, model: ModelSpec, tokenised: TokenisedPrompt, target: Int, kept: Int): ReadAheadResult {
+            touched = true
             val tokens = tokenised.tokens
             // The boundaries a request for this prompt would keep checkpoints at, before the target.
             val stops = if (settings.maxCheckpoints == 0) {
@@ -1237,9 +1283,13 @@ class LlamaEngine(
             } else {
                 checkNotNull(tokeniser).boundaryPositions(tokenised, after = kept, limit = settings.maxCheckpoints).filter { it < target }
             }
+            // What the native side was told, remembered: a reason to stop can go away again (the
+            // gate opens, a contender gives up), and asking again after the native side returned
+            // early would then take a stop for a failure and empty the memory.
+            var toldToStop = false
             val observer = object : EvaluationObserver {
                 override fun onProgress(evaluatedTokens: Int) = Unit
-                override fun isCancelled(): Boolean = shouldStop()
+                override fun isCancelled(): Boolean = shouldStop().also { if (it) toldToStop = true }
             }
             for (stop in stops + target) {
                 if (stop > memory.size) {
@@ -1253,7 +1303,8 @@ class LlamaEngine(
                         part.fill(0)
                     }
                     if (evaluated < part.size) {
-                        if (!shouldStop()) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "Evaluation stopped early without being stopped")
+                        if (!toldToStop) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "Evaluation stopped early without being stopped")
+                        stoppedReadAheadAt = memory.size
                         return ReadAheadResult.Stopped(kept, memory.size - kept)
                     }
                 }
@@ -1263,6 +1314,7 @@ class LlamaEngine(
                     saveFollowingCheckpoint(native)
                 }
             }
+            stoppedReadAheadAt = -1
             return ReadAheadResult.Read(kept, memory.size - kept)
         }
     }

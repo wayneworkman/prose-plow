@@ -64,7 +64,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * @param heldConversation the key of the conversation the engine last worked on, or null.
  * @param requestsBuilt how many requests the chats have handed the engine so far, with the
- *   read-aheads that changed its memory.
+ *   read-aheads that changed its memory or may have.
  * @param enabled whether the setting is on now.
  * @param saveBoundMillis how long a lock by itself may wait for a save: the fourth bounded wait
  *   of a close, beside the reply, forgetting and the writes.

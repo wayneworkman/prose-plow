@@ -1,6 +1,7 @@
 package us.theworkmans.proseplow.core.engine
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,6 +10,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import us.theworkmans.proseplow.core.model.ModelSpec
 
@@ -30,6 +34,8 @@ import us.theworkmans.proseplow.core.model.ModelSpec
  *
  * - A read-ahead ([readAhead]) takes [readAheadMillis] and answers [readAheadResult]; a request,
  *   a save, a restore, [forget], [unload] and a [load] stop it, as does cancelling its caller.
+ *   Once stopped it takes [readAheadLetGoMillis] to let go, as the real one finishes its chunk.
+ *   Read-aheads do not overlap: one asked for while another is under way waits for it to end.
  *
  * What happened is recorded: [requests], [readAheads], and the counters of generations started,
  * completed and cancelled. Saving and restoring the memory are recorded and answered from [saveResult] and
@@ -181,6 +187,21 @@ class FakeInferenceEngine : InferenceEngine {
      */
     var readAheadGivesWay: Boolean = true
 
+    /**
+     * How long a read-ahead takes to let go once something stopped it, in (virtual)
+     * milliseconds, whatever stopped it: the chunk the real engine finishes first.
+     */
+    var readAheadLetGoMillis: Long = 0
+
+    /**
+     * When set, a read-ahead throws it instead of answering, which the real engine promises
+     * never to do: for a test of how a caller copes when that promise is broken.
+     */
+    var readAheadThrows: RuntimeException? = null
+
+    /** Held by the read-ahead under way, so that a second one waits for it, as the real engine's does. */
+    private val readAheadTurn = Mutex()
+
     /** The context size passed with every restore, in the order of [restores]. */
     val restoreContexts = ArrayList<Int?>()
 
@@ -232,26 +253,36 @@ class FakeInferenceEngine : InferenceEngine {
 
     override suspend fun readAhead(request: GenerationRequest): ReadAheadResult {
         readAheads += request
-        activeReadAheads++
         val startEpoch = epoch.value
         val startRequests = interruptions.value
-        try {
-            val stop = combine(epoch, interruptions) { now, asked -> readAheadGivesWay && (now != startEpoch || asked != startRequests) }
-            val stopped = when (val millis = readAheadMillis) {
-                null -> stop.first { it }
-                else -> withTimeoutOrNull(millis) { stop.first { it } } ?: false
-            }
-            if (stopped) {
+        return readAheadTurn.withLock {
+            activeReadAheads++
+            try {
+                val stop = combine(epoch, interruptions) { now, asked -> readAheadGivesWay && (now != startEpoch || asked != startRequests) }
+                val stopped = when (val millis = readAheadMillis) {
+                    null -> stop.first { it }
+                    else -> withTimeoutOrNull(millis) { stop.first { it } } ?: false
+                }
+                if (stopped) {
+                    stoppedReadAheads++
+                    letGo()
+                    return@withLock ReadAheadResult.Stopped(keptTokens = 0, readTokens = 0)
+                }
+                readAheadThrows?.let { throw it }
+                readAheadResult
+            } catch (e: CancellationException) {
                 stoppedReadAheads++
-                return ReadAheadResult.Stopped(keptTokens = 0, readTokens = 0)
+                letGo()
+                throw e
+            } finally {
+                activeReadAheads--
             }
-            return readAheadResult
-        } catch (e: CancellationException) {
-            stoppedReadAheads++
-            throw e
-        } finally {
-            activeReadAheads--
         }
+    }
+
+    /** The time a stopped read-ahead takes to let go ([readAheadLetGoMillis]); not cut short by the cancellation that stopped it. */
+    private suspend fun letGo() {
+        if (readAheadLetGoMillis > 0) withContext(NonCancellable) { delay(readAheadLetGoMillis) }
     }
 
     /** Moves on with every request, save and restore, which a read-ahead gives way to. */

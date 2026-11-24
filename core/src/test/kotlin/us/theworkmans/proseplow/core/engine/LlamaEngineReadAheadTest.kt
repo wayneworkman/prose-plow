@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -389,9 +390,8 @@ class LlamaEngineReadAheadTest {
 
     /**
      * Catches a read-ahead that waits at a closed gate, holding the engine, instead of ending,
-     * and one that begins while it is closed. A read-ahead that was stopped is not taken up
-     * again by the next: the memory is then the beginning of the conversation, as for a model
-     * without the difference, and the next message reads the rest.
+     * and one that begins while it is closed. The read-ahead asked for once the gate is open
+     * again reads on from where the stopped one ended.
      */
     @Test
     fun `a closed gate stops it, and it does not begin while the gate is closed`() = runTest {
@@ -405,8 +405,9 @@ class LlamaEngineReadAheadTest {
         gate.open()
         val result = interrupted(test, history) { gate.close() }
         assertTrue("$result", result is ReadAheadResult.Stopped)
+        val held = test.fake.memory.size
         gate.open()
-        assertEquals(ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.NOTHING_TO_READ), test.readAhead(*history.toTypedArray()))
+        assertEquals(ReadAheadResult.Read(held, nextMessageStart(test, history) - held), test.readAhead(*history.toTypedArray()))
     }
 
     /** Catches a read-ahead that does not stop for its caller, or leaves the engine's record of the memory behind the native one. */
@@ -478,6 +479,334 @@ class LlamaEngineReadAheadTest {
         val next = history + user("Shorter.")
         val events = test.generate(*next.toTypedArray())
         assertEquals(tokens(test, next).size - start, test.readFor(events))
+    }
+
+    // --- Stops, overlaps, failures and what a request would do on the way ---
+
+    /**
+     * A native layer that does [after] each time it has been told to stop, before it returns:
+     * another thread can act between the native side's last look and the engine's next one.
+     */
+    private class ActsAfterStop(private val delegate: FakeNativeLlama, private val after: () -> Unit) : NativeLlama by delegate {
+        override fun evaluate(tokens: IntArray, chunkSize: Int, observer: EvaluationObserver): Int =
+            delegate.evaluate(
+                tokens,
+                chunkSize,
+                object : EvaluationObserver {
+                    override fun onProgress(evaluatedTokens: Int) = observer.onProgress(evaluatedTokens)
+
+                    override fun isCancelled(): Boolean = observer.isCancelled().also { if (it) after() }
+                },
+            )
+    }
+
+    /**
+     * Catches a stop whose reason went away again (the gate opened again before the native side
+     * returned) taken for a failure of the native side: the memory would be emptied, the saved
+     * image deleted, and the next message would read the whole conversation.
+     */
+    @Test
+    fun `a reason to stop that goes away again is still a stop, and clears nothing`() = runTest {
+        val gate = GenerationGate()
+        val fake = FakeNativeLlama(contextTokens = qwen.contextLength).also {
+            it.registerChatMl()
+            it.refuseRewind = true
+        }
+        val engine = LlamaEngine(
+            factory = NativeLlamaFactory { _, _, _, _ -> ActsAfterStop(fake) { gate.open() } },
+            nativeDispatcher = StandardTestDispatcher(testScheduler),
+            gate = gate,
+        )
+        engine.load(qwen)
+        vault.onCommit = { fake.memory.toList() }
+        fake.enqueueReply("A".repeat(300))
+        val answer = assistant(PromptWhitespace.strip(engine.generate(ask(question)).toList().done().text))
+        assertTrue(engine.saveMemory(vault, KEY, SaveTrigger.LOCK) is MemorySaveResult.Saved)
+        var closed = false
+        fake.afterChunk = {
+            if (!closed) {
+                closed = true
+                gate.close()
+            }
+        }
+        val result = engine.readAhead(ask(question, answer))
+        fake.afterChunk = {}
+        assertTrue("$result", result is ReadAheadResult.Stopped)
+        val stopped = result as ReadAheadResult.Stopped
+        assertEquals("the memory is as far as it had read", stopped.keptTokens + stopped.readTokens, fake.memory.size)
+        assertTrue("nothing was cleared", fake.calls.none { it is Call.ClearMemory })
+        fake.clearCalls()
+        fake.enqueueReply("Fine.")
+        val events = engine.generate(ask(question, answer, user("Shorter."))).toList()
+        assertEquals("the next message keeps what was read", stopped.keptTokens + stopped.readTokens, events.done().stats.reusedPromptTokens)
+        assertTrue(fake.calls.none { it is Call.ClearMemory })
+    }
+
+    /**
+     * Catches a second read-ahead that throws while the first holds the engine (both held the
+     * mutex as the same owner), and one that does not take up what the first left: the second
+     * waits for the first, stopped by its caller, to let go, and then reads on from there.
+     */
+    @Test
+    fun `a second read-ahead waits for the first to let go and then does what is left`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        val start = nextMessageStart(test, history)
+        lateinit var first: Job
+        var second: Any? = null
+        var heldAtStop = 0
+        var chunks = 0
+        test.fake.afterChunk = { held ->
+            if (++chunks == 1) {
+                heldAtStop = held
+                first.cancel()
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    second = try {
+                        test.engine.readAhead(ask(*history.toTypedArray()))
+                    } catch (e: IllegalStateException) {
+                        e
+                    }
+                }
+                assertNull("it waits for the first", second)
+            }
+        }
+        first = launch { test.engine.readAhead(ask(*history.toTypedArray())) }
+        first.join()
+        runCurrent()
+        test.fake.afterChunk = {}
+        assertEquals(ReadAheadResult.Read(heldAtStop, start - heldAtStop), second)
+        assertEquals(start, test.fake.memory.size)
+    }
+
+    /**
+     * Catches a read-ahead stopped part-way (by the save on leaving the screen) that the next
+     * one does not take up: the next message would read the rest of the answer again. Also that
+     * a request in between, which changes the memory, ends that.
+     */
+    @Test
+    fun `a stopped read-ahead is taken up by the next one, up to where the next message begins`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        val start = nextMessageStart(test, history)
+        var saved: MemorySaveResult? = null
+        val result = interrupted(test, history) {
+            launch(start = CoroutineStart.UNDISPATCHED) { saved = test.engine.saveMemory(vault, KEY, SaveTrigger.LEFT_SCREEN) }
+        }
+        runCurrent()
+        assertTrue("$result", result is ReadAheadResult.Stopped)
+        assertNotNull(saved)
+        val held = test.fake.memory.size
+        assertTrue(held < start)
+        test.fake.clearCalls()
+        assertEquals(ReadAheadResult.Read(held, start - held), test.readAhead(*history.toTypedArray()))
+        assertTrue("it only reads on", test.fake.calls.none { it is Call.RestoreCheckpoint || it is Call.RewindTo || it is Call.ClearMemory })
+        assertTrue("and keeps a checkpoint where the next message begins", start in test.fake.checkpoints.values)
+        test.fake.clearCalls()
+        val next = history + user("Shorter.")
+        assertEquals(tokens(test, next).size - start, test.readFor(test.generate(*next.toTypedArray())))
+    }
+
+    /**
+     * Catches the checkpoint at a read-ahead's end taken as one of the prompt's four instead of
+     * one that follows a reply: after three turns, each read ahead, it would push out the
+     * checkpoint where the second question begins, and an edit of that question would read the
+     * whole conversation again after clearing the memory.
+     */
+    @Test
+    fun `after three read-ahead turns an edit of the second-last question goes back to where it begins`() = runTest {
+        val test = engine()
+        val q1 = user("One?")
+        val a1 = assistant(PromptWhitespace.strip(test.generate(q1, reply = "A".repeat(100)).done().text))
+        test.readAhead(q1, a1)
+        val q2 = user("Two?")
+        val a2 = assistant(PromptWhitespace.strip(test.generate(q1, a1, q2, reply = "B".repeat(100)).done().text))
+        test.readAhead(q1, a1, q2, a2)
+        val q3 = user("Three?")
+        val a3 = assistant(PromptWhitespace.strip(test.generate(q1, a1, q2, a2, q3, reply = "C".repeat(100)).done().text))
+        assertTrue(test.readAhead(q1, a1, q2, a2, q3, a3) is ReadAheadResult.Read)
+        test.fake.clearCalls()
+        val edited = listOf(q1, a1, user("Two, edited?"))
+        val events = test.generate(*edited.toTypedArray())
+        assertEquals(tokens(test, edited).size - nextMessageStart(test, listOf(q1, a1)), test.readFor(events))
+    }
+
+    /**
+     * Catches a read-ahead that begins although something else has asked for the engine and
+     * waits for its turn: it must answer that the engine is busy at once, not after the
+     * read-ahead under way has let go (or, without the second look, after the request too).
+     */
+    @Test
+    fun `one asked for while a request waits for the engine answers busy at once`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        var second: ReadAheadResult? = null
+        var answeredAtOnce = false
+        var chunks = 0
+        test.fake.afterChunk = {
+            if (++chunks == 1) {
+                test.fake.enqueueReply("Fine.")
+                launch(start = CoroutineStart.UNDISPATCHED) { test.engine.generate(ask(*(history + user("Shorter.")).toTypedArray())).toList() }
+                launch(start = CoroutineStart.UNDISPATCHED) { second = test.engine.readAhead(ask(*history.toTypedArray())) }
+                answeredAtOnce = second != null
+            }
+        }
+        test.readAhead(*history.toTypedArray())
+        test.fake.afterChunk = {}
+        runCurrent()
+        assertTrue("answered before the first let go", answeredAtOnce)
+        assertEquals(ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.BUSY), second)
+    }
+
+    /**
+     * Catches a read-ahead that waited for the engine and then runs although a request had the
+     * engine meanwhile: it would take the memory back from the request's reply to the answer
+     * before it.
+     */
+    @Test
+    fun `one that waited while a request had the engine does nothing`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        val next = history + user("Shorter.")
+        lateinit var first: Job
+        var second: ReadAheadResult? = null
+        var chunks = 0
+        test.fake.afterChunk = {
+            if (++chunks == 1) {
+                // The first is stopped by its caller; the second waits for it; a request comes after both.
+                first.cancel()
+                launch(start = CoroutineStart.UNDISPATCHED) { second = test.engine.readAhead(ask(*history.toTypedArray())) }
+                test.fake.enqueueReply("Fine.")
+                launch(start = CoroutineStart.UNDISPATCHED) { test.engine.generate(ask(*next.toTypedArray())).toList() }
+            }
+        }
+        first = launch { test.engine.readAhead(ask(*history.toTypedArray())) }
+        first.join()
+        test.fake.afterChunk = {}
+        runCurrent()
+        assertEquals(ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.BUSY), second)
+        val prompt = tokens(test, next)
+        assertTrue("the request's reply stays", test.fake.memory.size > prompt.size)
+        assertEquals(prompt, test.fake.memory.subList(0, prompt.size))
+    }
+
+    /**
+     * Catches a failure of the native side after the read-ahead went back that leaves the memory
+     * as it is (it can no longer be trusted), one reported as [ReadAheadResult.Skipped] (which
+     * says the memory is as it was), and a failure before anything was changed that empties it.
+     */
+    @Test
+    fun `a failure after the memory was changed empties it and says so, one before changes nothing`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        val held = test.fake.memory.toList()
+        test.fake.clearCalls()
+        test.fake.beforeCall = { if (it is Call.Tokenize) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "failed") }
+        assertEquals(ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.FAILED), test.readAhead(*history.toTypedArray()))
+        test.fake.beforeCall = {}
+        assertEquals(emptyList<Call>(), test.changesToMemory())
+        assertEquals(held, test.fake.memory)
+
+        test.fake.beforeCall = { if (it is Call.Evaluate) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "failed") }
+        assertEquals(ReadAheadResult.Failed, test.readAhead(*history.toTypedArray()))
+        test.fake.beforeCall = {}
+        assertEquals(1, test.fake.callsOf<Call.ClearMemory>().size)
+        assertEquals(0, test.fake.memory.size)
+    }
+
+    /**
+     * Catches a read-ahead that lifts a mark of [LlamaEngine.markNotToBeSaved] when a failure
+     * empties the memory: only a request made after the mark, forgetting, a load or an unload
+     * may, so a saved memory must still not be restored afterwards.
+     */
+    @Test
+    fun `a failed read-ahead lifts no mark`() = runTest {
+        // A saved memory of the same conversation, made by another engine.
+        val elsewhere = engine()
+        val history = listOf(question, elsewhere.answerEndedByItself())
+        val otherVault = FakeMemoryVault().also { v -> v.onCommit = { elsewhere.fake.memory.toList() } }
+        assertTrue(elsewhere.engine.saveMemory(otherVault, KEY, SaveTrigger.LOCK) is MemorySaveResult.Saved)
+
+        val test = engine()
+        test.answerEndedByItself()
+        test.engine.markNotToBeSaved()
+        // A request made after the mark, which keeps the memory: the mark stays.
+        val next = history + user("Shorter.")
+        val answer = assistant(PromptWhitespace.strip(test.generate(*next.toTypedArray()).done().text))
+        test.fake.beforeCall = { if (it is Call.Evaluate) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "failed") }
+        assertEquals(ReadAheadResult.Failed, test.readAhead(*(next + answer).toTypedArray()))
+        test.fake.beforeCall = {}
+        assertEquals(MemoryRestoreResult.NotRestored(MemoryRestoreResult.NotRestored.Reason.MARKED), test.engine.restoreMemory(otherVault, KEY))
+    }
+
+    /**
+     * Holds the chunk sizes, which decide how long whatever stops a read-ahead waits: 32 tokens
+     * while the part read leaves less than 1,024 in memory, the model's deep chunk (128 here, as
+     * for Qwen3.5) once it leaves that many or more.
+     */
+    @Test
+    fun `it reads in small chunks below the deep-read depth and in the deep chunk beyond it`() = runTest {
+        val settings = LlamaEngine.Settings()
+        for ((length, chunk) in listOf(300 to settings.evaluationChunk, 1200 to qwen.deepReadChunk)) {
+            val test = engine()
+            val history = listOf(question, test.answerEndedByItself(length))
+            test.fake.clearCalls()
+            assertTrue(test.readAhead(*history.toTypedArray()) is ReadAheadResult.Read)
+            val evaluations = test.fake.evaluations
+            assertTrue("$length", evaluations.isNotEmpty())
+            for (evaluation in evaluations) {
+                assertEquals("$length: $evaluation", if (evaluation.to >= settings.deepReadTokens) qwen.deepReadChunk else settings.evaluationChunk, evaluation.chunkSize)
+            }
+            assertTrue("$length", evaluations.any { it.chunkSize == chunk })
+        }
+    }
+
+    /** Catches a read-ahead for another model than the loaded one, and one over a memory whose native length is not the engine's record. */
+    @Test
+    fun `it does nothing for another model or when the native memory is not what the engine knows`() = runTest {
+        val test = engine()
+        val history = listOf(question, test.answerEndedByItself())
+        val held = test.fake.memory.toList()
+        test.fake.clearCalls()
+        assertEquals(
+            ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.NOT_LOADED),
+            test.engine.readAhead(ask(*history.toTypedArray()).copy(modelId = "another")),
+        )
+        assertEquals(emptyList<Call>(), test.changesToMemory())
+
+        // One token more natively than the engine knows of.
+        test.fake.evaluate(
+            intArrayOf(held.last()),
+            1,
+            object : EvaluationObserver {
+                override fun onProgress(evaluatedTokens: Int) = Unit
+
+                override fun isCancelled(): Boolean = false
+            },
+        )
+        test.fake.clearCalls()
+        assertEquals(ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.OTHER_CONVERSATION), test.readAhead(*history.toTypedArray()))
+        assertEquals(emptyList<Call>(), test.changesToMemory())
+    }
+
+    /**
+     * Catches a read-ahead that takes no checkpoints at the boundaries it reads past, as a
+     * request would: one that goes back to an earlier question (here, one edited in the
+     * conversation it is given) must leave a checkpoint where the next question begins, so that
+     * an edit of that one does not read from the earlier one again.
+     */
+    @Test
+    fun `it keeps checkpoints at the boundaries it reads past`() = runTest {
+        val test = engine()
+        val q1 = user("One?")
+        val a1 = assistant(PromptWhitespace.strip(test.generate(q1, reply = "A".repeat(100)).done().text))
+        val q2 = user("Two?")
+        val a2 = assistant(PromptWhitespace.strip(test.generate(q1, a1, q2, reply = "B".repeat(100)).done().text))
+        val changed = listOf(q1, assistant(a1.content.dropLast(10)), q2, a2)
+        assertTrue(test.readAhead(*changed.toTypedArray()) is ReadAheadResult.Read)
+        test.fake.clearCalls()
+        val edited = listOf(q1, assistant(a1.content.dropLast(10)), user("Two, edited?"))
+        val events = test.generate(*edited.toTypedArray())
+        assertEquals(tokens(test, edited).size - nextMessageStart(test, edited.dropLast(1)), test.readFor(events))
     }
 
     private companion object {

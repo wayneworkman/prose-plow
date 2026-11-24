@@ -40,9 +40,11 @@ import java.util.concurrent.Executors
  * the markers around it, the opening of the reply, and for Boris-2 the end of the earlier
  * answer that its plain-text markers leave unread. For Qwen3.5 the read-ahead must have read
  * (its template writes the answer differently once it is history); for Boris-2 it must find
- * nothing to do and touch nothing. After an answer stopped by its reader, "Continue" without a
- * read-ahead must read no more than two intervals of the checkpoints that follow a reply and
- * whatever of the prompt differs from the memory.
+ * nothing to do and touch nothing. After an answer stopped by its reader once it is several
+ * hundred tokens long ([STOP_AFTER_DELTAS]), "Continue" without a read-ahead must read no more
+ * than two intervals of the checkpoints that follow a reply and whatever of the prompt differs
+ * from the memory: without those checkpoints it would read the whole answer again, so the
+ * bound tells the two apart by hundreds of tokens.
  *
  * The requests are the app's: the model's own sampling (with a fixed seed), its prompt format,
  * the history as [us.theworkmans.proseplow.core.chat.promptHistory] sends it (every text
@@ -140,17 +142,23 @@ class RereadDiagnosisDeviceTest {
                         val text = StringBuilder()
                         val enough = CompletableDeferred<Unit>()
                         var deltas = 0
+                        var endedByItself = false
                         val job = launch {
                             engine.generate(first).collect { event ->
                                 if (event is GenerationEvent.TextDelta) {
                                     text.append(event.text)
                                     if (++deltas >= STOP_AFTER_DELTAS) enough.complete(Unit)
                                 }
-                                if (event is GenerationEvent.Done) enough.complete(Unit)
+                                if (event is GenerationEvent.Done) {
+                                    // Ended before it was long enough to stop.
+                                    if (deltas < STOP_AFTER_DELTAS) endedByItself = true
+                                    enough.complete(Unit)
+                                }
                             }
                         }
                         enough.await()
                         job.cancelAndJoin()
+                        assertTrue("$tag: the answer ended by itself after $deltas pieces, before it could be stopped", !endedByItself && deltas >= STOP_AFTER_DELTAS)
                         text.toString()
                     } else {
                         val done = finished(engine.generate(first).toList())
@@ -237,7 +245,10 @@ class RereadDiagnosisDeviceTest {
     private companion object {
         const val SEED = 20261123
         const val CUT_AT = 96
-        const val STOP_AFTER_DELTAS = 60
+
+        /** How many pieces of text the stopped answer has: several hundred tokens, far more than the 64 "Continue" may read. */
+        const val STOP_AFTER_DELTAS = 400
+
         const val KEY = "acceptance"
 
         /**

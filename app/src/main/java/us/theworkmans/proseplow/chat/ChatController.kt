@@ -199,16 +199,21 @@ enum class ChatNotice {
  *   conversation ahead as the next message will render it ([InferenceEngine.readAhead]), for
  *   the chat whose answer it was: at once when the answer ended by itself (the model ended
  *   its turn, or a stop string), and for an answer that can be continued (cut off at its
- *   length limit, or stopped) only once the user starts typing a new message in that chat (its
- *   draft stops being blank, or already was not when the answer ended), so that "Continue"
- *   stays quick if that is what they choose. Typing starts it for an answer that ended by
- *   itself too, when nothing read ahead for it yet (it ended out of sight). Only while
+ *   length limit, or stopped) only while the user has a new message in that chat (its draft
+ *   is not blank), so that "Continue" stays quick if that is what they choose. It starts when
+ *   the answer ends, and otherwise on the one user action that is taken as the user at work in
+ *   that chat: a change of its draft. That starts it whenever it is wanted and not yet done:
+ *   the draft of a continuable answer stops being blank; the answer ended out of sight, where
+ *   nothing is read ahead, and the user types in that chat back in sight, whether the draft
+ *   was blank or not; or a read-ahead of it was stopped on the way (leaving the screen stops
+ *   one), and the engine then reads on from where it stopped. Once one has read up to the next
+ *   message, or the engine found nothing to do, later keystrokes start nothing. Only while
  *   [mayReadAhead] allows (the app is in sight and unlocked), never because a chat was
  *   opened or the app came back, and never while a reply is being written. Everything goes
  *   before it: a reply of any kind, a prune or deletion that makes the engine forget, a model
  *   load, a change of system prompt and the lock stop it without waiting for it, and the
- *   engine itself stops it within a chunk for a request or a save. Nothing on screen
- *   changes for it.
+ *   engine itself stops it at the end of the chunk it is reading for a request or a save.
+ *   Nothing on screen changes for it.
  * - **No memory is saved of text that is gone.** This class is the session's
  *   [MemoryConversations]: it tells the store what a conversation is now, and answers "no such
  *   conversation" for a chat whose stored messages were removed or changed (an edit, an answer
@@ -291,13 +296,27 @@ class ChatController(
 
     private var running: Running? = null
 
-    /** The read-ahead under way for the chat [sessionId]. An object of its own so that its job can tell whether it is still the current one. */
+    /**
+     * The read-ahead under way for the chat [sessionId]. An object of its own so that its job can
+     * tell whether it is still the current one. [counted] is set once it has been counted for
+     * the saves ([requestsBuilt]), so that it is counted once.
+     */
     private class ReadingAhead(val sessionId: String) {
         lateinit var job: Job
+        var counted = false
     }
 
     /** The read-ahead under way, if any. Main thread only. */
     private var readingAhead: ReadingAhead? = null
+
+    /**
+     * The chat whose answer needs no further read-ahead: one read up to where the next message
+     * begins, or the engine found nothing to do and said why (anything but busy). A change of
+     * its draft starts none; any other chat's draft may. Set back to null whenever a reply
+     * begins and whenever the engine may have lost what it read: a forgetting, a model load, a
+     * change of a system prompt. Main thread only.
+     */
+    private var readAheadDone: String? = null
 
     /**
      * The chat whose conversation the engine was last given, or read back from a saved memory,
@@ -326,9 +345,11 @@ class ChatController(
 
     /**
      * How many requests have been handed to the engine since the session opened, together with
-     * the read-aheads that changed its memory or may have (one whose caller was stopped is
-     * counted); from any thread. A memory known to be on disk as it is in the engine stops
-     * being known so when this moves on.
+     * the read-aheads that changed its memory or may have; from any thread. A memory known to be
+     * on disk as it is in the engine stops being known so when this moves on. A read-ahead that
+     * this class stops is counted the moment it is stopped, before the engine has let go of it,
+     * so that a save asked for right after the stop (on leaving the screen) is taken for the
+     * memory the read-ahead leaves: the save waits for it to let go and saves what it read.
      */
     val requestsBuilt: Long get() = builtRequests.get()
 
@@ -542,15 +563,17 @@ class ChatController(
 
     /**
      * Keeps what is typed but not sent in the chat [sessionId]. It is stored, encrypted, like the
-     * rest. When the draft stops being blank the user has started a new message, which starts
-     * the read-ahead of the answer before it ([readAheadAfterAnswer]); later keystrokes do not.
+     * rest. A change of the draft is the user at work in that chat, the one action that starts
+     * a read-ahead other than an answer's end ([readAheadAfterAnswer]): of an answer that can be
+     * continued once the draft is not blank, and of one that ended by itself or whose draft was
+     * already not blank when it was not read ahead at its end (it ended out of sight) or was
+     * stopped on the way. Once it is done, later keystrokes start nothing.
      */
     fun setDraft(sessionId: String, text: String) {
         val session = usable(sessionId) ?: return
         if (session.draft == text) return
-        val started = isBlankMessage(session.draft) && !isBlankMessage(text)
         commit(session.withDraft(text), urgent = false)
-        if (started) readAheadAfterAnswer(sessionId, typing = true)
+        if (readAheadDone != sessionId) readAheadAfterAnswer(sessionId)
     }
 
     // --- Turns ---------------------------------------------------------------------------------
@@ -881,6 +904,7 @@ class ChatController(
         // what the engine holds now, and no restore, until its memory has been emptied.
         engine.markNotToBeSaved()
         stopReadingAhead()
+        readAheadDone = null
         engineHolds = null
         mayHold.clear()
         val previous = lastTurn
@@ -912,6 +936,7 @@ class ChatController(
         if (previous != null && previous.modelId == spec.id && previous.job.isActive) return
         // A load ends a read-ahead in the engine anyway; it is not left to find that out.
         stopReadingAhead()
+        readAheadDone = null
         val job = scope.launch(start = CoroutineStart.LAZY) {
             previous?.job?.cancelAndJoin()
             engine.load(spec)
@@ -948,8 +973,10 @@ class ChatController(
     private fun begin(prepared: ChatSession?): Boolean {
         if (prepared == null || finishingOnly) return false
         val assistantId = prepared.streamingMessageId ?: return false
-        // Whatever reply this is, in whichever chat, it goes before a read-ahead.
+        // Whatever reply this is, in whichever chat, it goes before a read-ahead, and changes
+        // what the engine holds.
         stopReadingAhead()
+        readAheadDone = null
         val interrupted = endRunning()
         if (interrupted != null && interrupted.sessionId != prepared.id) _notices.trySend(ChatNotice.OTHER_REPLY_STOPPED)
         commit(prepared, urgent = true)
@@ -1042,7 +1069,7 @@ class ChatController(
             }
             if (running == null && !closed) {
                 onTurnEnded()
-                readAheadAfterAnswer(reply.sessionId, typing = false, answerId = reply.assistantId)
+                readAheadAfterAnswer(reply.sessionId, answerId = reply.assistantId)
             }
         }
     }
@@ -1061,13 +1088,21 @@ class ChatController(
 
     /**
      * Main thread: starts the read-ahead of the chat [sessionId] when the class comment's rule
-     * says so. [typing] says that the user has just started a new message; otherwise the answer
-     * [answerId] has just ended. Nothing is started while a reply is being written anywhere, for
-     * a chat whose last message is not an answer with text, for a chat the engine is not known
-     * to hold (or holds in a form the store may not save, after a change), or while one is under
-     * way for this chat already.
+     * says so: called when the answer [answerId] has just ended, and with no [answerId] when the
+     * user has changed that chat's draft. It is wanted for an answer that ended by itself, and
+     * for one that can be continued while the draft is not blank. Nothing is started while a
+     * reply is being written anywhere, out of sight or behind the lock ([mayReadAhead]), for a
+     * chat whose last message is not an answer with text (or not [answerId]), for a chat the
+     * engine is not known to hold (or holds in a form the store may not save, after a change),
+     * or while one is under way for this chat already.
+     *
+     * When it ends, a read-ahead that read up to the next message, or found nothing to do, makes
+     * the chat [readAheadDone]; one that was stopped, failed to answer or found the engine busy
+     * does not, so that the next change of the draft starts it again and the engine reads on
+     * from where it stopped. It is counted for the saves ([requestsBuilt]) when it changed the
+     * memory or may have, once.
      */
-    private fun readAheadAfterAnswer(sessionId: String, typing: Boolean, answerId: String? = null) {
+    private fun readAheadAfterAnswer(sessionId: String, answerId: String? = null) {
         if (closed || finishingOnly || running != null || !mayReadAhead()) return
         if (engineHolds != sessionId || staleSince.containsKey(sessionId)) return
         if (readingAhead?.let { it.sessionId == sessionId && it.job.isActive } == true) return
@@ -1076,12 +1111,8 @@ class ChatController(
         if (session.isGenerating || last.role != Role.ASSISTANT || PromptWhitespace.isBlank(last.text)) return
         if (answerId != null && last.id != answerId) return
         val endedByItself = last.status == MessageStatus.COMPLETE && last.finishReason in ENDED_BY_ITSELF
-        val wanted = when {
-            typing -> endedByItself || canContinue(session)
-            // An answer that can be continued waits for a new message, unless one is already being typed.
-            else -> endedByItself || (canContinue(session) && !isBlankMessage(session.draft))
-        }
-        if (!wanted) return
+        // An answer that can be continued waits for a new message, unless one is already being typed.
+        if (!endedByItself && !(canContinue(session) && !isBlankMessage(session.draft))) return
         val spec = models.firstOrNull { it.id == (last.modelId ?: session.modelId) } ?: return
         val request = requestOf(session, spec)
         stopReadingAhead()
@@ -1096,23 +1127,44 @@ class ChatController(
                 // The engine promises not to throw; the next message reads what it must.
             } finally {
                 // A memory the keeper knew to be on disk is no longer known to be: the read-ahead
-                // went back below it, or read further, or may have before it was stopped.
-                if (result == null || result is ReadAheadResult.Read || result is ReadAheadResult.Stopped) builtRequests.incrementAndGet()
-                if (readingAhead === reading) readingAhead = null
+                // went back below it, or read further, or emptied it, or may have before it was
+                // stopped or failed to answer.
+                val changed = result == null || result is ReadAheadResult.Read || result is ReadAheadResult.Stopped || result == ReadAheadResult.Failed
+                if (changed && !reading.counted) {
+                    reading.counted = true
+                    builtRequests.incrementAndGet()
+                }
+                if (readingAhead === reading) {
+                    readingAhead = null
+                    if (result.needsNoFurtherReadAhead()) readAheadDone = sessionId
+                }
             }
         }
         readingAhead = reading
         reading.job.start()
     }
 
+    /** Whether this outcome leaves nothing for a later read-ahead of the same answer to do; see [readAheadAfterAnswer]. */
+    private fun ReadAheadResult?.needsNoFurtherReadAhead(): Boolean = when (this) {
+        null, is ReadAheadResult.Stopped -> false
+        is ReadAheadResult.Skipped -> reason != ReadAheadResult.Skipped.Reason.BUSY
+        is ReadAheadResult.Read, ReadAheadResult.Failed -> true
+    }
+
     /**
      * Main thread: stops the read-ahead under way, if any, without waiting for it: the engine
      * lets go of it within a chunk, and anything that needs the engine waits for that there. Also
-     * called by the session when the app leaves the screen.
+     * called by the session when the app leaves the screen. It is counted for the saves at once
+     * ([requestsBuilt]): it may have changed the memory, and the save on leaving that follows
+     * must find it counted already.
      */
     fun stopReadingAhead() {
         val reading = readingAhead ?: return
         readingAhead = null
+        if (reading.job.isActive && !reading.counted) {
+            reading.counted = true
+            builtRequests.incrementAndGet()
+        }
         reading.job.cancel()
     }
 
@@ -1184,6 +1236,7 @@ class ChatController(
         if (closed) return
         // What it would read was made with the prompt that is gone.
         stopReadingAhead()
+        readAheadDone = null
         val loaded = (engine.state.value as? EngineState.Ready)?.modelId
         if (loaded == null || loaded == modelId) {
             val held = mayHold + listOfNotNull(engineHolds, restoring)

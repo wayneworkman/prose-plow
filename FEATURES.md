@@ -1137,7 +1137,11 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
     engine's side at its next piece, and the store lets the engine's thread go within one chunk)
     and nothing of it is kept. A memory that is on disk as it is in the engine, because it was
     saved or read back and no request was made since (nor a read-ahead that changed the
-    memory, CHAT-25), is not written again.
+    memory or may have, CHAT-25), is not written again. A read-ahead that leaving the screen
+    stops is counted the moment it is stopped, before the save on leaving is asked for, so
+    that save, which waits for the read-ahead to let go and holds what it read, is taken for
+    the memory as it then is: the lock does not write it a second time, and no keep-alive is
+    asked for to save nothing new.
 
   "Lock now" and a reset never save (LOCK-16), and neither does a lock by itself or the end of a
   lease while nothing keeps the process awake (LOCK-13, BG-16). No save is asked for while an
@@ -1323,26 +1327,36 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   read the answer again (DEC-56):
   - at once when the answer ended by itself: the model ended its turn, or wrote a stop string;
   - for an answer that can be continued (cut off at its length limit, or stopped; MSG-12) only
-    when the user starts typing a new message in that chat: the moment its draft stops being
-    blank (whitespace alone is blank, as for sending), not again for every key, and at once
-    when the draft was already not blank as the answer ended. Typing in an edit of an earlier
-    message is not a new message;
-  - typing a new message also starts it for an answer that ended by itself and was not read
-    ahead, because it ended while the app was out of sight;
+    while the user has a new message in that chat: at once when its draft was already not
+    blank as the answer ended, and otherwise the moment the draft stops being blank (whitespace
+    alone is blank, as for sending). Typing in an edit of an earlier message is not a new
+    message;
+  - besides the end of an answer, the one thing that starts it is the user at work in that
+    chat, which is taken to mean a change of its draft (typing, deleting, pasting), and only
+    while a read-ahead is wanted by the two rules above and not yet done. That covers an answer
+    that ended while the app was out of sight, where nothing is read ahead, whether the draft
+    was blank then or not, and a read-ahead that was stopped on the way (leaving the screen stops
+    one), which the engine then takes up where it stopped (ENG-44). Once a read-ahead has read
+    up to the next message, or the engine found nothing to do, no key starts another;
   - never because the app was unlocked, a chat was opened or the app came back to the screen;
     never while the app is out of sight or behind the lock (LEASE-01); never while a reply is
-    being written; never after an answer that failed or has no text, and never for a chat whose
-    stored messages changed since the engine last read them (STORE-29).
+    being written; never after an answer that failed or has no text, never for a chat whose
+    stored messages changed since the engine last read them (STORE-29), and never for a chat
+    whose conversation the engine is not known to hold.
 
   Nothing on screen says that it runs: no reply is being written, the input stays as it is and
-  can be used, and a message can be sent at once. A read-ahead that changed the memory counts,
-  for the saves of STORE-28, as a request does: the memory on disk is no longer taken for the
-  one in the engine.
-- **CHAT-26** Everything goes before a read-ahead, without a wait the user could notice: sending
-  a message, "Continue", "Answer again", an edit, a retry and a reply in another chat stop it as
-  they begin; so do a prune or deletion that makes the engine forget (CHAT-23), loading a model,
-  a change of a system prompt, leaving the screen and the lock. The app stops it itself and the
-  engine stops it too, within one chunk (ENG-45); the reply then keeps what it had read.
+  can be used, and a message can be sent at once (its reply waits for the chunk of CHAT-26). A
+  read-ahead that changed the memory, or may have (it was stopped, or emptied the memory after
+  a failure), counts for the saves of STORE-28 as a request does: the memory on disk is no
+  longer taken for the one in the engine.
+- **CHAT-26** Everything goes before a read-ahead: sending a message, "Continue", "Answer again",
+  an edit, a retry and a reply in another chat stop it as they begin; so do a prune or deletion
+  that makes the engine forget (CHAT-23), loading a model, a change of a system prompt, leaving
+  the screen and the lock. The app stops it itself and the engine stops it too, at the end of
+  the chunk it is reading (ENG-45): what comes first waits for that chunk, up to 128 tokens for
+  Qwen3.5 once the part being read leaves 1,024 tokens or more in memory, about 1.4 to 2.5 s on
+  the tested phone, the same wait a long reading of a request has for a stop (ENG-11, ENG-22).
+  The reply then keeps what it had read.
 
 ## 12. Messages and replies (MSG)
 
@@ -2691,7 +2705,8 @@ is what a port has to reproduce, whatever it is written in.
   (the longest common beginning, ENG-07, or the checkpoint before it, ENG-08), reads up to the
   beginning of the placeholder, saving the checkpoints a request would save on the way (ENG-09),
   and keeps a checkpoint where the placeholder begins. It samples nothing and emits no events;
-  its caller learns whether it read, was stopped on the way, or did nothing and why. The
+  its caller learns whether it read, was stopped on the way, failed after it had changed the
+  memory (which is then emptied, ENG-44), or did nothing and why. The
   checkpoint at its end counts as one that follows a reply, so it takes the place of none of
   the 4 of the prompt, and the next request takes it over as the checkpoint of the boundary it
   stands at, where the message the user then sends begins: editing that message goes back to
@@ -2704,11 +2719,16 @@ is what a port has to reproduce, whatever it is written in.
 - **ENG-44** What a read-ahead may do. It does only what the next request would do anyway:
   - when the conversation as rendered begins with everything the memory holds, it does nothing at
     all (Boris-2, whose format writes an answer the same way before and after, and a
-    conversation already read ahead). A read-ahead that was stopped is therefore not taken up
-    again by the next one; the next message reads the rest;
+    conversation already read ahead). The one exception is the memory a read-ahead that was
+    stopped part-way left, as long as nothing but a save has had the engine since: it is a true
+    beginning of the conversation in its history form, so the next request would keep all of it
+    and read on, and the next read-ahead reads on from there to where the next message begins;
   - it never clears the memory: where a request would have to clear it (no checkpoint at or
-    before the common beginning), it does nothing. Only a failure of the native side once it
-    has begun to change the memory empties it, as for a failed request;
+    before the common beginning), it does nothing. A stop, whatever its reason and even when the
+    reason has gone away again by the time the native side returns (the gate opened again),
+    leaves the memory as far as it had read and clears nothing. Only a failure of the native
+    side once it has begun to change the memory empties it, as for a failed request, and its
+    caller is told so; a failure before that changes nothing;
   - it never makes the context larger and never leaves turns out: when the conversation and the
     room for the next reply (ENG-04) do not fit the context as it is, under a size the user
     chose for it if that is smaller, it does nothing;
@@ -2717,10 +2737,16 @@ is what a port has to reproduce, whatever it is written in.
     boundary where the next message begins.
 - **ENG-45** A read-ahead gives way. A request, "forget" (and so the lock), loading or unloading
   a model, a save of the memory of either kind, a restore, the generation gate closing (ENG-22)
-  and its caller giving up each stop it within one chunk of reading (the check runs between and
-  inside chunks); one that is asked for before the read-ahead has begun, or has had the engine
-  since the read-ahead was asked for, makes it do nothing. It never waits at the gate. What it
-  read by then stays: it is a true state of the memory and the beginning of the next prompt. A
+  and its caller giving up each stop it at the end of the chunk it is reading: the engine asks
+  between chunks (the native side may ask inside one as well, but for Qwen3.5 it stops only
+  between chunks), so what comes first waits for up to one chunk of ENG-11, up to 128 tokens for
+  Qwen3.5 once the part being read leaves 1,024 tokens or more in memory, about 1.4 to 2.5 s on
+  the tested phone. One that is asked for before the read-ahead has begun, or has had the
+  engine since the read-ahead was asked for, makes it do nothing. It never waits at the gate.
+  Read-aheads do not overlap: one asked for while another holds the engine waits for that one
+  to let go and then does what is left of its own (nothing after a read-ahead that read up to
+  the same place, the rest after one that was stopped). What a stopped read-ahead had read
+  stays: it is a true state of the memory and the beginning of the next prompt. A
   save when the app leaves the screen does not answer "busy" because of a read-ahead (ENG-38): it
   waits the chunk for the read-ahead to let go, and saves what it had read; the save of a lock
   does not wait behind it either. A read-ahead that goes back below a saved image deletes the

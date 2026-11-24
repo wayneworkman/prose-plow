@@ -68,9 +68,9 @@ data class GenerationRequest(
 /**
  * What a read-ahead ([InferenceEngine.readAhead]) did.
  *
- * [Read] and [Stopped] are the outcomes that changed the model's memory; [Skipped] left it
- * exactly as it was, and so did a read-ahead whose caller was cancelled before it changed
- * anything (that caller gets no result at all).
+ * [Read], [Stopped] and [Failed] are the outcomes that changed the model's memory, or may have;
+ * [Skipped], for every one of its reasons, left it exactly as it was. A caller that is cancelled gets no result at all, whether
+ * or not the memory was changed by then, and must take it as changed.
  */
 sealed interface ReadAheadResult {
 
@@ -87,7 +87,14 @@ sealed interface ReadAheadResult {
      */
     data class Stopped(val keptTokens: Int, val readTokens: Int) : ReadAheadResult
 
-    /** Nothing was done, for [reason]; the memory is as it was. */
+    /**
+     * The native side failed after the read-ahead had begun to change the memory, which can then
+     * no longer be trusted: the memory was emptied, as for a failed request, and the next request
+     * reads the whole conversation.
+     */
+    data object Failed : ReadAheadResult
+
+    /** Nothing was done, for [reason]; the memory is exactly as it was, whatever the reason. */
     data class Skipped(val reason: Reason) : ReadAheadResult {
         enum class Reason {
             /** No model is loaded, or another model than the request's. */
@@ -117,7 +124,7 @@ sealed interface ReadAheadResult {
             /** Something that goes first wanted the engine before the read-ahead had changed anything. */
             BUSY,
 
-            /** The native side failed; the memory was cleared, as for a failed request. */
+            /** The native side failed before the read-ahead had changed anything (a failure after that is [Failed]). */
             FAILED,
         }
     }
@@ -178,10 +185,25 @@ interface InferenceEngine {
      *
      * It does nothing ([ReadAheadResult.Skipped]) when the next request would keep the whole
      * memory anyway, and never clears the memory, grows the context or leaves turns out for it.
+     * The one memory the next request would keep whole and that is still read on from is the one
+     * a read-ahead stopped part-way left, as long as nothing but a save has had the engine since:
+     * that is a true beginning of the conversation's history form, and reading on to where the
+     * next message begins is exactly what that request would read first. Only a failure of the
+     * native side after the memory was changed empties it ([ReadAheadResult.Failed]).
+     *
      * It gives way: a request, [forget], [forgetKeepingSavedMemory], a [load], an [unload], a
      * [saveMemory], a [restoreMemory], a closed [GenerationGate] and cancelling the caller each
-     * stop it within one chunk of the prompt, and one that is asked for before it has begun
-     * makes it do nothing. What it read by then stays.
+     * stop it, and one that is asked for before it has begun makes it do nothing. It is stopped
+     * between two chunks of the prompt: a chunk under way is finished first, which is the same
+     * wait a long reading of a request has for a stop: up to 128 tokens for Qwen3.5 when the part
+     * being read leaves 1,024 tokens or more in memory, about 1.4 to 2.5 seconds on the tested
+     * phone, and up to 32 tokens below that. What it read by then stays.
+     *
+     * Read-aheads do not overlap. One asked for while another holds the engine waits for that
+     * one to let go (within a chunk, when it was stopped) and then does what is left of its own:
+     * nothing when the first read up to where the same next message begins, the rest when the
+     * first was stopped part-way. It still does nothing when something else asked for the engine
+     * meanwhile, or had it.
      *
      * The checkpoint at its end is one of those that follow a reply, so it displaces none of a
      * prompt's; the next request takes it over as the checkpoint of the boundary it stands at.
@@ -232,8 +254,9 @@ interface InferenceEngine {
      * save at its next piece and then runs; so do [forget], [unload], a [load] and cancelling the
      * caller. The image becomes the vault's only when every piece was written.
      *
-     * A [readAhead] goes second to a save of either trigger: it stops within one chunk, and a
-     * save on leaving the screen waits for that instead of answering that the engine is busy.
+     * A [readAhead] goes second to a save of either trigger: it stops at the end of the chunk it
+     * is reading, and a save on leaving the screen waits for that instead of answering that the
+     * engine is busy.
      * What the read-ahead had read by then is saved.
      */
     suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult
