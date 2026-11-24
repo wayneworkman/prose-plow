@@ -7,6 +7,15 @@ five small patches. Nothing is downloaded while the app runs, and the app declar
 permission at all. Every chat is stored encrypted behind a lock that cannot be switched off: a
 passphrase, or a fingerprint that the passphrase has set up, and never a PIN.
 
+<p align="center">
+  <img src="docs/prose-plow-demo.gif" width="300"
+       alt="The app on a phone in airplane mode: Qwen3.5 0.8B answers why the sky is blue, then Shard-2 continues a sentence in a new chat">
+</p>
+
+<p align="center"><sub>Recorded on the test phone in airplane mode. Qwen3.5 0.8B answers a question, then
+Shard-2 continues a text in a new chat. The typing is sped up; the answers play at the speed the
+phone wrote them.</sub></p>
+
 There are no binary releases and no official signing key. You build the app yourself from this
 repository and sign it with a key of your own, and this file says how: from a bare Ubuntu 24.04
 machine to an APK on a phone, with every tool, the version of it that worked, and every command.
@@ -1910,6 +1919,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `llama/` | The Android library around the native code: the CMake build for arm64, the JNI binding, the packaging of the models, the checks on the finished APK, and the tests that run on a phone |
 | `native/` | Everything below the JVM: the patches to llama.cpp, the three architectures this project adds, the converters, the native library and the generation session, and the host tests. See `native/README.md`, and `native/patches/README.md` for moving llama.cpp to a newer commit |
 | `models/` | `manifest.json` with the pinned revisions and hashes, and `convert_models.py`. See `models/README.md` |
+| `docs/` | `prose-plow-demo.gif`, the recording shown at the top of this file |
 | `fastlane/` | The store metadata in the layout F-Droid reads (`metadata/android/en-US/`: title, descriptions, changelog, icon), and the script that renders the icon from the launcher artwork. See `fastlane/README.md` |
 | `third_party/llama.cpp` | Upstream llama.cpp as a git submodule at a pinned commit. It is never edited: builds work on a patched copy |
 | `gradle/libs.versions.toml` | Every Gradle plugin and library with its version |
