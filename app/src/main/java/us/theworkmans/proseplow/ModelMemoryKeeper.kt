@@ -56,14 +56,15 @@ import java.util.concurrent.atomic.AtomicInteger
  *   turned on the engine gets a vault object it has not seen, so that nothing it knew of the
  *   deleted memory is taken for what is on disk.
  * - **Not twice for nothing.** A memory that is on disk as it is in the engine (saved or
- *   restored, and no request made since, as [requestsBuilt] counts them) is not written again
- *   at the lock.
+ *   restored, and no request made since, nor a read-ahead that changed the memory, as
+ *   [requestsBuilt] counts them) is not written again at the lock.
  *
  * Main thread for [saveOnLeaving] and [setEnabled]; [close] and [awaitStopped] from the lock's
  * thread.
  *
  * @param heldConversation the key of the conversation the engine last worked on, or null.
- * @param requestsBuilt how many requests the chats have handed the engine so far.
+ * @param requestsBuilt how many requests the chats have handed the engine so far, with the
+ *   read-aheads that changed its memory.
  * @param enabled whether the setting is on now.
  * @param saveBoundMillis how long a lock by itself may wait for a save: the fourth bounded wait
  *   of a close, beside the reply, forgetting and the writes.

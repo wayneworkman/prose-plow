@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeoutOrNull
@@ -27,8 +28,11 @@ import us.theworkmans.proseplow.core.model.ModelSpec
  *   [FinishReason.CANCELLED], reporting the text emitted so far.
  * - A cancelled collection ends the generation without a final event.
  *
- * What happened is recorded: [requests], and the counters of generations started, completed and
- * cancelled. Saving and restoring the memory are recorded and answered from [saveResult] and
+ * - A read-ahead ([readAhead]) takes [readAheadMillis] and answers [readAheadResult]; a request,
+ *   a save, a restore, [forget], [unload] and a [load] stop it, as does cancelling its caller.
+ *
+ * What happened is recorded: [requests], [readAheads], and the counters of generations started,
+ * completed and cancelled. Saving and restoring the memory are recorded and answered from [saveResult] and
  * [restoreResult]; nothing is written to a vault. Meant for single-threaded tests; nothing here
  * is synchronised.
  */
@@ -151,6 +155,32 @@ class FakeInferenceEngine : InferenceEngine {
     /** As [onSave], for [restoreMemory]. */
     var onRestore: (suspend (vault: MemoryVault, conversationKey: String, maxContextTokens: Int?) -> MemoryRestoreResult)? = null
 
+    /** Every read-ahead asked for, oldest first. */
+    val readAheads = ArrayList<GenerationRequest>()
+
+    /** Read-aheads that ended because their caller was cancelled, or the engine was made to forget, unload or load. */
+    var stoppedReadAheads: Int = 0
+        private set
+
+    /** Read-aheads under way right now. */
+    var activeReadAheads: Int = 0
+        private set
+
+    /** What [readAhead] answers. */
+    var readAheadResult: ReadAheadResult = ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.NOTHING_TO_READ)
+
+    /**
+     * How long a read-ahead takes, in (virtual) milliseconds; null for one that runs until it is
+     * stopped. [forget], [unload], a [load], a request, a save and a restore stop it, as the real engine's do.
+     */
+    var readAheadMillis: Long? = 0
+
+    /**
+     * False makes a read-ahead stop only for its caller's cancellation, so that a test can tell
+     * that whoever drives the engine stops it, without relying on the engine to.
+     */
+    var readAheadGivesWay: Boolean = true
+
     /** The context size passed with every restore, in the order of [restores]. */
     val restoreContexts = ArrayList<Int?>()
 
@@ -200,12 +230,41 @@ class FakeInferenceEngine : InferenceEngine {
         epoch.value++
     }
 
+    override suspend fun readAhead(request: GenerationRequest): ReadAheadResult {
+        readAheads += request
+        activeReadAheads++
+        val startEpoch = epoch.value
+        val startRequests = interruptions.value
+        try {
+            val stop = combine(epoch, interruptions) { now, asked -> readAheadGivesWay && (now != startEpoch || asked != startRequests) }
+            val stopped = when (val millis = readAheadMillis) {
+                null -> stop.first { it }
+                else -> withTimeoutOrNull(millis) { stop.first { it } } ?: false
+            }
+            if (stopped) {
+                stoppedReadAheads++
+                return ReadAheadResult.Stopped(keptTokens = 0, readTokens = 0)
+            }
+            return readAheadResult
+        } catch (e: CancellationException) {
+            stoppedReadAheads++
+            throw e
+        } finally {
+            activeReadAheads--
+        }
+    }
+
+    /** Moves on with every request, save and restore, which a read-ahead gives way to. */
+    private val interruptions = MutableStateFlow(0)
+
     override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult {
+        interruptions.value++
         saves += conversationKey to trigger
         return onSave?.invoke(vault, conversationKey, trigger) ?: saveResult
     }
 
     override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
+        interruptions.value++
         restores += conversationKey
         restoreContexts += maxContextTokens
         return onRestore?.invoke(vault, conversationKey, maxContextTokens) ?: restoreResult
@@ -216,6 +275,7 @@ class FakeInferenceEngine : InferenceEngine {
     }
 
     override fun generate(request: GenerationRequest): Flow<GenerationEvent> = flow {
+        interruptions.value++
         recordedRequests += request
         startedGenerations++
         activeGenerations++

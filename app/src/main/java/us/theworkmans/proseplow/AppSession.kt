@@ -239,6 +239,8 @@ class AppSession(
                 onTurnEnded = ::onTurnEnded,
                 onMemoryRestored = { keeper?.noteRestored() },
                 deleteSavedMemory = memoryFiles::deleteAll,
+                // Never out of sight, and never behind the lock.
+                mayReadAhead = { inSight && !finishingOnly },
             )
             // A system prompt that is replaced or cleared stays neither in the saved memory nor
             // in what the store may save next.
@@ -354,6 +356,8 @@ class AppSession(
     fun leftScreen() {
         flushWrites()
         inSight = false
+        // Nothing is read ahead out of sight; the save below would stop it in any case.
+        chat.stopReadingAhead()
         saveIfIdle(outOfSight = false)
     }
 

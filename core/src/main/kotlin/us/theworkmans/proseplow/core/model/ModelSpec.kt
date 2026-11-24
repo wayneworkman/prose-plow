@@ -77,7 +77,11 @@ enum class ModelFamily(val promptFormat: PromptFormat, val continuesText: Boolea
  *   length (a model with recurrent state: Qwen3.5, Boris-2), which can only go back to a
  *   checkpoint. The engine then also keeps two checkpoints that follow a reply while it is
  *   written, so that a next request that differs from the memory near the end of that reply
- *   does not read the whole reply again. A model that can cut its memory back (attention only:
+ *   ("Continue" after a reply was stopped, a reply whose end tokenises differently) does not
+ *   read the whole reply again. They cannot spare a request that differs before the reply's
+ *   first token, as every new message after a Qwen3.5 answer does (its format leaves the
+ *   answer's empty think block out of the history); the engine's read-ahead does that reading
+ *   earlier instead. A model that can cut its memory back (attention only:
  *   Peacebell, and Shard-2, whose session refuses only cuts behind a restored window) needs no
  *   such checkpoints and is given none. A wrong true costs time and never correctness: the
  *   engine still falls back to the checkpoints of the prompt.

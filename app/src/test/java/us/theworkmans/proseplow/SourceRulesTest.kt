@@ -845,13 +845,18 @@ class SourceRulesTest {
 
         val controller = code(File(module, "$main/chat/ChatController.kt"))
         assertEquals(
-            "every reply is asked for in one place, with the model's settings as they are then and its chat's conversation key",
+            "every reply, and every read-ahead for the next, is asked for in one place, with the model's settings as they are then and its chat's conversation key",
             listOf(
-                "val request = (sessions[reply.sessionId] ?: return)" +
-                    ".generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)" +
-                    ".copy(conversationKey = conversationKeyOf(reply.sessionId))",
+                "return session.generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens)" +
+                    ".copy(conversationKey = conversationKeyOf(session.id))",
             ),
             controller.filter { it.contains("generationRequest(") },
+        )
+        assertTrue(controller.contains("val settings = requestSettings(spec)"))
+        assertEquals(
+            "a reply and a read-ahead build their request there",
+            listOf("val request = requestOf(sessions[reply.sessionId] ?: return, spec)", "val request = requestOf(session, spec)"),
+            controller.filter { it.contains("requestOf(") && !it.contains("fun requestOf(") },
         )
         assertEquals(listOf("ChatController.kt"), users(all, ".generationRequest("))
         val session = code(File(module, "$main/AppSession.kt")).joinToString("\n")

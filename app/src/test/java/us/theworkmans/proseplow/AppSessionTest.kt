@@ -231,6 +231,8 @@ class AppSessionTest {
 
         override fun generate(request: GenerationRequest): Flow<GenerationEvent> = delegate.generate(request)
 
+        override suspend fun readAhead(request: GenerationRequest) = delegate.readAhead(request)
+
         override suspend fun forget(): Unit = awaitCancellation()
 
         override suspend fun forgetKeepingSavedMemory(): Unit = awaitCancellation()

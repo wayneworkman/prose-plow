@@ -1136,11 +1136,15 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
     at all. Both together take at most 10 seconds; then the save is stopped both ways (the
     engine's side at its next piece, and the store lets the engine's thread go within one chunk)
     and nothing of it is kept. A memory that is on disk as it is in the engine, because it was
-    saved or read back and no request was made since, is not written again.
+    saved or read back and no request was made since (nor a read-ahead that changed the
+    memory, CHAT-25), is not written again.
 
   "Lock now" and a reset never save (LOCK-16), and neither does a lock by itself or the end of a
   lease while nothing keeps the process awake (LOCK-13, BG-16). No save is asked for while an
-  answer is being written; one that is running is stopped by the next request (ENG-38).
+  answer is being written; one that is running is stopped by the next request (ENG-38). A
+  read-ahead (CHAT-25) runs only in sight, so it never runs beside the save that follows an
+  answer ending out of sight; leaving the screen stops it, and the save then made holds what
+  it had read (ENG-45).
 - **STORE-29** What the store is told of a conversation, which it binds a memory to (STORE-25):
   the chat whose conversation key names it (every request names its chat by `chat:` followed by
   the chat's id, the same at every unlock and never the same for two chats), with its messages
@@ -1188,7 +1192,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 `chat/SessionDrawer.kt`, `core/src/main/kotlin/us/theworkmans/proseplow/core/chat/ChatSession.kt`,
 `core/.../chat/MessageExpiry.kt`, `security/TrustedTime.kt`, `security/TrustedClock.kt`;
 tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeTest.kt`,
-`chat/MessageExpiryChatTest.kt`, `security/TrustedClockTest.kt`,
+`chat/MessageExpiryChatTest.kt`, `chat/ReadAheadChatTest.kt`, `security/TrustedClockTest.kt`,
 `core/src/test/kotlin/us/theworkmans/proseplow/core/chat/ChatSessionTest.kt`,
 `core/src/test/kotlin/us/theworkmans/proseplow/core/chat/MessageExpiryTest.kt`,
 `security/TrustedTimeTest.kt`.
@@ -1314,6 +1318,31 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   configuration (FMT-06) at every unlock, every lock and every start of the lock (LOCK-22).
   Setting the date back therefore keeps no message alive and dates no message in the past;
   setting it forward is believed, and messages then expire early.
+- **CHAT-25** After an answer the engine is asked to read the conversation ahead (ENG-43), for
+  the chat whose answer it was and that conversation only, so that the next message does not
+  read the answer again (DEC-56):
+  - at once when the answer ended by itself: the model ended its turn, or wrote a stop string;
+  - for an answer that can be continued (cut off at its length limit, or stopped; MSG-12) only
+    when the user starts typing a new message in that chat: the moment its draft stops being
+    blank (whitespace alone is blank, as for sending), not again for every key, and at once
+    when the draft was already not blank as the answer ended. Typing in an edit of an earlier
+    message is not a new message;
+  - typing a new message also starts it for an answer that ended by itself and was not read
+    ahead, because it ended while the app was out of sight;
+  - never because the app was unlocked, a chat was opened or the app came back to the screen;
+    never while the app is out of sight or behind the lock (LEASE-01); never while a reply is
+    being written; never after an answer that failed or has no text, and never for a chat whose
+    stored messages changed since the engine last read them (STORE-29).
+
+  Nothing on screen says that it runs: no reply is being written, the input stays as it is and
+  can be used, and a message can be sent at once. A read-ahead that changed the memory counts,
+  for the saves of STORE-28, as a request does: the memory on disk is no longer taken for the
+  one in the engine.
+- **CHAT-26** Everything goes before a read-ahead, without a wait the user could notice: sending
+  a message, "Continue", "Answer again", an edit, a retry and a reply in another chat stop it as
+  they begin; so do a prune or deletion that makes the engine forget (CHAT-23), loading a model,
+  a change of a system prompt, leaving the screen and the lock. The app stops it itself and the
+  engine stops it too, within one chunk (ENG-45); the reply then keeps what it had read.
 
 ## 12. Messages and replies (MSG)
 
@@ -2278,15 +2307,21 @@ is what a port has to reproduce, whatever it is written in.
   A model that cannot remove the end of its memory (Qwen3.5, Boris-2; NAT-08) has two more
   checkpoints, which follow the reply while it is written: one is taken every 32 tokens of the
   reply, and the latest two are kept; the oldest of the two is dropped before the next is taken.
-  The reason: the text of a reply tokenised again is not always the tokens that were sampled (a
-  reply cut off at the length limit, whitespace trimmed at its end), so the next request can
-  differ from the memory near the end of the reply, and without them the only checkpoint before
-  that point is the one in front of the reply, which reads the whole reply again (about 13
-  seconds for 1,000 tokens of Qwen3.5 on the tested phone). With them, a request that differs
-  from the memory anywhere in the last 32 tokens of the reply reads again at most 64 tokens and
-  the difference (about a second for Qwen3.5), and never goes back to the checkpoint in front of
-  the reply: the latest lies at or before that point, or the one before it does, and neither
-  lies more than 64 tokens before it. Two are needed because a reply can end just after one was
+  The reason: a request can differ from the memory near the end of the reply, and without them
+  the only checkpoint before that point is the one in front of the reply, which reads the whole
+  reply again. Two such requests: "Continue" after a reply was stopped (MSG-12), whose prompt
+  ends with the last token in memory, which must be read afresh (ENG-07) while the model cannot
+  go back by one token; and a reply whose text, tokenised again, is not the tokens that were
+  sampled near its end (whitespace trimmed at its end, a reply cut off at the length limit).
+  With them, a request that differs from the memory anywhere in the last 32 tokens of the reply
+  reads again at most 64 tokens and the difference (about a second for Qwen3.5), and never goes
+  back to the checkpoint in front of the reply: the latest lies at or before that point, or the
+  one before it does, and neither lies more than 64 tokens before it. They do not, and cannot,
+  spare Qwen3.5 the second reading of an answer before the next message (about 13 seconds for
+  1,000 tokens on the tested phone): its prompt format writes the turn being written with an
+  empty think block and the same answer, once it is history, without one (FMT-10), so the next
+  message differs from the memory four tokens before the answer's first token, before every one
+  of them. That reading is done earlier instead, by the read-ahead (ENG-43). Two are needed because a reply can end just after one was
   taken, which leaves the latest behind a difference of a few tokens. They are not among the 4:
   they never take the place of a checkpoint of the prompt, and they are dropped like the others
   when the conversation is cut before them; a checkpoint of a later prompt that falls on the very
@@ -2580,7 +2615,8 @@ is what a port has to reproduce, whatever it is written in.
   image of Qwen3.5 carries up to 6 checkpoints, 116 MiB of it. A save is made only when all of these hold, and otherwise the caller is told
   which did not:
   - a model is loaded and nothing else holds the engine. When the app has left the screen a reply
-    or a load in progress goes first and nothing is saved; the save of a lock waits its turn;
+    or a load in progress goes first and nothing is saved, except a read-ahead, which stops for
+    the save (ENG-45); the save of a lock waits its turn;
   - the memory is not empty and is the conversation named: the latest request carried that key;
   - the memory is not marked "not to be saved" (ENG-41);
   - reading the memory again would take at least 20 seconds by the model's reading curve on this
@@ -2640,6 +2676,49 @@ is what a port has to reproduce, whatever it is written in.
   progress, and that it ended with the conversation restored (with the number of tokens that need
   not be read again) or to be read again. Forgetting and loading another model return it to
   nothing to show.
+- **ENG-43** Reading ahead. On request, after an answer, the engine reads the conversation into
+  the model's memory as the next new message will find it, so that that message reads only
+  itself. It is given the conversation as a request for the next message would carry it, ending
+  with the answer, and adds an empty message of the user in place of the next one. It renders
+  and tokenises that as a request does (ENG-06), keeps of the memory what a request would keep
+  (the longest common beginning, ENG-07, or the checkpoint before it, ENG-08), reads up to the
+  beginning of the placeholder, saving the checkpoints a request would save on the way (ENG-09),
+  and keeps a checkpoint where the placeholder begins. It samples nothing and emits no events;
+  its caller learns whether it read, was stopped on the way, or did nothing and why. The
+  checkpoint at its end counts as one that follows a reply, so it takes the place of none of
+  the 4 of the prompt, and the next request takes it over as the checkpoint of the boundary it
+  stands at, where the message the user then sends begins: editing that message goes back to
+  it. For Qwen3.5 it reads the earlier answer in its history form (FMT-10). It does not keep the
+  state at the end of the answer for "Continue": once the memory goes back and reads the other
+  form, a checkpoint of that end no longer describes the memory, and restoring it would be
+  refused or would mix two conversations. "Continue" after a read-ahead therefore reads the
+  answer again; that is why an answer that can be continued is read ahead only once a new
+  message is begun (CHAT-25).
+- **ENG-44** What a read-ahead may do. It does only what the next request would do anyway:
+  - when the conversation as rendered begins with everything the memory holds, it does nothing at
+    all (Boris-2, whose format writes an answer the same way before and after, and a
+    conversation already read ahead). A read-ahead that was stopped is therefore not taken up
+    again by the next one; the next message reads the rest;
+  - it never clears the memory: where a request would have to clear it (no checkpoint at or
+    before the common beginning), it does nothing. Only a failure of the native side once it
+    has begun to change the memory empties it, as for a failed request;
+  - it never makes the context larger and never leaves turns out: when the conversation and the
+    room for the next reply (ENG-04) do not fit the context as it is, under a size the user
+    chose for it if that is smaller, it does nothing;
+  - it does nothing for a model that continues text, for a conversation other than the one in
+    memory (its key, as for ENG-38), for an empty memory, and when the tokeniser puts no
+    boundary where the next message begins.
+- **ENG-45** A read-ahead gives way. A request, "forget" (and so the lock), loading or unloading
+  a model, a save of the memory of either kind, a restore, the generation gate closing (ENG-22)
+  and its caller giving up each stop it within one chunk of reading (the check runs between and
+  inside chunks); one that is asked for before the read-ahead has begun, or has had the engine
+  since the read-ahead was asked for, makes it do nothing. It never waits at the gate. What it
+  read by then stays: it is a true state of the memory and the beginning of the next prompt. A
+  save when the app leaves the screen does not answer "busy" because of a read-ahead (ENG-38): it
+  waits the chunk for the read-ahead to let go, and saves what it had read; the save of a lock
+  does not wait behind it either. A read-ahead that goes back below a saved image deletes the
+  image (ENG-40), as every going back does; a save after it holds the history form, so that
+  after a lock and a restore the next message reads only itself.
 
 ## 20. The native session (NAT)
 
@@ -3422,7 +3501,12 @@ This section is exact where the others describe. Each item carries one of three 
     `\n</think>\n\n` then the answer, and `<|im_end|>\n` unless it is the message being
     continued;
   - the opening of a new reply: `<|im_start|>assistant\n<think>\n\n</think>\n\n`, which is how
-    the template switches thinking off;
+    the template switches thinking off. So the reply the model writes stands in its memory
+    after an empty think block, and the same reply, once a new message of the user follows it,
+    is rendered as an earlier reply without one: the next prompt differs from the memory four
+    tokens before the answer, and the whole answer is read again before the next reply. No
+    layout faithful to the template avoids that (with thinking on, the reasoning is dropped from
+    history the same way); the engine reads the history form ahead instead (ENG-43);
   - a message being continued keeps its end exactly and loses only the whitespace at its start;
     continuing an empty answer is the opening of a new reply, token for token.
 
@@ -4071,6 +4155,23 @@ only state a rule, the item says so and states its effect instead of inventing a
   keep-alive. What the keep-alive does not cover: the wait of up to 5 seconds to hear of it,
   and the three bounded waits every closing has (LOCK-17), which a device that sleeps through
   them prolongs.
+- **DEC-56** *After an answer the conversation is read ahead in its history form* (ENG-43 to
+  ENG-45, CHAT-25, CHAT-26). The owner's decision of 2026-11-23, after it was measured on the
+  phone that Qwen3.5 reads every answer a second time before the next reply (about 13 seconds
+  for 1,000 tokens): its own template opens the turn being written with an empty think block
+  and renders the same answer without it once it is history (FMT-10), so the memory and the
+  next request part four tokens before the answer, and no layout faithful to the template
+  avoids that. The reading cannot be avoided, only moved: it is done while the person reads
+  the answer. At once after an answer that ended by itself; after one that can be continued
+  only when the user starts typing a new message, because a read-ahead replaces the end of the
+  answer in memory and "Continue" would then read it again, while without one "Continue" stays
+  quick (ENG-09). Never merely because the app was unlocked, opened or came back, never out of
+  sight and never behind the lock: it costs processor time and battery, and is wasted when no
+  new message follows. Rejected: keeping the think block in earlier answers, which changes what
+  the model is asked against its template; and keeping the end-of-reply state beside the
+  read-ahead for "Continue", which is unsound (ENG-43). Preserve: the read-ahead does only what
+  the next request would do, never clears the memory, never grows the context, never leaves
+  turns out, and gives way to everything within a chunk.
 
 ## 27. Planned tools: design considerations (TOOL)
 

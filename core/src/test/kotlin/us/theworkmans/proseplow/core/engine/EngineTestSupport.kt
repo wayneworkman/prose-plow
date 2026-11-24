@@ -105,6 +105,7 @@ internal class TestEngine(val engine: LlamaEngine, val factory: FakeNativeLlamaF
  */
 internal fun TestScope.newEngine(
     settings: LlamaEngine.Settings = LlamaEngine.Settings(),
+    gate: GenerationGate = GenerationGate(),
     configure: (FakeNativeLlama) -> Unit = {},
 ): TestEngine {
     lateinit var created: TestEngine
@@ -120,6 +121,7 @@ internal fun TestScope.newEngine(
         settings = settings,
         nanoTime = { factory.opened.lastOrNull()?.second?.nanos ?: 0L },
         newSeed = { TEST_SEED },
+        gate = gate,
     )
     created = TestEngine(engine, factory)
     return created
@@ -129,8 +131,9 @@ internal fun TestScope.newEngine(
 internal suspend fun TestScope.loadedEngine(
     model: ModelSpec = testModel(),
     settings: LlamaEngine.Settings = LlamaEngine.Settings(),
+    gate: GenerationGate = GenerationGate(),
     configure: (FakeNativeLlama) -> Unit = {},
-): TestEngine = newEngine(settings, configure).also { it.engine.load(model) }
+): TestEngine = newEngine(settings, gate, configure).also { it.engine.load(model) }
 
 // --- Reading event lists ---
 

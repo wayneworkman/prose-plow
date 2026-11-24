@@ -46,7 +46,7 @@ class LlamaEngineFollowingCheckpointTest {
         spec: ModelSpec = recurrent,
         settings: LlamaEngine.Settings = LlamaEngine.Settings(),
         configure: (FakeNativeLlama) -> Unit = cannotCut,
-    ): TestEngine = loadedEngine(spec, settings, configure)
+    ): TestEngine = loadedEngine(spec, settings, configure = configure)
 
     /** Asks [messages] with the scripted [reply], which is text and, where [piece] is given, that piece after [before] characters. */
     private suspend fun TestEngine.ask(

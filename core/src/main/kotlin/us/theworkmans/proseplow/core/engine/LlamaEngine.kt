@@ -14,8 +14,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -26,6 +28,7 @@ import us.theworkmans.proseplow.core.model.ReplyLength
 import us.theworkmans.proseplow.core.prompt.Prompt
 import us.theworkmans.proseplow.core.prompt.PromptFormatException
 import us.theworkmans.proseplow.core.prompt.PromptInput
+import us.theworkmans.proseplow.core.prompt.PromptMessage
 import us.theworkmans.proseplow.core.prompt.PromptRole
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import java.util.concurrent.TimeUnit
@@ -126,14 +129,25 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  *    the reply the reader sees loses its last token ([GenerationEvent.TextReplaced]). For a
  *    model that cannot cut its memory back ([ModelSpec.cutsMemoryBack]) two more checkpoints
  *    **follow the reply**: one is taken every [Settings.followingCheckpointInterval] tokens of
- *    the reply, and the latest two are kept. The reply's text tokenised again is not always
- *    the tokens that were sampled (a reply cut off at the length limit, whitespace trimmed at
- *    its end), so the next request can differ from the memory near the end of the reply. Where
- *    it differs within the last interval of the reply, one of the two lies at or before that
- *    point and less than two intervals before it, so the request reads again at most two
- *    intervals and the difference, not the whole reply. They are apart from the checkpoints of
- *    step 3 and never displace one of them, so at most [Settings.maxCheckpoints] and
- *    [FOLLOWING_CHECKPOINTS] more are held at any moment.
+ *    the reply, and the latest two are kept. They serve a request that differs from the memory
+ *    near the end of the reply. "Continue" after a reply was stopped is one: its prompt ends
+ *    with the last token in memory, which must be read afresh for a prediction, and such a
+ *    model cannot go back by one token. A reply whose text, tokenised again, is not the tokens
+ *    that were sampled near its end (cut off at the length limit, whitespace trimmed at its end)
+ *    is another. Where the request differs within the last interval of the reply, one of the
+ *    two lies at or before that point and less than two intervals before it, so the request
+ *    reads again at most two intervals and the difference, not the whole reply. They cannot
+ *    help a request that differs from the memory before the reply's first token: a prompt
+ *    format that writes an earlier answer differently from the turn that was being written
+ *    (Qwen3.5 opens that turn with an empty think block and leaves it out of the history) makes
+ *    the next new message read the whole answer again, whatever checkpoints follow it; step 5
+ *    does that reading earlier. They are apart from the checkpoints of step 3 and never
+ *    displace one of them, so at most [Settings.maxCheckpoints] and [FOLLOWING_CHECKPOINTS]
+ *    more are held at any moment.
+ * 5. **Reads ahead** when asked to ([readAhead]), after an answer: the conversation as the next
+ *    new message will render it, read through the same steps 1 to 3 up to the start of that
+ *    message, with nothing sampled. It is the reading that message would do anyway, done while
+ *    the person reads the answer, and it gives way to everything else within one chunk.
  *
  * Invariants:
  * - All calls into [NativeLlama] and [NativeLlamaFactory] are made on [nativeDispatcher], one at
@@ -194,7 +208,9 @@ class LlamaEngine(
      *   follows it is taken, for a model that cannot cut its memory back
      *   ([ModelSpec.cutsMemoryBack]); 0 switches them off. The latest [FOLLOWING_CHECKPOINTS]
      *   are kept, so a request whose tokens differ from the memory anywhere in the last this
-     *   many tokens of the last reply reads again at most twice this many and the difference.
+     *   many tokens of the last reply reads again at most twice this many and the difference:
+     *   "Continue" after a reply was stopped, and a reply whose end tokenises differently. A
+     *   difference before the reply (Qwen3.5's think block) is beyond them; see [readAhead].
      *   32: a checkpoint is a copy of the recurrent state (19.3 MiB for Qwen3.5, 0.36 MiB for
      *   Boris-2), a few milliseconds every 32 tokens of a reply that takes Qwen3.5 more than
      *   three seconds to write on the tested phone, while reading 64 tokens again takes it about
@@ -245,9 +261,9 @@ class LlamaEngine(
 
     /**
      * A saved state of the memory when it held exactly the first [position] tokens. [follows]
-     * marks a checkpoint that follows a reply ([Settings.followingCheckpointInterval]);
-     * the others were taken at boundaries of a prompt, and only they count towards
-     * [Settings.maxCheckpoints].
+     * marks a checkpoint that follows a reply ([Settings.followingCheckpointInterval]), or the
+     * one a read-ahead keeps at its end ([readAhead]); the others were taken at boundaries of a
+     * prompt, and only they count towards [Settings.maxCheckpoints].
      */
     private class Checkpoint(val position: Int, val handle: Int, val follows: Boolean = false)
 
@@ -330,6 +346,27 @@ class LlamaEngine(
     /** Moves on whenever a request is collected, so that a save in progress stops for it. */
     private val requests = AtomicInteger(0)
 
+    /**
+     * How many operations other than a read-ahead have asked for the engine and not yet ended:
+     * requests, saves, restores, loads, unloads and forgetting. Raised the moment one is asked
+     * for, before it waits for the mutex, so that a read-ahead stops for it within a chunk, and
+     * one that has not begun does nothing ([readAhead]).
+     */
+    private val contenders = AtomicInteger(0)
+
+    /**
+     * Moves on whenever an operation other than a read-ahead gets the mutex. A read-ahead that
+     * finds it moved since it was asked for does nothing: the memory may no longer be the one
+     * whose answer it was asked to prepare.
+     */
+    private val operations = AtomicInteger(0)
+
+    /**
+     * Counts the read-aheads that have let go of the mutex, raised just after each lets go, so
+     * that a save on leaving the screen can wait for the one holding it ([lockForLeaving]).
+     */
+    private val readAheadsEnded = MutableStateFlow(0L)
+
     private val _memoryRestore = MutableStateFlow<MemoryRestoreState>(MemoryRestoreState.Idle)
     override val memoryRestore: StateFlow<MemoryRestoreState> = _memoryRestore.asStateFlow()
 
@@ -344,7 +381,7 @@ class LlamaEngine(
         if (current is EngineState.Ready && current.modelId == model.id) return
         epoch.incrementAndGet()
         val marksBefore = marks.get()
-        mutex.withLock {
+        turn {
             withContext(nativeDispatcher) {
                 if (native != null && loaded?.id == model.id) return@withContext
                 marksBeforeOperation = marksBefore
@@ -386,7 +423,7 @@ class LlamaEngine(
         val marksBefore = marks.get()
         // Not cancellable: once asked for, the model must really be freed.
         withContext(NonCancellable) {
-            mutex.withLock {
+            turn {
                 withContext(nativeDispatcher) {
                     marksBeforeOperation = marksBefore
                     closeNative()
@@ -411,7 +448,7 @@ class LlamaEngine(
         val marksBefore = marks.get()
         // Not cancellable: the app is locking, and the conversation must be gone when this returns.
         withContext(NonCancellable) {
-            mutex.withLock {
+            turn {
                 withContext(nativeDispatcher) {
                     marksBeforeOperation = marksBefore
                     // The memory is cleared first and the image deleted second: deleting is work
@@ -591,17 +628,63 @@ class LlamaEngine(
 
     override suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult {
         val startEpoch = epoch.get()
-        // On leaving the screen a reply, a load or anything else that holds the engine goes first,
-        // and the save is not made; the lock's save waits its turn (its caller bounds the wait).
-        if (trigger == SaveTrigger.LEFT_SCREEN) {
-            if (!mutex.tryLock()) return MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.BUSY)
-        } else {
-            mutex.lock()
-        }
+        // Counted at once: a read-ahead stops for the save within a chunk, and none begins.
+        contenders.incrementAndGet()
         try {
-            return withContext(nativeDispatcher) { save(vault, conversationKey, trigger, startEpoch, coroutineContext.job) }
+            // On leaving the screen a reply, a load or anything else that holds the engine goes
+            // first, and the save is not made, except a read-ahead, which gives way to it; the
+            // lock's save waits its turn (its caller bounds the wait).
+            if (trigger == SaveTrigger.LEFT_SCREEN) {
+                if (!lockForLeaving()) return MemorySaveResult.NotSaved(MemorySaveResult.NotSaved.Reason.BUSY)
+            } else {
+                mutex.lock()
+            }
+            try {
+                operations.incrementAndGet()
+                return withContext(nativeDispatcher) { save(vault, conversationKey, trigger, startEpoch, coroutineContext.job) }
+            } finally {
+                mutex.unlock()
+            }
         } finally {
-            mutex.unlock()
+            contenders.decrementAndGet()
+        }
+    }
+
+    /**
+     * Takes the mutex for a save on leaving the screen when nothing but a read-ahead holds it,
+     * and returns false at once when anything else does. A read-ahead stops within a chunk for
+     * the save, which is already counted among the [contenders], and lets go; this waits for
+     * that ([readAheadsEnded]) instead of answering that the engine is busy, and asks again. A
+     * read-ahead asked for meanwhile does nothing while the save is counted, so the asking ends.
+     */
+    private suspend fun lockForLeaving(): Boolean {
+        while (true) {
+            val ended = readAheadsEnded.value
+            if (mutex.tryLock()) return true
+            if (mutex.holdsLock(READ_AHEAD)) {
+                readAheadsEnded.first { it != ended }
+                continue
+            }
+            // Something else holds it, or a read-ahead let go of it between the two looks.
+            if (mutex.tryLock()) return true
+            if (!mutex.holdsLock(READ_AHEAD)) return false
+        }
+    }
+
+    /**
+     * Runs [block] with the mutex held, as an operation a read-ahead gives way to: counted among
+     * the [contenders] from the moment it is asked for until it has ended, and moving
+     * [operations] on once it has the mutex.
+     */
+    private suspend inline fun <T> turn(block: () -> T): T {
+        contenders.incrementAndGet()
+        try {
+            return mutex.withLock {
+                operations.incrementAndGet()
+                block()
+            }
+        } finally {
+            contenders.decrementAndGet()
         }
     }
 
@@ -709,7 +792,7 @@ class LlamaEngine(
 
     override suspend fun restoreMemory(vault: MemoryVault, conversationKey: String, maxContextTokens: Int?): MemoryRestoreResult {
         val startEpoch = epoch.get()
-        return mutex.withLock {
+        return turn {
             withContext(nativeDispatcher) { restore(vault, conversationKey, maxContextTokens, startEpoch, coroutineContext.job) }
         }
     }
@@ -926,13 +1009,24 @@ class LlamaEngine(
         val marksBefore = marks.get()
         return flow {
             val startEpoch = epoch.get()
-            // A save in progress stops at its next piece and lets this request have the engine.
+            // A save in progress stops at its next piece and lets this request have the engine,
+            // and so does a read-ahead, which stops within a chunk.
             requests.incrementAndGet()
-            emitAll(
-                channelFlow { mutex.withLock { generate(request, startEpoch, marksBefore) } }
-                    .buffer(Channel.UNLIMITED)
-                    .flowOn(nativeDispatcher),
-            )
+            contenders.incrementAndGet()
+            try {
+                emitAll(
+                    channelFlow {
+                        mutex.withLock {
+                            operations.incrementAndGet()
+                            generate(request, startEpoch, marksBefore)
+                        }
+                    }
+                        .buffer(Channel.UNLIMITED)
+                        .flowOn(nativeDispatcher),
+                )
+            } finally {
+                contenders.decrementAndGet()
+            }
         }
     }
 
@@ -976,6 +1070,201 @@ class LlamaEngine(
             EngineError.Unexpected(describe(e))
         }
         send(GenerationEvent.Error(error))
+    }
+
+    /**
+     * What [model]'s prompt format is given for [messages] of [request]: the request's system
+     * prompt and extra system text, each left out when it is blank, and both when the model was
+     * trained without a system message, which then gets no system text of any kind.
+     */
+    private fun promptInput(model: ModelSpec, request: GenerationRequest, messages: List<PromptMessage>): PromptInput {
+        fun String?.forModel(): String? = this?.takeIf { model.supportsSystemPrompt }?.takeUnless(PromptWhitespace::isBlank)
+        return PromptInput(
+            messages = messages,
+            systemPrompt = request.systemPrompt.forModel(),
+            extraSystemText = request.extraSystemText.forModel(),
+            continueFinalMessage = request.continueFinalMessage,
+        )
+    }
+
+    // --- Reading ahead ---
+
+    override suspend fun readAhead(request: GenerationRequest): ReadAheadResult {
+        val startEpoch = epoch.get()
+        val startOperations = operations.get()
+        // Whatever has asked for the engine goes first, and a closed gate means that someone
+        // needs the processor: neither waits for a read-ahead, which is never needed.
+        if (contenders.get() > 0 || gate.isClosed) return ReadAheadResult.Skipped(ReadAheadResult.Skipped.Reason.BUSY)
+        mutex.lock(READ_AHEAD)
+        try {
+            return withContext(nativeDispatcher) { ReadAhead(request, startEpoch, startOperations, coroutineContext.job).run() }
+        } finally {
+            mutex.unlock(READ_AHEAD)
+            // After letting go: a save on leaving the screen that waits for this asks for the mutex now.
+            readAheadsEnded.update { it + 1 }
+        }
+    }
+
+    /**
+     * One read-ahead ([readAhead]) from start to finish, on [nativeDispatcher] with the mutex
+     * held; used once. Its steps are those of a request ([Generation]) up to the point where the
+     * next message begins, with the rules that make it the work of the next request done
+     * earlier and nothing more:
+     * - It keeps of the memory exactly what a request for the same prompt would keep, and does
+     *   nothing at all when that is the whole memory: the next request would read nothing again.
+     * - It does nothing where a request would clear the memory, grow the context or leave turns
+     *   out: those are a request's decisions, made with the message it carries.
+     * - It stops between and inside chunks the moment anything else asks for the engine
+     *   ([contenders]), the engine moves to another epoch, the [gate] closes or its caller is
+     *   cancelled, and does nothing when an operation had the engine since it was asked for.
+     *   The memory then holds what it read, a true state and the beginning of the next prompt.
+     * - The only time it empties the memory is a failure of the native side once it had begun
+     *   to change it, when the memory can no longer be trusted, exactly as a request does.
+     *
+     * @param startOperations [operations] when the read-ahead was asked for.
+     */
+    private inner class ReadAhead(
+        private val request: GenerationRequest,
+        private val startEpoch: Int,
+        private val startOperations: Int,
+        private val job: Job,
+    ) {
+        private var tokeniser: PromptTokeniser? = null
+
+        /** True once the memory may have been changed: a failure from then on empties it. */
+        private var touched = false
+
+        /** Polled between and inside chunks: something goes first. */
+        private fun shouldStop(): Boolean = epoch.get() != startEpoch || !job.isActive || contenders.get() > 0 || gate.isClosed
+
+        private fun skipped(reason: ReadAheadResult.Skipped.Reason) = ReadAheadResult.Skipped(reason)
+
+        /** Runs the read-ahead and wipes the token arrays it made, however it ends (see [Generation.run]). */
+        fun run(): ReadAheadResult {
+            val native = native ?: return skipped(ReadAheadResult.Skipped.Reason.NOT_LOADED)
+            try {
+                return steps(native)
+            } catch (_: NativeLlamaException) {
+                return failed(native)
+            } catch (_: RuntimeException) {
+                return failed(native)
+            } finally {
+                tokeniser?.wipe()
+                tokeniser = null
+            }
+        }
+
+        private fun failed(native: NativeLlama): ReadAheadResult {
+            if (touched) clearMemory(native)
+            return skipped(ReadAheadResult.Skipped.Reason.FAILED)
+        }
+
+        private fun steps(native: NativeLlama): ReadAheadResult {
+            if (shouldStop() || operations.get() != startOperations) return skipped(ReadAheadResult.Skipped.Reason.BUSY)
+            val model = loaded ?: return skipped(ReadAheadResult.Skipped.Reason.NOT_LOADED)
+            if (request.modelId != model.id) return skipped(ReadAheadResult.Skipped.Reason.NOT_LOADED)
+            if (model.family.continuesText) return skipped(ReadAheadResult.Skipped.Reason.NOT_A_CHAT)
+            if (request.continueFinalMessage) return skipped(ReadAheadResult.Skipped.Reason.INVALID)
+            if (memory.size == 0 || memoryKey != request.conversationKey || native.memoryTokenCount() != memory.size) {
+                return skipped(ReadAheadResult.Skipped.Reason.OTHER_CONVERSATION)
+            }
+            // A read-ahead rebuilds nothing from an empty memory, so it lifts no mark.
+            marksBeforeOperation = 0
+
+            // The conversation as the next message will render it, with an empty message in its place.
+            val prompt = try {
+                model.promptFormat.render(promptInput(model, request, request.messages + PromptMessage(PromptRole.USER, "")))
+            } catch (_: PromptFormatException) {
+                return skipped(ReadAheadResult.Skipped.Reason.INVALID)
+            }
+            if (!PromptTokeniser.withinLimit(prompt)) return skipped(ReadAheadResult.Skipped.Reason.NO_ROOM)
+            val tokeniser = PromptTokeniser(native).also { tokeniser = it }
+            val tokenised = tokeniser.tokenise(prompt)
+            val tokens = tokenised.tokens
+            // The last boundary opens the reply; the one before it is where the placeholder, and so
+            // the next message, begins.
+            val target = tokeniser.boundaryPosition(tokenised, prompt.boundaries.lastIndex - 1)
+            if (target == null || target < 1) return skipped(ReadAheadResult.Skipped.Reason.NO_BOUNDARY)
+
+            // The next request and its reply in the context as it is, without growing it and
+            // without leaving anything out; a size the user chose below it counts at once.
+            val room = minOf(Sizing(native, model, request.maxContextTokens, tell = null).contextLimit(), native.contextSize())
+            val requested = (request.maxNewTokens ?: model.defaultMaxNewTokens).coerceAtLeast(1)
+            if (tokens.size + minOf(requested, ReplyLength.maxTokens(room)) > room) return skipped(ReadAheadResult.Skipped.Reason.NO_ROOM)
+
+            val common = memory.commonPrefixWith(tokens)
+            if (common >= memory.size) return skipped(ReadAheadResult.Skipped.Reason.NOTHING_TO_READ)
+            if (!goBack(native, minOf(common, target))) return skipped(ReadAheadResult.Skipped.Reason.WOULD_CLEAR)
+            val kept = memory.size
+            return read(native, model, tokenised, target, kept)
+        }
+
+        /**
+         * Shortens the memory to [keep] tokens, or to the latest checkpoint at or before that
+         * when the model cannot cut its memory back, as a request does; returns false, with
+         * nothing changed, where a request would have to clear the memory instead.
+         */
+        private fun goBack(native: NativeLlama, keep: Int): Boolean {
+            touched = true
+            if (keep > 0 && native.rewindTo(keep)) {
+                memory.truncate(keep)
+                dropSavedIfBeyondMemory()
+                dropCheckpointsAfter(native, keep)
+                return true
+            }
+            // A refused cut leaves the memory exactly as it was.
+            val checkpoint = checkpoints.filter { it.position in 1..keep }.maxByOrNull { it.position } ?: return false
+            if (!native.restoreCheckpoint(checkpoint.handle)) {
+                throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "A checkpoint could not be restored")
+            }
+            memory.truncate(checkpoint.position)
+            dropSavedIfBeyondMemory()
+            dropCheckpointsAfter(native, checkpoint.position)
+            return true
+        }
+
+        /**
+         * Reads the prompt from the memory's end up to [target], taking the checkpoints a request
+         * would take at the boundaries on the way, and at [target] one that follows the reply
+         * (for a model that cannot cut its memory back; the next request takes it over as its
+         * own, see [Generation]). A stop leaves what was read.
+         */
+        private fun read(native: NativeLlama, model: ModelSpec, tokenised: TokenisedPrompt, target: Int, kept: Int): ReadAheadResult {
+            val tokens = tokenised.tokens
+            // The boundaries a request for this prompt would keep checkpoints at, before the target.
+            val stops = if (settings.maxCheckpoints == 0) {
+                emptyList()
+            } else {
+                checkNotNull(tokeniser).boundaryPositions(tokenised, after = kept, limit = settings.maxCheckpoints).filter { it < target }
+            }
+            val observer = object : EvaluationObserver {
+                override fun onProgress(evaluatedTokens: Int) = Unit
+                override fun isCancelled(): Boolean = shouldStop()
+            }
+            for (stop in stops + target) {
+                if (stop > memory.size) {
+                    val part = tokens.copyOfRange(memory.size, stop)
+                    val chunk = if (stop >= settings.deepReadTokens) model.deepReadChunk else settings.evaluationChunk
+                    val evaluated: Int
+                    try {
+                        evaluated = native.evaluate(part, chunk, observer)
+                        memory.addAll(part, evaluated)
+                    } finally {
+                        part.fill(0)
+                    }
+                    if (evaluated < part.size) {
+                        if (!shouldStop()) throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "Evaluation stopped early without being stopped")
+                        return ReadAheadResult.Stopped(kept, memory.size - kept)
+                    }
+                }
+                if (stop < target) {
+                    saveCheckpoint(native, stop)
+                } else if (!model.cutsMemoryBack && settings.maxCheckpoints > 0) {
+                    saveFollowingCheckpoint(native)
+                }
+            }
+            return ReadAheadResult.Read(kept, memory.size - kept)
+        }
     }
 
     /**
@@ -1158,6 +1447,61 @@ class LlamaEngine(
         }
     }
 
+    // --- Checkpoints, shared by a generation and a read-ahead (native thread, mutex held) ---
+
+    /** Checkpoints beyond [position] describe a conversation that no longer exists. */
+    private fun dropCheckpointsAfter(native: NativeLlama, position: Int) {
+        val stale = checkpoints.filter { it.position > position }
+        for (checkpoint in stale) native.dropCheckpoint(checkpoint.handle)
+        checkpoints.removeAll(stale.toSet())
+    }
+
+    /**
+     * Keeps a checkpoint of the memory as it is now, at [position] (its length), among
+     * those of the prompts, dropping the oldest of them first when [Settings.maxCheckpoints]
+     * are held, so that the native side never holds more than the limit. The checkpoints
+     * that follow a reply are not counted and never dropped here. When one of them sits at
+     * this very position it is taken over as this boundary's checkpoint instead of a copy
+     * being made: it is the same state, and the next reply takes its own.
+     */
+    private fun saveCheckpoint(native: NativeLlama, position: Int) {
+        val existing = checkpoints.firstOrNull { it.position == position }
+        if (existing != null && !existing.follows) return
+        while (checkpoints.count { !it.follows } >= settings.maxCheckpoints) {
+            val oldest = checkpoints.filter { !it.follows }.minBy { it.position }
+            native.dropCheckpoint(oldest.handle)
+            checkpoints.remove(oldest)
+        }
+        if (existing != null) {
+            checkpoints.remove(existing)
+            checkpoints += Checkpoint(position, existing.handle)
+            return
+        }
+        val handle = native.saveCheckpoint()
+        if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(position, handle)
+    }
+
+    /**
+     * Takes a checkpoint that follows the reply, of the memory as it is now, and keeps the
+     * latest [FOLLOWING_CHECKPOINTS]. The oldest following one is dropped before the new one
+     * is taken, so that no more than [Settings.maxCheckpoints] and [FOLLOWING_CHECKPOINTS]
+     * are ever held, even for a moment (with the defaults: 4 and 1 held, then 4 and 2). Called
+     * on the native thread between two tokens of the reply, or where a read-ahead ends, never
+     * inside a native computation.
+     */
+    private fun saveFollowingCheckpoint(native: NativeLlama) {
+        while (checkpoints.count { it.follows } >= FOLLOWING_CHECKPOINTS) {
+            val oldest = checkpoints.filter { it.follows }.minBy { it.position }
+            native.dropCheckpoint(oldest.handle)
+            checkpoints.remove(oldest)
+        }
+        // A checkpoint of this length is this state already. During a reply none is: every
+        // checkpoint of a prompt lies at or before the reply's start.
+        if (checkpoints.any { it.position == memory.size }) return
+        val handle = native.saveCheckpoint()
+        if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(memory.size, handle, follows = true)
+    }
+
     /**
      * One generation from start to finish. A class only so that the steps can share their state;
      * it runs on [nativeDispatcher] with the mutex held and is used once.
@@ -1328,9 +1672,6 @@ class LlamaEngine(
             if (messages.none { it.role == PromptRole.USER }) {
                 throw PromptFormatException("The conversation has no user message.")
             }
-            // A model trained without a system message gets no system text of any kind.
-            val systemPrompt = request.systemPrompt.takeIf { model.supportsSystemPrompt }.nonBlank()
-            val extraSystemText = request.extraSystemText.takeIf { model.supportsSystemPrompt }.nonBlank()
             // Each round tokenises afresh; what the previous round's tokeniser made is not used again.
             this.tokeniser?.wipe()
             val tokeniser = PromptTokeniser(native)
@@ -1340,14 +1681,7 @@ class LlamaEngine(
             val candidates = if (model.family.continuesText) listOf(0) else ContextBudget.startCandidates(messages)
             val rendered = HashMap<Int, Prompt>()
             fun rendering(start: Int): Prompt = rendered.getOrPut(start) {
-                model.promptFormat.render(
-                    PromptInput(
-                        messages = messages.subList(start, messages.size),
-                        systemPrompt = systemPrompt,
-                        extraSystemText = extraSystemText,
-                        continueFinalMessage = request.continueFinalMessage,
-                    ),
-                )
+                model.promptFormat.render(promptInput(model, request, messages.subList(start, messages.size)))
             }
             // Turns whose text the tokenizer could not take at all are left out first.
             val starts = ContextBudget.tokenisable(candidates) { start -> PromptTokeniser.withinLimit(rendering(start)) }
@@ -1362,8 +1696,6 @@ class LlamaEngine(
 
         /** The tokeniser of the latest round of fitting; [run] wipes it when the generation ends. */
         private var tokeniser: PromptTokeniser? = null
-
-        private fun String?.nonBlank(): String? = this?.takeUnless(PromptWhitespace::isBlank)
 
         // --- Step 2: reuse what the memory holds ---
 
@@ -1394,12 +1726,7 @@ class LlamaEngine(
             clearMemory()
         }
 
-        /** Checkpoints beyond [position] describe a conversation that no longer exists. */
-        private fun dropCheckpointsAfter(position: Int) {
-            val stale = checkpoints.filter { it.position > position }
-            for (checkpoint in stale) native.dropCheckpoint(checkpoint.handle)
-            checkpoints.removeAll(stale.toSet())
-        }
+        private fun dropCheckpointsAfter(position: Int) = dropCheckpointsAfter(native, position)
 
         private fun clearMemory() {
             if (!this@LlamaEngine.clearMemory(native)) {
@@ -1409,13 +1736,22 @@ class LlamaEngine(
 
         // --- Step 3: evaluate the rest of the prompt, with checkpoints ---
 
-        /** Returns false when the engine interrupted the evaluation. */
+        /**
+         * Returns false when the engine interrupted the evaluation.
+         *
+         * A boundary where the memory already ends is one of the prompt's last boundaries too
+         * when a checkpoint that follows a reply stands there: the one a read-ahead keeps where
+         * the next message begins. It is taken over as that boundary's checkpoint, as the request
+         * would have taken one had it read up to it itself. At such a boundary without one,
+         * nothing is taken: a request takes checkpoints only of what it reads.
+         */
         private suspend fun evaluatePrompt(prompt: TokenisedPrompt): Boolean {
             val tokens = prompt.tokens
+            val start = memory.size
             val stops = if (settings.maxCheckpoints == 0) {
                 emptyList()
             } else {
-                checkNotNull(tokeniser).boundaryPositions(prompt, after = memory.size, limit = settings.maxCheckpoints)
+                checkNotNull(tokeniser).boundaryPositions(prompt, after = maxOf(start - 1, 0), limit = settings.maxCheckpoints)
             }
             for (stop in stops + tokens.size) {
                 if (stop > memory.size) {
@@ -1438,55 +1774,14 @@ class LlamaEngine(
                         throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "Evaluation stopped early without being cancelled")
                     }
                 }
-                if (stop < tokens.size) saveCheckpoint(stop)
+                if (stop < tokens.size && (stop > start || checkpoints.any { it.position == stop && it.follows })) saveCheckpoint(stop)
             }
             return true
         }
 
-        /**
-         * Keeps a checkpoint of the memory as it is now, at [position] (its length), among
-         * those of the prompts, dropping the oldest of them first when [Settings.maxCheckpoints]
-         * are held, so that the native side never holds more than the limit. The checkpoints
-         * that follow a reply are not counted and never dropped here. When one of them sits at
-         * this very position it is taken over as this boundary's checkpoint instead of a copy
-         * being made: it is the same state, and the next reply takes its own.
-         */
-        private fun saveCheckpoint(position: Int) {
-            val existing = checkpoints.firstOrNull { it.position == position }
-            if (existing != null && !existing.follows) return
-            while (checkpoints.count { !it.follows } >= settings.maxCheckpoints) {
-                val oldest = checkpoints.filter { !it.follows }.minBy { it.position }
-                native.dropCheckpoint(oldest.handle)
-                checkpoints.remove(oldest)
-            }
-            if (existing != null) {
-                checkpoints.remove(existing)
-                checkpoints += Checkpoint(position, existing.handle)
-                return
-            }
-            val handle = native.saveCheckpoint()
-            if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(position, handle)
-        }
+        private fun saveCheckpoint(position: Int) = saveCheckpoint(native, position)
 
-        /**
-         * Takes a checkpoint that follows the reply, of the memory as it is now, and keeps the
-         * latest [FOLLOWING_CHECKPOINTS]. The oldest following one is dropped before the new one
-         * is taken, so that no more than [Settings.maxCheckpoints] and [FOLLOWING_CHECKPOINTS]
-         * are ever held, even for a moment (with the defaults: 4 and 1 held, then 4 and 2). Called
-         * on the native thread between two tokens of the reply, never inside a native
-         * computation.
-         */
-        private fun saveFollowingCheckpoint() {
-            while (checkpoints.count { it.follows } >= FOLLOWING_CHECKPOINTS) {
-                val oldest = checkpoints.filter { it.follows }.minBy { it.position }
-                native.dropCheckpoint(oldest.handle)
-                checkpoints.remove(oldest)
-            }
-            // Every checkpoint of a prompt lies at or before the reply's start, so none is here.
-            if (checkpoints.any { it.position == memory.size }) return
-            val handle = native.saveCheckpoint()
-            if (handle != NativeLlama.NO_CHECKPOINT) checkpoints += Checkpoint(memory.size, handle, follows = true)
-        }
+        private fun saveFollowingCheckpoint() = saveFollowingCheckpoint(native)
 
         /** Reports prompt progress from inside the native call, and passes on cancellation. */
         private inner class PromptObserver(private val base: Int, private val total: Int) : EvaluationObserver {
@@ -1687,5 +1982,8 @@ class LlamaEngine(
 
         /** More rounds of fitting than a context has ways to shrink mean that something is wrong. */
         private const val MAX_FITTING_ROUNDS = 8
+
+        /** The owner a read-ahead holds the mutex as, so that a save on leaving the screen can tell it from anything else. */
+        private val READ_AHEAD = Any()
     }
 }

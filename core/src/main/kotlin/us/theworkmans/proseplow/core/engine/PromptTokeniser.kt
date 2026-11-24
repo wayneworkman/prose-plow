@@ -151,6 +151,16 @@ internal class PromptTokeniser(private val native: NativeLlama) {
     }
 
     /**
+     * The token position of the prompt's message boundary number [index] (in the order of
+     * [Prompt.boundaries]), or null when there is no such boundary or the tokenizer puts no token
+     * boundary there; checked as [boundaryPositions] checks every boundary.
+     */
+    fun boundaryPosition(tokenised: TokenisedPrompt, index: Int): Int? {
+        val boundary = tokenised.prompt.boundaries.getOrNull(index) ?: return null
+        return positionOf(tokenised, boundary)
+    }
+
+    /**
      * The token position at which the content of the open assistant message begins
      * ([Prompt.replyContentStart]), or null when the prompt has no such marker or the tokenizer
      * does not put a token boundary there. The check is the one [boundaryPositions] makes: a

@@ -34,10 +34,12 @@ import us.theworkmans.proseplow.core.engine.EngineError
 import us.theworkmans.proseplow.core.engine.EngineState
 import us.theworkmans.proseplow.core.engine.FinishReason
 import us.theworkmans.proseplow.core.engine.GenerationEvent
+import us.theworkmans.proseplow.core.engine.GenerationRequest
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.MemoryRestoreResult
 import us.theworkmans.proseplow.core.engine.MemoryRestoreState
 import us.theworkmans.proseplow.core.engine.MemoryVault
+import us.theworkmans.proseplow.core.engine.ReadAheadResult
 import us.theworkmans.proseplow.core.model.ModelCatalog
 import us.theworkmans.proseplow.core.model.ModelSpec
 import us.theworkmans.proseplow.core.model.SamplingParams
@@ -193,6 +195,20 @@ enum class ChatNotice {
  *   the unlock for the chat on screen once its model is loaded, and before the first request of
  *   any other chat. A request is built only after that call has returned. Every request carries
  *   its chat's [conversationKeyOf].
+ * - **The next message finds the conversation read.** After an answer the engine reads the
+ *   conversation ahead as the next message will render it ([InferenceEngine.readAhead]), for
+ *   the chat whose answer it was: at once when the answer ended by itself (the model ended
+ *   its turn, or a stop string), and for an answer that can be continued (cut off at its
+ *   length limit, or stopped) only once the user starts typing a new message in that chat (its
+ *   draft stops being blank, or already was not when the answer ended), so that "Continue"
+ *   stays quick if that is what they choose. Typing starts it for an answer that ended by
+ *   itself too, when nothing read ahead for it yet (it ended out of sight). Only while
+ *   [mayReadAhead] allows (the app is in sight and unlocked), never because a chat was
+ *   opened or the app came back, and never while a reply is being written. Everything goes
+ *   before it: a reply of any kind, a prune or deletion that makes the engine forget, a model
+ *   load, a change of system prompt and the lock stop it without waiting for it, and the
+ *   engine itself stops it within a chunk for a request or a save. Nothing on screen
+ *   changes for it.
  * - **No memory is saved of text that is gone.** This class is the session's
  *   [MemoryConversations]: it tells the store what a conversation is now, and answers "no such
  *   conversation" for a chat whose stored messages were removed or changed (an edit, an answer
@@ -232,6 +248,8 @@ enum class ChatNotice {
  * @param deleteSavedMemory deletes whatever saved memory there is, of whichever chat, without
  *   the key; blocking, run by the writer. For a change of a system prompt
  *   ([systemPromptChanged]).
+ * @param mayReadAhead asked on the main dispatcher before a read-ahead is started: false while
+ *   the app is out of sight, and behind the lock.
  */
 class ChatController(
     private val store: SessionStore,
@@ -251,6 +269,7 @@ class ChatController(
     private val onTurnEnded: () -> Unit = {},
     private val onMemoryRestored: () -> Unit = {},
     private val deleteSavedMemory: () -> Unit = {},
+    private val mayReadAhead: () -> Boolean = { true },
 ) : MemoryConversations {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
@@ -271,6 +290,14 @@ class ChatController(
     private class Loading(val modelId: String, val job: Job)
 
     private var running: Running? = null
+
+    /** The read-ahead under way for the chat [sessionId]. An object of its own so that its job can tell whether it is still the current one. */
+    private class ReadingAhead(val sessionId: String) {
+        lateinit var job: Job
+    }
+
+    /** The read-ahead under way, if any. Main thread only. */
+    private var readingAhead: ReadingAhead? = null
 
     /**
      * The chat whose conversation the engine was last given, or read back from a saved memory,
@@ -297,7 +324,12 @@ class ChatController(
 
     private val builtRequests = AtomicLong(0)
 
-    /** How many requests have been handed to the engine since the session opened; from any thread. */
+    /**
+     * How many requests have been handed to the engine since the session opened, together with
+     * the read-aheads that changed its memory or may have (one whose caller was stopped is
+     * counted); from any thread. A memory known to be on disk as it is in the engine stops
+     * being known so when this moves on.
+     */
     val requestsBuilt: Long get() = builtRequests.get()
 
     /**
@@ -447,6 +479,7 @@ class ChatController(
             running = null
             reply.job.cancel()
         }
+        if (readingAhead?.sessionId == id) stopReadingAhead()
         val removed = sessions.remove(id)
         incomplete.remove(id)
         // The store deletes the chat's saved memory first.
@@ -507,10 +540,17 @@ class ChatController(
         }
     }
 
-    /** Keeps what is typed but not sent in the chat [sessionId]. It is stored, encrypted, like the rest. */
+    /**
+     * Keeps what is typed but not sent in the chat [sessionId]. It is stored, encrypted, like the
+     * rest. When the draft stops being blank the user has started a new message, which starts
+     * the read-ahead of the answer before it ([readAheadAfterAnswer]); later keystrokes do not.
+     */
     fun setDraft(sessionId: String, text: String) {
         val session = usable(sessionId) ?: return
-        if (session.draft != text) commit(session.withDraft(text), urgent = false)
+        if (session.draft == text) return
+        val started = isBlankMessage(session.draft) && !isBlankMessage(text)
+        commit(session.withDraft(text), urgent = false)
+        if (started) readAheadAfterAnswer(sessionId, typing = true)
     }
 
     // --- Turns ---------------------------------------------------------------------------------
@@ -603,6 +643,7 @@ class ChatController(
      */
     fun finishOnly() {
         finishingOnly = true
+        stopReadingAhead()
     }
 
     /** The user has unlocked again and is back in this very session: replies can be asked for as before. */
@@ -625,8 +666,10 @@ class ChatController(
             loading?.job?.cancel()
             // A restore stops at its next piece; the saved memory it was reading stays on disk.
             restoreJob?.cancel()
+            val reading = readingAhead?.job
+            stopReadingAhead()
             endRunning()
-            withTimeoutOrNull(ENGINE_TIMEOUT_MILLIS) { listOfNotNull(lastTurn, loading?.job, opening).joinAll() }
+            withTimeoutOrNull(ENGINE_TIMEOUT_MILLIS) { listOfNotNull(lastTurn, loading?.job, opening, reading).joinAll() }
             scope.cancel()
             writer.flush()
         }
@@ -837,6 +880,7 @@ class ChatController(
         // At once, before any request can be built without the removed messages: no save of
         // what the engine holds now, and no restore, until its memory has been emptied.
         engine.markNotToBeSaved()
+        stopReadingAhead()
         engineHolds = null
         mayHold.clear()
         val previous = lastTurn
@@ -866,6 +910,8 @@ class ChatController(
         if (current is EngineState.Ready && current.modelId == spec.id) return
         val previous = loading
         if (previous != null && previous.modelId == spec.id && previous.job.isActive) return
+        // A load ends a read-ahead in the engine anyway; it is not left to find that out.
+        stopReadingAhead()
         val job = scope.launch(start = CoroutineStart.LAZY) {
             previous?.job?.cancelAndJoin()
             engine.load(spec)
@@ -902,6 +948,8 @@ class ChatController(
     private fun begin(prepared: ChatSession?): Boolean {
         if (prepared == null || finishingOnly) return false
         val assistantId = prepared.streamingMessageId ?: return false
+        // Whatever reply this is, in whichever chat, it goes before a read-ahead.
+        stopReadingAhead()
         val interrupted = endRunning()
         if (interrupted != null && interrupted.sessionId != prepared.id) _notices.trySend(ChatNotice.OTHER_REPLY_STOPPED)
         commit(prepared, urgent = true)
@@ -952,8 +1000,7 @@ class ChatController(
             restoreJob?.join()
             if (engineHolds != reply.sessionId) restoreMemory(reply.sessionId, spec)
             // Read again: the draft may have changed while the model was loading.
-            val settings = requestSettings(spec)
-            val request = (sessions[reply.sessionId] ?: return).generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens).copy(conversationKey = conversationKeyOf(reply.sessionId))
+            val request = requestOf(sessions[reply.sessionId] ?: return, spec)
             val builtAfter = changes.get()
             val carried = RequestText(request.systemPrompt, request.extraSystemText)
             builtRequests.incrementAndGet()
@@ -993,8 +1040,80 @@ class ChatController(
                 val limit = lifetime()
                 if (limit.limitMillis != null) expireLoaded(reply.sessionId, limit, clock.nowMillis())
             }
-            if (running == null && !closed) onTurnEnded()
+            if (running == null && !closed) {
+                onTurnEnded()
+                readAheadAfterAnswer(reply.sessionId, typing = false, answerId = reply.assistantId)
+            }
         }
+    }
+
+    /**
+     * The request of [session] as it stands now, to [spec], with that model's settings as they
+     * are at this moment and the chat's conversation key: what every reply is asked for with,
+     * and so what a read-ahead prepares the next one for.
+     */
+    private fun requestOf(session: ChatSession, spec: ModelSpec): GenerationRequest {
+        val settings = requestSettings(spec)
+        return session.generationRequest(spec, settings.systemPrompt, settings.sampling, settings.maxNewTokens, settings.maxContextTokens).copy(conversationKey = conversationKeyOf(session.id))
+    }
+
+    // --- Internals: reading ahead ----------------------------------------------------------------
+
+    /**
+     * Main thread: starts the read-ahead of the chat [sessionId] when the class comment's rule
+     * says so. [typing] says that the user has just started a new message; otherwise the answer
+     * [answerId] has just ended. Nothing is started while a reply is being written anywhere, for
+     * a chat whose last message is not an answer with text, for a chat the engine is not known
+     * to hold (or holds in a form the store may not save, after a change), or while one is under
+     * way for this chat already.
+     */
+    private fun readAheadAfterAnswer(sessionId: String, typing: Boolean, answerId: String? = null) {
+        if (closed || finishingOnly || running != null || !mayReadAhead()) return
+        if (engineHolds != sessionId || staleSince.containsKey(sessionId)) return
+        if (readingAhead?.let { it.sessionId == sessionId && it.job.isActive } == true) return
+        val session = sessions[sessionId] ?: return
+        val last = session.messages.lastOrNull() ?: return
+        if (session.isGenerating || last.role != Role.ASSISTANT || PromptWhitespace.isBlank(last.text)) return
+        if (answerId != null && last.id != answerId) return
+        val endedByItself = last.status == MessageStatus.COMPLETE && last.finishReason in ENDED_BY_ITSELF
+        val wanted = when {
+            typing -> endedByItself || canContinue(session)
+            // An answer that can be continued waits for a new message, unless one is already being typed.
+            else -> endedByItself || (canContinue(session) && !isBlankMessage(session.draft))
+        }
+        if (!wanted) return
+        val spec = models.firstOrNull { it.id == (last.modelId ?: session.modelId) } ?: return
+        val request = requestOf(session, spec)
+        stopReadingAhead()
+        val reading = ReadingAhead(sessionId)
+        reading.job = scope.launch(start = CoroutineStart.LAZY) {
+            var result: ReadAheadResult? = null
+            try {
+                result = engine.readAhead(request)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: RuntimeException) {
+                // The engine promises not to throw; the next message reads what it must.
+            } finally {
+                // A memory the keeper knew to be on disk is no longer known to be: the read-ahead
+                // went back below it, or read further, or may have before it was stopped.
+                if (result == null || result is ReadAheadResult.Read || result is ReadAheadResult.Stopped) builtRequests.incrementAndGet()
+                if (readingAhead === reading) readingAhead = null
+            }
+        }
+        readingAhead = reading
+        reading.job.start()
+    }
+
+    /**
+     * Main thread: stops the read-ahead under way, if any, without waiting for it: the engine
+     * lets go of it within a chunk, and anything that needs the engine waits for that there. Also
+     * called by the session when the app leaves the screen.
+     */
+    fun stopReadingAhead() {
+        val reading = readingAhead ?: return
+        readingAhead = null
+        reading.job.cancel()
     }
 
     // --- Internals: the model's saved memory -----------------------------------------------------
@@ -1063,6 +1182,8 @@ class ChatController(
      */
     fun systemPromptChanged(modelId: String) {
         if (closed) return
+        // What it would read was made with the prompt that is gone.
+        stopReadingAhead()
         val loaded = (engine.state.value as? EngineState.Ready)?.modelId
         if (loaded == null || loaded == modelId) {
             val held = mayHold + listOfNotNull(engineHolds, restoring)
@@ -1183,6 +1304,9 @@ class ChatController(
 
         /** How often expired messages are looked for while a session lives: hourly. */
         const val EXPIRY_INTERVAL_MILLIS: Long = 60 * 60 * 1000L
+
+        /** How an answer ends by itself: the model ended its turn, or wrote a stop string. */
+        private val ENDED_BY_ITSELF = setOf(FinishReason.END_OF_TURN, FinishReason.STOP_STRING)
 
         /** How long [shutdown] waits for the engine to let go of a generation or a load. */
         const val ENGINE_TIMEOUT_MILLIS: Long = 10_000L

@@ -66,6 +66,64 @@ data class GenerationRequest(
 )
 
 /**
+ * What a read-ahead ([InferenceEngine.readAhead]) did.
+ *
+ * [Read] and [Stopped] are the outcomes that changed the model's memory; [Skipped] left it
+ * exactly as it was, and so did a read-ahead whose caller was cancelled before it changed
+ * anything (that caller gets no result at all).
+ */
+sealed interface ReadAheadResult {
+
+    /**
+     * The conversation is in memory up to the start of the next message: [keptTokens] of the
+     * memory were kept, and [readTokens] were read after them.
+     */
+    data class Read(val keptTokens: Int, val readTokens: Int) : ReadAheadResult
+
+    /**
+     * Something that goes first stopped the read-ahead on the way, after it had kept
+     * [keptTokens] of the memory and read [readTokens] after them. What it read stays: the
+     * memory is a true state of that many tokens, the beginning of the next request's prompt.
+     */
+    data class Stopped(val keptTokens: Int, val readTokens: Int) : ReadAheadResult
+
+    /** Nothing was done, for [reason]; the memory is as it was. */
+    data class Skipped(val reason: Reason) : ReadAheadResult {
+        enum class Reason {
+            /** No model is loaded, or another model than the request's. */
+            NOT_LOADED,
+
+            /** The model continues text: its next request is the user's text alone, with nothing to prepare. */
+            NOT_A_CHAT,
+
+            /** The request continues its last message, or cannot be rendered. */
+            INVALID,
+
+            /** The memory is empty or holds another conversation than the request's. */
+            OTHER_CONVERSATION,
+
+            /** The next request would keep the whole memory: there is nothing it would read again. */
+            NOTHING_TO_READ,
+
+            /** The tokenizer puts no token boundary where the next message begins, so there is no place to read up to. */
+            NO_BOUNDARY,
+
+            /** The model cannot go back far enough without clearing its memory. */
+            WOULD_CLEAR,
+
+            /** The conversation and its reply would not fit the context as it is: the next request would grow it or leave turns out. */
+            NO_ROOM,
+
+            /** Something that goes first wanted the engine before the read-ahead had changed anything. */
+            BUSY,
+
+            /** The native side failed; the memory was cleared, as for a failed request. */
+            FAILED,
+        }
+    }
+}
+
+/**
  * The inference engine as the rest of the app sees it. Everything above this interface is
  * independent of llama.cpp and can be tested against a fake.
  *
@@ -103,6 +161,35 @@ interface InferenceEngine {
     fun generate(request: GenerationRequest): Flow<GenerationEvent>
 
     /**
+     * Reads the conversation of [request] into the model's memory as the next new message will
+     * find it, so that that message reads only itself: the work the next request would do
+     * anyway, done earlier, while the person reads the answer. Some prompt formats write the
+     * answer being written differently from the same answer once it is history (Qwen3.5 opens
+     * the turn with an empty think block and leaves it out of earlier turns), so the memory
+     * after an answer and the next request part ways before the answer, and the whole answer
+     * is read again.
+     *
+     * [request] is the conversation as a request for the next message would carry it, ending
+     * with the answer; [GenerationRequest.continueFinalMessage] must be false. The engine adds an
+     * empty user message in place of the next one, renders and tokenises that, keeps of the
+     * memory what a request would keep (the longest common beginning, or the checkpoint before
+     * it on a model that cannot cut its memory back), reads up to the start of the placeholder,
+     * and keeps a checkpoint there. It samples nothing and emits nothing.
+     *
+     * It does nothing ([ReadAheadResult.Skipped]) when the next request would keep the whole
+     * memory anyway, and never clears the memory, grows the context or leaves turns out for it.
+     * It gives way: a request, [forget], [forgetKeepingSavedMemory], a [load], an [unload], a
+     * [saveMemory], a [restoreMemory], a closed [GenerationGate] and cancelling the caller each
+     * stop it within one chunk of the prompt, and one that is asked for before it has begun
+     * makes it do nothing. What it read by then stays.
+     *
+     * The checkpoint at its end is one of those that follow a reply, so it displaces none of a
+     * prompt's; the next request takes it over as the checkpoint of the boundary it stands at.
+     * The end-of-reply state is not kept: "Continue" after a read-ahead reads the answer again.
+     */
+    suspend fun readAhead(request: GenerationRequest): ReadAheadResult
+
+    /**
      * Drops everything the engine and the native layer remember of any conversation, and returns
      * when that is done. The model stays loaded. A generation in flight ends with
      * [FinishReason.CANCELLED].
@@ -131,7 +218,8 @@ interface InferenceEngine {
      * Saves what the model's memory holds now into [vault], as the memory of the conversation
      * [conversationKey], and returns at once with a reason when it should not:
      * - no model is loaded, or (for [SaveTrigger.LEFT_SCREEN]) the engine is busy with a reply,
-     *   a load or anything else; for [SaveTrigger.LOCK] the save waits its turn instead;
+     *   a load or anything else but a [readAhead]; for [SaveTrigger.LOCK] the save waits its
+     *   turn instead;
      * - the memory is empty, or is not that conversation's (the latest request named another);
      * - the memory was marked with [markNotToBeSaved] and has not been rebuilt from nothing;
      * - reading it again would take less than the engine's least worth saving (about 20 seconds
@@ -143,6 +231,10 @@ interface InferenceEngine {
      * whatever the outcome it is as it was. A request that arrives while a save runs stops the
      * save at its next piece and then runs; so do [forget], [unload], a [load] and cancelling the
      * caller. The image becomes the vault's only when every piece was written.
+     *
+     * A [readAhead] goes second to a save of either trigger: it stops within one chunk, and a
+     * save on leaving the screen waits for that instead of answering that the engine is busy.
+     * What the read-ahead had read by then is saved.
      */
     suspend fun saveMemory(vault: MemoryVault, conversationKey: String, trigger: SaveTrigger): MemorySaveResult
 
