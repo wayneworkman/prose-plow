@@ -55,7 +55,7 @@ class RuntimeDeviceTest {
     /**
      * The library finds the assets of its APK and nothing else, in every build type: a file
      * placed for the tests is found by the tests' own locator only. Meaningful on a phone where
-     * such a file was placed (Qwen3.5 or Shard-2, see native/README.md, "On the phone"); it
+     * such a file was placed (Qwen3.5, say; see native/README.md, "On the phone"); it
      * reports which models it could check.
      */
     @Test

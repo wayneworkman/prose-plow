@@ -1881,6 +1881,26 @@
       "in_apk": "assets/models/boris-2-instruct.gguf.so, 291,853,184 bytes, when the build bundles it"
     },
     {
+      "id": "model:shard-2",
+      "kind": "model",
+      "name": "Shard-2",
+      "model_id": "shard-2",
+      "repository": "Glint-Research/Shard-2",
+      "revision": "46b9eb99c475694a1129ad8f3a9825d244a8ec79",
+      "version": "revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 of https://huggingface.co/Glint-Research/Shard-2",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Glint-Research, the publisher of the model's repository"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "The metadata of the model card (README.md) at the pinned revision states license: mit, and that is the only statement of a licence in the repository: it has no LICENSE file, no NOTICE file and no copyright line in any file (7 files listed at the pinned revision: .gitattributes, README.md, Shard-2.pt, config.json, infer.py, requirements.txt, tokenizer.json). The project takes the card's declaration as the model's licence and attributes the model to the publisher of the repository; no copyright line is made up for it.",
+      "attribution": "Published by Glint-Research under the MIT License, as the metadata of its model card declares (license: mit) at revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79; the repository has no licence file and gives no copyright line.",
+      "changes": "The file in the app is a conversion made by the Prose Plow project: the weights were written as a GGUF file with the 81 matrices cast from 32-bit to 16-bit floats and the norm weights kept as 32-bit floats, no tensor was otherwise transformed, one tensor that the model never reads (indexer.gate) was left out, which layers are local and which global was stored as metadata, and the tokenizer was embedded in the file with the model's deletion token added at id 4096. SHA-256 of the result: c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f.",
+      "in_apk": "assets/models/shard-2.gguf.so, 99,048,160 bytes, when the build bundles it"
+    },
+    {
       "id": "asset:material-icons",
       "kind": "artwork",
       "name": "Material Design icons",
@@ -1912,6 +1932,24 @@
       "notice": null,
       "source": "The model card says that the project and all associated files are under the Apache License 2.0, Copyright 2026 OpenCerebral; the Python files themselves have no licence header. No NOTICE file in the repository.",
       "changes": "A new implementation in C++ for llama.cpp's graph interface, with a memory for incremental decoding that the reference does not have. No line of the Python code is copied.",
+      "in_apk": "compiled into libllama.so",
+      "precaution": true
+    },
+    {
+      "id": "port:shard2",
+      "kind": "port",
+      "name": "Reference implementation of Shard-2 (the architecture in infer.py), which the shard2 architecture of this app was written against",
+      "version": "revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 of https://huggingface.co/Glint-Research/Shard-2",
+      "licence": "MIT",
+      "licence_text": "licences/MIT.txt",
+      "holders": [
+        "Glint-Research, the publisher of the model's repository"
+      ],
+      "copyright_lines": [],
+      "notice": null,
+      "source": "infer.py has no licence header; the repository declares license: mit in the metadata of its model card only, and has no licence file, no NOTICE file and no copyright line.",
+      "attribution": "Published by Glint-Research with the model, under the MIT License that its model card declares; no copyright line is given.",
+      "changes": "A new implementation in C++ for llama.cpp's graph interface, made of llama.cpp's own building blocks, with a memory for incremental decoding that the reference does not have. No line of the Python code is copied into the app.",
       "in_apk": "compiled into libllama.so",
       "precaution": true
     }

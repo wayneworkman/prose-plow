@@ -39,7 +39,7 @@ class ReplyLengthTest {
             ModelCatalog.BORIS_2_INSTRUCT to Triple(512, 1024, 1024),
             ModelCatalog.SHARD_2 to Triple(200, 2048, 2048),
         )
-        val known = ModelCatalog.bundled + ModelCatalog.SHARD_2
+        val known = ModelCatalog.all
         assertEquals("every model is looked at", known.toSet(), expected.keys)
         val phone = DeviceContextLimits(totalBytes = 5_500_000_000L)
         for ((model, numbers) in expected) {

@@ -95,7 +95,7 @@ counts them must be in the last table. A sentence that only names one patch (suc
 | git, GNU patch, bash, tar, `systemd-run` | The system (on Ubuntu, `patch` is its own package) | Everything |
 | Network access | | Section 3 (one fetch) |
 | The Python virtualenv with `native/requirements.txt` installed (CMake, Ninja, PyTorch and the converters' packages) | `native/README.md`, "What you need", which creates it with `python3 -m venv` and `pip install -r native/requirements.txt` (the root `README.md` repeats this under "Locations and environment") | Step 2.5 and section 6 (host build, conversions, host tests) |
-| All five model checkpoints, including the optional `peacebell-v1-148m` and `shard-2` | The root `README.md`, "Get the model checkpoints", which downloads each one at the revision `models/manifest.json` pins | Step 2.5 and sections 6.3, 6.4 and 6.6. Without a checkpoint its tests are skipped, and a skipped test proves nothing. Shard-2 matters because its hooks are part of patch 0001 |
+| All five model checkpoints, including the optional `peacebell-v1-148m` | The root `README.md`, "Get the model checkpoints", which downloads each one at the revision `models/manifest.json` pins | Step 2.5 and sections 6.3, 6.4 and 6.6. Without a checkpoint its tests are skipped, and a skipped test proves nothing. Shard-2 matters because its hooks are part of patch 0001 |
 | The JDK and Android SDK packages | The root `README.md`, "Building on Ubuntu 24.04" | Sections 6.5 and 6.6 |
 | An arm64 Android phone with USB debugging enabled, and `adb` | `native/README.md`, "On the phone" | Section 6.6 |
 | About 30 GB of free disk | The root `README.md`, "Disk space and time" | Section 6 |
@@ -935,15 +935,12 @@ tests"):
 capped ./gradlew --no-daemon :llama:assembleDebugAndroidTest -Pproseplow.models=all -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"
 adb install -r llama/build/outputs/apk/androidTest/debug/llama-debug-androidTest.apk
 PACKAGE=us.theworkmans.proseplow.llama.test
-adb shell "run-as $PACKAGE sh -c 'umask 077 && mkdir -p files/models'"
-adb exec-in "run-as $PACKAGE sh -c 'umask 077 && cat > files/models/shard-2.gguf'" < "$PROSEPLOW_MODEL_OUT/shard-2/shard-2-f16.gguf"
 adb shell am instrument -r -w $PACKAGE/androidx.test.runner.AndroidJUnitRunner > "$PIN_WORK/phone-run.txt"
 grep -E 'PROSEPLOW|OK \(|FAILURES' "$PIN_WORK/phone-run.txt"
 adb uninstall $PACKAGE
 ```
 
-The `run-as` lines place Shard-2, which no APK carries, as described under "A model without
-rebuilding the test APK". The run must contain `OK (` with the number of tests, and no
+The test APK carries all four bundled models, Shard-2 among them. The run must contain `OK (` with the number of tests, and no
 `FAILURES!!!`. Then compare the `PROSEPLOW` lines with the table in `native/README.md` ("What was
 measured"). That table was measured on one particular phone. On another phone, run these same
 commands once at the old pin first (before section 3, or after section 8), and compare with

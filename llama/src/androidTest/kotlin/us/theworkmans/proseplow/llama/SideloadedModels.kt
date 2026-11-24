@@ -7,9 +7,9 @@ import java.io.File
 /**
  * For the device tests only: a model file placed in the test package's private storage, for a
  * model that is too large to be built into the test APK and installed again for every change to
- * the code (Qwen3.5), or that no build packages (Shard-2). This lives in the test sources, so no
- * build of the library or of the app contains it; the library's own [ModelFiles.locate] finds
- * the APK's assets and nothing else.
+ * the code (Qwen3.5), or any other model a test APK was built without. This lives in the test
+ * sources, so no build of the library or of the app contains it; the library's own
+ * [ModelFiles.locate] finds the APK's assets and nothing else.
  *
  * The file is `files/models/<ggufFileName>` under the test package's data directory, written
  * through `run-as` (the commands are in `native/README.md`, "On the phone"). Nothing verifies it

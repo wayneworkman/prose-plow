@@ -150,7 +150,7 @@ internal object NativeRuntime {
  * @param locate where a model's file is. The app always has [ModelFiles.locate], the APK's own
  *   assets ([NativeEngine.factory] passes nothing else, and the class is internal to this
  *   module). Only this module's device tests pass another, which also finds files they placed in
- *   the test package's private storage, for models too large for the test APK or not bundled.
+ *   the test package's private storage, for models too large for the test APK or left out of it.
  */
 internal class LlamaFactory(
     private val context: Context,

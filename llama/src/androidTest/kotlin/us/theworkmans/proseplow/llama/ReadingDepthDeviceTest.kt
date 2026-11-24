@@ -159,8 +159,11 @@ class ReadingDepthDeviceTest {
     private fun mib(bytes: Long): Long = bytes / (1L shl 20)
 
     private companion object {
-        /** Every bundled model: the two whose context can grow, and the one that is read to its own limit. */
-        val DEPTH_MODELS: List<ModelSpec> = listOf(ModelCatalog.QWEN35_0_8B, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.BORIS_2_INSTRUCT)
+        /**
+         * Every bundled model: the two whose context can grow, and the two that are read to their
+         * own limit. Shard-2's times are not in the catalogue yet; this is how they are measured.
+         */
+        val DEPTH_MODELS: List<ModelSpec> = listOf(ModelCatalog.QWEN35_0_8B, ModelCatalog.PEACEBELL_V1_291M, ModelCatalog.BORIS_2_INSTRUCT, ModelCatalog.SHARD_2)
 
         const val DEFAULT_FRACTION: Double = 0.4
 

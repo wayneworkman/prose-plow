@@ -22,11 +22,14 @@ LOCAL layers only; local layers see a window of 256 keys ((query - key) < 256), 
 (every sixth counting back from the last) see everything and carry no position at all; SwiGLU
 with a fused gate|up projection; a final norm and a readout tied to the embedding.
 
-The copied code is under the licence of the model repository:
+The copied code is under the licence that the model repository declares: `license: mit` in the
+metadata of the model card (README.md) of Glint-Research/Shard-2 at revision
+46b9eb99c475694a1129ad8f3a9825d244a8ec79, which models/manifest.json pins. The repository has
+no licence file, infer.py has no licence header, and no copyright line is given anywhere in it,
+so none is written here. The code is Glint-Research's, as the publisher of the repository, and
+the MIT permission notice is:
 
     MIT License
-
-    Copyright (c) the authors of Shard-2 (Glint-Research)
 
     Permission is hereby granted, free of charge, to any person obtaining a copy of this
     software and associated documentation files (the "Software"), to deal in the Software

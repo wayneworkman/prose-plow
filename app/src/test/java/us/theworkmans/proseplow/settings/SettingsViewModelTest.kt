@@ -95,9 +95,7 @@ class SettingsViewModelTest {
 
     @Test
     fun aModelThatContinuesTextHasNoSystemPromptAndShowsItsOwnTemperature() = runTest {
-        // Shard-2 is known to the catalogue and not shipped, so the build that carries it is
-        // spelled out here.
-        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled + ModelCatalog.SHARD_2 }
+        val app = SessionFixture(temp.root, testScheduler)
         val session = app.open()
         val viewModel = SettingsViewModel(session.settings, session.models, decimalSeparator = { '.' })
         val shard = ModelCatalog.SHARD_2
@@ -213,7 +211,6 @@ class SettingsViewModelTest {
     fun theSizesToChooseFromAreThoseThisPhoneAllowsEachWithWhatItCosts() = runTest {
         val app = SessionFixture(temp.root, testScheduler).apply {
             contextLimits = testPhone
-            models = ModelCatalog.bundled + ModelCatalog.SHARD_2
         }
         val session = app.open()
         val viewModel = viewModelOver(session)
@@ -382,7 +379,7 @@ class SettingsViewModelTest {
 
     @Test
     fun theRowOfAModelSaysTheValuesItsNextAnswerWouldHave() = runTest {
-        val app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled + ModelCatalog.SHARD_2 }
+        val app = SessionFixture(temp.root, testScheduler)
         val session = app.open()
         val list = viewModelOver(session) // The Settings page.
         val page = viewModelOver(session) // A model's page, with a ViewModel of its own over the same store.

@@ -32,12 +32,12 @@ class ModelCatalogManifestTest {
 
     @Test
     fun everyModelOfTheCatalogueIsInTheManifest() {
-        for (model in ModelCatalog.bundled + ModelCatalog.SHARD_2) assertTrue(model.id, model.id in entries)
+        for (model in ModelCatalog.all) assertTrue(model.id, model.id in entries)
     }
 
     @Test
     fun theCataloguesContextNumbersAreTheManifests() {
-        for (model in ModelCatalog.bundled + ModelCatalog.SHARD_2) {
+        for (model in ModelCatalog.all) {
             val entry = entries.getValue(model.id)
             val trained = checkNotNull(entry.number(TRAINED_CONTEXT)) { "${model.id} has no whole number as $TRAINED_CONTEXT" }
             val bytesPerToken = checkNotNull(entry.number(BYTES_PER_TOKEN)) { "${model.id} has no whole number as $BYTES_PER_TOKEN" }

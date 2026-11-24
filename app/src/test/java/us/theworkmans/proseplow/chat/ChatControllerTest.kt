@@ -542,9 +542,7 @@ class ChatControllerTest {
 
     @Test
     fun aModelThatContinuesTextIsGivenWhatWasTypedExactlyAndItsReplyIsKeptExactly() = runTest {
-        // Shard-2 is known to the catalogue and not shipped, so the build that carries it is
-        // spelled out here.
-        app = SessionFixture(temp.root, testScheduler).apply { models = ModelCatalog.bundled + ModelCatalog.SHARD_2 }
+        app = SessionFixture(temp.root, testScheduler)
         val session = unlocked()
         val id = session.id
         val shard = ModelCatalog.SHARD_2.id

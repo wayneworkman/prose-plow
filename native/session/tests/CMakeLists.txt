@@ -34,7 +34,7 @@ target_include_directories(test_penalties PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/.
 target_link_libraries(test_penalties PRIVATE proseplow_session)
 target_compile_options(test_penalties PRIVATE -Wall -Wextra -Wpedantic)
 
-# One penalties entry per bundled model, and one for Shard-2: the kinds of memory go back in
+# One penalties entry per bundled model: the kinds of memory go back in
 # different ways, and what the penalties cover has to survive each of them.
 function(proseplow_add_penalties_test model)
     add_test(NAME ${model}.penalties
@@ -169,7 +169,7 @@ endfunction()
 proseplow_add_session_test(peacebell-v1-291m)
 proseplow_add_session_test(boris-2-instruct)
 proseplow_add_session_test(qwen3.5-0.8b)
-# Shard-2, as the file that would ship: attention only like peacebell, but with windowed layers,
+# Shard-2, the fourth bundled model: attention only like peacebell, but with windowed layers,
 # whose checkpoint is that window and whose memory, once a checkpoint was restored, can only be
 # cut back as far as the restored window reaches.
 proseplow_add_session_test(shard-2)

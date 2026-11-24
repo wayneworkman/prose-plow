@@ -56,19 +56,19 @@ class ModelCatalogTest {
 
     @Test
     fun `what is offered is what is bundled, and a model can be known without being bundled`() {
-        // A model is bundled unless it says otherwise, and `bundled` alone decides whether the
-        // catalogue offers it. Shown on a copy of a model that ships, and on Shard-2, which is
-        // known and not shipped.
+        // Every catalogue model ships today, so the rule is shown on a copy of one that does
+        // not: a model is bundled unless it says otherwise, and `bundled` alone decides whether
+        // the catalogue offers it.
         val notShipped = ModelCatalog.BORIS_2_INSTRUCT.copy(id = "known-but-not-shipped", ggufFileName = "known-but-not-shipped.gguf", bundled = false)
         assertTrue(ModelCatalog.BORIS_2_INSTRUCT.bundled)
         assertFalse(notShipped.bundled)
         assertEquals(ModelCatalog.all.filter { it.bundled }, ModelCatalog.bundled)
         assertEquals(ModelCatalog.bundled, (ModelCatalog.all + notShipped).filter { it.bundled })
         assertEquals(
-            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct"),
+            listOf("qwen3.5-0.8b", "peacebell-v1-291m", "boris-2-instruct", "shard-2"),
             ModelCatalog.bundled.map { it.id },
         )
-        assertEquals(listOf("shard-2"), ModelCatalog.all.filterNot { it.bundled }.map { it.id })
+        assertEquals(emptyList<String>(), ModelCatalog.all.filterNot { it.bundled }.map { it.id })
     }
 
     @Test
@@ -137,7 +137,7 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun `Shard-2 continues text with its reference sampling and a deletion token, and is known but not offered`() {
+    fun `Shard-2 continues text with its reference sampling and a deletion token, and is offered`() {
         val model = ModelCatalog.SHARD_2
         assertEquals("shard-2", model.id)
         assertEquals("Shard-2", model.displayName)
@@ -157,9 +157,9 @@ class ModelCatalogTest {
         assertFalse(model.supportsSystemPrompt)
         assertEquals("Glint-Research/Shard-2", model.sourceRepository)
         assertEquals("MIT", model.licence)
-        // Not shipped until the model's repository carries a licence; see the catalogue.
-        assertFalse(model.bundled)
-        assertFalse(model in ModelCatalog.bundled)
+        // Bundled since the licence its model card declares was accepted (FEATURES.md, DEC-57).
+        assertTrue(model.bundled)
+        assertTrue(model in ModelCatalog.bundled)
         assertSame(model, ModelCatalog.find("shard-2"))
     }
 
@@ -205,11 +205,12 @@ class ModelCatalogTest {
     /** Only a bundled model whose file is present is offered: a model that is not bundled never is, whatever file is there. */
     @Test
     fun theAppOffersOnlyBundledModelsWhoseFilesArePresent() {
-        assertFalse(ModelCatalog.SHARD_2.bundled)
         assertEquals("every file there", ModelCatalog.bundled, ModelCatalog.offered { true })
-        assertFalse("a sideloaded Shard-2 is not offered", ModelCatalog.SHARD_2 in ModelCatalog.offered { true })
         assertEquals(emptyList<ModelSpec>(), ModelCatalog.offered { false })
-        assertEquals(emptyList<ModelSpec>(), ModelCatalog.offered { it == ModelCatalog.SHARD_2 })
+        assertEquals(listOf(ModelCatalog.SHARD_2), ModelCatalog.offered { it == ModelCatalog.SHARD_2 })
+        // A model that is not bundled is never offered, whatever file is there.
+        val notShipped = ModelCatalog.SHARD_2.copy(id = "known-but-not-shipped", ggufFileName = "known-but-not-shipped.gguf", bundled = false)
+        assertFalse(notShipped in ModelCatalog.offered { true })
         assertEquals(
             "in catalogue order",
             listOf(ModelCatalog.QWEN35_0_8B, ModelCatalog.BORIS_2_INSTRUCT),

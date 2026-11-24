@@ -59,7 +59,11 @@ Chats:
   the model's page on Hugging Face (`huggingface.co/<owner>/<name>`) and open it in the phone's
   own browser at a tap. The app has no browser of its own and loads nothing itself.
 - **A system prompt for each model**, on its page, for the models that were trained with one
-  (Qwen3.5 and Boris-2; Peacebell was trained without one and has none).
+  (Qwen3.5 and Boris-2; Peacebell was trained without one and has none, and so has Shard-2,
+  which is not a chat model).
+- **A model that continues text.** Shard-2 is given the latest message exactly as written and
+  writes on from it, taking back words as it goes (see [Shard-2: a model that continues
+  text](#shard-2-a-model-that-continues-text)). Its empty chat and its input field say so.
 - **A temperature for each model**, from 0 to 2. Left empty, a model uses its own reference
   value; 0 always picks the most likely word. It applies from the next answer and switches
   with the model.
@@ -202,27 +206,27 @@ its copyright lines, and the text of every licence.
 ## The models
 
 A model is part of the build: which of them an APK carries is decided when it is built, and the
-app offers exactly those. Three are bundled. A fourth, Shard-2, is supported and tested but not
-bundled; see [Supported, not bundled: Shard-2](#supported-not-bundled-shard-2).
+app offers exactly those. Four are bundled.
 
 | `id` | Name in the app | Source repository on Hugging Face | Licence | Parameters | File in the APK |
 | --- | --- | --- | --- | --- | --- |
 | `qwen3.5-0.8b` | Qwen3.5 0.8B | `Qwen/Qwen3.5-0.8B` | Apache-2.0 | 0.8 billion in the checkpoint; 752 million in the file, which is text only | 1,516,742,752 bytes |
 | `peacebell-v1-291m` | Peacebell v1 291M | `wayneworkman2012/peacebell-v1-291M` | Apache-2.0; the name Peacebell is reserved by the model card and is used here with its owner's permission | 291 million | 583,680,096 bytes |
 | `boris-2-instruct` | Boris-2-Instruct | `opencerebral/Boris-2-Instruct` | Apache-2.0 | 144 million | 291,853,184 bytes |
+| `shard-2` | Shard-2 | `Glint-Research/Shard-2` | MIT, as declared in the metadata of its model card; see [Shard-2's licence](#shard-2s-licence) | 49.4 million | 99,048,160 bytes |
 
-All three together are 2,392,276,032 bytes (2.39 GB). The exact revision of each repository and
+All four together are 2,491,324,192 bytes (2.49 GB). The exact revision of each repository and
 the SHA-256 of every file that is read from it are pinned in `models/manifest.json`, together
 with the SHA-256 the converted file must have.
 
-| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
-| --- | --- | --- | --- |
-| What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts |
-| Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project |
-| Context, tokens: at the start, and the most the model was trained with | 4,096; 262,144 | 4,096; 32,768 | 2,048; 2,048 |
-| Longest reply, tokens: the default, and the most it can be set to | 1,024; 4,096 | 1,024; 4,096 | 512; 1,024 |
-| Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 |
-| System prompt | yes | no | yes |
+| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct | Shard-2 |
+| --- | --- | --- | --- | --- |
+| What it is | A general assistant in many languages; the default for a new chat | Answers questions about the Second World War from memory; not a general assistant | A very small chat model: fluent, often wrong on facts | Not a chat model: it continues the text you write, and can take back words it has just written |
+| Architecture in llama.cpp | `qwen35`, as upstream has it | `peacebell`, ported by this project | `boris2`, ported by this project | `shard2`, ported by this project |
+| Context, tokens: at the start, and the most the model was trained with | 4,096; 262,144 | 4,096; 32,768 | 2,048; 2,048 | 4,096; 4,096 (its file would allow 8,192, which its card calls untested) |
+| Longest reply, tokens: the default, and the most it can be set to | 1,024; 4,096 | 1,024; 4,096 | 512; 1,024 | 200; 2,048 |
+| Sampling | temperature 1.0, top-k 20, presence penalty 2.0 | greedy | temperature 0.7, top-k 50, top-p 0.9, repetition penalty 1.1 | temperature 0.9, top-k 100 |
+| System prompt | yes | no | yes | no |
 
 The sampling values are each model's own reference settings, taken from its published files.
 The repetition penalty counts every token of the conversation; the presence penalty counts the
@@ -274,7 +278,9 @@ needs more.
   reading time from a curve measured on the tested phone with these chunks, kept in the model
   catalogue: Qwen3.5 read 2,048 tokens from nothing in 30 seconds, 4,096 in 64, 8,192 in 139
   and 15,872 in 314; Peacebell 2,048 in 16, 4,096 in 36, 8,192 in 89 and 15,872 in 242;
-  Boris-2 its first 1,536 in 5. The phone had been measuring for an hour by then and was warm
+  Boris-2 its first 1,536 in 5. Shard-2 was not measured: its context cannot grow anyway, its
+  page states what its context costs in memory without a time, and the app takes its speed from
+  the first prompt of 256 tokens or more it reads, as a constant rate. The phone had been measuring for an hour by then and was warm
   (battery at 34 degrees Celsius); cool, it began about a quarter faster. Between two measured
   lengths the time is interpolated; beyond the longest one it is extrapolated, with the cost
   of a token growing on at the rate the last measurements show, so the times of the largest
@@ -377,28 +383,32 @@ then ends apps without asking. If it ends this one, the chats are safe: a messag
 to disk, encrypted, when it is sent, and an answer while it is being written, so at most the
 last words of the answer under way are lost.
 
-### Supported, not bundled: Shard-2
+### Shard-2: a model that continues text
 
-The repository carries everything that is needed to run `Glint-Research/Shard-2` (49.4 million
-parameters; 99,048,160 bytes as a 16-bit file): the `shard2` architecture for llama.cpp, its
-converter, its tests on the host and on a phone, and the prompt format and engine support for a
-model that continues text. **No build of the app contains the model, and the app does not offer
-it.** The reason is its licence: the model's repository names one (MIT) only in the metadata of
-its model card and has no licence file and no copyright notice, and this app ships a model only
-when its licence is established. When that is settled, switching it on is a small change:
-`"purpose": "bundled"` for `shard-2` in `models/manifest.json`, `bundled = true` for it in
-`core/src/main/kotlin/us/theworkmans/proseplow/core/model/ModelCatalog.kt`, its entry in the
-third-party notices (`app/notices/`; a test fails while a bundled model has none), and the
-model's lines in this file and in the store description.
+Shard-2 is the one model here that is not a chat model. It is given only the latest message,
+exactly as written, and writes on from it: earlier turns are not sent, nothing is trimmed, and
+there is no system prompt. "Continue" gives it the text and its partial answer and lets it
+write on. It has one token beyond its tokenizer that takes back the token before it: the app
+applies that as it happens, so words the model retracts disappear from the reply while the
+model itself still sees what it abandoned. Its context stays at the 4,096 tokens its card
+says it was trained with. How long it takes to read a conversation on a phone was not
+measured, so its context does not grow by itself (it starts at its largest anyway), and its
+memory is not kept across a lock until the app has seen how fast the phone reads it. At the
+speed measured on the tested phone, about 800 prompt tokens a second, its whole context is read
+again in seconds, below the 20 seconds of reading that make a memory worth keeping, so in
+practice its memory is not kept. Its checkpoint is published as a Python pickle; the converter loads
+it in PyTorch's weights-only mode and runs none of the code published with it.
 
-What it is, for when that happens: Shard-2 is not a chat model. It is given only the latest
-message, exactly as written, and writes on from it (context 4,096 tokens, which is what its
-card says it was trained with and where it stays; replies of up to 200,
-temperature 0.9 and top-k 100 as in its reference script, no system prompt). It has one token
-beyond its tokenizer that takes back the token before it: the app applies that as it happens,
-so words the model retracts disappear from the reply while the model itself still sees what it
-abandoned. Its checkpoint is published as a Python pickle; the converter loads it in PyTorch's
-weights-only mode and runs none of the code published with it.
+### Shard-2's licence
+
+The repository `Glint-Research/Shard-2` states its licence in one place only: the metadata of
+its model card says `license: mit` (at commit `46b9eb99c475694a1129ad8f3a9825d244a8ec79`, the
+revision `models/manifest.json` pins). It has no licence file and no copyright line. The model
+was therefore left out of the app at first; it is bundled since the card's declaration was
+accepted as the model's licence. The third-party notices give the MIT permission text,
+attribute the model to the publisher of the repository, Glint-Research, as the card declares,
+and name the repository and that commit as where the declaration is made. They do not supply a
+copyright line, since the publisher gives none.
 
 ### Precision: 16-bit floats, no quantisation
 
@@ -421,17 +431,17 @@ These are measurements on a single device, a Samsung Galaxy XCover7 Pro (SM-G766
 7s Gen 3, four Cortex-A720 and four Cortex-A520 cores, 5.5 GB of memory, Android 17). They are
 not a promise for any other phone.
 
-| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
-| --- | --- | --- | --- |
-| Reading the conversation (prompt), tokens per second | 89 | 183 | 379 |
-| Writing the reply, tokens per second | 9.3 | 24 | 52 |
-| Loading the model | 0.45 s | 0.14 s | 0.12 s |
-| Memory of the process with the model loaded | 1,621 MiB | 888 MiB | 475 MiB |
+| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct | Shard-2 |
+| --- | --- | --- | --- | --- |
+| Reading the conversation (prompt), tokens per second | 89 | 183 | 379 | 791 to 834 |
+| Writing the reply, tokens per second | 9.3 | 24 | 52 | 123 to 129 |
+| Loading the model | 0.45 s | 0.14 s | 0.12 s | 0.07 s |
+| Memory of the process with the model loaded | 1,621 MiB | 888 MiB | 475 MiB | 304 MiB |
 
 The figures come from the tests in `llama/src/androidTest`, not from timing the app's screens:
 the 16-bit files, mapped into memory, on the CPU with four threads pinned to the four fast
 cores and the test in front. With three unpinned threads, which is what the engine falls back
-to when it may not pin, the prompt speeds were 67, 140 and 289 tokens per second; the writing
+to when it may not pin, the prompt speeds were 67, 140, 289 and 640 tokens per second; the writing
 speed, measured that way for Qwen3.5, did not change. Speeds varied by a few per cent between
 runs. `native/README.md` ("On the phone") has the full table and how to repeat it.
 The prompt speeds are those of a short prompt read from nothing. A long conversation is read
@@ -612,7 +622,8 @@ optionally a second time by a fingerprint key.
   about ten seconds; when an answer ends while the app is out of sight and still unlocked, the
   same, and the service that kept the app running for the answer stays until that save has
   ended. A memory is saved at all only when reading it again would take at least twenty
-  seconds. Saving on leaving the screen is the main path, because Android freezes the app about
+  seconds (by the measured curve of the model, or for Shard-2, which has none, by the speed the
+  app last saw it read at; nothing is saved for it before that). Saving on leaving the screen is the main path, because Android freezes the app about
   a minute after it leaves the screen and the lock's timer may then run late; on the tested
   phone a 600 MB save begun when the screen was left took about two seconds. At most one saved
   memory exists. After an unlock it is read back for the chat on screen once its model is
@@ -782,9 +793,8 @@ it or losing the phone loses the chats.
   reply's tokens become strings straight away.
 - That does not reach everything. llama.cpp makes copies of its own while it works and frees
   them without overwriting them: measured on that phone after the native clear, copies of the
-  prompt's text were still readable in the process for two of the four models that were
-  measured (the three bundled ones and Shard-2), and copies of the prompt's token numbers for
-  all four, some of them even after the session was closed (the
+  prompt's text were still readable in the process for two of the four models, and copies of
+  the prompt's token numbers for all four, some of them even after the session was closed (the
   token numbers of replies were not). Java strings cannot be overwritten at all.
 - Saving and reading back the model's memory hands it to Android's AES-GCM one chunk of 4 MiB
   at a time, from a direct buffer that is overwritten after every chunk, and through no other
@@ -1013,9 +1023,11 @@ audited it.
 
 ### What was verified, and how
 
-The check described here covers the three bundled models. Shard-2, which is supported but not
-bundled, was downloaded, converted and tested on the development machine only, not in this
-clean-machine check.
+The check described here was made while the app bundled three models, before Shard-2 (99 MB)
+was bundled as a fourth: where this section and "Disk space and time" below say "all three
+models", and in their times, sizes and disk figures, they mean Qwen3.5, Peacebell and Boris-2.
+Shard-2 was downloaded, converted and tested on the development machine, not in that
+clean-machine check; an APK with all four models is 2,542,144,262 bytes (2.54 GB) as a debug build.
 
 These instructions were followed literally, on 22 November 2026, on Ubuntu 24.04.5 (x86_64) in a
 clean clone, with a freshly downloaded JDK, a freshly installed Android SDK in an empty
@@ -1223,7 +1235,7 @@ source env.sh            # JAVA_HOME, ANDROID_HOME; java and adb on PATH
 
 ### Get the model checkpoints
 
-Nothing in this repository downloads a model. Fetch the three checkpoints yourself, each at the
+Nothing in this repository downloads a model. Fetch the four checkpoints yourself, each at the
 revision that `models/manifest.json` pins, into `$PROSEPLOW_MODEL_SRC/<id>`:
 
 ```sh
@@ -1233,6 +1245,8 @@ hf download wayneworkman2012/peacebell-v1-291M --revision a44de191d94e8bf944b31a
     --local-dir "$PROSEPLOW_MODEL_SRC/peacebell-v1-291m"
 hf download opencerebral/Boris-2-Instruct --revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d \
     --local-dir "$PROSEPLOW_MODEL_SRC/boris-2-instruct"
+hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
+    --local-dir "$PROSEPLOW_MODEL_SRC/shard-2"
 ```
 
 No account and no token were needed for the command that was run in the check (Boris-2); `hf`
@@ -1241,22 +1255,24 @@ each model's own licence (see the table above). How the files get there does not
 checkpoint in a Hugging Face hub cache is found as well, and the hashes decide whether the
 files are the right ones.
 
-The manifest lists two more models, `peacebell-v1-148m` and `shard-2`, which are converted and
-tested but not bundled. They are optional: without them, the native tests that need them report
-themselves as skipped. To run those too:
+The manifest lists one more model, `peacebell-v1-148m`, which is converted and tested but not
+bundled. It is optional: without it, the native tests that need it report themselves as
+skipped. To run those too:
 
 ```sh
 hf download wayneworkman2012/peacebell-v1-148M --revision 9155a36017601957565a569c73a2b53c9c6a67ec \
     --local-dir "$PROSEPLOW_MODEL_SRC/peacebell-v1-148m"
-hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
-    --local-dir "$PROSEPLOW_MODEL_SRC/shard-2"
 ```
+
+Shard-2's weights, `Shard-2.pt`, are a Python pickle. Nothing here runs the `infer.py` that is
+published beside them, and the converter and the tests load the weights only in PyTorch's
+weights-only mode (`models/README.md`, "shard-2"); do not run that script either.
 
 ### Convert the models
 
 ```sh
 native/tools/prepare-llama-src.sh
-python3 models/convert_models.py peacebell-v1-291m boris-2-instruct qwen3.5-0.8b
+python3 models/convert_models.py peacebell-v1-291m boris-2-instruct shard-2 qwen3.5-0.8b
 ```
 
 The first command writes the patched copy of llama.cpp, which holds the converters, into
@@ -1267,11 +1283,12 @@ comes out differently. It prints one line per model:
 
     peacebell-v1-291m: wrote peacebell-v1-291m-f16.gguf, 583680096 bytes, sha256 df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868
     boris-2-instruct: wrote boris-2-instruct-f16.gguf, 291853184 bytes, sha256 758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6
+    shard-2: wrote shard-2-f16.gguf, 99048160 bytes, sha256 c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f
     qwen3.5-0.8b: wrote qwen3.5-0.8b-f16.gguf, 1516742752 bytes, sha256 91bcb80bb68c2a51e7eb4e28cf088f79678e236f9f16120060b84a57ae7f0978
 
 The files are `$PROSEPLOW_MODEL_OUT/<id>/<id>-f16.gguf`. Name the models as above, or pass
-`--available`: without either, the script also wants the two optional checkpoints and ends
-with an error when one is not there, after converting the others.
+`--available`: without either, the script also wants the optional checkpoint and ends with an
+error when it is not there, after converting the others.
 
 ### Run the native tests on the host
 
@@ -1315,7 +1332,7 @@ Which models an APK carries is chosen on the command line:
 # No model: quick to build and install, and the app says that it has none
 ./gradlew :app:assembleDebug
 
-# All three models
+# All four models
 ./gradlew :app:assembleDebug -Pproseplow.models=all -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"
 
 # Or a selection
@@ -1328,6 +1345,7 @@ The result is `app/build/outputs/apk/debug/app-debug.apk`:
 | --- | --- | --- |
 | none | 50,176,101 bytes | 41,911,126 bytes |
 | all three | 2,442,483,998 bytes | 2,434,219,023 bytes |
+| all four | 2,542,144,262 bytes | not built with four models yet |
 
 The build compiles llama.cpp for arm64 with the NDK (seven variants of the CPU backend, of which
 the app loads the best one for the phone's processor), copies each selected model into the APK
@@ -1489,7 +1507,7 @@ not touch a phone. Where something below was not done by the developers either, 
    adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 
-   The phone needs free storage for the APK, 2.4 GB with all three models. Over USB a 715 MB APK
+   The phone needs free storage for the APK, 2.5 GB with all four models. Over USB a 715 MB APK
    took 20 seconds and a 2.8 GiB test APK 87 seconds. `-r` replaces an installed build of the
    same kind and keeps its data.
 
@@ -1629,8 +1647,10 @@ A model is a build change, never a download by the app. In outline:
    state, 256 otherwise) and licence, and its name to the
    app's strings. A test compares the context numbers with the manifest's.
 5. Add it to the third-party notices (`app/notices/`): its licence, its copyright lines and
-   what the conversion changed. A model is bundled only when its licence is established; a
-   test fails while a bundled model has no entry there.
+   what the conversion changed. A model is bundled only when its licence is established (for
+   Shard-2, whose repository declares one only in its model card's metadata, that took a
+   decision of its own: [Shard-2's licence](#shard-2s-licence)); a test fails while a bundled
+   model has no entry there.
 
 Removing a model is the reverse. The details are in `models/README.md` (the manifest, getting
 checkpoints, converting, "Adding a model", "Removing a model") and in `native/README.md`
@@ -1705,7 +1725,7 @@ summary:
 | Other libraries the ones above depend on: Guava's ListenableFuture, JSpecify, JetBrains annotations | Apache-2.0 | Their respective authors |
 | The icons of the app's buttons and of its notification: Material Design icons | Apache-2.0 | Google LLC |
 | Support classes that the Android build tools (D8/R8) write into the app's code | BSD-3-Clause | The R8 project authors; listed as a precaution |
-| The models, when they are bundled | See [The models](#the-models): Apache-2.0 each | Qwen3.5-0.8B: Copyright 2026 Alibaba Cloud; peacebell-v1-291M, whose model card reserves the name Peacebell for the unmodified weights; Boris-2-Instruct: Copyright 2026 OpenCerebral. The files in the app are conversions, and the notices say what each conversion changed. The `boris2` architecture was written against that model's reference implementation, which the notices credit |
+| The models, when they are bundled | See [The models](#the-models): Apache-2.0 for Qwen3.5-0.8B, peacebell-v1-291M and Boris-2-Instruct; MIT for Shard-2, as the metadata of its model card declares | Qwen3.5-0.8B: Copyright 2026 Alibaba Cloud; peacebell-v1-291M, whose model card reserves the name Peacebell for the unmodified weights; Boris-2-Instruct: Copyright 2026 OpenCerebral; Shard-2: published by Glint-Research under the MIT License as its model card declares at commit `46b9eb99c475694a1129ad8f3a9825d244a8ec79`, with no licence file and no copyright line in its repository, so the notices give none (see [Shard-2's licence](#shard-2s-licence)). The files in the app are conversions, and the notices say what each conversion changed. The `boris2` and `shard2` architectures were written against those models' reference implementations, which the notices credit |
 
 The exact versions are in `gradle/libs.versions.toml` and in `app/notices/notices.json`. Used
 for building and testing only, and not part of an APK: Gradle and the Android Gradle plugin
@@ -1743,8 +1763,8 @@ number is changed:
   `toolchains/llvm/prebuilt/<host>/NOTICE` and the licence of R8 in the plugin's `builder`
   artifact with the two texts in `app/notices/licences/`.
 - **A model is bundled, or no longer bundled.** A bundled model has an entry with its
-  repository, revision and licence, the copyright lines its repository states and a statement
-  of what the conversion changed, and the same in `NOTICES.txt`; any other model has neither.
+  repository, revision and licence, the copyright lines its repository states (or, where it
+  states none, an attribution that says so) and a statement of what the conversion changed, and the same in `NOTICES.txt`; any other model has neither.
 
 In `NOTICES.txt` the list of part 1 has one paragraph on one line, which the app wraps to the
 screen. The licence texts of part 2 are copied unchanged, line breaks included; the app joins

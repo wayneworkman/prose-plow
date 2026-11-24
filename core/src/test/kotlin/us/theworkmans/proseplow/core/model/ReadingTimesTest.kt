@@ -134,8 +134,20 @@ class ReadingTimesTest {
         }
     }
 
+    /**
+     * Shard-2's times were not measured on the tested phone. Without them the engine keeps a
+     * context at its starting size when left to itself and saves no memory until it has seen
+     * the device read; that costs Shard-2 nothing it could have had only because its context
+     * starts at the most it can become. Any other bundled model must have its times.
+     */
     @Test
-    fun `every bundled model has reading times`() {
-        for (model in ModelCatalog.bundled) assertTrue(model.id, model.readingTimes.isKnown)
+    fun `every bundled model has reading times, but for Shard-2, whose context cannot grow`() {
+        val unmeasured = listOf(ModelCatalog.SHARD_2)
+        for (model in ModelCatalog.bundled - unmeasured) assertTrue(model.id, model.readingTimes.isKnown)
+        for (model in unmeasured) {
+            assertTrue(model.id, model in ModelCatalog.bundled)
+            assertFalse(model.id, model.readingTimes.isKnown)
+            assertEquals("${model.id} starts at its largest context", model.maxContextLength, model.contextLength)
+        }
     }
 }

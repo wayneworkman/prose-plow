@@ -1543,7 +1543,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 `chat/ChatControllerTest.kt`, `ModelCatalogManifestTest.kt`,
 `llama/src/test/.../BundledModelNamesTest.kt`.
 
-- **MODEL-01** Three models are bundled. Their names are proper names and are shown as they are
+- **MODEL-01** Four models are bundled. Their names are proper names and are shown as they are
   in every language.
 
   | Id (stored in chats; never reused or changed) | Name shown | Description shown | Source repository on Hugging Face | Licence shown |
@@ -1551,6 +1551,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   | `qwen3.5-0.8b` | "Qwen3.5 0.8B" | "A general assistant that speaks many languages. The most capable model here." | `Qwen/Qwen3.5-0.8B` | Apache-2.0 |
   | `peacebell-v1-291m` | "Peacebell v1 291M" | "Answers questions about the Second World War from memory. Not a general assistant." | `wayneworkman2012/peacebell-v1-291M` | Apache-2.0 |
   | `boris-2-instruct` | "Boris-2-Instruct" | "A very small chat model for everyday questions. Fluent, but often wrong on facts." | `opencerebral/Boris-2-Instruct` | Apache-2.0 |
+  | `shard-2` | "Shard-2" | "Continues the text you write. It is not a chat model and does not answer questions. It can take back words it has just written. Its facts are often invented." | `Glint-Research/Shard-2` | MIT (MODEL-21, DEC-57) |
 
 - **MODEL-02** The app offers exactly the models of its catalogue that are marked as bundled and
   whose files the installation carries, in the order of the catalogue; both conditions are
@@ -1563,21 +1564,21 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   context may grow can be changed by the user (section 15); everything else is fixed. FMT-14 and
   FMT-15 give the exact rules, and FMT-20 those of the context.
 
-  | | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
-  | --- | --- | --- | --- |
-  | Context at the start, tokens (ENG-28) | 4,096 | 4,096 | 2,048 |
-  | The most the context can become, tokens: what the model was trained with | 262,144 | 32,768 | 2,048 |
-  | Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 |
-  | Reading times on the tested phone, assumed until the device the app runs on is measured: seconds to read so many tokens from nothing (ENG-30) | 2,048 in 30.4; 4,096 in 63.5; 6,144 in 99.6; 8,192 in 138.8; 10,240 in 181.9; 12,288 in 227.2; 14,336 in 275.4; 15,872 in 313.5 | 2,048 in 15.5; 4,096 in 35.5; 6,144 in 60.1; 8,192 in 89.2; 10,240 in 125.1; 12,288 in 163.5; 14,336 in 206.4; 15,872 in 241.6 | 512 in 1.3; 1,024 in 2.9; 1,536 in 5.1 |
-  | Chunk of a deep read, tokens (ENG-11) | 128 | 256 | 128 |
-  | Longest reply, tokens: default; allowed range (MSET-11) | 1,024; 16 to at most 4,096 | 1,024; 16 to at most 4,096 | 512; 16 to 1,024 |
-  | Temperature | 1.0 | 0 (always the most likely token) | 0.7 |
-  | Top-k; top-p | 20; off | 50; 0.9 (both only matter once the temperature is raised) | 50; 0.9 |
-  | Penalties | presence 2.0 | none | repetition 1.1 |
-  | A reply ends at | its end-of-turn token or its end-of-text token | its end-of-turn token | the end-of-turn marker written out as text, or its end-of-text token |
-  | Tokens never produced | none | token 0 | none |
-  | System prompt | yes | no (trained without one) | yes |
-  | Prompt format (FMT-09 to FMT-12) | ChatML with control tokens, thinking off | ChatML with injected marker ids | ChatML as plain text |
+  | | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct | Shard-2 |
+  | --- | --- | --- | --- | --- |
+  | Context at the start, tokens (ENG-28) | 4,096 | 4,096 | 2,048 | 4,096 |
+  | The most the context can become, tokens: what the model was trained with | 262,144 | 32,768 | 2,048 | 4,096 (its file would allow 8,192; ENG-29) |
+  | Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 | 40,960 |
+  | Reading times on the tested phone, assumed until the device the app runs on is measured: seconds to read so many tokens from nothing (ENG-30) | 2,048 in 30.4; 4,096 in 63.5; 6,144 in 99.6; 8,192 in 138.8; 10,240 in 181.9; 12,288 in 227.2; 14,336 in 275.4; 15,872 in 313.5 | 2,048 in 15.5; 4,096 in 35.5; 6,144 in 60.1; 8,192 in 89.2; 10,240 in 125.1; 12,288 in 163.5; 14,336 in 206.4; 15,872 in 241.6 | 512 in 1.3; 1,024 in 2.9; 1,536 in 5.1 | not measured (ENG-30 says what follows) |
+  | Chunk of a deep read, tokens (ENG-11) | 128 | 256 | 128 | 256 |
+  | Longest reply, tokens: default; allowed range (MSET-11) | 1,024; 16 to at most 4,096 | 1,024; 16 to at most 4,096 | 512; 16 to 1,024 | 200; 16 to 2,048 |
+  | Temperature | 1.0 | 0 (always the most likely token) | 0.7 | 0.9 |
+  | Top-k; top-p | 20; off | 50; 0.9 (both only matter once the temperature is raised) | 50; 0.9 | 100; off |
+  | Penalties | presence 2.0 | none | repetition 1.1 | none |
+  | A reply ends at | its end-of-turn token or its end-of-text token | its end-of-turn token | the end-of-turn marker written out as text, or its end-of-text token | token 1 or token 2 |
+  | Tokens never produced | none | token 0 | none | none |
+  | System prompt | yes | no (trained without one) | yes | no (not a chat model) |
+  | Prompt format (FMT-09 to FMT-12) | ChatML with control tokens, thinking off | ChatML with injected marker ids | ChatML as plain text | none: the text itself (text continuation) |
 
   The trained context and the bytes for each token are also in `models/manifest.json`
   (`trained_context`, `context_bytes_per_token`), where a test of the native build holds them to the
@@ -1586,8 +1587,9 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   settings (the device run `ReadingDepthDeviceTest`), in each model's chunk of a deep read
   (ENG-11). The phone had been measuring for an hour by then and was warm (battery at 34 degrees
   Celsius); cool, it began about a quarter faster. Boris-2's run leaves room for a short reply, so
-  its last point is below its 2,048 tokens and the rest is extrapolated. Shard-2's chunk of a deep
-  read is 256.
+  its last point is below its 2,048 tokens and the rest is extrapolated. Shard-2's reading times
+  were not measured; its context cannot grow, and ENG-30 and ENG-38 say how the engine copes
+  without them. Shard-2's chunk of a deep read is 256.
 
 - **MODEL-05** The model of a chat is chosen by tapping the title of the chat screen (the action
   is described as "Switch model"). A menu lists every offered model with its name and its
@@ -1647,23 +1649,22 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   file is read into memory instead.
   - **On Android:** an asset of the APK, stored without compression on a 16 KiB boundary, opened
     as a file descriptor with an offset and a length.
-- **MODEL-19** The three bundled models together are 2,392,276,032 bytes, and one installable
+- **MODEL-19** The four bundled models together are 2,491,324,192 bytes, and one installable
   package carries the app and all of them.
   - **On Android:** an APK cannot exceed 4 GiB, which is the ceiling for the set of models.
   - **Parity note:** the largest model needed about 1.6 GiB of process memory on the phone that
-    was tested, and the whole package is about 2.4 GB. Whether another platform grants an app
+    was tested, and the whole package is about 2.5 GB. Whether another platform grants an app
     that much memory, and a package that size, has to be established.
 - **MODEL-20** Only the processor is used. On the phone that was tested its graphics processor
   wrote more slowly than the processor, and the neural accelerator would need a proprietary
   kit, which this project does not use.
-- **MODEL-21** A fourth model, **Shard-2** (`shard-2`, from `Glint-Research/Shard-2`), is fully
-  supported by the code and deliberately not bundled: its repository names a licence only in the
-  metadata of its model card, and the app ships a model only when its licence is established.
-  No build can package it (the build accepts only models the manifest marks as bundled, and
-  fails on any other model file it finds in the package), and no build offers it, not even a
-  build of any kind with its file in place (MODEL-02, MODEL-23). The support that exists, and
-  that a port must carry if it is to be switched on, is therefore reached today only by the
-  tests:
+- **MODEL-21** The fourth model, **Shard-2** (`shard-2`, from `Glint-Research/Shard-2`), is
+  bundled like the other three. Its repository declares a licence only in the metadata of its
+  model card (`license: mit`), with no licence file and no copyright line; it was left out of
+  the bundle on 2026-11-22 for that reason and bundled again on 2026-11-23, when that
+  declaration was accepted as its licence (DEC-57). The third-party notices carry the MIT
+  permission text, attribute the model to the publisher of its repository, and name the
+  revision where the declaration is made. What sets it apart from the other three:
   - It is not a chat model. It is given only the latest message, exactly as typed, and writes on
     from it: earlier turns are not sent, nothing is trimmed, and there is no system prompt.
   - The interface words three lines for it differently: the empty chat says "Start a text" and
@@ -1685,6 +1686,11 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
     not a chat model and does not answer questions. It can take back words it has just written.
     Its facts are often invented."
   - A long conversation is never reported as shortened for it, because no history is sent.
+  - Its reading times are not in the catalogue. Its context cannot grow anyway; its page states
+    what its context costs in memory without a time (MSET-20); and its memory is saved only
+    once the engine has seen how fast the device reads it, and only when reading it again would
+    take 20 seconds or more (ENG-38), which at the speed measured on the tested phone (about
+    800 prompt tokens a second) its whole context does not.
 - **MODEL-22** For a text-continuing model the chat screen still shows the user's text and the
   model's continuation as two separate messages. It shows the continuation without the
   whitespace in front of it (Markdown would otherwise take indented text for a block of code),
@@ -1693,8 +1699,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
 - **MODEL-23** Every build of the app, development builds included, uses the model files its
   APK carries and no other: a model file placed in the app's private storage is never looked
   for. Only the device tests of the native binding use such a file, placed in the private
-  storage of their own test package, for a model too large for the test APK or not bundled
-  (Shard-2); the code that looks for it is part of those tests and of no build of the app, and
+  storage of their own test package, for a model too large for the test APK or left out of it
+  (Qwen3.5, say); the code that looks for it is part of those tests and of no build of the app, and
   nothing verifies the file. A test with such a file in place checks that the binding's own
   lookup still finds only the APK's assets.
 
@@ -2622,7 +2628,8 @@ is what a port has to reproduce, whatever it is written in.
   - reading the memory again would take at least 20 seconds by the model's reading curve on this
     device (ENG-30); a model whose times nobody knows is not saved. This leaves out Boris-2 by its
     numbers (its whole context of 2,048 tokens reads in about 7 seconds on the tested phone), not
-    by its name;
+    by its name, and in practice Shard-2, which has no curve and whose whole context of 4,096
+    tokens reads in seconds at the speed measured on that phone;
   - when the app has left the screen: reading again what is new since the last save would take
     more than 10 seconds. The lock's own save does not ask this.
 
@@ -3651,7 +3658,7 @@ This section is exact where the others describe. Each item carries one of three 
   | Qwen3.5 0.8B | `Qwen/Qwen3.5-0.8B` at `2fc06364715b967f1860aea9cf38778875588b17` | 1,516,742,752 | `91bcb80bb68c2a51e7eb4e28cf088f79678e236f9f16120060b84a57ae7f0978` |
   | Peacebell v1 291M | `wayneworkman2012/peacebell-v1-291M` at `a44de191d94e8bf944b31a482fc0f04fa4433eb1` | 583,680,096 | `df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868` |
   | Boris-2-Instruct | `opencerebral/Boris-2-Instruct` at `9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d` | 291,853,184 | `758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6` |
-  | Shard-2 (not bundled) | `Glint-Research/Shard-2` at `46b9eb99c475694a1129ad8f3a9825d244a8ec79` | 99,048,160 | `c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f` |
+  | Shard-2 | `Glint-Research/Shard-2` at `46b9eb99c475694a1129ad8f3a9825d244a8ec79` | 99,048,160 | `c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f` |
 
   Peacebell, Boris-2 and Shard-2 are architectures that llama.cpp does not have; they need the
   architecture files and patches of `native/`, and Peacebell also the tokeniser front-end
@@ -4172,6 +4179,22 @@ only state a rule, the item says so and states its effect instead of inventing a
   read-ahead for "Continue", which is unsound (ENG-43). Preserve: the read-ahead does only what
   the next request would do, never clears the memory, never grows the context, never leaves
   turns out, and gives way to everything within a chunk.
+- **DEC-57** *Shard-2 is bundled under the licence its model card declares* (MODEL-01,
+  MODEL-21). Two decisions of the owner. On 2026-11-22: no model ships without an established
+  licence, and Shard-2 was taken out of the bundle (kept in the catalogue, the manifest and the
+  tests, but neither packaged nor offered), because its repository, `Glint-Research/Shard-2`,
+  names a licence only in the metadata of its model card (`license: mit`) and has no licence
+  file and no copyright line. On 2026-11-23 the owner accepted that declaration as the model's
+  licence, and Shard-2 was bundled again as a fourth model. The basis, checked against the
+  repository that day: one branch, whose head is commit
+  `46b9eb99c475694a1129ad8f3a9825d244a8ec79` (2026-11-03), the revision the manifest pins; the
+  card's metadata at that commit says `license: mit`; no file of the repository is a licence and
+  none carries a copyright line. Preserve: the third-party notices give the MIT permission text,
+  attribute the model to the publisher of its repository as the card declares, and name the
+  repository and that commit as where the declaration is made; they invent no copyright line
+  with a year or a person's name. A later revision of the model is a new decision, made on what
+  that revision's repository says. The rule itself stands for every other model: a licence must
+  be established before a model is bundled.
 
 ## 27. Planned tools: design considerations (TOOL)
 

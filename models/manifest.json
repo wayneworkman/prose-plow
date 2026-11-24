@@ -74,11 +74,11 @@
     {
       "id": "shard-2",
       "status": "ready",
-      "purpose": "validation",
+      "purpose": "bundled",
       "trained_context": 4096,
       "context_bytes_per_token": 40960,
       "file_context": 8192,
-      "note": "Architecture shard2 (a port of ours): a model that continues text and has a deletion token. The checkpoint is a pickle; the converter loads it with weights_only=True and in no other way, and infer.py is never run (the tests read it as text). Converted and tested as the file that would ship, and not bundled: the model's repository names a licence (MIT) only in the metadata of its model card and has no licence file and no copyright notice, and the app ships a model only when its licence is established. The purpose becomes bundled in the same change that switches the model on in the app's catalogue. Its trained_context is the 4,096 tokens the model card calls trained; the positions of the file reach 8,192 (file_context), which is what a session reports as the model's largest context, and a conversation beyond 4,096 tokens is untested.",
+      "note": "Architecture shard2 (a port of ours): a model that continues text and has a deletion token. The checkpoint is a pickle; the converter loads it with weights_only=True and in no other way, and infer.py is never run (the tests read it as text). Bundled. Its licence is the declaration license: mit in the metadata of the model card at the pinned revision; the repository has no licence file and no copyright notice, and the card's declaration was accepted as the model's licence on 2026-11-23 (FEATURES.md, DEC-57), after the model had been validation only from 2026-11-22. The purpose and the bundled flag of the app's catalogue change together. Its trained_context is the 4,096 tokens the model card calls trained; the positions of the file reach 8,192 (file_context), which is what a session reports as the model's largest context, and a conversation beyond 4,096 tokens is untested.",
       "name": "Shard-2",
       "repository": "Glint-Research/Shard-2",
       "revision": "46b9eb99c475694a1129ad8f3a9825d244a8ec79",
