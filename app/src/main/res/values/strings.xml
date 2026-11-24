@@ -30,6 +30,37 @@
     <string name="setup_no_recovery">A forgotten passphrase cannot be recovered. There is no reset link and no recovery key: the only way back in is to reset the app, which deletes all of its data.</string>
     <string name="setup_create">Create passphrase</string>
 
+    <!-- First run and changed terms: the statements to agree to, before set-up or the lock screen.
+         The statements and the two lines above the confirmation field are the terms themselves:
+         English whatever the device's language, never translated, and changing any of them is a
+         new version of the terms (Terms.TERMS_VERSION in the core). -->
+    <string name="terms_title">Before you start</string>
+    <string name="terms_progress">Statement %1$d of %2$d</string>
+    <string name="terms_instructions">Read the statement, then choose a button. The two buttons change places on every screen.</string>
+    <string name="terms_agree">I agree</string>
+    <string name="terms_disagree">I do not agree</string>
+    <string name="terms_statement_1" translatable="false">I am 18 or older.</string>
+    <string name="terms_statement_2" translatable="false">I am not in any of these US states, and I will not use this app there: %1$s.</string>
+    <string name="terms_statement_3" translatable="false">This app runs AI models on my phone. Their output can be wrong, misleading or offensive, and nobody reviews it.</string>
+    <string name="terms_statement_4" translatable="false">This app is not a doctor, lawyer, therapist or other professional. I will not rely on it for medical, legal, financial or safety decisions.</string>
+    <string name="terms_statement_5" translatable="false">This app is not for emergencies or crisis support. In the US, I can call or text 988.</string>
+    <string name="terms_statement_6" translatable="false">By default, my messages are deleted after 7 days. I can change this in Settings.</string>
+    <string name="terms_statement_7" translatable="false">My passphrase cannot be recovered. If I forget it, everything in the app is lost for good.</string>
+    <string name="terms_statement_8" translatable="false">This app is provided as is, with no warranty. To the extent the law allows, its authors are not liable for any harm or loss from my use of it.</string>
+    <string name="terms_statement_9" translatable="false">I am responsible for how I use this app and what I do with its output.</string>
+    <string name="terms_statement_10" translatable="false">Missouri law governs these terms, and any dispute will be brought in courts located in Missouri.</string>
+    <string name="terms_numbered">%1$d. %2$s</string>
+    <string name="terms_confirm_title">Confirm</string>
+    <string name="terms_build_line" translatable="false">These terms apply to this build of the app. The source code is licensed separately under the Apache License 2.0.</string>
+    <string name="terms_confirm_line" translatable="false">I have read and understood every statement above, and I agree to all of them.</string>
+    <string name="terms_field_label">Type the words I agree</string>
+    <string name="terms_continue">Agree and continue</string>
+    <string name="terms_open">Terms</string>
+    <string name="terms_record_title">Terms</string>
+    <string name="terms_record_version">You agreed to these statements (version %1$d).</string>
+    <string name="terms_record_when">You agreed to all of them on %1$s.</string>
+    <string name="information">Information</string>
+
     <!-- Lock screen -->
     <string name="lock_starting">Starting…</string>
     <string name="lock_title">%1$s is locked</string>

@@ -42,6 +42,7 @@ import us.theworkmans.proseplow.security.BiometricNotice
 import us.theworkmans.proseplow.security.BiometricPurpose
 import us.theworkmans.proseplow.security.LockState
 import us.theworkmans.proseplow.security.WindowSecurity
+import us.theworkmans.proseplow.terms.TermsGate
 import us.theworkmans.proseplow.ui.ActivityState
 import us.theworkmans.proseplow.ui.AppToasts
 import us.theworkmans.proseplow.ui.DiscardedTouchNotice
@@ -328,8 +329,19 @@ class MainActivity : FragmentActivity() {
                     )
                 }
             }
+            is LockState.TermsRequired -> TermsGate(appLock, container.termsFlow, onLeave = ::leaveAfterDisagreeing)
             else -> LockedContent(appLock, current)
         }
+    }
+
+    /**
+     * "I do not agree" in the terms: the app is left at once. The task is finished and taken out
+     * of the list of recent apps, so that nothing of the flow can be brought back from there. The
+     * process is not ended here: the lock ends it, in its one place, once nothing of the app is
+     * on screen any more ([us.theworkmans.proseplow.security.AppLock.declineTerms]).
+     */
+    private fun leaveAfterDisagreeing() {
+        finishAndRemoveTask()
     }
 
     override fun onStart() {

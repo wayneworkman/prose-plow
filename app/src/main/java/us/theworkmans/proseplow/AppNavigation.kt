@@ -34,6 +34,7 @@ import us.theworkmans.proseplow.settings.SettingsViewModel
 import us.theworkmans.proseplow.settings.ThirdPartyNoticesScreen
 import us.theworkmans.proseplow.settings.ThirdPartyNoticesViewModel
 import us.theworkmans.proseplow.settings.readThirdPartyNotices
+import us.theworkmans.proseplow.terms.TermsRecordScreen
 
 @Serializable
 private data object ChatRoute
@@ -51,8 +52,13 @@ private data object AboutRoute
 @Serializable
 private data object ThirdPartyNoticesRoute
 
+/** The terms that were agreed to, and when: the same screen from About and from the chat screen's "Information". */
+@Serializable
+private data object TermsRoute
+
 /**
- * The unlocked app: the chat, with Settings, About and the third-party notices behind it. It is
+ * The unlocked app: the chat, with Settings, About, the third-party notices and the terms that
+ * were agreed to behind it. It is
  * composed only while [session] is open, under a ViewModelStoreOwner that is the session's, so a
  * lock clears every screen's ViewModel. The chats and the reply that may be running are not in
  * any ViewModel: they are the session's ([AppSession.chat]) and carry on whichever screen is in
@@ -88,6 +94,7 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
             ChatScreen(
                 viewModel = chatViewModel,
                 onOpenSettings = dropUnlessResumed { navController.navigate(SettingsRoute) },
+                onOpenInformation = dropUnlessResumed { navController.navigate(TermsRoute) },
                 onLock = appLock::lock,
             )
         }
@@ -126,7 +133,12 @@ fun AppNavigation(session: AppSession, appLock: AppLock<*>) {
                 models = session.models,
                 onBack = dropUnlessResumed { navController.popBackStack() },
                 onOpenNotices = dropUnlessResumed { navController.navigate(ThirdPartyNoticesRoute) },
+                onOpenTerms = dropUnlessResumed { navController.navigate(TermsRoute) },
             )
+        }
+        composable<TermsRoute> {
+            val status by appLock.status.collectAsStateWithLifecycle()
+            TermsRecordScreen(agreement = status.termsAgreement, onBack = dropUnlessResumed { navController.popBackStack() })
         }
         composable<ThirdPartyNoticesRoute> {
             val resources = LocalResources.current

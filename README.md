@@ -39,6 +39,17 @@ effort until someone offers corrections by pull request.
 
 Everything in this list is in the code today.
 
+Before anything else:
+
+- **Terms to agree to.** Before the first set-up, after every reset of the app's data, and
+  again whenever a new build changes them, the app shows its terms one statement at a time,
+  each with the buttons "I agree" and "I do not agree" at new random places, then asks for the
+  words "I agree" to be typed. "I do not agree" closes the app. The app records which version
+  of the terms was agreed to and the date and time "Agree and continue" was pressed, in
+  `lock.json`; the information button on the chat screen, and "Terms" under About, show the
+  statements and that date and time. The app asks and does not check: it adds no location
+  permission, no date of birth and no content filter.
+
 Chats:
 
 - **Several chats.** They are listed in a drawer that slides over the conversation. A chat is
@@ -179,8 +190,8 @@ Privacy:
   removes every copy of a conversation from memory. Opening it again starts it afresh, at the
   lock screen; the model is then loaded again at the next unlock.
 - **No recovery.** A forgotten passphrase cannot be recovered. "Reset app data" deletes
-  everything after you have typed the word `delete`, and the app starts again with first-time
-  set-up.
+  everything after you have typed the word `delete`, and the app starts again with the terms
+  and first-time set-up.
 - **Incognito keyboard.** Every text field asks the keyboard not to learn from what is typed,
   and the app is excluded from autofill.
 - **Screenshots are blocked**, and so are screen recordings. "Allow screenshots for 10 minutes"
@@ -764,7 +775,7 @@ way on: "Reset app data", which is offered on the lock screen, on the error scre
 Settings. It asks for no passphrase, because it is the way on when the passphrase is forgotten;
 it asks you to type the word `delete`. It then deletes every Keystore key of the app first, from
 which moment nothing stored can be decrypted, then every file and the cache, and the lock
-configuration last, and the app starts again with first-time set-up. If something could not be
+configuration last, and the app starts again with the terms and first-time set-up. If something could not be
 deleted, the app says what.
 
 The app's data is in no backup: `allowBackup` is off and the data extraction rules exclude
@@ -976,8 +987,9 @@ it or losing the phone loses the chats.
   screen or locked, and the content of `lock.json` (whether fingerprint
   unlock is on and for how long, whether an answer is finished after locking, how many wrong
   attempts were made and when, how long messages are kept, whether the model's memory is kept
-  after locking, whether background maintenance is on, the latest trusted time, and when, on
-  the clock since the phone's start, the app last locked or was unlocked).
+  after locking, whether background maintenance is on, the latest trusted time, when, on
+  the clock since the phone's start, the app last locked or was unlocked, and which version of
+  the terms was agreed to and the date and time it was).
 - **A debug build.** A debug build is debuggable: a computer that is authorised for USB
   debugging can read its private files with `run-as` and attach a debugger to it. It runs
   the same models as a release build, from its own APK and from nowhere else. Use a release
@@ -1615,12 +1627,12 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 510 tests) | The chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints (those that follow a reply among them), reading a conversation ahead after an answer (what it reads, what it never does, and what it gives way to), saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
-| `app` (JVM, 870 tests) | The lock and the encryption with software keys and virtual time: the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, a save stopped when the keep-alive ends, no keep-alive asked for a closing with nothing to save, the binding to the system prompt the model last read, the switch, and Android below 12; the real inference engine joined with that store over real files; the chat controller and the view models over a scripted engine, among them when an answer is read ahead and what stops that; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
+| `core` (JVM, 525 tests) | The rules of the terms (the list of states, the typed confirmation, the second without response, the way through the flow, and the random placement of the two buttons over many seeds); the chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints (those that follow a reply among them), reading a conversation ahead after an answer (what it reads, what it never does, and what it gives way to), saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
+| `app` (JVM, 887 tests) | The lock and the encryption with software keys and virtual time: the terms before the set-up and before the lock screen (what is stored and when, a reset, "I do not agree", the failure screens), the wording of the terms against the digest of their version; the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, a save stopped when the keep-alive ends, no keep-alive asked for a closing with nothing to save, the binding to the system prompt the model last read, the switch, and Android below 12; the real inference engine joined with that store over real files; the chat controller and the view models over a scripted engine, among them when an answer is read ahead and what stops that; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
-| `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark, the sealed stream's frozen vectors and a stream of three 4 MiB chunks through the phone's own AES-GCM | `./gradlew :app:connectedDebugAndroidTest` |
+| `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark, the sealed stream's frozen vectors and a stream of three 4 MiB chunks through the phone's own AES-GCM, and the screens of the terms (the two buttons alike, the second without response, the way through statement by statement and the typed confirmation) | `./gradlew :app:connectedDebugAndroidTest` |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model; what the next message reads after a read-ahead, and "Continue" after a stop (`RereadDiagnosisDeviceTest`) | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
 The test counts are those of the commit named above. The two suites that need a phone are not

@@ -32,6 +32,8 @@ import us.theworkmans.proseplow.core.engine.DeviceContextLimits
 import us.theworkmans.proseplow.core.engine.GenerationGate
 import us.theworkmans.proseplow.core.engine.InferenceEngine
 import us.theworkmans.proseplow.core.engine.LlamaEngine
+import us.theworkmans.proseplow.core.terms.Terms
+import us.theworkmans.proseplow.core.terms.TermsFlow
 import us.theworkmans.proseplow.data.BuildIdentity
 import us.theworkmans.proseplow.data.ExpiredFiles
 import us.theworkmans.proseplow.data.FreeSpace
@@ -46,10 +48,12 @@ import us.theworkmans.proseplow.security.BiometricStatus
 import us.theworkmans.proseplow.security.Clock
 import us.theworkmans.proseplow.security.LockConfigStore
 import us.theworkmans.proseplow.security.LockManager
+import us.theworkmans.proseplow.security.LockState
 import us.theworkmans.proseplow.security.MaintenanceScheduling
 import us.theworkmans.proseplow.security.MakesWay
 import us.theworkmans.proseplow.security.ScreenshotAllowance
 import us.theworkmans.proseplow.security.TrustedClock
+import us.theworkmans.proseplow.terms.TermsText
 import java.util.concurrent.Executors
 
 /**
@@ -271,7 +275,16 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         // What has expired is deleted at every start of the lock, before anything can be unlocked.
         expiredData = ExpiredFiles(layout.sessions, layout.kept, layout.sessionIndex, modelMemory),
         maintenanceScheduling = MaintenanceScheduling(MaintenanceSchedule(AndroidMaintenanceSlot(app))::apply),
+        // The terms this build asks for, before the set-up and before the lock screen.
+        termsVersion = Terms.TERMS_VERSION,
     )
+
+    /**
+     * Where the person stands in the terms flow, for the life of the process: it survives a
+     * rotation and leaving the app, and nothing else. It starts afresh whenever the app is not in
+     * the flow (see init), so that the flow always begins at the first statement.
+     */
+    val termsFlow = TermsFlow(TermsText.statementCount)
 
     init {
         // For the life of the process: the answer service stays until a session that is being
@@ -290,5 +303,10 @@ class AppContainer(context: Context, memoryPressure: MemoryPressure) {
         // answer a close that waits to hear whether it runs.
         answerWork.whenKeepAliveEnds(appLock::onKeepAliveEnded)
         answerWork.whenKeepAliveStarts(appLock::onKeepAliveStarted)
+        // The place in the terms flow is not kept past the flow: once it is agreed to (or the
+        // app is anywhere else), the next time it is shown it starts at the first statement.
+        CoroutineScope(Dispatchers.Main.immediate).launch {
+            appLock.state.collect { state -> if (state !is LockState.TermsRequired) termsFlow.restart() }
+        }
     }
 }

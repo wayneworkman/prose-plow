@@ -85,6 +85,26 @@ class SourceRulesTest {
         }
     }
 
+    /**
+     * The terms' screens know the core (the rules of the flow), the lock (which records the
+     * agreement) and the shared pieces of the interface, and nothing of the chats, the settings or
+     * the lock's own screens. The app makes the lock with the version of the terms the core
+     * defines, and with no other number.
+     */
+    @Test
+    fun theTermsKnowOnlyTheCoreTheLockAndTheSharedInterface() {
+        for (file in sources("$main/terms")) {
+            val allowed = listOf("$app.core.", "$app.security.", "$app.ui.", "$app.terms.")
+            val other = imports(file).filter { it.startsWith("$app.") && allowed.none(it::startsWith) && it != "$app.R" }
+            assertEquals("${file.name} in terms imports a package it must not know", emptyList<String>(), other)
+        }
+        val container = code(File(module, "$main/ProsePlowApp.kt"))
+        assertEquals(listOf("termsVersion = Terms.TERMS_VERSION,"), container.filter { it.contains("termsVersion") })
+        assertEquals("one AppLock in the app", 1, container.count { it.contains("AppLock(") })
+        val lock = code(File(module, "$main/security/AppLock.kt"))
+        assertEquals("the version is only ever passed in", listOf("private val termsVersion: Int = 0,"), lock.filter { it.contains("val termsVersion") })
+    }
+
     @Test
     fun theStoresKnowNeitherTheScreensNorAndroid() {
         // data sits on the lock's primitives and the core, and under everything that shows something.
@@ -372,7 +392,15 @@ class SourceRulesTest {
         assertEquals(listOf("MainActivity.kt" to "else -> LockedContent(appLock, current)"), composed)
         val root = File(module, "$main/MainActivity.kt").readText().substringAfter("private fun AppRoot() {").substringBefore("\n    }\n")
         val branches = root.lines().map { it.trim() }.filter { it.startsWith("is LockState.") || it.startsWith("else ->") }
-        assertEquals(listOf("is LockState.Unlocked -> {", "else -> LockedContent(appLock, current)"), branches)
+        assertEquals(
+            listOf(
+                "is LockState.Unlocked -> {",
+                "is LockState.TermsRequired -> TermsGate(appLock, container.termsFlow, onLeave = ::leaveAfterDisagreeing)",
+                "else -> LockedContent(appLock, current)",
+            ),
+            branches,
+        )
+        assertTrue("the locked content shows nothing for the terms", lockedContent.contains("is LockState.TermsRequired -> Unit"))
 
         // 2. The dialogs of the unlocked app.
         val dialogs = functions(File(module, "$main/lock/PassphraseDialogs.kt"))
@@ -768,9 +796,19 @@ class SourceRulesTest {
     fun theProcessIsEndedInOnePlaceAndNeverInATestRun() {
         val all = sources(main)
         assertEquals(listOf("ProcessEnd.kt"), users(all, "killProcess("))
-        for (word in listOf("exitProcess(", "System.exit(", ".halt(", "finishAndRemoveTask(", "finishAffinity(")) {
+        for (word in listOf("exitProcess(", "System.exit(", ".halt(", "finishAffinity(")) {
             assertEquals("$word is another way to end the app", emptyList<String>(), users(all, word))
         }
+        // One way of leaving that ends no process: "I do not agree" in the terms finishes the task
+        // and takes it out of the recent apps, and the lock ends the process as it always does.
+        assertEquals(listOf("MainActivity.kt"), users(all, "finishAndRemoveTask("))
+        val leave = File(module, "$main/MainActivity.kt").readText().substringAfter("private fun leaveAfterDisagreeing() {").substringBefore("\n    }\n")
+        assertEquals(listOf("finishAndRemoveTask()"), leave.lines().map { it.trim() }.filter { it.isNotEmpty() })
+        assertEquals(
+            "it is called from the terms and nowhere else",
+            listOf("is LockState.TermsRequired -> TermsGate(appLock, container.termsFlow, onLeave = ::leaveAfterDisagreeing)"),
+            code(File(module, "$main/MainActivity.kt")).filter { it.contains("leaveAfterDisagreeing") && !it.contains("fun leaveAfterDisagreeing") },
+        )
         val end = File(module, "$main/ProcessEnd.kt").readText().substringAfter("override fun end() {").substringBefore("\n    }\n").lines().map { it.trim() }.filter { it.isNotEmpty() }
         assertEquals(
             listOf("if (InstrumentedRun.detected(app.classLoader)) return", "AnswerService.stop(app)", "Process.killProcess(Process.myPid())"),
@@ -797,7 +835,7 @@ class SourceRulesTest {
         val derivations = lock.filter { line -> listOf("m.checkPassphrase(", "m.changePassphrase(", "m.setUp(").any(line::contains) }
         assertEquals(
             listOf(
-                "val result = whileOthersStandAside { m.setUp(first) }",
+                "val result = whileOthersStandAside { m.setUp(first, terms) }",
                 "when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {",
                 "when (val result = whileOthersStandAside { m.checkPassphrase(passphrase) }) {",
                 "whileOthersStandAside { m.changePassphrase(proof, key, newPassphrase) }",

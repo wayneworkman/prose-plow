@@ -31,7 +31,7 @@ import us.theworkmans.proseplow.ui.SectionTitle
 
 /**
  * About: which version this is, where each model in this build comes from and under which
- * licence, and the way to the third-party notices.
+ * licence, the way to the third-party notices, and the way to the terms that were agreed to.
  *
  * The notices are a screen of their own ([ThirdPartyNoticesScreen]): the app is built with
  * llama.cpp, the C++ runtime and about a hundred libraries, and their licences ask for their
@@ -39,10 +39,11 @@ import us.theworkmans.proseplow.ui.SectionTitle
  *
  * @param models the models this build offers.
  * @param onOpenNotices opens the third-party notices.
+ * @param onOpenTerms opens the terms that were agreed to, and when.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit, onOpenNotices: () -> Unit) {
+fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit, onOpenNotices: () -> Unit, onOpenTerms: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -95,6 +96,7 @@ fun AboutScreen(models: List<ModelSpec>, onBack: () -> Unit, onOpenNotices: () -
                 // selection instead of doing nothing.
                 DisableSelection {
                     OutlinedButton(onClick = onOpenNotices) { Text(stringResource(R.string.about_third_party_open)) }
+                    OutlinedButton(onClick = onOpenTerms) { Text(stringResource(R.string.terms_open)) }
                 }
             }
         }

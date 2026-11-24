@@ -137,9 +137,13 @@ class MandatoryLockTest {
                 "trustedTime",
                 "backgroundMaintenance",
                 "keepModelMemory",
+                "acceptedTermsVersion",
+                "acceptedTerms",
             ),
             stored.keys,
         )
+        assertEquals("a set-up without terms records none", "0", stored.getValue("acceptedTermsVersion").toString())
+        assertEquals(JsonNull, stored.getValue("acceptedTerms"))
         assertEquals("the copy of the memory switch is on until a session says otherwise", "true", stored.getValue("keepModelMemory").toString())
         assertEquals("1", stored.getValue("version").toString())
         assertEquals(setOf("kdf", "salt", "iterations", "wrappedKey", "bindingGeneration"), stored.getValue("passphrase").jsonObject.keys)
@@ -153,6 +157,25 @@ class MandatoryLockTest {
         m.completeBiometricEnrollment(created.proof, created.key, m.prepareBiometricEnrollment(created.proof))
         stored = Json.parseToJsonElement(configFile.readText()).jsonObject
         assertEquals(setOf("wrappedKey", "keyGeneration"), stored.getValue("biometric").jsonObject.keys)
+    }
+
+    @Test
+    fun theAgreementToTheTermsIsStoredAsTheVersionAndOneTime() {
+        val m = manager()
+        m.start()
+        m.setUp(passphrase.toCharArray(), TermsAgreement(1, 1_800_000_000_000L))
+        var stored = Json.parseToJsonElement(configFile.readText()).jsonObject
+        assertEquals("1", stored.getValue("acceptedTermsVersion").toString())
+        assertEquals(setOf("version", "confirmedAtMillis"), stored.getValue("acceptedTerms").jsonObject.keys)
+        assertEquals("1800000000000", stored.getValue("acceptedTerms").jsonObject.getValue("confirmedAtMillis").toString())
+
+        // A later agreement replaces it, version and time together.
+        m.acceptTerms(TermsAgreement(2, 1_900_000_000_000L))
+        stored = Json.parseToJsonElement(configFile.readText()).jsonObject
+        assertEquals("2", stored.getValue("acceptedTermsVersion").toString())
+        assertEquals("2", stored.getValue("acceptedTerms").jsonObject.getValue("version").toString())
+        assertEquals("1900000000000", stored.getValue("acceptedTerms").jsonObject.getValue("confirmedAtMillis").toString())
+        assertEquals(StartResult.Locked, manager().start())
     }
 
     @Test

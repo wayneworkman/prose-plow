@@ -31,6 +31,13 @@ sealed interface LockState<out S : UnlockedSession> {
     /** First run, and after every reset: nothing is stored and a passphrase must be created. */
     data object SetupRequired : LockState<Nothing>
 
+    /**
+     * The terms must be agreed to first: before the set-up ([beforeSetup], nothing is stored), or
+     * before the lock screen, because the configuration records an older version of them or
+     * none. Nothing else can be reached until they are ([AppLock.acceptTerms]).
+     */
+    data class TermsRequired(val beforeSetup: Boolean) : LockState<Nothing>
+
     /** [generation] counts locks, so the fingerprint prompt is shown automatically once per lock. */
     data class Locked(val generation: Int) : LockState<Nothing>
 
@@ -67,6 +74,8 @@ data class SecurityStatus(
     val fingerprintPeriodOver: Boolean = false,
     /** The background maintenance job is to be scheduled ([LockConfig.backgroundMaintenance]). */
     val backgroundMaintenance: Boolean = true,
+    /** The agreement to the terms on record ([LockConfig.acceptedTerms]); null when there is none. */
+    val termsAgreement: TermsAgreement? = null,
 )
 
 enum class BiometricStatus {
@@ -206,6 +215,14 @@ data class SetupUi(
     val error: String? = null,
 )
 
+/** The terms flow's transient state as far as the lock is concerned: recording the agreement before the lock screen. */
+data class TermsUi(
+    /** The agreement is being written. */
+    val busy: Boolean = false,
+    /** What went wrong unexpectedly, as a technical detail (an exception's name). */
+    val error: String? = null,
+)
+
 /** Result of checking the passphrase from Settings. */
 sealed interface PassphraseCheck {
     class Ok(val proof: PassphraseProof) : PassphraseCheck
@@ -285,6 +302,14 @@ sealed interface PassphraseCheck {
  * that nothing can wipe. So whenever the app is locked, nothing is being finished, closed or
  * checked, and no activity is on screen, the process is ended ([ProcessEnder]); the next start
  * is a cold one, into the lock screen.
+ *
+ * The terms. Before the set-up, and before the lock screen whenever the configuration records a
+ * version of the terms below [termsVersion], the state is [LockState.TermsRequired], from which
+ * nothing can be unlocked or set up: only [acceptTerms] leads on. Before the set-up the agreement
+ * is held in this object until the set-up writes it with the first configuration, so nothing is
+ * stored before the passphrase is; before the lock screen it is written, durably, first. The
+ * failure screens are never preceded by the terms. Where a person stands within the flow is not
+ * the lock's business; only the agreement is.
  */
 class AppLock<S : UnlockedSession>(
     private val manager: LockManager,
@@ -326,6 +351,12 @@ class AppLock<S : UnlockedSession>(
     private val expiredData: ExpiredDataSweep = ExpiredDataSweep.None,
     /** Schedules the background maintenance job while its setting is on; see [startMaintenance]. */
     private val maintenanceScheduling: MaintenanceScheduling = MaintenanceScheduling.None,
+    /**
+     * The version of the terms this build asks for; see the class comment. The app passes the
+     * version of its terms. 0 asks for none: the default, for a lock beside which no terms are
+     * shown (the unit tests of everything else).
+     */
+    private val termsVersion: Int = 0,
 ) {
     private val mutex = Mutex()
     private val main = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -349,6 +380,23 @@ class AppLock<S : UnlockedSession>(
 
     private val _setupUi = MutableStateFlow(SetupUi())
     val setupUi: StateFlow<SetupUi> = _setupUi.asStateFlow()
+
+    private val _termsUi = MutableStateFlow(TermsUi())
+    val termsUi: StateFlow<TermsUi> = _termsUi.asStateFlow()
+
+    /**
+     * The agreement to the terms given before the set-up, held until the set-up writes it with the
+     * first configuration ([setUp]); never written by itself. Dropped at every start of the lock
+     * and by a reset, so that a new process, a Try again and a reset all ask again. Main thread only.
+     */
+    private var pendingTerms: TermsAgreement? = null
+
+    /**
+     * "I do not agree" was pressed in this process and no screen of the app was created since.
+     * The flow then counts as settled for the end of the process ([considerEndingProcess]): the
+     * person has left, and nothing of the flow is to be kept. Main thread only.
+     */
+    private var termsDeclined = false
 
     /** Set after an unlock when fingerprint unlock can be offered with that unlock's proof. */
     private val _fingerprintOffer = MutableStateFlow<FingerprintOffer?>(null)
@@ -544,6 +592,7 @@ class AppLock<S : UnlockedSession>(
             withManager { m ->
                 closeRetired()
                 var waitMillis = 0L
+                var termsOnRecord = 0
                 val next: LockState<Nothing> = try {
                     when (val result = m.start()) {
                         StartResult.SetupRequired -> {
@@ -557,6 +606,7 @@ class AppLock<S : UnlockedSession>(
                             maintenanceScheduling.apply(m.config?.backgroundMaintenance != false)
                             cleanUpWhileLocked(m)
                             waitMillis = m.backoffRemainingMillis()
+                            termsOnRecord = m.config?.acceptedTermsVersion ?: 0
                             LockState.Locked(0)
                         }
                         is StartResult.Unrecoverable -> LockState.Unrecoverable(result.reason)
@@ -570,7 +620,15 @@ class AppLock<S : UnlockedSession>(
                 publishStatus(m)
                 withContext(mainDispatcher) {
                     _setupUi.value = SetupUi()
-                    if (next is LockState.Locked) enterLocked(waitMillis) else _state.value = next
+                    _termsUi.value = TermsUi()
+                    // Every start asks again for an agreement that was only held in memory.
+                    pendingTerms = null
+                    when {
+                        next == LockState.SetupRequired && termsVersion > 0 -> _state.value = LockState.TermsRequired(beforeSetup = true)
+                        next is LockState.Locked && termsOnRecord < termsVersion -> _state.value = LockState.TermsRequired(beforeSetup = false)
+                        next is LockState.Locked -> enterLocked(waitMillis)
+                        else -> _state.value = next
+                    }
                 }
             }
         }
@@ -646,6 +704,7 @@ class AppLock<S : UnlockedSession>(
             fingerprintPeriodSeconds = config?.fingerprintPeriodSeconds ?: LockConfig.DEFAULT_FINGERPRINT_PERIOD_SECONDS,
             fingerprintPeriodOver = config?.biometric != null && !m.fingerprintPeriodRunning(),
             backgroundMaintenance = config?.backgroundMaintenance != false,
+            termsAgreement = config?.acceptedTerms,
         )
     }
 
@@ -871,17 +930,21 @@ class AppLock<S : UnlockedSession>(
      * counts as stopped once its last write has returned, so nothing is lost); nothing is using
      * the lock manager; no run of background maintenance is under way ([startMaintenance]);
      * and the app is locked. The screens that are neither unlocked nor
-     * locked (set-up, the error screens) count as locked once a session has been open in this
-     * process, which is the case after a reset: there is something in memory to release.
+     * locked (set-up, the terms, the error screens) count as locked once a session has been open
+     * in this process, which is the case after a reset: there is something in memory to release.
+     * The terms also count as locked once the person has left them with "I do not agree"
+     * ([declineTerms]).
      */
     private fun considerEndingProcess() {
         if (onScreen.isNotEmpty() || arriving.isNotEmpty() || successors > 0) return
         if (live != null || lease != null || unfinished != 0) return
-        if (mutex.isLocked || _unlockUi.value.busy || _setupUi.value.busy || pendingPurpose != null) return
+        if (mutex.isLocked || _unlockUi.value.busy || _setupUi.value.busy || _termsUi.value.busy || pendingPurpose != null) return
         if (maintenanceRuns > 0) return
         val settled = when (_state.value) {
             is LockState.Locked -> true
             LockState.SetupRequired, is LockState.Unrecoverable, is LockState.Failed -> everOpened
+            // As the set-up; and once the person has left with "I do not agree".
+            is LockState.TermsRequired -> everOpened || termsDeclined
             LockState.Starting, is LockState.Unlocked -> false
         }
         if (settled) processEnder.end()
@@ -1227,6 +1290,8 @@ class AppLock<S : UnlockedSession>(
      * screen, that one's place is taken.
      */
     fun onActivityCreated(who: Any = Unit) {
+        // Someone is back: what they leave from now on is judged afresh.
+        termsDeclined = false
         activities++
         if (successors > 0) successors--
         arriving.add(who)
@@ -1268,11 +1333,16 @@ class AppLock<S : UnlockedSession>(
     /**
      * Creates the passphrase from the two entries of the first-run screen (main thread), then
      * opens the first session. Both arrays are cleared here. The rules are checked before
-     * anything is made; while they are not met nothing exists on disk or in the key store.
+     * anything is made; while they are not met nothing exists on disk or in the key store. The
+     * agreement to the terms that was given before ([acceptTerms]) is written with the first
+     * configuration; when this lock asks for terms and none was given, nothing is done.
      */
     fun setUp(first: CharArray, second: CharArray) {
         val from = _state.value
-        if (from != LockState.SetupRequired || _setupUi.value.busy) {
+        // The agreement given before the set-up goes into the first configuration; without one
+        // (a lock that asks for terms) there is no set-up.
+        val terms = pendingTerms
+        if (from != LockState.SetupRequired || _setupUi.value.busy || (termsVersion > 0 && terms?.version != termsVersion)) {
             first.wipe()
             second.wipe()
             return
@@ -1289,7 +1359,7 @@ class AppLock<S : UnlockedSession>(
             try {
                 withManager { m ->
                     closeRetired()
-                    val result = whileOthersStandAside { m.setUp(first) }
+                    val result = whileOthersStandAside { m.setUp(first, terms) }
                     maintenanceScheduling.apply(m.config?.backgroundMaintenance != false)
                     publishStatus(m)
                     open(m, result.key, from, if (biometricAvailable()) FingerprintOffer.FIRST_SETUP to result.proof else null)
@@ -1303,6 +1373,63 @@ class AppLock<S : UnlockedSession>(
                 _setupUi.update { it.copy(busy = false) }
             }
         }
+    }
+
+    // --- The terms ----------------------------------------------------------------------------
+
+    /**
+     * "Agree and continue" on the terms' confirmation screen (main thread): the terms of
+     * [termsVersion] are agreed to now, by the date and time a person can set ([Clock.wallMillis],
+     * kept within what a configuration accepts). Only from [LockState.TermsRequired], and once
+     * at a time.
+     *
+     * Before the set-up the agreement is only held ([pendingTerms]) and the set-up screen follows;
+     * nothing is stored until a passphrase is. Before the lock screen it is written and made
+     * durable first, and the lock screen follows only then; when that fails, the flow stays and
+     * says so ([termsUi]), and pressing again tries again. A reset or another start in between
+     * wins: the lock screen is only shown if the flow is still what is on screen.
+     */
+    fun acceptTerms() {
+        val from = _state.value as? LockState.TermsRequired ?: return
+        if (termsVersion <= 0 || _termsUi.value.busy) return
+        val agreement = TermsAgreement(termsVersion, clock.wallMillis().coerceIn(0, TrustedTime.MAX_WALL_MILLIS))
+        if (from.beforeSetup) {
+            pendingTerms = agreement
+            _setupUi.value = SetupUi()
+            _state.value = LockState.SetupRequired
+            return
+        }
+        _termsUi.value = TermsUi(busy = true)
+        launchWork {
+            try {
+                withManager { m ->
+                    m.acceptTerms(agreement)
+                    val waitMillis = m.backoffRemainingMillis()
+                    publishStatus(m)
+                    withContext(mainDispatcher) { if (_state.value == from) enterLocked(waitMillis) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _termsUi.update { it.copy(error = describe(e)) }
+            } finally {
+                _termsUi.update { it.copy(busy = false) }
+            }
+        }
+    }
+
+    /**
+     * "I do not agree" (main thread): nothing is recorded, and an agreement held for the set-up is
+     * dropped. The screen leaves the app; once nothing of it is on screen any more, the process
+     * ends ([considerEndingProcess]), so that the next start begins the flow afresh. Only from
+     * [LockState.TermsRequired].
+     */
+    fun declineTerms() {
+        if (_state.value !is LockState.TermsRequired) return
+        pendingTerms = null
+        termsDeclined = true
+        _termsUi.value = TermsUi()
+        considerEndingProcess()
     }
 
     // --- Unlocking ----------------------------------------------------------------------------
@@ -1712,7 +1839,7 @@ class AppLock<S : UnlockedSession>(
      * "Reset app data" (main thread), from the lock screen (the forgotten-passphrase path), the
      * error screens, or Settings while unlocked: deletes every Keystore key of the app, every
      * file it has stored and the lock configuration, then starts again, which leads to the
-     * first-run set-up.
+     * terms and then the first-run set-up: an agreement is never carried over a reset.
      *
      * An unlocked session ends here first, and the deletion only begins once it is closed, its
      * key destroyed, and every session before it has really stopped writing, so no late write
@@ -1730,8 +1857,11 @@ class AppLock<S : UnlockedSession>(
         // A session that was being finished behind the lock ends with the rest: its files are about to go.
         lease?.let { if (release(it)) retire(it.live, SessionClose.IMMEDIATE) }
         pendingPurpose = null
+        // The terms are asked for again after every reset.
+        pendingTerms = null
         _unlockUi.value = UnlockUi()
         _setupUi.value = SetupUi()
+        _termsUi.value = TermsUi()
         _state.value = LockState.Starting
         launchWork {
             val report = try {
@@ -1766,6 +1896,7 @@ class AppLock<S : UnlockedSession>(
         val detail = describe(e)
         _unlockUi.update { it.copy(busy = false, error = detail) }
         _setupUi.update { it.copy(busy = false, error = detail) }
+        _termsUi.update { it.copy(busy = false, error = detail) }
         // The app is never left on its spinner: a start that died this way can be tried again.
         _state.compareAndSet(LockState.Starting, LockState.Failed(detail))
     }

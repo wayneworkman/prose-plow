@@ -59,7 +59,8 @@ import us.theworkmans.proseplow.ui.takeChars
 
 /**
  * Replaces all content while the app is not unlocked: first-run set-up, the lock screen, or why
- * the data cannot be opened. Nothing of the chats or settings is composed.
+ * the data cannot be opened. Nothing of the chats or settings is composed. The terms, which also
+ * come before the unlocked app, are not shown here but by the activity's root, in place of this.
  */
 @Composable
 fun LockedContent(appLock: AppLock<*>, state: LockState<*>) {
@@ -84,6 +85,8 @@ fun LockedContent(appLock: AppLock<*>, state: LockState<*>) {
                 is LockState.Unrecoverable -> UnrecoverableScreen(appLock, state.reason)
                 is LockState.Failed -> FailedScreen(appLock, state.detail)
                 is LockState.Unlocked<*> -> Unit
+                // The activity's root shows the terms in place of this content.
+                is LockState.TermsRequired -> Unit
             }
         }
     }

@@ -120,7 +120,7 @@ import us.theworkmans.proseplow.ui.rememberCopyToClipboard
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () -> Unit) {
+fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onOpenInformation: () -> Unit, onLock: () -> Unit) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val session = state.session
     val openId = state.chat.open.id
@@ -207,6 +207,10 @@ fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onLock: () 
                         )
                     },
                     actions = {
+                        // The terms that were agreed to, and when.
+                        IconButton(onClick = onOpenInformation) {
+                            Icon(painterResource(R.drawable.ic_info), contentDescription = stringResource(R.string.information))
+                        }
                         IconButton(onClick = viewModel::newChat) {
                             Icon(painterResource(R.drawable.ic_new_chat), contentDescription = stringResource(R.string.new_chat))
                         }

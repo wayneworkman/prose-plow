@@ -198,12 +198,17 @@ class LockManager(
      *
      * Returns the key and a proof (the passphrase was just set), so fingerprint unlock can be
      * offered at once.
+     *
+     * [terms] is the agreement to the terms that was given before set-up and held in memory
+     * until now; it is written with the first configuration, so that nothing at all is stored
+     * before the passphrase is (null: none, as for a lock that asks for no terms).
      * @throws IllegalStateException if a configuration or encrypted data exists (see [start]).
      */
     @Throws(IOException::class, GeneralSecurityException::class)
-    fun setUp(passphrase: CharArray): PassphraseResult.Success = withNfc(passphrase) { text ->
+    fun setUp(passphrase: CharArray, terms: TermsAgreement? = null): PassphraseResult.Success = withNfc(passphrase) { text ->
         check(config == null) { "A passphrase is already set" }
         require(PassphraseRules.check(text) == null) { "The passphrase does not meet the rules" }
+        require(terms == null || terms.isValid()) { "The agreement to the terms is not valid" }
         // Looked at again, not only at start: never make a key over a configuration or data that is there.
         check(store.read() == null && !encryptedDataExists()) { "The app is already set up" }
         ignoreFailure { vault.deleteAll() }
@@ -218,6 +223,8 @@ class LockManager(
                         // Creating the passphrase is the first unlock.
                         fingerprintPeriodStart = periodStartNow(),
                         trustedTime = trustedClock.mark(),
+                        acceptedTermsVersion = terms?.version ?: 0,
+                        acceptedTerms = terms,
                     ),
                 )
                 if (!durable) {
@@ -628,6 +635,24 @@ class LockManager(
     fun setFinishAnswerAfterLocking(enabled: Boolean) {
         val current = checkNotNull(config) { "No passphrase has been set up" }
         if (current.finishAnswerAfterLocking != enabled) save(current.copy(finishAnswerAfterLocking = enabled))
+    }
+
+    /**
+     * Records [agreement] as the agreement to the terms, in place of any before it, and returns
+     * only once that is durable (STORE-06 of the features: what a restart finds even after a
+     * power loss), so that the lock screen never shows before the agreement it follows is on
+     * disk. When the write is in place but could not be made durable, making it durable is tried
+     * once more before this fails.
+     * @throws IOException if it was not written, or not made durable.
+     * @throws IllegalStateException without a configuration.
+     */
+    @Throws(IOException::class)
+    fun acceptTerms(agreement: TermsAgreement) {
+        require(agreement.isValid()) { "The agreement to the terms is not valid" }
+        val current = checkNotNull(config) { "No passphrase has been set up" }
+        if (save(current.copy(acceptedTermsVersion = agreement.version, acceptedTerms = agreement))) return
+        configDurable = store.sync()
+        if (!configDurable) throw IOException("The agreement to the terms could not be made durable")
     }
 
     /**

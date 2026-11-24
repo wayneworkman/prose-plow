@@ -68,6 +68,7 @@ is about things that are **not** built and is kept apart from everything else.
 26. [Security model (THREAT, DEC)](#26-security-model-threat-dec)
 27. [Planned tools: design considerations (TOOL)](#27-planned-tools-design-considerations-tool)
 28. [What the app does not do (NOT)](#28-what-the-app-does-not-do-not)
+29. [The terms (TERMS)](#29-the-terms-terms)
 
 ## 1. The app as a whole (APP)
 
@@ -88,10 +89,12 @@ is about things that are **not** built and is kept apart from everything else.
 - **APP-04** The app is text only (no images, sound or files go into or come out of a model)
   and uses the processor only (no graphics processor, no neural accelerator).
 - **APP-05** The app has two groups of screens and only ever builds one of them.
-  - Not unlocked: a starting indicator, first-time set-up, the lock screen, and two failure
-    screens. Nothing of a chat or a setting exists in the interface while one of these shows.
+  - Not unlocked: a starting indicator, the terms (TERMS-04), first-time set-up, the lock
+    screen, and two failure screens. Nothing of a chat or a setting exists in the interface
+    while one of these shows.
   - Unlocked: the chat screen, which is the home screen and carries the list of chats as a
-    drawer; Settings; a page for each model; About; the third-party notices.
+    drawer; Settings; a page for each model; About; the third-party notices; the terms that were
+    agreed to (TERMS-16).
 - **APP-06** The app can be opened from the launcher, from the list of recent apps and by
   tapping one of its two notifications (BG-08). All three lead to the lock screen when the app
   is locked. Nothing else opens it: it registers no share target, no link handler, no widget and
@@ -118,7 +121,8 @@ is about things that are **not** built and is kept apart from everything else.
 - **APP-11** The screen stays on for as long as a reply is being written, on whichever unlocked
   screen is in front, so that a long answer is not cut off by the device going to sleep.
 - **APP-12** The back action closes the list of chats when it is open. On Settings, a model's
-  page, About and the notices it returns to the screen before. On the chat screen with the
+  page, About, the notices and the terms that were agreed to it returns to the screen before.
+  In the terms flow it does what TERMS-08 says. On the chat screen with the
   drawer closed it leaves the app, as the platform defines that.
 - **APP-13** A tap that opens another screen is ignored while the screen it was made on is not
   fully in front, so two quick taps never open a screen twice.
@@ -143,12 +147,13 @@ is about things that are **not** built and is kept apart from everything else.
 
 ## 2. First run and set-up (SETUP)
 
-**Source:** `lock/LockScreens.kt` (`SetupScreen`), `security/AppLock.kt` (`setUp`),
+**Source:** `lock/LockScreens.kt` (`SetupScreen`), `security/AppLock.kt` (`start`, `setUp`),
 `security/LockManager.kt` (`start`, `setUp`), `security/Passphrase.kt`; tests
 `security/LockManagerTest.kt`, `security/AppLockTest.kt`, `security/DurabilityTest.kt`.
 
-- **SETUP-01** When nothing is stored, the app starts at the set-up screen, and there is no way
-  past it without creating a passphrase. It shows, in this order:
+- **SETUP-01** When nothing is stored, the app starts at the terms flow (TERMS-04) and reaches
+  the set-up screen only after it; there is no way past the set-up screen without creating a
+  passphrase. It shows, in this order:
   - the title "Create your passphrase";
   - "Prose Plow encrypts everything it stores on this phone. Your passphrase unlocks it each
     time you open the app; without it nothing can be read.";
@@ -194,7 +199,8 @@ is about things that are **not** built and is kept apart from everything else.
 - **SETUP-11** Hardware keys that an earlier set-up left behind without finishing (or that a
   reset could not delete) are deleted at every start that finds nothing set up; they protect
   nothing.
-- **SETUP-12** The same screen follows every complete reset (RESET-08).
+- **SETUP-12** The terms flow, then the same screen, follow every complete reset (RESET-08,
+  TERMS-14).
 - **SETUP-13** The set-up screen can never be captured in a screenshot or a recording, whatever
   screenshot allowance may be running (PRIV-03).
 
@@ -722,8 +728,10 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
   - no passphrase or fingerprint check, set-up or other work of the lock is running;
   - no run of the background maintenance job holds the process (BG-14). A run that has finished
     holds it until the platform has been told so, and is looked at again only after that;
-  - the app is locked. The set-up screen and the two failure screens count as locked only if a
-    session was open earlier in the same process, which is the case after a reset.
+  - the app is locked. The terms flow, the set-up screen and the two failure screens count as
+    locked only if a session was open earlier in the same process, which is the case after a
+    reset; the terms flow also counts as locked once "I do not agree" was pressed in it
+    (TERMS-09).
 - **END-02** The conditions are looked at when the app leaves the screen, when a screen of the
   app is destroyed (one that was on its way to being shown may have been all that held the
   process; a rotation is not leaving the screen), and after every piece of the lock's own work,
@@ -735,7 +743,10 @@ of the device's starts); tests `security/AppLockTest.kt`, `security/LockHardenin
     that keep-alive runs, so the process lives up to 10 seconds longer, and a save that was
     stopped at that bound keeps it alive until its writing thread has returned;
   - leaving the lock screen without unlocking ends the process;
-  - leaving the first-run set-up screen does not (nothing was ever decrypted in that process);
+  - leaving the first-run set-up screen does not (nothing was ever decrypted in that process),
+    and neither does leaving the terms flow without answering, so that its place is kept
+    (TERMS-13);
+  - leaving the app with "I do not agree" does;
   - the app stays in the list of recent apps, and opening it is a fresh start at the lock
     screen;
   - the model is loaded again at the next unlock;
@@ -819,7 +830,9 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
 
   Each step is tried even if one before it failed.
 - **RESET-08** After a reset the saved state of the screens is deleted and the app starts again
-  as from a fresh launch. When everything was deleted, that is first-time set-up.
+  as from a fresh launch. When everything was deleted, that is the terms flow and then
+  first-time set-up (TERMS-14): an agreement to the terms is never carried over a reset, from
+  whichever screen the reset was made.
 - **RESET-09** When something could not be deleted, a dialog titled "The reset is not complete"
   lists what, with "OK" to close it:
   - keys: "Some of the app's keys could not be deleted from the phone's key store. The app tries
@@ -908,7 +921,7 @@ tests `security/AppLockTest.kt`, `security/AppFilesTest.kt`, `security/LockManag
   | `settings.enc` | The system prompt of each model; the temperature, the longest reply and the size chosen for the context of each model (MSET-22); whether the question about notifications has been asked; and how long messages are kept (SECSET-13) | Encrypted, purpose `settings` |
   | `kept/*.enc` | Exact copies of files that could not be read completely, made before they were replaced (STORE-09) | Encrypted, as the original was |
   | `model-memory/<chat id>.enc` | The model's saved memory of one conversation, at most one such file (STORE-24), written as STORE-28 describes. The file's last-modified time is the date of the oldest message it was made from | A sealed stream (FMT-21) for the purpose `model-memory:<chat id>`, with the store's header (FMT-22) |
-  | `security/lock.json` | The lock configuration (FMT-06), with readable copies of how long messages are kept and of SECSET-15, and the trusted time (CHAT-24) | Plain JSON without a secret in the clear |
+  | `security/lock.json` | The lock configuration (FMT-06), with readable copies of how long messages are kept and of SECSET-15, the trusted time (CHAT-24), and the version of the terms that were accepted with the date and time they were (TERMS-12) | Plain JSON without a secret in the clear |
 
   The model files are part of the installed app and are not encrypted: they are public files.
 - **STORE-02** Every file that is encrypted with the data key has a name ending in `.enc` and
@@ -1210,7 +1223,8 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   first message or its first draft, and a chat that is left empty is forgotten when the user
   moves to another. A chat that only ever held a draft is deleted when the draft has been
   cleared and the user moves on.
-- **CHAT-04** A new chat is started from the top bar (a button described as "New chat") or from
+- **CHAT-04** A new chat is started from the top bar (a button described as "New chat"; to its
+  left is the button of TERMS-22) or from
   the first entry of the list of chats. It uses the model of the chat that was on screen if this
   build offers that model, otherwise the default model (MODEL-03), otherwise the first model
   the build offers. Asking for a new chat while the chat on screen is already empty does
@@ -2021,7 +2035,7 @@ tests `chat/ChatControllerTest.kt`, `chat/ChatViewModelTest.kt`, `chat/AiNoticeT
   turning off; the user switching it off; a reset; the end of the app's process. Giving it again
   while it runs starts the full time afresh.
 - **PRIV-03** An allowance only ever opens the unlocked app. Wherever the app is not unlocked
-  (first-time set-up, the lock screen, both failure screens) the screen cannot be captured,
+  (the terms flow, first-time set-up, the lock screen, both failure screens) the screen cannot be captured,
   allowance or not. Locking does not end an allowance: it has no effect while the app is locked
   and applies again after an unlock within its time, as long as the process is the same one
   (END-03).
@@ -3048,7 +3062,8 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
 
 **Source:** `settings/SettingsScreen.kt`, `settings/AboutScreen.kt`,
 `settings/ThirdPartyNoticesScreen.kt`, `settings/ThirdPartyNoticesText.kt`,
-`settings/ThirdPartyNoticesViewModel.kt`, `app/notices/`, `fastlane/metadata/android/en-US/`;
+`settings/ThirdPartyNoticesViewModel.kt`, `terms/TermsScreens.kt` (`TermsRecordScreen`),
+`app/notices/`, `fastlane/metadata/android/en-US/`;
 tests `settings/ThirdPartyNoticesTextTest.kt`, `ThirdPartyNoticesTest.kt`.
 
 - **ABOUT-01** The "About" group of Settings shows the app's name and version, as "Prose Plow
@@ -3064,7 +3079,8 @@ tests `settings/ThirdPartyNoticesTextTest.kt`, `ThirdPartyNoticesTest.kt`.
   - the heading "Open-source software and models", the text "The models are run by llama.cpp.
     The app is built with it and with other open-source software, and carries the models listed
     above. The notices name every one of them, with its copyright lines and the text of its
-    licence.", and the button "Third-party notices".
+    licence.", and the button "Third-party notices";
+  - the button "Terms", which opens the terms that were agreed to (TERMS-16).
 
   The text of the screen can be selected and copied.
 - **ABOUT-03** The screen "Third-party notices" shows the whole text of the notices: every
@@ -3106,13 +3122,14 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
   are quoted with the buttons throughout this document ("Open the list of chats", "New chat",
   "More options", "Send", "Send the edited message", "Stop", "Copy message", "Edit message",
   "Answer again", "Copy code", "Cancel editing", "Go to the latest message", "Delete {title}",
-  "Back", and the two that empty a number field). Icons that only repeat the words beside them
+  "Back", "Information", and the two that empty a number field). Icons that only repeat the words beside them
   have none.
 - **A11Y-02** Things that appear and matter are announced politely when they appear, without
   taking the focus: every notice and failure card; the messages under the fields of the set-up
   and lock screens; the messages of the security settings; the line that says a number entry is
   not valid; the line that says a message is being edited; the screen of a chat that cannot be
-  opened; and the line that says a model is being loaded.
+  opened; the line that says a model is being loaded; "Statement {n} of {total}" when a
+  statement of the terms appears (TERMS-19); and a failure under the terms' confirmation field.
 - **A11Y-03** A reply is not read out word by word while it streams. The line under it is
   announced when it moves from one stage to the next ("Loading the model…", "Reading the
   conversation…", "Writing…"), never for every step of a progress bar, and the newest reply is
@@ -3120,8 +3137,9 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
 - **A11Y-04** The line "This app uses AI, and AI can make mistakes." is never announced by
   itself, only when the user moves to it (CHAT-20).
 - **A11Y-05** The titles of Settings and of a model's page, the headings of the groups in
-  Settings and About, the heading "Context" on a model's page, and every heading of the notices
-  are marked as headings, so a screen reader can move from one to the next.
+  Settings and About, the heading "Context" on a model's page, every heading of the notices, and
+  the titles of the terms' screens (TERMS-19) are marked as headings, so a screen reader can
+  move from one to the next.
 - **A11Y-06** A row that is one action is read as one thing with what a tap does: a model's row
   in Settings ("open its settings"), the model card row ("open it in your browser"), and the
   title of the chat screen ("Switch model"). While the model picker is unavailable the title
@@ -3323,6 +3341,10 @@ This section is exact where the others describe. Each item carries one of three 
   | `trustedTime.bootCount` | number or null | The device's count of starts at that moment; null when it could not be read | when not null, not negative |
   | `backgroundMaintenance` | boolean, default true | SECSET-14; a file without the field means on | |
   | `keepModelMemory` | boolean, default true | The readable copy of SECSET-15, written from the setting at every unlock and when the switch is changed, and used when the settings cannot say (SECSET-15); a file without the field means on | |
+  | `acceptedTermsVersion` | number, default 0 | The version of the terms that were agreed to (TERMS-12); a file without the field means 0 | not negative, and equal to `acceptedTerms.version`, or 0 when `acceptedTerms` is null |
+  | `acceptedTerms` | object or null, default null | The agreement to the terms of `acceptedTermsVersion` (TERMS-12); null when none was given, which a file without the field means. Like the rest of this file it can be read by anyone who can read the app's private storage | when not null, both fields below |
+  | `acceptedTerms.version` | number | The version agreed to | 1 or more |
+  | `acceptedTerms.confirmedAtMillis` | number | When "Agree and continue" was pressed, by the date and time, in milliseconds since 1970 | 0 to 253,402,300,799,999 (the end of the year 9999) |
 
   The hardware keys are named `proseplow.passphrase.binding.` and `proseplow.dek.biometric.`
   followed by the generation in decimal without leading zeros. Every key of the app begins with
@@ -3842,7 +3864,8 @@ without these properties has not reached parity.
   file last changed on the medium, roughly when the app last left the screen or locked after
   that conversation; and the content of
   the lock configuration (whether fingerprint unlock is on, whether an answer is finished after
-  locking, how many wrong attempts were made and when).
+  locking, how many wrong attempts were made and when, and which version of the terms was agreed
+  to and the date and time of that agreement, TERMS-12).
 - **THREAT-19** What the notifications tell: that the app is writing an answer, or has finished
   one, or is unlocked and waiting to lock itself, or is locking (BG-04), and when. Nothing else.
 - **THREAT-25** What the expiry of messages (CHAT-22) does not do. Deleting is not erasing:
@@ -4221,6 +4244,17 @@ only state a rule, the item says so and states its effect instead of inventing a
   with a year or a person's name. A later revision of the model is a new decision, made on what
   that revision's repository says. The rule itself stands for every other model: a licence must
   be established before a model is bundled.
+- **DEC-58** *The agreement to the terms records the date and time it was given* (TERMS-12,
+  TERMS-22, TERMS-23). The owner's decision of 2026-11-23, which replaces the sentence of the
+  terms' specification that nothing but the version is recorded ("no date, no time"): the
+  version is recorded together with one date and time, the moment "Agree and continue" was
+  pressed, and the chat screen gains "Information", which shows the statements and that moment.
+  No time is recorded for each statement, and no copy of the answers. The time is taken from the
+  date and time a person can set, because it is a record for the person and nothing is timed by
+  it; it is stored in the lock configuration, beside the version, because that is the only place
+  the flow can write before a key exists, and so it can be read by anyone who can read the app's
+  private storage (THREAT-18). Preserve: one time, for the version on record, replaced by the next
+  agreement; a configuration in which the version and the agreement disagree counts as damaged.
 
 ## 27. Planned tools: design considerations (TOOL)
 
@@ -4469,3 +4503,190 @@ Parity includes the absences. A port that adds one of these has changed what the
   later, and a system may end an app without refusing anything first. What is kept then is the chat
   on the disk (STORE-07): every message as it was sent, and the answer under way as far as it had
   been written, at most a second behind.
+
+## 29. The terms (TERMS)
+
+**Source:** `core/.../terms/Terms.kt` (the constants, the list of states, the match of the
+confirmation, the second without response), `core/.../terms/TermsProgress.kt` (where a person
+stands in the flow), `core/.../terms/ButtonPlacement.kt` (TERMS-20), `terms/TermsText.kt`,
+`terms/TermsScreens.kt`, `security/AppLock.kt` (`start`, `acceptTerms`, `declineTerms`,
+`setUp`, `reset`), `security/LockManager.kt` (`setUp`, `acceptTerms`), `security/LockConfig.kt`
+(`TermsAgreement`), `MainActivity.kt`, `chat/ChatScreen.kt`, `settings/AboutScreen.kt`; tests
+`core/.../terms/TermsTest.kt`, `core/.../terms/TermsProgressTest.kt`,
+`core/.../terms/ButtonPlacerTest.kt`, `terms/TermsTextTest.kt`, `security/AppLockTest.kt`,
+`SourceRulesTest.kt`, `app/src/androidTest/.../terms/TermsFlowOnDeviceTest.kt`.
+
+A gate that every user passes before the app can be used. Before set-up, and again whenever the
+terms change, the app shows ten statements one at a time. The upper half of the screen holds the
+statement; the lower half holds the two buttons "I agree" and "I do not agree", at new random
+places for every statement. "I agree" moves to the next statement, and "I do not agree" leaves
+the app. A last screen lists all ten statements and requires the words I agree to be typed.
+Until that is done, no other screen can be reached. The app records the version of the terms
+that were accepted and the date and time they were.
+
+The app asks and does not verify. It adds no location permission, no date-of-birth entry, no
+network use and no content filter.
+
+Two constants decide the terms, and are read from one place everywhere:
+
+| Name | Value in version 1 | Meaning |
+| --- | --- | --- |
+| `TERMS_VERSION` | 1 | The version of the terms this build asks for |
+| `BLOCKED_STATES` | California, Colorado, Connecticut, Georgia, Hawaii, Idaho, Iowa, Maine, Nebraska, New Hampshire, New York, Oregon, Rhode Island, Tennessee, Utah, Washington | The states named in statement 2, in alphabetical order |
+
+`BLOCKED_STATES` holds every state with an enacted chatbot law as of 23 November 2026, including
+laws not yet in force. Adding a state is a change of TERMS-15.
+
+- **TERMS-01** The statements, in this order:
+  1. "I am 18 or older."
+  2. "I am not in any of these US states, and I will not use this app there: {states}."
+  3. "This app runs AI models on my phone. Their output can be wrong, misleading or offensive,
+     and nobody reviews it."
+  4. "This app is not a doctor, lawyer, therapist or other professional. I will not rely on it
+     for medical, legal, financial or safety decisions."
+  5. "This app is not for emergencies or crisis support. In the US, I can call or text 988."
+  6. "By default, my messages are deleted after 7 days. I can change this in Settings."
+  7. "My passphrase cannot be recovered. If I forget it, everything in the app is lost for
+     good."
+  8. "This app is provided as is, with no warranty. To the extent the law allows, its authors
+     are not liable for any harm or loss from my use of it."
+  9. "I am responsible for how I use this app and what I do with its output."
+  10. "Missouri law governs these terms, and any dispute will be brought in courts located in
+      Missouri."
+
+  Where they are listed together (TERMS-10, TERMS-16) each is shown as "{n}. {statement}", the
+  number counting from 1.
+- **TERMS-02** `{states}` is made from `BLOCKED_STATES`, in alphabetical order: one name stands
+  alone; two are joined by " and "; three or more are separated by ", " with " and " before the
+  last ("California, Colorado, …, Utah and Washington"). If the list is empty, statement 2 is
+  left out and the count of statements is one lower.
+- **TERMS-03** The number of days in statement 6 is the default of SECSET-13. A test holds the
+  two together.
+- **TERMS-04** The flow is shown in two cases, and in no other:
+  - when nothing is stored, before the set-up screen (SETUP-01);
+  - when a lock configuration exists and the version it records (TERMS-12) is lower than
+    `TERMS_VERSION`, before the lock screen.
+
+  The failure screens (RESET) are not preceded by it.
+- **TERMS-05** While the flow is showing, no other screen can be reached by any route: the
+  launcher, the list of recent apps, a notification, a link or another app. There is no way to
+  skip it and no way to agree to everything at once. No model is loaded and no chat is opened
+  until it is finished: the lock neither sets up nor unlocks anything while it asks for the
+  terms.
+- **TERMS-06** Each statement has its own screen. Under a top bar, the screen is divided into
+  an upper half and a lower half.
+  - The top bar shows the title "Before you start" and, except on the first statement, the
+    back button ("Back").
+  - The upper half shows, in this order: "Statement {n} of {total}"; "Read the statement, then
+    choose a button. The two buttons change places on every screen."; and the statement's
+    text. If they do not fit, the upper half scrolls.
+  - The lower half holds two buttons and nothing else: "I agree" and "I do not agree". They
+    have the same size, shape and colours, and neither is emphasised. TERMS-20 says where they
+    are placed.
+- **TERMS-07** Pressing "I agree" shows the next statement, and after the last statement the
+  confirmation screen (TERMS-10). There is no checkbox and no "Next" button.
+- **TERMS-08** "Back" returns to the statement before. Agreement to that statement is not
+  kept: it is shown as if for the first time, with its buttons placed anew, and "I agree" must
+  be pressed on it again to move on. The system's back action does what "Back" does, and on the
+  first statement it leaves the app. From the confirmation screen "Back" returns to the last
+  statement, and what was typed into the field is gone.
+- **TERMS-09** Every screen of the flow, each statement and the confirmation screen, has the
+  button "I do not agree". Pressing it leaves the app at once, without a dialog or a question.
+  Nothing is recorded, and the progress of TERMS-13 is thrown away: the next start shows the
+  first statement and an empty field.
+
+  **On Android:** the task is finished and removed from the list of recent apps. Once nothing
+  of the app is on screen, the process ends (END-01), in the one place it is ever ended.
+- **TERMS-10** After the last statement comes the confirmation screen. It can only be reached
+  by pressing "I agree" on every statement in order. Its buttons do not move. It shows, in
+  this order:
+  - the title "Confirm";
+  - every statement of TERMS-01, numbered, as plain text;
+  - "These terms apply to this build of the app. The source code is licensed separately under
+    the Apache License 2.0.";
+  - "I have read and understood every statement above, and I agree to all of them.";
+  - a text field labelled "Type the words I agree";
+  - the button "Agree and continue";
+  - the buttons "Back" and "I do not agree" (TERMS-09).
+- **TERMS-11** The field starts empty and is never filled in for the user. "Agree and continue"
+  is enabled only while the field matches: leading and trailing blanks are dropped, a run of
+  blanks counts as one, letter case is ignored, and the result must be exactly `i agree`. The
+  keyboard's action key does what the button does, and nothing when the button is disabled.
+
+  **On Android:** the field is an ordinary text field that is excluded from autofill.
+- **TERMS-12** Agreement is recorded in the lock configuration (FMT-06) as the version agreed
+  to, `acceptedTermsVersion`, and beside it, for that version, the date and time "Agree and
+  continue" was pressed (`acceptedTerms`, TERMS-23). A file without the fields means 0 and no
+  time. Nothing else is recorded: no time for each statement and no copy of the answers.
+  - On a first run the agreement is held in memory until set-up succeeds and is written with
+    the first configuration (SETUP-07). SETUP-06 still holds: until then nothing exists. If the
+    process ends before set-up succeeds, the flow is shown again.
+  - When a configuration already exists, the agreement is written and made durable (STORE-06)
+    before the lock screen is shown. If that fails, the confirmation screen stays and shows
+    "Something went wrong: {detail}", and "Agree and continue" can be pressed again.
+  - A later agreement, to a higher version, replaces the earlier one with its time.
+- **TERMS-13** Progress through the flow is kept in memory only. Turning the device, or leaving
+  the app and returning while the process lives, keeps the place and the typed text. A new
+  process starts at the first statement with an empty field, and so does the next start after
+  "I do not agree" (TERMS-09). Once the flow is left for any other screen, the next flow begins
+  at the first statement.
+- **TERMS-14** After a complete reset (RESET-08) nothing is stored, so the flow is shown again
+  before set-up. This holds for every reset: from the lock screen, from the failure screens and
+  from the security settings. An agreement that was held in memory for a set-up that had not
+  happened yet is dropped by a reset too.
+- **TERMS-15** `TERMS_VERSION` is raised whenever any of these change: the wording of a
+  statement, the wording of the two lines above the field in TERMS-10, `BLOCKED_STATES`, or the
+  default of SECSET-13. A test holds a digest of all of them against the version, so changing
+  one without raising the version fails the build.
+- **TERMS-16** The About screen (ABOUT-02) has the button "Terms". It opens a screen titled
+  "Terms" that shows "You agreed to these statements (version {n}).", "You agreed to all of them
+  on {date and time}." (TERMS-23), every statement of TERMS-01, numbered, and the line about the
+  build and the source code from TERMS-10. The text can be selected and copied. Nothing on it
+  can be changed, and it has neither "I agree" nor "I do not agree". It has a back button
+  ("Back"). The button of TERMS-22 opens the same screen.
+- **TERMS-17** The statements are shown in English whatever the language of the device, and
+  are not translated. Neither are the two lines above the field in TERMS-10.
+- **TERMS-18** The flow is shown while the app is not unlocked, so its screens cannot be
+  captured (PRIV-03).
+- **TERMS-19** Accessibility:
+  - the titles "Before you start", "Confirm" and "Terms" are marked as headings (A11Y-05);
+  - when a statement appears, a screen reader's focus moves to its text, and "Statement {n} of
+    {total}" is announced politely (A11Y-02);
+  - each of the two buttons is read by its own words. A screen reader meets them in the order
+    of their places on the screen, which changes with every statement;
+  - the buttons keep the platform's full touch target, and the text follows the user's font
+    size and wraps (A11Y-08).
+- **TERMS-20** The two buttons of a statement screen are placed at random each time a statement
+  appears, and again whenever the size of the lower half changes (the device is turned, the
+  window is resized, or the font size changes).
+  - Both buttons have the size of the one with the longer label, and are never wider than the
+    lower half less its margins; a label that does not fit wraps.
+  - Each lies wholly inside the lower half, at least 16 dp from its edges and clear of the
+    system bars.
+  - The two never overlap, and at least 24 dp of empty space separates them, across or
+    vertically.
+  - Within those rules every pair of places is equally likely, so either button can be to the
+    left or right of the other, or above or below it. The places on one screen do not depend
+    on the places on any other.
+  - If the lower half cannot hold both buttons under these rules, they are placed one above
+    the other, 24 dp apart, in the middle, in random order, and the lower half scrolls.
+  - The buttons appear in their places without animation.
+
+  The placement is one function of the area, the button size and a source of random numbers, so
+  that a test can drive it with a fixed seed. The function draws the pair of places exactly
+  from those that fit, without drawing again: two places conflict only when they are close both
+  across and vertically, so the pairs that fit can be counted and drawn from directly, and the
+  time it takes is bounded however narrowly the area holds the two.
+- **TERMS-21** For the first second after a statement appears, and after the buttons are
+  placed anew (TERMS-20), neither button responds, and both are shown as disabled. This keeps
+  the second tap of a double tap from landing on a button that has just moved under the finger.
+  The second is counted on the device clock.
+- **TERMS-22** The chat screen's top bar has, immediately to the left of "New chat" (CHAT-04), a
+  button described as "Information". It opens the screen of TERMS-16: the statements of the
+  accepted version, numbered, and once, the date and time all of them were agreed to.
+- **TERMS-23** The date and time recorded with the agreement (TERMS-12) is the moment "Agree and
+  continue" was pressed, by the date and time a person can set (not the device clock), stored in
+  milliseconds since 1970 and shown in the device's time zone and in its format for dates and
+  times. It is in the lock configuration, which must be readable before the app is unlocked, so
+  anyone who can read the app's private storage can read it (THREAT-18). It is a record for the
+  user: nothing is timed or decided by it.

@@ -91,6 +91,19 @@ data class LockConfig(
      * Its type is its validation: a value that is not a boolean makes the configuration unreadable.
      */
     val keepModelMemory: Boolean = true,
+    /**
+     * The version of the terms that were agreed to (see [AppLock]); 0 when none were, which a
+     * file written before this field existed means. It is here, and not with the encrypted
+     * settings, because the terms are asked for before the lock screen, and on a first run
+     * before any key exists. Always the version of [acceptedTerms], which [isValid] checks.
+     */
+    val acceptedTermsVersion: Int = 0,
+    /**
+     * The agreement to the terms of [acceptedTermsVersion]: that version and when it was
+     * confirmed. Null when no terms were agreed to, which a file written before this field
+     * existed means. It is readable by anyone who can read the app's private storage.
+     */
+    val acceptedTerms: TermsAgreement? = null,
 ) {
     /**
      * Every field is in range and every wrap well formed, so nothing read from the file can make
@@ -106,6 +119,8 @@ data class LockConfig(
         if (messageLifetimeDays !in MESSAGE_LIFETIME_CHOICES_DAYS) return false
         if (trustedTime != null && !trustedTime.isValid()) return false
         if (failedAttempts < 0 || lastFailureWallMillis < 0 || lastFailureElapsedMillis < 0) return false
+        if (acceptedTermsVersion < 0 || (acceptedTerms?.version ?: 0) != acceptedTermsVersion) return false
+        if (acceptedTerms != null && !acceptedTerms.isValid()) return false
         if (!passphrase.isValid(minIterations)) return false
         if (biometric != null && !biometric.isValid()) return false
         // Generations are never reused, so the highest one committed is at least every one in use.
@@ -218,6 +233,17 @@ data class BiometricWrap(val wrappedKey: String, val keyGeneration: Int) {
 data class FingerprintPeriodStart(val elapsedMillis: Long, val bootCount: Int) {
     /** Neither value can be negative on a phone; a negative one is a damaged configuration. */
     fun isValid(): Boolean = elapsedMillis >= 0 && bootCount >= 0
+}
+
+/**
+ * An agreement to the terms: their [version] and when "Agree and continue" was pressed on it, by
+ * the date and time a person can set ([Clock.wallMillis]), in milliseconds since 1970. A record
+ * for the person to look at, never something the lock times anything by.
+ */
+@Serializable
+data class TermsAgreement(val version: Int, val confirmedAtMillis: Long) {
+    /** A version of at least 1 (0 is "none"), and a time a device clock can give. */
+    fun isValid(): Boolean = version >= 1 && confirmedAtMillis in 0..TrustedTime.MAX_WALL_MILLIS
 }
 
 class LockConfigUnreadableException(message: String, cause: Throwable? = null) : IOException(message, cause)

@@ -11,6 +11,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -208,9 +209,9 @@ class AppLockTest {
     /**
      * A new "process" over the same files and keys. [visible]: with an activity that is created
      * with it and reaches the screen, as the app really starts; without one, nothing is ever on
-     * screen for this lock.
+     * screen for this lock. [termsVersion]: the version of the terms the lock asks for (0: none).
      */
-    private fun TestScope.startApp(visible: Boolean = false, beforeAnythingRuns: () -> Unit = {}): AppLock<FakeSession> {
+    private fun TestScope.startApp(visible: Boolean = false, termsVersion: Int = 0, beforeAnythingRuns: () -> Unit = {}): AppLock<FakeSession> {
         processEnds = 0
         logAtProcessEnd = null
         vault.onUse = ::insideTheManager
@@ -285,6 +286,7 @@ class AppLockTest {
                 log += "expired data swept"
                 sweeps += lifetime to now
             },
+            termsVersion = termsVersion,
         )
         assertEquals("nothing is known before the configuration was read", LockState.Starting, lock.state.value)
         if (visible) {
@@ -3436,5 +3438,250 @@ class AppLockTest {
         }
         assertEquals(0, finished)
         assertEquals("a run stopped early holds nothing: the process ends as it would have", 1, processEnds)
+    }
+
+    // --- The terms ------------------------------------------------------------------------------
+
+    @Test
+    fun aFirstRunShowsTheTermsBeforeTheSetUpAndNothingElseCanBeReached() = runTest(dispatcher) {
+        startApp(termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+        nothingIsPersisted()
+
+        // Neither a set-up nor an unlock gets past the terms.
+        lock.setUp(passphrase.toCharArray(), passphrase.toCharArray())
+        enter(passphrase)
+        runCurrent()
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+        assertTrue(sessions.isEmpty())
+        nothingIsPersisted()
+
+        clock.wall = 1_800_000_000_000L
+        lock.acceptTerms()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        runCurrent()
+        // SETUP-06: still nothing until a passphrase is set.
+        nothingIsPersisted()
+
+        clock.wall = 1_800_000_060_000L
+        createPassphrase()
+        val stored = storedConfig()
+        assertEquals(1, stored.acceptedTermsVersion)
+        assertEquals("the moment Agree and continue was pressed", TermsAgreement(1, 1_800_000_000_000L), stored.acceptedTerms)
+        assertEquals(TermsAgreement(1, 1_800_000_000_000L), lock.status.value.termsAgreement)
+
+        startApp(termsVersion = 1)
+        assertEquals("the next start goes to the lock screen", LockState.Locked(1), lock.state.value)
+    }
+
+    @Test
+    fun aFirstRunThatEndsBeforeTheSetUpLeavesNothingAndShowsTheTermsAgain() = runTest(dispatcher) {
+        startApp(termsVersion = 1)
+        lock.acceptTerms()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        runCurrent()
+        nothingIsPersisted()
+
+        startApp(termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+        nothingIsPersisted()
+    }
+
+    @Test
+    fun aConfigurationWithoutTheFieldOrWithALowerVersionShowsTheTermsBeforeTheLockScreen() = runTest(dispatcher) {
+        // Set up by a build that asked for no terms: the file has no agreement.
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        assertEquals(0, storedConfig().acceptedTermsVersion)
+        assertNull(storedConfig().acceptedTerms)
+
+        startApp(termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = false), lock.state.value)
+        enter(passphrase)
+        assertEquals("no unlock past the terms", LockState.TermsRequired(beforeSetup = false), lock.state.value)
+        assertEquals(1, sessions.size)
+
+        // The agreement is on disk, durably, before the lock screen shows.
+        val atWrite = mutableListOf<LockState<*>>()
+        onConfigWrite = { atWrite += lock.state.value }
+        clock.wall = 1_800_000_000_000L
+        lock.acceptTerms()
+        assertTrue("written off the main thread", lock.termsUi.value.busy)
+        runCurrent()
+        onConfigWrite = {}
+        assertTrue(atWrite.isNotEmpty())
+        assertTrue("the lock screen came after the write: $atWrite", atWrite.all { it == LockState.TermsRequired(beforeSetup = false) })
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(TermsUi(), lock.termsUi.value)
+        assertEquals(TermsAgreement(1, 1_800_000_000_000L), storedConfig().acceptedTerms)
+        assertEquals(1, storedConfig().acceptedTermsVersion)
+        enter(passphrase)
+        session()
+
+        // A build with newer terms asks again, and records the new version and time in place of the old.
+        startApp(termsVersion = 2)
+        assertEquals(LockState.TermsRequired(beforeSetup = false), lock.state.value)
+        clock.wall = 1_900_000_000_000L
+        lock.acceptTerms()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(TermsAgreement(2, 1_900_000_000_000L), storedConfig().acceptedTerms)
+        assertEquals(2, storedConfig().acceptedTermsVersion)
+
+        // And a build with the same or older terms does not.
+        startApp(termsVersion = 2)
+        assertTrue(lock.state.value is LockState.Locked)
+        startApp(termsVersion = 1)
+        assertTrue(lock.state.value is LockState.Locked)
+    }
+
+    @Test
+    fun anAgreementThatCannotBeWrittenKeepsTheTermsOnScreenAndCanBeGivenAgain() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        startApp(termsVersion = 1)
+        onConfigWrite = { throw IOException("disk full") }
+        lock.acceptTerms()
+        runCurrent()
+        onConfigWrite = {}
+        assertEquals(LockState.TermsRequired(beforeSetup = false), lock.state.value)
+        assertFalse(lock.termsUi.value.busy)
+        assertTrue(lock.termsUi.value.error, lock.termsUi.value.error!!.startsWith("IOException"))
+        assertEquals(0, storedConfig().acceptedTermsVersion)
+
+        lock.acceptTerms()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        assertEquals(1, storedConfig().acceptedTermsVersion)
+    }
+
+    @Test
+    fun everyCompleteResetIsFollowedByTheTerms() = runTest(dispatcher) {
+        startApp(termsVersion = 1)
+        lock.acceptTerms()
+        createPassphrase()
+
+        // From Settings, while unlocked.
+        lock.reset()
+        runCurrent()
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+        nothingIsPersisted()
+        lock.setUp(passphrase.toCharArray(), passphrase.toCharArray())
+        runCurrent()
+        assertEquals("the agreement before the reset is not carried over", LockState.TermsRequired(beforeSetup = true), lock.state.value)
+
+        // From the lock screen (the forgotten passphrase).
+        lock.acceptTerms()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        assertTrue(lock.state.value is LockState.Locked)
+        lock.reset()
+        runCurrent()
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+
+        // From the set-up screen, after the terms were agreed to but before a passphrase was set
+        // (a failure screen's reset): the agreement held in memory goes too.
+        lock.acceptTerms()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        lock.reset()
+        runCurrent()
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+    }
+
+    @Test
+    fun theFailureScreensAreNotPrecededByTheTerms() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        files.lockConfig.writeText("{ not json")
+        startApp(termsVersion = 1)
+        assertEquals(LockState.Unrecoverable(UnrecoverableReason.CONFIG_UNREADABLE), lock.state.value)
+    }
+
+    @Test
+    fun iDoNotAgreeRecordsNothingAndTheProcessEndsOnceTheAppHasLeft() = runTest(dispatcher) {
+        // Before the set-up.
+        startApp(visible = true, termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+        lock.declineTerms()
+        runCurrent()
+        assertEquals("not while the app is still on screen", 0, processEnds)
+        lock.onBackground()
+        runCurrent()
+        assertEquals("once it has left the screen", 1, processEnds)
+        nothingIsPersisted()
+        startApp(termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+
+        // Before the lock screen: the configuration is left as it was.
+        startApp()
+        createPassphrase()
+        lock.lock()
+        runCurrent()
+        val before = files.lockConfig.readText()
+        startApp(visible = true, termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = false), lock.state.value)
+        lock.declineTerms()
+        lock.onBackground()
+        runCurrent()
+        assertEquals(1, processEnds)
+        assertEquals(before, files.lockConfig.readText())
+        startApp(termsVersion = 1)
+        assertEquals(LockState.TermsRequired(beforeSetup = false), lock.state.value)
+    }
+
+    @Test
+    fun leavingTheTermsWithoutAnsweringKeepsTheProcessAsTheSetUpDoes() = runTest(dispatcher) {
+        startApp(visible = true, termsVersion = 1)
+        lock.onBackground()
+        runCurrent()
+        assertEquals("nothing was ever decrypted, and the place in the flow is kept", 0, processEnds)
+        assertEquals(LockState.TermsRequired(beforeSetup = true), lock.state.value)
+    }
+
+    @Test
+    fun theTermsAreOnlyAgreedToFromTheTermsAndALockWithoutTermsNeverShowsThem() = runTest(dispatcher) {
+        startApp()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        lock.acceptTerms()
+        lock.declineTerms()
+        runCurrent()
+        assertEquals(LockState.SetupRequired, lock.state.value)
+        createPassphrase()
+        lock.acceptTerms()
+        runCurrent()
+        assertNull(storedConfig().acceptedTerms)
+        assertNull(lock.status.value.termsAgreement)
+    }
+
+    @Test
+    fun theAgreementIsValidatedLikeEveryOtherField() = runTest(dispatcher) {
+        startApp()
+        createPassphrase()
+        val plain = storedConfig()
+        assertTrue(plain.isValid(minIterations = 1))
+        val agreed = plain.copy(acceptedTermsVersion = 1, acceptedTerms = TermsAgreement(1, 1_800_000_000_000L))
+        assertTrue(agreed.isValid(minIterations = 1))
+        assertFalse("a version without its agreement", plain.copy(acceptedTermsVersion = 1).isValid(minIterations = 1))
+        assertFalse("an agreement without its version", plain.copy(acceptedTerms = TermsAgreement(1, 0)).isValid(minIterations = 1))
+        assertFalse("versions that differ", agreed.copy(acceptedTermsVersion = 2).isValid(minIterations = 1))
+        assertFalse("a negative version", plain.copy(acceptedTermsVersion = -1).isValid(minIterations = 1))
+        assertFalse("version 0 is none", plain.copy(acceptedTerms = TermsAgreement(0, 0)).isValid(minIterations = 1))
+        assertFalse("a time before 1970", agreed.copy(acceptedTerms = TermsAgreement(1, -1)).isValid(minIterations = 1))
+        assertFalse("a time after 9999", agreed.copy(acceptedTerms = TermsAgreement(1, TrustedTime.MAX_WALL_MILLIS + 1)).isValid(minIterations = 1))
+        // A file written before the fields existed reads as no agreement.
+        val json = Json { ignoreUnknownKeys = true }
+        val old = json.parseToJsonElement(Json.encodeToString(LockConfig.serializer(), plain)).let { element ->
+            JsonObject(element as JsonObject - "acceptedTermsVersion" - "acceptedTerms")
+        }
+        val read = json.decodeFromString(LockConfig.serializer(), old.toString())
+        assertEquals(0, read.acceptedTermsVersion)
+        assertNull(read.acceptedTerms)
     }
 }

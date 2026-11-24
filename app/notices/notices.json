@@ -1914,7 +1914,7 @@
       "notice": null,
       "source": "LICENSE of google/material-design-icons is the Apache text without a filled-in copyright line; the holder is inferred from the publisher. No NOTICE file at the root of google/material-design-icons (default branch, listed 2026-11-22).",
       "changes": "Used as vector drawables with the outlines unchanged.",
-      "in_apk": "16 drawables res/drawable/ic_*.xml (every ic_*.xml of commit 5418261 except ic_launcher_foreground.xml, which is the project's own artwork)"
+      "in_apk": "18 drawables res/drawable/ic_*.xml (every ic_*.xml except ic_launcher_foreground.xml, which is the project's own artwork)"
     },
     {
       "id": "port:boris2",
