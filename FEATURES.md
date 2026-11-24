@@ -3218,7 +3218,7 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
 `llama/src/main/cpp/CMakeLists.txt`, `native/CMakeLists.txt`, `models/manifest.json`,
 `models/convert_models.py`, `tools/signing-key.sh`, `tools/keyring.py`,
 `app/src/test/java/us/theworkmans/proseplow/SourceRulesTest.kt`, `ThirdPartyNoticesTest.kt`,
-`README.md` ("Build from source"), `native/README.md`.
+`README.md` ("Build from source on Ubuntu 24.04"), `native/README.md`.
 
 These are properties a build of the app is held to by the build itself or by tests. A port needs
 its own means for each of them.

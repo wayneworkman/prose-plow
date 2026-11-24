@@ -1,10 +1,12 @@
+# shellcheck shell=bash
 # Source this file (". native/tools/env.sh") before building or testing the native code on a host.
 # It only changes the current shell.
 #
 # The tools (cmake, ninja, the Python packages of native/requirements.txt) come from a virtualenv,
 # PROSEPLOW_VENV, by default ~/proseplow/venv: the one the README creates and the Gradle build
 # converts the models with. When neither exists the tools are taken from PATH as it is, which is
-# fine when the right environment is already active.
+# fine when the right environment is already active; unless a virtualenv is active, a warning
+# names the python3 that will be used.
 
 if [ -z "${PROSEPLOW_VENV:-}" ] && [ -x "${HOME}/proseplow/venv/bin/python" ]; then
     export PROSEPLOW_VENV="${HOME}/proseplow/venv"
@@ -19,6 +21,9 @@ if [ -n "${PROSEPLOW_VENV:-}" ]; then
     else
         echo "native/tools/env.sh: PROSEPLOW_VENV=${PROSEPLOW_VENV} has no bin/python (see native/README.md)" >&2
     fi
+elif [ -z "${VIRTUAL_ENV:-}" ]; then
+    echo "native/tools/env.sh: no virtualenv (PROSEPLOW_VENV is not set and ~/proseplow/venv does not exist);" \
+        "using $(command -v python3 || echo 'no python3 at all') and the cmake and ninja on PATH (see native/README.md)" >&2
 fi
 
 # Everything that is generated goes under one scratch directory outside the source directories,

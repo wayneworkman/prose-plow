@@ -5,6 +5,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.xml.XMLConstants
@@ -381,7 +382,8 @@ androidComponents {
  * There is no official key and no published APK: everyone who installs the app built it and
  * signs it with a key of their own. The key is a PKCS12 keystore, by default
  * `~/.config/proseplow/proseplow-release.p12` (made once by `tools/signing-key.sh`), with the
- * alias `proseplow`. Its password is taken, in this order, from the environment variable
+ * alias `proseplow`; a relative `-Pproseplow.keystore` or `PROSEPLOW_KEYSTORE` is taken from the
+ * repository's root. Its password is taken, in this order, from the environment variable
  * `PROSEPLOW_KEYSTORE_PASSWORD`, or from the login keyring through `tools/keyring.py`, where the
  * key script put it. It reaches `apksigner` on its standard input, never on a command line or in
  * an environment, and is never printed or written anywhere.
@@ -441,7 +443,7 @@ abstract class SignApk @Inject constructor(private val exec: ExecOperations) : D
                 "No signing key at $keystore. A release APK is signed with your own key; create it once with\n\n" +
                     "    tools/signing-key.sh\n\n" +
                     "and back it up together with its password (README.md, \"Create your signing key\"). A key kept elsewhere is " +
-                    "named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE.",
+                    "named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE (a relative path is taken from the repository's root).",
             )
         }
         val password = password(keystore)
@@ -512,12 +514,21 @@ abstract class SignApk @Inject constructor(private val exec: ExecOperations) : D
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
                 .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
                 .start()
-            val text = process.inputStream.bufferedReader().readText()
-            // A keyring that is locked and asks to be unlocked gets a minute; then the build goes on without it.
-            if (process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0) {
-                text.trimEnd('\n').takeIf { it.isNotEmpty() }?.let { return it }
+            // The output is read on a thread of its own, so that the wait below is what bounds the
+            // lookup: reading it here would block until the tool ends, which a keyring that waits to
+            // be unlocked (over SSH, say) may never do. Such a keyring gets a minute; then the tool
+            // is stopped and the build ends with the message below.
+            val output = FutureTask { process.inputStream.bufferedReader().readText() }
+            Thread(output, "keyring.py get").apply { isDaemon = true }.start()
+            if (process.waitFor(60, TimeUnit.SECONDS)) {
+                val text = runCatching { output.get(10, TimeUnit.SECONDS) }.getOrNull()
+                if (process.exitValue() == 0) {
+                    text?.trimEnd('\n')?.takeIf { it.isNotEmpty() }?.let { return it }
+                }
             } else {
                 process.destroyForcibly()
+                output.cancel(true)
+                logger.warn("$path: tools/keyring.py get gave no answer within 60 seconds (a locked keyring?) and was stopped.")
             }
         }
         throw GradleException(
@@ -625,13 +636,18 @@ val signRelease: Boolean = when (val value = providers.gradleProperty("proseplow
 }
 androidComponents {
     val home = System.getProperty("user.home")
+    val repositoryRoot = rootDir
     onVariants(selector().withBuildType("release")) { variant ->
         if (!signRelease) return@onVariants
         val sign = tasks.register<SignApk>("sign${variant.name.replaceFirstChar(Char::uppercaseChar)}Apk") {
             group = "build"
             description = "Signs the ${variant.name} APK with the builder's own key (tools/signing-key.sh makes it)."
+            // A relative path is taken from the repository's root, as tools/signing-key.sh and
+            // tools/sign-release.sh take it, rather than from the working directory of the Gradle
+            // process, which is not necessarily the one the build was started in.
             val keystore = providers.gradleProperty("proseplow.keystore")
                 .orElse(providers.environmentVariable("PROSEPLOW_KEYSTORE"))
+                .map { repositoryRoot.resolve(it).normalize().path }
                 .orElse(File(home, ".config/proseplow/proseplow-release.p12").path)
             keystorePath.set(keystore)
             keystoreFile.from(keystore.map { path -> listOf(File(path)).filter { it.isFile } })

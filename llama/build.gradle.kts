@@ -268,26 +268,30 @@ abstract class ConvertModels @Inject constructor(private val exec: ExecOperation
         val sources = File(checkpointDirectory.get())
         val python = File(pythonEnvironment.get(), "bin/python")
         val missing = pending.filter { checkpointOf(sources, it) == null }
-        if (missing.isNotEmpty()) {
+        // Both are checked before either is reported, so that one message says everything that is missing.
+        val noPython = !python.canExecute()
+        if (missing.isNotEmpty() || noPython) {
             val hf = File(pythonEnvironment.get(), "bin/hf")
             throw GradleException(
                 buildString {
-                    append("Not converted yet, and no checkpoint to convert from: ${missing.joinToString { it.id }}.\n")
-                    append("The checkpoints are looked for in $sources (-Pproseplow.modelSrc=<dir> or PROSEPLOW_MODEL_SRC to look elsewhere).\n")
-                    append("Download ${if (missing.size == 1) "it" else "them"} at the pinned revision (README.md, \"Get the model checkpoints\"):\n\n")
-                    for (entry in missing) {
-                        append("    $hf download ${entry.repository} --revision ${entry.revision} \\\n")
-                        append("        --local-dir \"${File(sources, entry.id)}\"\n")
+                    if (noPython) {
+                        append("Converting ${pending.joinToString { it.id }} needs the Python environment, and there is none at ${pythonEnvironment.get()} ")
+                        append("(no bin/python). Create it as README.md, \"The Python environment\", says, or name the one you have with ")
+                        append("-Pproseplow.venv=<dir> or PROSEPLOW_VENV.\n")
+                        if (missing.isNotEmpty()) append("\n")
                     }
-                    append("\nOr leave ${if (missing.size == 1) "it" else "them"} out of the APK: -Pproseplow.models=<ids> names the models to bundle, -Pproseplow.models=none bundles none.")
-                },
-            )
-        }
-        if (!python.canExecute()) {
-            throw GradleException(
-                "Converting ${pending.joinToString { it.id }} needs the Python environment, and there is none at ${pythonEnvironment.get()} " +
-                    "(no bin/python). Create it as README.md, \"The Python environment\", says, or name the one you have with " +
-                    "-Pproseplow.venv=<dir> or PROSEPLOW_VENV.",
+                    if (missing.isNotEmpty()) {
+                        append("Not converted yet, and no checkpoint to convert from: ${missing.joinToString { it.id }}.\n")
+                        append("The checkpoints are looked for in $sources (-Pproseplow.modelSrc=<dir> or PROSEPLOW_MODEL_SRC to look elsewhere).\n")
+                        append("Download ${if (missing.size == 1) "it" else "them"} at the pinned revision (README.md, \"Get the model checkpoints\")")
+                        append(if (noPython) ", once the Python environment is there:\n\n" else ":\n\n")
+                        for (entry in missing) {
+                            append("    \"$hf\" download ${entry.repository} --revision ${entry.revision} \\\n")
+                            append("        --local-dir \"${File(sources, entry.id)}\"\n")
+                        }
+                        append("\nOr leave ${if (missing.size == 1) "it" else "them"} out of the APK: -Pproseplow.models=<ids> names the models to bundle, -Pproseplow.models=none bundles none.")
+                    }
+                }.trimEnd(),
             )
         }
 
@@ -309,6 +313,12 @@ abstract class ConvertModels @Inject constructor(private val exec: ExecOperation
                 environment("PYTHONDONTWRITEBYTECODE", "1")
                 isIgnoreExitValue = true
             }
+            if (result.exitValue == MISSING_PACKAGES) {
+                throw GradleException(
+                    "The Python environment at ${pythonEnvironment.get()} lacks packages the converters need (named above). " +
+                        "Run `pip install -r native/requirements.txt` in it (README.md, \"The Python environment\").",
+                )
+            }
             if (result.exitValue != 0) {
                 throw GradleException(
                     "${entry.id}: models/convert_models.py failed (exit ${result.exitValue}); its message is above. A checkpoint file " +
@@ -317,6 +327,11 @@ abstract class ConvertModels @Inject constructor(private val exec: ExecOperation
             }
             logger.lifecycle("$path: ${entry.id} converted in ${(System.nanoTime() - started) / 1_000_000_000} s")
         }
+    }
+
+    private companion object {
+        /** convert_models.py's exit status when the Python environment lacks packages (EXIT_MISSING_PACKAGES there). */
+        const val MISSING_PACKAGES = 3
     }
 
     /** The directory of [entry]'s checkpoint under [sources], in either layout convert_models.py accepts, or null. */

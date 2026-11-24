@@ -166,7 +166,7 @@ The same, step by step:
 . native/tools/env.sh                                   # tools on PATH, CPU only
 native/tools/prepare-llama-src.sh                       # the patched copy, $PROSEPLOW_LLAMA_SRC
 cmake -S native -B "$PROSEPLOW_BUILD/host" -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build "$PROSEPLOW_BUILD/host" -j "${PROSEPLOW_JOBS:-4}"
+cmake --build "$PROSEPLOW_BUILD/host" -j "${PROSEPLOW_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 python3 models/convert_models.py --also-f32 --available # F16 to ship, F32 to validate
 ctest --test-dir "$PROSEPLOW_BUILD/host" --output-on-failure
 ```
@@ -1363,17 +1363,17 @@ a build from nothing.
 ### What is built
 
 Twelve libraries of this module reach the APK, eleven built here and the C++ runtime. Sizes are
-for the stripped files that both a debug and a release APK contain, measured for a build of
-commit `af14daa`; later changes to the native code move `libllama.so` and
+for the stripped files that both a debug and a release APK contain, measured on
+24 November 2026; later changes to the native code move `libllama.so` and
 `libproseplow_jni.so` by some kilobytes. The app's APK carries one library more,
-`libandroidx.graphics.path.so` (10,096 bytes), which Compose brings: thirteen in all, 13,588,024
+`libandroidx.graphics.path.so` (10,096 bytes), which Compose brings: thirteen in all, 13,643,632
 bytes in that build, as the root `README.md` says. The app module strips them when it
 packages them, which needs the same `ndkVersion` there as here: without it the build still
 succeeds, prints "Unable to strip the following libraries", and every APK is about 80 MB larger.
 
 | Library | Bytes | What it is |
 | --- | --- | --- |
-| `libllama.so` | 4,155,512 | llama.cpp |
+| `libllama.so` | 4,162,520 | llama.cpp |
 | `libggml-base.so`, `libggml.so` | 771,272, 55,384 | ggml and its backend registry |
 | `libggml-cpu-android_armv8.0_1.so` | 951,248 | The CPU backend for any arm64 processor |
 | `libggml-cpu-android_armv8.2_1.so` | 985,568 | with the dot product instructions |
@@ -1381,9 +1381,9 @@ succeeds, prints "Unable to strip the following libraries", and every APK is abo
 | `libggml-cpu-android_armv8.6_1.so` | 1,034,768 | and int8 matrix multiply |
 | `libggml-cpu-android_armv9.0_1.so` | 1,038,816 | and SVE2 |
 | `libggml-cpu-android_armv9.2_1.so`, `..._armv9.2_2.so` | 1,038,816 each | and SME, in two combinations |
-| `libproseplow_jni.so` | 110,752 | The session, the tokenizer front-end and the JNI binding |
+| `libproseplow_jni.so` | 159,352 | The session, the tokenizer front-end and the JNI binding |
 | `libc++_shared.so` | 1,374,336 | The C++ runtime, from the NDK |
-| all twelve | 13,577,928 | |
+| all twelve | 13,633,536 | |
 
 Every loadable segment of every one is aligned to 16 KiB (`llvm-objdump -p`), so they load on
 devices with 16 KB pages; the build checks that for each APK it writes (next section).
@@ -1503,7 +1503,7 @@ What packaging costs, measured for a debug build on a desktop with an SSD:
 | peacebell-v1-291m (583.7 MB) | 10 s | about 634 MB | 2.9 GB |
 | qwen3.5-0.8b (1,516.7 MB) | 27 s | about 1,567 MB | 7.4 GB |
 | three: peacebell, Boris-2, Qwen3.5 (2,392.3 MB) | 65 s | 2,442.5 MB | 12 GB |
-| all four, with Shard-2 (2,491.3 MB) | 76 s, which now includes hashing the models in the APK | 2,541.3 MB; 2,542.1 MB when built again with Shard-2 bundled for good | not measured |
+| all four, with Shard-2 (2,491.3 MB) | 76 s, which now includes hashing the models in the APK | about 2,542 MB (a debug APK varies by up to a megabyte from build to build) | not measured |
 
 AGP keeps four copies of an asset on its way into an APK (the generated directory, the merged
 assets of the library, those of the app, and a packaging intermediate) besides the APK itself:

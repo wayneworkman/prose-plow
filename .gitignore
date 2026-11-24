@@ -26,6 +26,8 @@ captures/
 # ... nor under the name a model has as an asset of the app (native/README.md, "Models in the APK")
 *.gguf.so
 *.safetensors
+# ... nor a PyTorch checkpoint (Shard-2's weights are Shard-2.pt)
+*.pt
 
 # Signing material
 *.jks

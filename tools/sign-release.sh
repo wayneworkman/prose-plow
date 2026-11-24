@@ -9,7 +9,8 @@
 #
 # Defaults: app/build/outputs/apk/release/app-release-unsigned.apk in (what the unsigned build
 # writes), and prose-plow-<versionName>.apk in the repository's root out (APKs are git-ignored).
-# The key: PROSEPLOW_KEYSTORE, by default ~/.config/proseplow/proseplow-release.p12, alias
+# The key: PROSEPLOW_KEYSTORE, by default ~/.config/proseplow/proseplow-release.p12 (a relative
+# path is taken from the repository's root, as the release build takes it), alias
 # PROSEPLOW_KEY_ALIAS or "proseplow". The password: PROSEPLOW_KEYSTORE_PASSWORD, or else the login
 # keyring (tools/keyring.py), the same order as the release build; it is never printed.
 #
@@ -23,10 +24,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-# shellcheck source=../env.sh
+# shellcheck source=SCRIPTDIR/../env.sh
 source "$root/env.sh" >/dev/null
 
 keystore="${PROSEPLOW_KEYSTORE:-$HOME/.config/proseplow/proseplow-release.p12}"
+[[ "$keystore" == /* ]] || keystore="$root/$keystore"
 alias_name="${PROSEPLOW_KEY_ALIAS:-proseplow}"
 build_tools="${ANDROID_HOME:?env.sh must set ANDROID_HOME}/build-tools/37.0.0"
 version="$(sed -n 's/^ *versionName = "\(.*\)"$/\1/p' "$root/app/build.gradle.kts" | head -n 1)"
@@ -37,7 +39,13 @@ signed="${2:-$root/prose-plow-${version:?no versionName in app/build.gradle.kts}
 [[ -f "$keystore" ]] || { echo "No keystore at $keystore: run tools/signing-key.sh once" >&2; exit 1; }
 
 if [[ -z "${PROSEPLOW_KEYSTORE_PASSWORD:-}" ]]; then
-    PROSEPLOW_KEYSTORE_PASSWORD="$("$here/keyring.py" get 2>/dev/null || true)"
+    # A keyring that waits to be unlocked (over SSH, say) gets a minute.
+    status=0
+    PROSEPLOW_KEYSTORE_PASSWORD="$(timeout 60 "$here/keyring.py" get 2>/dev/null)" || status=$?
+    if [[ "$status" -eq 124 ]]; then
+        echo "tools/keyring.py get gave no answer within 60 seconds (a locked keyring?) and was stopped." >&2
+    fi
+    [[ "$status" -eq 0 ]] || PROSEPLOW_KEYSTORE_PASSWORD=""
 fi
 if [[ -z "$PROSEPLOW_KEYSTORE_PASSWORD" ]]; then
     echo "No password for $keystore: set PROSEPLOW_KEYSTORE_PASSWORD (read -rs PROSEPLOW_KEYSTORE_PASSWORD && export PROSEPLOW_KEYSTORE_PASSWORD)," >&2

@@ -9,8 +9,9 @@ the script that converts them.
 | `manifest.json` | One entry per model: where it comes from, the revision and SHA-256 of every source file, the converter, the float type and the output file name |
 | `convert_models.py` | Verifies the source files against the manifest and converts them |
 
-Model weights are never committed: `*.gguf` and `*.safetensors` are git-ignored, and both the
-checkpoints and the converted files live outside the source directories.
+Model weights are never committed: `*.gguf`, `*.gguf.so`, `*.safetensors` and `*.pt` are
+git-ignored, and both the checkpoints and the converted files live outside the source
+directories.
 
 A checkpoint is data from somebody else. Keep each in a directory of its own, never run
 anything from it, and note which kind of file the weights are: safetensors is data by

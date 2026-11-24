@@ -2,7 +2,7 @@
 THIRD-PARTY NOTICES
 ==============================================================================
 
-Prose Plow is licensed under the Apache License, Version 2.0, whose text is in part 2 of this document. An installed copy of the app also contains the software, models and artwork listed below. Each is the work of its own authors and is used under its own licence. The components are grouped by licence in part 1; the text of every licence follows once in part 2.
+Prose Plow is Copyright 2026 Wayne Workman and is licensed under the Apache License, Version 2.0, whose text is in part 2 of this document. An installed copy of the app also contains the software, models and artwork listed below. Each is the work of its own authors and is used under its own licence. The components are grouped by licence in part 1; the text of every licence follows once in part 2.
 
 Which models an installed copy contains is decided when it is built. The About screen lists the models of this copy; the notices below cover every model that a build can contain.
 

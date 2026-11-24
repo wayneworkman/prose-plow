@@ -48,8 +48,11 @@ Before anything else:
   words "I agree" to be typed. "I do not agree" closes the app. The app records which version
   of the terms was agreed to and the date and time "Agree and continue" was pressed, in
   `lock.json`; the information button on the chat screen, and "Terms" under About, show the
-  statements and that date and time. The app asks and does not check: it adds no location
-  permission, no date of birth and no content filter.
+  statements and that date and time. Among the ten statements, the user confirms being 18 or
+  older and not being in any of 16 US states (the list is in
+  [`FEATURES.md`, section 29](FEATURES.md#29-the-terms-terms)), agrees that Missouri law governs
+  the terms, and accepts that the app is provided as is, with no warranty. The app asks and does
+  not check: it adds no location permission, no date of birth and no content filter.
 
 Chats:
 
@@ -109,7 +112,7 @@ Chats:
   way is lost.
 - **Drafts.** What you have typed and not sent is kept with its chat.
 - **An answer is finished when you leave.** While an answer is being written the app runs a
-  foreground service, with a silent notification that says "Writing an answer..." and nothing
+  foreground service, with a silent notification that says "Writing an answer…" and nothing
   else, so the answer goes on when the app is in the background or the screen is off. The same
   service keeps the app's lock on time while it waits out of sight (see "Locks by itself"). When one
   is finished while you are not looking, a second notification says "Your answer is ready.";
@@ -260,12 +263,12 @@ full when the context is created, whether or not a conversation fills it, so the
 create the largest context a model could have: it starts small and grows when a conversation
 needs more.
 
-| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct |
-| --- | --- | --- | --- |
-| Context at the start, tokens | 4,096 | 4,096 | 2,048 |
-| The most the model was trained with, tokens | 262,144 | 32,768 | 2,048 |
-| Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 |
-| Memory of the context at the start | 50 MB | 273 MB | 130 MB |
+| | Qwen3.5 0.8B | Peacebell v1 291M | Boris-2-Instruct | Shard-2 |
+| --- | --- | --- | --- | --- |
+| Context at the start, tokens | 4,096 | 4,096 | 2,048 | 4,096 |
+| The most the model was trained with, tokens | 262,144 | 32,768 | 2,048 | 4,096 |
+| Memory for each token of context, bytes | 12,288 | 66,560 | 63,488 | 40,960 |
+| Memory of the context at the start | 50 MB | 273 MB | 130 MB | 168 MB |
 
 - **Steps.** When a conversation, and the room kept free for its reply, no longer fit, the
   context is made larger: to twice the starting size, four times, and so on, with the limit
@@ -597,7 +600,7 @@ optionally a second time by a fingerprint key.
   loaded, no conversation held, or its memory already on disk as the model holds it), the
   service is not started at all and the session is closed at once as "Lock now" closes it. While nothing but the lock is waited for, its notification says
   "Unlocked; it locks itself when its time is up."; while an answer is being written it says
-  "Writing an answer..."; and while only the closing of a session after the lock is waited for,
+  "Writing an answer…"; and while only the closing of a session after the lock is waited for,
   "Locking the app…". Each is one fixed sentence in the same notification, whose kind is named
   "Running in the background" in the phone's settings.
 - **When Android does not keep the app running, the lock waits for the return.** If Android
@@ -867,7 +870,7 @@ it or losing the phone loses the chats.
 
 ### Other measures
 
-- The window is secure (`FLAG_SECURE`) from its first frame, which keeps it out of screenshots,
+- The window has `FLAG_SECURE` set from its first frame, which keeps it out of screenshots,
   screen recordings and screen sharing, except while the app is unlocked and a screenshot
   allowance runs (see "What the app does"). The allowance exists in memory only and is timed on
   the clock that counts from the phone's start, so changing the date does not stretch it. When
@@ -875,10 +878,10 @@ it or losing the phone loses the chats.
   was opened during it does not stay capturable. The preview in the app switcher is switched
   off separately and always.
 - **Where a passphrase is typed, nothing is captured, allowance or not.** The set-up screen, the
-  lock screen and the error screens are secure whatever the allowance says: locking the app
-  does not end an allowance, but it has no effect until the app is unlocked again within its
-  time. The dialogs of the unlocked app in which a passphrase is typed (changing it, confirming
-  it) are secure by a setting of their own. A passphrase field shows a bullet for every
+  lock screen and the error screens have `FLAG_SECURE` set whatever the allowance says: locking
+  the app does not end an allowance, but it has no effect until the app is unlocked again within
+  its time. The dialogs of the unlocked app in which a passphrase is typed (changing it, confirming
+  it) have `FLAG_SECURE` set by a setting of their own. A passphrase field shows a bullet for every
   character from the moment it is typed, never the last character, and gives accessibility
   services bullets instead of the typed text.
 - Every text field asks the keyboard not to learn from it
@@ -903,8 +906,8 @@ it or losing the phone loses the chats.
   (it requires the `DUMP` permission). No build type contains the user interface library's
   preview activity.
 - The app's two notifications are each one fixed sentence: the ongoing one says "Writing an
-  answer..." or "Unlocked; it locks itself when its time is up.", the other "Your answer is
-  ready.". The code that builds them has no access to a chat, and a test that reads
+  answer…", "Unlocked; it locks itself when its time is up." or "Locking the app…", the other
+  "Your answer is ready.". The code that builds them has no access to a chat, and a test that reads
   the sources fails if a notification is ever given a text with something filled in.
 - The service that keeps the process alive while an answer is written, or while the lock waits
   out of sight, is not exported, takes
@@ -1056,14 +1059,15 @@ The check described here was made while the app bundled three models, before Sha
 was bundled as a fourth: where this section and "Disk space and time" below say "all three
 models", and in their times, sizes and disk figures, they mean Qwen3.5, Peacebell and Boris-2.
 Shard-2 was downloaded, converted and tested on the development machine, not in that
-clean-machine check; an APK with all four models is 2,542,144,262 bytes (2.54 GB) as a debug build.
+clean-machine check; an APK with all four models is about 2.54 GB as a debug build (see "Choosing
+the models" below for the measured sizes).
 
 These instructions were followed literally, on 22 November 2026, on Ubuntu 24.04.5 (x86_64) in a
 clean clone, with a freshly downloaded JDK, a freshly installed Android SDK in an empty
 directory, a new Python virtualenv and an empty Gradle user home, so that every download in them
-was really made. The Gradle steps were last run at commit `3cd0cc7`. The conversions and the
-native suite were run in the same clone at `295c975`; nothing under `native/`, `models/`,
-`llama/` or `third_party/` differs between the two.
+was really made. The Gradle steps, the conversions and the native suite were last run in that
+clone on 22 November 2026, at two commits of that day between which nothing under `native/`,
+`models/`, `llama/` or `third_party/` differed.
 
 - Run as written: the JDK and command-line tools downloads with their checksums, the
   installation of the five SDK packages, the clone, the virtualenv, the download of the Boris-2
@@ -1145,13 +1149,35 @@ runs unless they say otherwise.
 The Android Gradle plugin keeps four copies of every bundled model on its way into an APK, which
 is where the 12 GB go. `rm -rf app/build llama/build` gives them back.
 
+Memory: 16 GB of RAM is comfortable. 8 GB works only with the native build limited to 2 to 4
+parallel jobs and little else running. The limit is the environment variable `PROSEPLOW_JOBS`,
+which by default is unset, so that the native build runs one job per processor:
+
+```sh
+export PROSEPLOW_JOBS=4    # before the first ./gradlew that builds an APK
+```
+
+The Gradle build fixes the limit when CMake first configures the native build, so to change it
+later, delete `llama/.cxx` as well. `native/tools/host-check.sh` reads the same variable.
+
 ### Toolchain setup
 
 Everything is installed in user space under `~/Android`, which is where `env.sh` looks for it.
 To use another place, install there and export `PROSEPLOW_JAVA_HOME` and
-`PROSEPLOW_ANDROID_HOME` before you source `env.sh`. Nothing below edits your shell profile.
+`PROSEPLOW_ANDROID_HOME` before you source `env.sh`. Where neither those nor the directories
+under `~/Android` exist, `env.sh` keeps the `JAVA_HOME` and `ANDROID_HOME` your environment
+already has, and warns when it finds neither. Nothing below edits your shell profile.
 
 #### 1. System packages
+
+What the host must be, whatever the distribution:
+
+- **x86_64 Linux.** The Linux NDK and build-tools are published for x86_64 only, so an ARM
+  machine cannot build the app.
+- **Python 3.12 or newer, and glibc 2.28 or newer.** The pinned numpy needs Python 3.12, and
+  the pinned torch publishes wheels for glibc 2.28 and later only. Ubuntu 24.04 has both. On an
+  older system, use a newer Python from the distribution, from the deadsnakes archive (Ubuntu),
+  or from `uv python install 3.12`, and create the virtualenv below with that Python.
 
 The only step that needs `sudo`:
 
@@ -1159,6 +1185,13 @@ The only step that needs `sudo`:
 sudo apt update
 sudo apt install git curl unzip build-essential python3 python3-venv
 ```
+
+On other distributions (untested, best effort, like the Windows and macOS notes below; please
+correct them by pull request): on Fedora, `sudo dnf install git curl unzip gcc gcc-c++ make
+python3 diffutils`; on Arch, `sudo pacman -S --needed git curl unzip base-devel python`. The
+login keyring that `tools/signing-key.sh` can use is optional: it needs `python3-gobject` and
+`libsecret` (Fedora) or `python-gobject` and `libsecret` (Arch); without them the signing
+password is printed once instead (see "Create your signing key").
 
 #### 2. The JDK
 
@@ -1235,14 +1268,18 @@ git submodule status
 The last command must print a line that begins with a blank, not with `-` or `+`, and names the
 pinned commit: `8d60873dfb8619f2b5ed31adfbab07cccb40db5c third_party/llama.cpp`, followed by a
 description in brackets. After a clone without `--recurse-submodules`, run
-`git submodule update --init third_party/llama.cpp`. Every command from here on is run in this
-directory.
+`git submodule update --init third_party/llama.cpp`. The submodule is fetched shallow (one
+commit, `shallow = true` in `.gitmodules`); a mirror that refuses to fetch a commit directly
+makes that fail, and then `git submodule update --init --no-recommend-shallow
+third_party/llama.cpp` fetches its whole history instead. Every command from here on is run in
+this directory.
 
 ### Where things go
 
 The build uses three places outside the repository. Nothing has to be set if you take the
 defaults, which every command below uses; nothing is ever written next to the sources, except
-by Gradle into its `build` directories.
+by Gradle into directories that are git-ignored: the `build` directories of the root and of each
+module, `.gradle/`, `.kotlin/` and `llama/.cxx/` (the native build tree).
 
 | What | Default | To put it elsewhere |
 | --- | --- | --- |
@@ -1320,7 +1357,10 @@ That one command does everything: it converts each model whose converted file is
 writes the patched copy of llama.cpp, compiles it for arm64 with the NDK (seven variants of the
 CPU backend, of which the app loads the best one for the phone's processor), compiles the app,
 and packages the four models into the APK. The result is
-`app/build/outputs/apk/debug/app-debug.apk`, 2,542,320,388 bytes with all four models.
+`app/build/outputs/apk/debug/app-debug.apk`, about 2.54 GB with all four models. The line
+`C/C++: fatal: not a git repository (or any of the parent directories): .git`, printed twice
+while CMake configures the native build, is expected: the patched copy of llama.cpp that it
+builds is not a git checkout.
 
 Converting is the task `:llama:convertModels`. For each model it does one of three things:
 
@@ -1343,17 +1383,27 @@ Converting is the task `:llama:convertModels`. For each model it does one of thr
       The checkpoints are looked for in ~/proseplow/checkpoints (-Pproseplow.modelSrc=<dir> or PROSEPLOW_MODEL_SRC to look elsewhere).
       Download it at the pinned revision (README.md, "Get the model checkpoints"):
 
-          ~/proseplow/venv/bin/hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
+          "~/proseplow/venv/bin/hf" download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
               --local-dir "~/proseplow/checkpoints/shard-2"
 
       Or leave it out of the APK: -Pproseplow.models=<ids> names the models to bundle, -Pproseplow.models=none bundles none.
+
+  When the Python environment is missing too, the same message says so first. An environment
+  without the packages of `native/requirements.txt` stops the build at the first conversion
+  with a message that names the missing packages and says to run
+  `pip install -r native/requirements.txt` in it.
 
 The files it writes are `~/proseplow/build/models/<id>/<id>-f16.gguf`, each with a small
 `<id>-f16.gguf.json` beside it that records what it was made from. Then the packaging step copies
 each model into the APK and compares its SHA-256 with the manifest once more, and the finished APK
 is checked again (see "Check the APK" below): a model file that is not the pinned conversion fails
 the build. A second `./gradlew assembleDebug` with nothing changed converts nothing, copies
-nothing and ends in about 20 seconds (`convertModels UP-TO-DATE`, `packageDebug UP-TO-DATE`).
+nothing and ends in about 20 seconds on an idle machine; on a loaded one it can take minutes,
+because Gradle still hashes the inputs of every task to find them unchanged. What it should
+report as `UP-TO-DATE` (run with `--console=plain` to see every task) are
+`:llama:prepareLlamaSource`, `:llama:buildCMakeDebug[arm64-v8a]`, `:llama:convertModels`,
+`:llama:packageDebugModels`, `:app:addDebugModelAssets` and `:app:packageDebug`; a task that
+runs again instead means one of its inputs changed.
 
 How long it took on the development machine (16 threads, 6 compile jobs, an SSD): the four
 conversions 22 seconds in all (Qwen3.5 12 s, Peacebell 4 s, Boris-2 4 s, Shard-2 2 s), and the
@@ -1390,13 +1440,17 @@ tools/signing-key.sh
 ```
 
 It creates a 4096-bit RSA key in `~/.config/proseplow/proseplow-release.p12` (readable by you
-only; `PROSEPLOW_KEYSTORE` names another file), and prints its owner and its SHA-256
-fingerprint. Its password is decided like this:
+only; `PROSEPLOW_KEYSTORE` names another file, and a relative path in it is taken from the
+repository's root, in this script, in `tools/sign-release.sh` and in the release build alike),
+and prints its owner and its SHA-256 fingerprint. Its password is decided like this:
 
 - If `PROSEPLOW_KEYSTORE_PASSWORD` is set, that is the password. It is neither stored nor shown.
 - Otherwise, on a desktop with a login keyring (GNOME Keyring, reached through the system
   Python's `gi` bindings): a random password, which goes into the keyring and is not shown. The
   build finds it there; `tools/keyring.py get` prints it when you need it for your backup.
+  A keyring that does not answer within a minute (one locked and waiting to be unlocked, over
+  SSH for instance) stops the script with a message, and the release build and
+  `tools/sign-release.sh` go on without it, asking for `PROSEPLOW_KEYSTORE_PASSWORD`.
 - Otherwise (a machine without a keyring, a remote shell): a random password, printed once,
   with the instruction to store it. It is stored nowhere on the machine.
 
@@ -1453,7 +1507,7 @@ Without a key, or without its password, the build stops with what to do:
 
         tools/signing-key.sh
 
-    and back it up together with its password (README.md, "Create your signing key"). A key kept elsewhere is named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE.
+    and back it up together with its password (README.md, "Create your signing key"). A key kept elsewhere is named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE (a relative path is taken from the repository's root).
 
 **An unsigned release APK**, for a builder whose signing happens elsewhere (a build server that
 signs with its own key, or a machine without the key):
@@ -1463,7 +1517,9 @@ signs with its own key, or a machine without the key):
 ```
 
 writes `app/build/outputs/apk/release/app-release-unsigned.apk`, with the models in it and every
-check of the APK made, and asks for no key. `tools/sign-release.sh` signs such an APK later with
+check of the APK made, and asks for no key. It also removes a signed `app-release.apk` that an
+earlier release build left in that directory: copy that one elsewhere first if you want to keep
+it. `tools/sign-release.sh` signs such an APK later with
 your key, in the same way as the build (v3 only, alignment kept), and verifies it:
 
 ```sh
@@ -1501,8 +1557,13 @@ the environment variable of the same row, chooses otherwise:
 
 | Models | Debug APK | Release APK |
 | --- | --- | --- |
-| none | 50,176,101 bytes | 41,911,126 bytes, before signing |
-| all four | 2,542,320,388 bytes | 2,534,083,729 bytes, signed |
+| none | about 50 MB | about 42 MB, before signing |
+| all four | 2,543,238,567 bytes | 2,534,100,113 bytes, signed |
+
+The sizes with all four models were measured on 23 and 24 November 2026 for builds of the same
+source. A debug APK varies by up to a megabyte from one build to another, because the build
+updates it in place (a clean build from a fresh clone gave 2,542,336,800 bytes); the release
+APK is written afresh each time and changes only when the source does.
 
 The limit of the APK format is 4 GiB. **Changing the selection needs nothing by hand.** The
 packaging tasks take the selection and the manifest as inputs, so the APK is written afresh
@@ -1577,19 +1638,19 @@ unzip -p "$APK" assets/models/qwen3.5-0.8b.gguf.so | sha256sum
 
 Check that the native libraries were stripped of their debug information. The build must not
 have printed `Unable to strip the following libraries`, and the `unzip -l` listing must show
-sizes close to these, in a debug and in a release APK alike. They were measured for a build of
-commit `af14daa`; later changes to the native code move `libllama.so` and
+sizes close to these, in a debug and in a release APK alike. They were measured on
+24 November 2026; later changes to the native code move `libllama.so` and
 `libproseplow_jni.so` by some kilobytes:
 
 | Library | Bytes |
 | --- | --- |
-| `libllama.so` | 4,155,512 |
+| `libllama.so` | 4,162,520 |
 | `libggml-base.so` | 771,272 |
-| `libproseplow_jni.so` | 110,752 |
+| `libproseplow_jni.so` | 159,352 |
 | `libc++_shared.so` | 1,374,336 |
 
-All thirteen libraries of that build together were 13,588,024 bytes: the twelve that
-`native/README.md` lists under "What is built" (13,577,928 bytes) and
+All thirteen libraries of that build together were 13,643,632 bytes: the twelve that
+`native/README.md` lists under "What is built" (13,633,536 bytes) and
 `libandroidx.graphics.path.so` (10,096 bytes), which Compose brings. If `libllama.so` is about 40 MB instead,
 the NDK named in `app/build.gradle.kts` is not installed. The native libraries are reproducible:
 in the check, the libraries built from a clean clone in another directory with a freshly
@@ -1749,7 +1810,7 @@ None of it has been tried.
 | `app` smoke test, on a phone | The whole debug app from a clean start, with all four models: terms, passphrase, an answer from each model, "Information", lock and unlock, and the saved memory restored instead of read again. Resets the debug app's data; runs only when asked for | See [The smoke test](#the-smoke-test) |
 | `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model; what the next message reads after a read-ahead, and "Continue" after a stop (`RereadDiagnosisDeviceTest`) | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
-The test counts are those of the commit named above. The two suites that need a phone are not
+The test counts are those of the current commit. The two suites that need a phone are not
 part of `check`. They need a phone that is connected with USB debugging, awake and unlocked.
 
 - The tests of `app` use Keystore keys and files of their own, never the app's. One of them
@@ -1858,6 +1919,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `local.properties.example` | A template for the optional `local.properties` |
 | `FEATURES.md` | Everything the app does that a user or a tester can observe, item by item and with its exact wording, so that a version for another platform can be held to the same behaviour |
 | `LICENSE` | The Apache License 2.0 |
+| `SECURITY.md` | How to report a vulnerability privately, and what is in scope |
 
 ## Contributing
 
@@ -1887,7 +1949,12 @@ sections, from someone who has actually followed them.
 Contributions are accepted under the licence of the repository, as section 5 of the Apache
 License 2.0 says.
 
+**Reporting problems.** Report bugs as GitHub issues on this repository. Report a vulnerability
+privately instead, as [`SECURITY.md`](SECURITY.md) describes, never as a public issue.
+
 ## Licence and third-party notices
+
+Copyright 2026 Wayne Workman.
 
 Prose Plow is licensed under the Apache License, Version 2.0; the text is in `LICENSE`.
 
@@ -1917,6 +1984,18 @@ for building and testing only, and not part of an APK: Gradle and the Android Gr
 the Python packages of `native/requirements.txt` under their own licences, and the Android SDK
 and NDK under the Android Software Development Kit License Agreement, which you accept yourself
 when you install them.
+
+A few files of this repository are under other licences than Apache-2.0, because they are, or
+change, other people's work:
+
+- The patches in `native/patches/` modify llama.cpp and are under its licence, MIT (Copyright (c)
+  2023-2026 The ggml authors). `0002-arm-f16-weights-kernel.patch` also changes tinyBLAS
+  (`ggml/src/ggml-cpu/llamafile/sgemm.cpp`), MIT, Copyright 2024 Mozilla Foundation.
+- `native/tests/refgen/reference_shard2.py` contains a copy of the model code of Shard-2's
+  `infer.py`, under the MIT licence that Glint-Research's model card declares; its docstring
+  gives the attribution and the permission notice.
+- The Gradle wrapper (`gradlew`, `gradlew.bat` and `gradle/wrapper/`) is Gradle's, under
+  Apache-2.0.
 
 ### Keeping the notices right
 

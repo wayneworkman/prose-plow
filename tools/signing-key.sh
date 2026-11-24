@@ -2,7 +2,8 @@
 # Creates your APK signing key, once, and afterwards only shows its fingerprint.
 #
 # The key is a PKCS12 keystore outside the repository (mode 600), by default
-# ~/.config/proseplow/proseplow-release.p12; PROSEPLOW_KEYSTORE names another file, and
+# ~/.config/proseplow/proseplow-release.p12; PROSEPLOW_KEYSTORE names another file (a relative
+# path is taken from the repository's root, as the release build takes it), and
 # PROSEPLOW_KEY_ALIAS another alias than "proseplow". ./gradlew assembleRelease signs with it.
 #
 # The password, in this order:
@@ -22,14 +23,32 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../env.sh
-source "$here/../env.sh" >/dev/null
+root="$(cd "$here/.." && pwd)"
+# shellcheck source=SCRIPTDIR/../env.sh
+source "$root/env.sh" >/dev/null
 
 keystore="${PROSEPLOW_KEYSTORE:-$HOME/.config/proseplow/proseplow-release.p12}"
+[[ "$keystore" == /* ]] || keystore="$root/$keystore"
 alias_name="${PROSEPLOW_KEY_ALIAS:-proseplow}"
 
 keyring_usable() {
     [[ -x "$here/keyring.py" ]] && timeout 30 "$here/keyring.py" available 2>/dev/null
+}
+
+# Runs tools/keyring.py with a limit of a minute, so that a keyring that waits to be unlocked (over
+# SSH, say) cannot stop the script for good; a call that runs out says so and fails with status 124.
+# What "get" says on its standard error (that there is no password) is left out: the callers decide.
+keyring() {
+    local status=0
+    if [[ "$1" == get ]]; then
+        timeout 60 "$here/keyring.py" "$@" 2>/dev/null || status=$?
+    else
+        timeout 60 "$here/keyring.py" "$@" || status=$?
+    fi
+    if [[ "$status" -eq 124 ]]; then
+        echo "tools/keyring.py $1 gave no answer within 60 seconds (a locked keyring?) and was stopped." >&2
+    fi
+    return "$status"
 }
 
 show_key() {
@@ -40,7 +59,7 @@ show_key() {
 if [[ -e "$keystore" ]]; then
     echo "The signing key already exists: $keystore"
     if [[ -z "${PROSEPLOW_KEYSTORE_PASSWORD:-}" ]] && keyring_usable; then
-        PROSEPLOW_KEYSTORE_PASSWORD="$("$here/keyring.py" get 2>/dev/null || true)"
+        PROSEPLOW_KEYSTORE_PASSWORD="$(keyring get || true)"
     fi
     if [[ -n "${PROSEPLOW_KEYSTORE_PASSWORD:-}" ]]; then
         export PROSEPLOW_KEYSTORE_PASSWORD
@@ -58,16 +77,30 @@ shown=0
 if [[ -n "${PROSEPLOW_KEYSTORE_PASSWORD:-}" ]]; then
     where="the password you gave in PROSEPLOW_KEYSTORE_PASSWORD"
 elif keyring_usable; then
-    if "$here/keyring.py" get >/dev/null 2>&1; then
+    status=0
+    keyring get >/dev/null || status=$?
+    if [[ "$status" -eq 0 ]]; then
         echo "The login keyring already holds a Prose Plow signing password, but $keystore is missing." >&2
         echo "Restore the keystore from its backup; this script will not replace the password." >&2
+        exit 1
+    fi
+    if [[ "$status" -eq 124 ]]; then
+        echo "The login keyring did not answer within 60 seconds; unlock it and run this script again." >&2
         exit 1
     fi
     PROSEPLOW_KEYSTORE_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
     # The password goes into the keyring first and is read back, so a key is never made that the
     # keyring cannot open again.
-    printf '%s\n' "$PROSEPLOW_KEYSTORE_PASSWORD" | "$here/keyring.py" set
-    [[ "$("$here/keyring.py" get)" == "$PROSEPLOW_KEYSTORE_PASSWORD" ]]
+    if ! printf '%s\n' "$PROSEPLOW_KEYSTORE_PASSWORD" | keyring set; then
+        echo "Could not store the password in the login keyring; no key was made." >&2
+        exit 1
+    fi
+    if [[ "$(keyring get || true)" != "$PROSEPLOW_KEYSTORE_PASSWORD" ]]; then
+        echo "The login keyring did not give back the password just stored in it; no key was made." >&2
+        echo "Unlock the keyring, or run this script with PROSEPLOW_KEYSTORE_PASSWORD set to a password of your own." >&2
+        echo "If the keyring holds the new password after all, remove that entry first, or this script will ask for a backup." >&2
+        exit 1
+    fi
     where="a random password, kept in the login keyring (tools/keyring.py get prints it)"
 else
     PROSEPLOW_KEYSTORE_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"

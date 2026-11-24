@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -225,6 +226,28 @@ def ensure(entry: dict, src: Path | None, out: Path, llama_src: Path, ftype: str
     return convert(entry, src_dir, out, llama_src, ftype, quiet=True)
 
 
+# The packages the converters import (native/requirements.txt pins them). They are looked for before
+# anything is converted, so that an environment without them says how to fix it instead of failing
+# halfway through a driver with an ImportError.
+_PACKAGES = ("numpy", "torch", "transformers", "tokenizers", "sentencepiece", "google.protobuf", "safetensors", "yaml")
+
+# The exit status when packages are missing; the Gradle build (llama/build.gradle.kts) recognises it.
+EXIT_MISSING_PACKAGES = 3
+
+
+def missing_packages() -> list[str]:
+    """The packages of _PACKAGES this Python cannot import, found without importing them."""
+    missing = []
+    for name in _PACKAGES:
+        try:
+            found = importlib.util.find_spec(name) is not None
+        except ModuleNotFoundError:  # a parent package (google) is missing
+            found = False
+        if not found:
+            missing.append(name)
+    return missing
+
+
 def _env_path(name: str) -> Path | None:
     value = os.environ.get(name)
     return Path(value) if value else None
@@ -255,6 +278,11 @@ def main() -> int:
         unknown = set(args.ids) - {e["id"] for e in entries}
         if unknown:
             parser.error(f"not in the manifest: {', '.join(sorted(unknown))}")
+        missing = missing_packages()
+        if missing:
+            print(f"convert_models: this Python ({sys.executable}) lacks {', '.join(missing)}; "
+                  f"run `pip install -r native/requirements.txt` in its virtualenv", file=sys.stderr)
+            return EXIT_MISSING_PACKAGES
 
         failed = False
         for entry in entries:
