@@ -7,11 +7,13 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 // The Android library around the native code. It implements the native seam that :core defines
 // and is the only module that knows about JNI, llama.cpp and the bundled model files.
 //
-// Three things happen here that an ordinary library module does not have (native/README.md,
+// Four things happen here that an ordinary library module does not have (native/README.md,
 // "The Android build", describes them for a reader; the comments below are for a maintainer):
 // 1. prepareLlamaSource writes the patched copy of llama.cpp into this module's build directory;
 // 2. CMake (src/main/cpp/CMakeLists.txt) compiles it, our own libraries and the JNI binding;
-// 3. package<Variant>Models puts the selected, hash-verified model files among the assets.
+// 3. convertModels converts the checkpoints of the selected models that are not converted yet;
+// 4. package<Variant>Models puts the selected, hash-verified model files into a directory of
+//    assets, which only the app's APK and this module's test APK take in (see section 4).
 plugins {
     // AGP 9 has built-in Kotlin support; org.jetbrains.kotlin.android must not be applied.
     alias(libs.plugins.android.library)
@@ -23,10 +25,26 @@ plugins {
 fun setting(property: String, environment: String): Provider<String> =
     providers.gradleProperty(property).orElse(providers.environmentVariable(environment))
 
-// Which models go into the APK: "none", "all", or manifest ids separated by commas.
-val bundledModels: Provider<String> = setting("proseplow.models", "PROSEPLOW_MODELS").orElse("none")
-// Where the converted models are: <directory>/<id>/<output>, as models/convert_models.py writes them.
+// The three directories outside the repository have defaults under ~/proseplow, the places the
+// README's build instructions use, so that a build that follows them needs no setting at all.
+val proseplowHome: String = File(System.getProperty("user.home"), "proseplow").path
+
+// Which models go into the APK: "all" (the default: an app is built to be used), "none", or
+// manifest ids separated by commas. apk-checks.gradle.kts reads the same setting with the same
+// default and must stay in step with this line.
+val bundledModels: Provider<String> = setting("proseplow.models", "PROSEPLOW_MODELS").orElse("all")
+// Where the converted models are: <directory>/<id>/<output>, as models/convert_models.py writes
+// them. Without a setting: $PROSEPLOW_BUILD/models, the place native/tools/env.sh gives the host
+// build, or ~/proseplow/build/models.
 val convertedModels: Provider<String> = setting("proseplow.modelDir", "PROSEPLOW_MODEL_OUT")
+    .orElse(providers.environmentVariable("PROSEPLOW_BUILD").map { File(it, "models").path })
+    .orElse(File(proseplowHome, "build/models").path)
+// Where the downloaded checkpoints are, as <directory>/<id>/ or as a Hugging Face hub cache.
+val checkpoints: Provider<String> = setting("proseplow.modelSrc", "PROSEPLOW_MODEL_SRC")
+    .orElse(File(proseplowHome, "checkpoints").path)
+// The Python virtualenv with the packages of native/requirements.txt, which the converters need.
+val pythonVenv: Provider<String> = setting("proseplow.venv", "PROSEPLOW_VENV")
+    .orElse(File(proseplowHome, "venv").path)
 
 val repository: Directory = rootProject.layout.projectDirectory
 val llamaSource: Provider<Directory> = layout.buildDirectory.dir("llama-src")
@@ -179,7 +197,169 @@ tasks.configureEach {
     }
 }
 
-// --- 3. The models ---
+// --- 3. Converting the models ---
+
+/**
+ * Makes sure that the converted file of every selected model is there and is the pinned one,
+ * converting what is missing with models/convert_models.py, one model at a time.
+ *
+ * For each model, in manifest order:
+ * - a converted file whose SHA-256 is the manifest's `output_sha256` is left as it is;
+ * - otherwise its checkpoint must be under [checkpointDirectory], and the converter of the
+ *   Python environment turns it into the file (the script verifies every source file and the
+ *   result against the manifest, and fails on any difference);
+ * - a model that has neither stops the build before anything is converted, with the download
+ *   command for each such model, so that one message lists everything that is missing.
+ *
+ * The task's outputs are the converted files of the selection, and its inputs the selection and
+ * the manifest, which pins what those files must be. Gradle therefore runs it again only when a
+ * file was removed or changed, or the selection or the manifest changed; a build in which none of
+ * that happened skips it. The checkpoints are deliberately not inputs: hashing gigabytes on every
+ * build would cost more than it could find, and the converter hashes them when it reads them.
+ * The Python environment and the checkpoints are only needed when something must be converted,
+ * so a builder who already has the converted files needs neither.
+ */
+abstract class ConvertModels @Inject constructor(private val exec: ExecOperations) : DefaultTask() {
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val manifest: RegularFileProperty
+
+    /** "none", "all", or manifest ids separated by commas. */
+    @get:Input
+    abstract val selection: Property<String>
+
+    @get:Internal
+    abstract val checkpointDirectory: Property<String>
+
+    @get:Internal
+    abstract val modelDirectory: Property<String>
+
+    @get:Internal
+    abstract val pythonEnvironment: Property<String>
+
+    /** models/convert_models.py. */
+    @get:Internal
+    abstract val converter: RegularFileProperty
+
+    /** The patched llama.cpp copy, which holds the converters; written by prepareLlamaSource. */
+    @get:Internal
+    abstract val llamaSource: DirectoryProperty
+
+    /** The converted file of each selected model, at the place packaging reads it from. */
+    @get:OutputFiles
+    abstract val converted: ConfigurableFileCollection
+
+    @TaskAction
+    fun convert() {
+        val entries = PackageModels.selected(manifest.get().asFile, selection.get())
+        val directory = modelDirectory.get()
+        val pending = entries.filter { entry ->
+            val file = PackageModels.sourceFile(directory, entry)
+            val current = file.isFile && sha256(file) == entry.sha256
+            if (current) logger.info("$path: ${entry.id}: $file is the pinned conversion")
+            !current
+        }
+        if (pending.isEmpty()) {
+            if (entries.isNotEmpty()) logger.lifecycle("$path: ${entries.joinToString { it.id }}: already converted, as pinned")
+            return
+        }
+
+        val sources = File(checkpointDirectory.get())
+        val python = File(pythonEnvironment.get(), "bin/python")
+        val missing = pending.filter { checkpointOf(sources, it) == null }
+        if (missing.isNotEmpty()) {
+            val hf = File(pythonEnvironment.get(), "bin/hf")
+            throw GradleException(
+                buildString {
+                    append("Not converted yet, and no checkpoint to convert from: ${missing.joinToString { it.id }}.\n")
+                    append("The checkpoints are looked for in $sources (-Pproseplow.modelSrc=<dir> or PROSEPLOW_MODEL_SRC to look elsewhere).\n")
+                    append("Download ${if (missing.size == 1) "it" else "them"} at the pinned revision (README.md, \"Get the model checkpoints\"):\n\n")
+                    for (entry in missing) {
+                        append("    $hf download ${entry.repository} --revision ${entry.revision} \\\n")
+                        append("        --local-dir \"${File(sources, entry.id)}\"\n")
+                    }
+                    append("\nOr leave ${if (missing.size == 1) "it" else "them"} out of the APK: -Pproseplow.models=<ids> names the models to bundle, -Pproseplow.models=none bundles none.")
+                },
+            )
+        }
+        if (!python.canExecute()) {
+            throw GradleException(
+                "Converting ${pending.joinToString { it.id }} needs the Python environment, and there is none at ${pythonEnvironment.get()} " +
+                    "(no bin/python). Create it as README.md, \"The Python environment\", says, or name the one you have with " +
+                    "-Pproseplow.venv=<dir> or PROSEPLOW_VENV.",
+            )
+        }
+
+        for (entry in pending) {
+            logger.lifecycle("$path: converting ${entry.id} from ${checkpointOf(sources, entry)} (one model at a time)")
+            val started = System.nanoTime()
+            val result = exec.exec {
+                commandLine(
+                    python.path, converter.get().asFile.path,
+                    "--src", sources.path,
+                    "--out", directory,
+                    "--llama-src", llamaSource.get().asFile.path,
+                    // The file is missing or is not the pinned one, whatever the record beside it says.
+                    "--force",
+                    entry.id,
+                )
+                // CPU only, and no bytecode caches in the repository or the patched copy.
+                environment("CUDA_VISIBLE_DEVICES", "")
+                environment("PYTHONDONTWRITEBYTECODE", "1")
+                isIgnoreExitValue = true
+            }
+            if (result.exitValue != 0) {
+                throw GradleException(
+                    "${entry.id}: models/convert_models.py failed (exit ${result.exitValue}); its message is above. A checkpoint file " +
+                        "that is not the pinned one is replaced by downloading it again (README.md, \"Get the model checkpoints\").",
+                )
+            }
+            logger.lifecycle("$path: ${entry.id} converted in ${(System.nanoTime() - started) / 1_000_000_000} s")
+        }
+    }
+
+    /** The directory of [entry]'s checkpoint under [sources], in either layout convert_models.py accepts, or null. */
+    private fun checkpointOf(sources: File, entry: PackageModels.Entry): File? =
+        listOf(
+            File(sources, entry.id),
+            File(sources, "models--${entry.repository.replace("/", "--")}/snapshots/${entry.revision}"),
+        ).firstOrNull { it.isDirectory }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(1 shl 20)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+}
+
+val convertModels = tasks.register<ConvertModels>("convertModels") {
+    group = "build"
+    description = "Converts the checkpoints of the selected models whose pinned 16-bit file is not there yet."
+    manifest.set(repository.file("models/manifest.json"))
+    selection.set(bundledModels)
+    checkpointDirectory.set(checkpoints)
+    modelDirectory.set(convertedModels)
+    pythonEnvironment.set(pythonVenv)
+    converter.set(repository.file("models/convert_models.py"))
+    llamaSource.set(prepareLlamaSource.flatMap { it.output })
+    converted.from(
+        bundledModels.zip(convertedModels) { selection, directory ->
+            PackageModels.selected(repository.file("models/manifest.json").asFile, selection).map { PackageModels.sourceFile(directory, it) }
+        },
+    )
+    // The copy is only read when something is converted, but it must be there before that.
+    dependsOn(prepareLlamaSource)
+}
+
+// --- 4. The models in the APK ---
 
 /**
  * Copies the selected models into a directory of assets, each verified against the SHA-256 that
@@ -201,12 +381,11 @@ abstract class PackageModels : DefaultTask() {
     @get:Input
     abstract val selection: Property<String>
 
-    /** The directory of converted models; only needed when something is selected. */
+    /** The directory of converted models. */
     @get:Input
-    @get:Optional
     abstract val modelDirectory: Property<String>
 
-    /** The same files as inputs, so that a re-converted model is packaged again. */
+    /** The same files, as convertModels left them, as inputs: a re-converted model is packaged again. */
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
     abstract val modelFiles: ConfigurableFileCollection
@@ -224,12 +403,12 @@ abstract class PackageModels : DefaultTask() {
             logger.lifecycle("$path: no model is bundled (proseplow.models=${selection.get()}). The app will list none of its own.")
             return
         }
-        val directory = modelDirectory.orNull?.takeIf { it.isNotBlank() }
-            ?: throw GradleException("Models are selected (${selection.get()}) but no directory was given: pass -Pproseplow.modelDir=<dir> or set PROSEPLOW_MODEL_OUT (see native/README.md).")
+        val directory = modelDirectory.get()
         for (entry in entries) {
             val source = sourceFile(directory, entry)
             if (!source.isFile) {
-                throw GradleException("${entry.id}: $source does not exist. Convert the model first (models/README.md).")
+                // convertModels runs first and fails rather than leave a file out; this is a file removed since.
+                throw GradleException("${entry.id}: $source does not exist. Build again, and convertModels converts it.")
             }
             val copy = target.resolve(assetName(entry.id))
             val digest = MessageDigest.getInstance("SHA-256")
@@ -253,8 +432,8 @@ abstract class PackageModels : DefaultTask() {
         }
     }
 
-    /** One model of the manifest that can be packaged. */
-    class Entry(val id: String, val output: String, val sha256: String)
+    /** One model of the manifest that can be packaged, with where its checkpoint is published. */
+    class Entry(val id: String, val output: String, val sha256: String, val repository: String, val revision: String)
 
     companion object {
         const val ASSET_DIRECTORY = "models"
@@ -289,33 +468,53 @@ abstract class PackageModels : DefaultTask() {
                 val id = model["id"] as String
                 val sha256 = model["output_sha256"] as String?
                     ?: throw GradleException("$id has no output_sha256 in models/manifest.json; a model is only packaged against a pinned hash.")
-                Entry(id, model["output"] as String, sha256)
+                Entry(id, model["output"] as String, sha256, model["repository"] as String, model["revision"] as String)
             }
         }
     }
 }
 
+// Where the models go, and why not into this library's own assets. Android lint of the app, and
+// so `check`, reads the merged assets of this library: models among them would make every lint
+// run convert and copy gigabytes, and fail on a machine without the checkpoints. So the
+// library's own assets carry no model, and the models reach only what installs them:
+// - the app's APK: the app module adds them to its merged assets (a transform of AGP's ASSETS
+//   artifact there), taking this directory through the configuration <variant>ModelAssets below;
+//   lint of the app does not read its own merged assets;
+// - this module's test APK: as generated assets of its androidTest component, which nothing but
+//   the test APK reads.
+// Converting and packaging therefore run for the tasks that build those APKs and for no other.
+// (Without models in it, the library's AAR stays small too.)
+
+/** The Usage of the configurations that hand the model directory to the app module. */
+val modelAssetsUsage: Usage = objects.named(Usage::class.java, "proseplow-model-assets")
+/** Which build type's model directory a configuration carries; the app module asks by the same name. */
+val modelAssetsBuildType: Attribute<String> = Attribute.of("us.theworkmans.proseplow.modelAssets.buildType", String::class.java)
+
 androidComponents {
     onVariants { variant ->
-        val packageModels = tasks.register<PackageModels>("package${variant.name.replaceFirstChar(Char::uppercaseChar)}Models") {
+        val capitalised = variant.name.replaceFirstChar(Char::uppercaseChar)
+        val packageModels = tasks.register<PackageModels>("package${capitalised}Models") {
             group = "build"
-            description = "Puts the selected model files, verified against models/manifest.json, among the ${variant.name} assets."
+            description = "Puts the selected model files, verified against models/manifest.json, into a directory of ${variant.name} assets."
             manifest.set(repository.file("models/manifest.json"))
             selection.set(bundledModels)
             modelDirectory.set(convertedModels)
-            modelFiles.from(
-                bundledModels.zip(convertedModels.orElse("")) { selection, directory ->
-                    if (directory.isBlank()) {
-                        emptyList()
-                    } else {
-                        PackageModels.selected(repository.file("models/manifest.json").asFile, selection).map { PackageModels.sourceFile(directory, it) }
-                    }
-                },
-            )
+            // The outputs of convertModels, which makes this task depend on it: every packaging
+            // of models, for either variant and for the test APK, converts first.
+            modelFiles.from(convertModels)
+            output.convention(layout.buildDirectory.dir("generated/proseplow-models/${variant.name}"))
         }
-        // AGP decides where the directory is and merges it into the variant's assets, from
-        // where it reaches the app's APK like any other asset of a library.
-        variant.sources.assets?.addGeneratedSourceDirectory(packageModels, PackageModels::output)
+        // For the app module: this directory, under the attributes it asks for.
+        configurations.consumable("${variant.name}ModelAssets") {
+            attributes {
+                attribute(Usage.USAGE_ATTRIBUTE, modelAssetsUsage)
+                attribute(modelAssetsBuildType, variant.buildType ?: variant.name)
+            }
+            outgoing.artifact(packageModels.flatMap { it.output })
+        }
+        // For this module's test APK (AGP decides where the directory is when it is added here).
+        variant.androidTest?.sources?.assets?.addGeneratedSourceDirectory(packageModels, PackageModels::output)
     }
 }
 

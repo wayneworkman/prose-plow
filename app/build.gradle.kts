@@ -1,8 +1,16 @@
+import com.android.build.api.artifact.ArtifactTransformationRequest
 import com.android.build.api.artifact.SingleArtifact
 import groovy.json.JsonSlurper
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.process.ExecOperations
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.w3c.dom.Element
 
@@ -65,6 +73,8 @@ android {
         }
         release {
             isMinifyEnabled = false
+            // No signingConfig, on purpose: AGP packages the release APK unsigned, and signReleaseApk
+            // (below) signs it with the builder's own key. See SignApk for why.
         }
     }
 
@@ -362,6 +372,277 @@ androidComponents {
         }
         variant.sources.res?.addGeneratedSourceDirectory(notices, GenerateThirdPartyNotices::output)
         tasks.named("check") { dependsOn(notices) }
+    }
+}
+
+/**
+ * Signs the release APK with the key of whoever builds it, and verifies the result.
+ *
+ * There is no official key and no published APK: everyone who installs the app built it and
+ * signs it with a key of their own. The key is a PKCS12 keystore, by default
+ * `~/.config/proseplow/proseplow-release.p12` (made once by `tools/signing-key.sh`), with the
+ * alias `proseplow`. Its password is taken, in this order, from the environment variable
+ * `PROSEPLOW_KEYSTORE_PASSWORD`, or from the login keyring through `tools/keyring.py`, where the
+ * key script put it. It reaches `apksigner` on its standard input, never on a command line or in
+ * an environment, and is never printed or written anywhere.
+ *
+ * Why a task and not AGP's `signingConfigs`: a signing configuration takes its password as a plain
+ * string while the build is configured, so it would have to be looked up for every build, debug
+ * builds and `check` included, and AGP writes the configuration, password and all, into a file
+ * of the build directory. Here it is looked up only when a release APK is signed and lives only in
+ * memory while it is.
+ *
+ * The signature is what `apksigner` gives an APK whose minimum SDK is 28 with the v1 (JAR) scheme
+ * switched off: APK Signature Scheme v3, which Android 9, the oldest version the app runs on,
+ * checks. The v1 signature is off because it is what stops tools that copy signatures from
+ * handling an APK of more than 2 GiB, and v4 is off because it is a separate file that installing
+ * does not need. Alignment is kept as AGP made it (`--alignment-preserved`): the models inside are
+ * mapped in place and must stay on their 16 KiB boundaries, which the checks of
+ * `apk-checks.gradle.kts` confirm on the signed file too.
+ *
+ * The task is a transform of the variant's APK, so the signed file is THE release APK: it is what
+ * `assembleRelease` leaves in `build/outputs/apk/release/` and what `installRelease` installs.
+ */
+abstract class SignApk @Inject constructor(private val exec: ExecOperations) : DefaultTask() {
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val unsigned: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val signed: DirectoryProperty
+
+    @get:Internal
+    abstract val transformationRequest: Property<ArtifactTransformationRequest<SignApk>>
+
+    @get:Input
+    abstract val keystorePath: Property<String>
+
+    /** The keystore again, as a file whose content is an input: a new key signs again. Empty while it is missing. */
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val keystoreFile: ConfigurableFileCollection
+
+    @get:Input
+    abstract val keyAlias: Property<String>
+
+    @get:Internal
+    abstract val buildTools: DirectoryProperty
+
+    /** tools/keyring.py of the repository. */
+    @get:Internal
+    abstract val keyringTool: RegularFileProperty
+
+    @TaskAction
+    fun sign() {
+        val keystore = File(keystorePath.get())
+        if (!keystore.isFile) {
+            throw GradleException(
+                "No signing key at $keystore. A release APK is signed with your own key; create it once with\n\n" +
+                    "    tools/signing-key.sh\n\n" +
+                    "and back it up together with its password (README.md, \"Create your signing key\"). A key kept elsewhere is " +
+                    "named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE.",
+            )
+        }
+        val password = password(keystore)
+        val apksigner = buildTools.file("apksigner").get().asFile.path
+        val zipalign = buildTools.file("zipalign").get().asFile.path
+        // apksigner and zipalign are started by scripts that need a Java; the one running Gradle will do.
+        val javaHome = System.getProperty("java.home")
+        // The directory belongs to this task. An APK left there by an earlier build (the unsigned
+        // one, from before the build signed by itself) would be mistaken for the result.
+        signed.get().asFile.listFiles { file -> file.name.endsWith(".apk") || file.name.endsWith(".idsig") }?.forEach { it.delete() }
+
+        transformationRequest.get().submit(this) { artifact ->
+            val input = File(artifact.outputFile)
+            val output = signed.file(input.name.replace("-unsigned", "")).get().asFile
+            output.delete()
+            // apksigner prompts for the password even when it reads it from its input; what it
+            // says is only shown when it fails. It never repeats the password.
+            val said = ByteArrayOutputStream()
+            val signing = exec.exec {
+                commandLine(
+                    apksigner, "sign",
+                    "--ks", keystore.path, "--ks-type", "PKCS12", "--ks-key-alias", keyAlias.get(),
+                    "--ks-pass", "stdin",
+                    "--v1-signing-enabled", "false",
+                    "--v4-signing-enabled", "false",
+                    "--alignment-preserved", "true",
+                    "--out", output.path, input.path,
+                )
+                environment("JAVA_HOME", javaHome)
+                standardInput = ByteArrayInputStream((password + "\n").toByteArray())
+                standardOutput = said
+                errorOutput = said
+                isIgnoreExitValue = true
+            }
+            if (signing.exitValue != 0) {
+                output.delete()
+                throw GradleException(
+                    "apksigner could not sign with $keystore (alias ${keyAlias.get()}):\n" +
+                        said.toString().replace("Keystore password for signer #1: ", "").lines()
+                            .filterNot { it.trimStart().startsWith("at ") || it.trimStart().startsWith("... ") }
+                            .joinToString("\n").trim() + "\nA wrong password, " +
+                        "or a keystore whose key has another alias (-Pproseplow.keyAlias=<alias> or PROSEPLOW_KEY_ALIAS), are the usual causes.",
+                )
+            }
+            val report = ByteArrayOutputStream()
+            exec.exec {
+                commandLine(apksigner, "verify", "--verbose", "--print-certs", output.path)
+                environment("JAVA_HOME", javaHome)
+                standardOutput = report
+            }
+            exec.exec {
+                commandLine(zipalign, "-c", "-P", "16", "4", output.path)
+            }
+            val summary = report.toString().lines().filter {
+                it.startsWith("Verifies") || it.startsWith("Verified using v") || it.contains("certificate DN") || it.contains("certificate SHA-256")
+            }
+            logger.lifecycle("$path: signed $output\n" + summary.joinToString("\n") { "    $it" })
+            output
+        }
+    }
+
+    /** The keystore's password from the environment or the login keyring; it never leaves this process except to apksigner. */
+    private fun password(keystore: File): String {
+        System.getenv(PASSWORD_VARIABLE)?.takeIf { it.isNotEmpty() }?.let { return it }
+        val tool = keyringTool.get().asFile
+        if (tool.canExecute()) {
+            val process = ProcessBuilder(tool.path, "get")
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                .start()
+            val text = process.inputStream.bufferedReader().readText()
+            // A keyring that is locked and asks to be unlocked gets a minute; then the build goes on without it.
+            if (process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0) {
+                text.trimEnd('\n').takeIf { it.isNotEmpty() }?.let { return it }
+            } else {
+                process.destroyForcibly()
+            }
+        }
+        throw GradleException(
+            "No password for the signing key $keystore: $PASSWORD_VARIABLE is not set, and the login keyring holds none " +
+                "(or there is no keyring here). Give it for this build without leaving it in your shell's history:\n\n" +
+                "    read -rs $PASSWORD_VARIABLE && export $PASSWORD_VARIABLE\n\n" +
+                "and run the build again (README.md, \"Build a release APK\").",
+        )
+    }
+
+    private companion object {
+        const val PASSWORD_VARIABLE = "PROSEPLOW_KEYSTORE_PASSWORD"
+    }
+}
+
+/**
+ * Adds the models to a variant's merged assets: the directory that `:llama:package<Variant>Models`
+ * fills, verified against the manifest, joined to what AGP merged.
+ *
+ * This is where the models enter the app, rather than as assets of the library, so that only
+ * the tasks that build an APK (and through them `assemble`, `install` and `bundle`) need them.
+ * Android lint, which `check` runs, reads the library's merged assets but not this module's, and
+ * never asks for a model; `llama/build.gradle.kts`, "4. The models in the APK", says more.
+ *
+ * The models are hard links to the packaged files where the file system allows it, so that this
+ * step costs neither the time nor the disk of another copy; otherwise they are copied. A model
+ * whose name an asset of the app already has fails the task rather than replace it.
+ */
+abstract class AddModelAssets : DefaultTask() {
+
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val merged: DirectoryProperty
+
+    /** The model directories of `:llama`, through the configuration `<variant>ModelAssets`. */
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val models: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val combined: DirectoryProperty
+
+    @TaskAction
+    fun combine() {
+        val target = combined.get().asFile
+        target.deleteRecursively()
+        merged.get().asFile.copyRecursively(target)
+        for (directory in models.files.filter { it.isDirectory }) {
+            for (file in directory.walkTopDown().filter { it.isFile }) {
+                val placed = target.resolve(file.relativeTo(directory).path)
+                if (placed.exists()) {
+                    throw GradleException("The asset ${file.relativeTo(directory)} exists twice: among the app's assets and among the models.")
+                }
+                placed.parentFile.mkdirs()
+                try {
+                    Files.createLink(placed.toPath(), file.toPath())
+                } catch (_: IOException) {
+                    file.copyTo(placed)
+                } catch (_: UnsupportedOperationException) {
+                    file.copyTo(placed)
+                }
+            }
+        }
+    }
+}
+
+// add<Variant>ModelAssets: the models of :llama, joined to the merged assets of each variant.
+val modelAssetsUsage: Usage = objects.named(Usage::class.java, "proseplow-model-assets")
+val modelAssetsBuildType: Attribute<String> = Attribute.of("us.theworkmans.proseplow.modelAssets.buildType", String::class.java)
+val modelAssetsSource = configurations.dependencyScope("modelAssets")
+dependencies {
+    add(modelAssetsSource.name, project(":llama"))
+}
+androidComponents {
+    onVariants { variant ->
+        val capitalised = variant.name.replaceFirstChar(Char::uppercaseChar)
+        val wanted = configurations.resolvable("${variant.name}ModelAssets") {
+            extendsFrom(modelAssetsSource.get())
+            attributes {
+                attribute(Usage.USAGE_ATTRIBUTE, modelAssetsUsage)
+                attribute(modelAssetsBuildType, variant.buildType ?: variant.name)
+            }
+        }
+        val add = tasks.register<AddModelAssets>("add${capitalised}ModelAssets") {
+            group = "build"
+            description = "Adds the bundled models to the merged ${variant.name} assets."
+            models.from(wanted)
+        }
+        variant.artifacts.use(add)
+            .wiredWithDirectories(AddModelAssets::merged, AddModelAssets::combined)
+            .toTransform(SingleArtifact.ASSETS)
+    }
+}
+
+// signReleaseApk: put between AGP's packaging and everything that takes the release APK.
+//
+// -Pproseplow.sign=false (or PROSEPLOW_SIGN=false) leaves it out, for a builder whose signing
+// happens elsewhere (a build server that signs with its own key, or tools/sign-release.sh later):
+// assembleRelease then writes app-release-unsigned.apk, as AGP does without a signing
+// configuration, with the models in it and every check of the APK made.
+val signRelease: Boolean = when (val value = providers.gradleProperty("proseplow.sign").orElse(providers.environmentVariable("PROSEPLOW_SIGN")).getOrElse("true")) {
+    "true" -> true
+    "false" -> false
+    else -> throw GradleException("proseplow.sign is \"true\" (the default) or \"false\", not \"$value\".")
+}
+androidComponents {
+    val home = System.getProperty("user.home")
+    onVariants(selector().withBuildType("release")) { variant ->
+        if (!signRelease) return@onVariants
+        val sign = tasks.register<SignApk>("sign${variant.name.replaceFirstChar(Char::uppercaseChar)}Apk") {
+            group = "build"
+            description = "Signs the ${variant.name} APK with the builder's own key (tools/signing-key.sh makes it)."
+            val keystore = providers.gradleProperty("proseplow.keystore")
+                .orElse(providers.environmentVariable("PROSEPLOW_KEYSTORE"))
+                .orElse(File(home, ".config/proseplow/proseplow-release.p12").path)
+            keystorePath.set(keystore)
+            keystoreFile.from(keystore.map { path -> listOf(File(path)).filter { it.isFile } })
+            keyAlias.set(providers.gradleProperty("proseplow.keyAlias").orElse(providers.environmentVariable("PROSEPLOW_KEY_ALIAS")).orElse("proseplow"))
+            buildTools.set(sdkComponents.sdkDirectory.map { it.dir("build-tools/${android.buildToolsVersion}") })
+            keyringTool.set(rootProject.layout.projectDirectory.file("tools/keyring.py"))
+        }
+        val request = variant.artifacts.use(sign)
+            .wiredWithDirectories(SignApk::unsigned, SignApk::signed)
+            .toTransformMany(SingleArtifact.APK)
+        sign.configure { transformationRequest.set(request) }
     }
 }
 

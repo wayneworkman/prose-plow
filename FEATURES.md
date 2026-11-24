@@ -3164,6 +3164,7 @@ blocks), `ui/SecureInput.kt`; tests `SourceRulesTest.kt`,
 
 **Source:** `app/build.gradle.kts`, `llama/build.gradle.kts`, `llama/apk-checks.gradle.kts`,
 `llama/src/main/cpp/CMakeLists.txt`, `native/CMakeLists.txt`, `models/manifest.json`,
+`models/convert_models.py`, `tools/signing-key.sh`, `tools/keyring.py`,
 `app/src/test/java/us/theworkmans/proseplow/SourceRulesTest.kt`, `ThirdPartyNoticesTest.kt`,
 `README.md` ("Build from source"), `native/README.md`.
 
@@ -3224,13 +3225,27 @@ its own means for each of them.
   revision of each source repository and the SHA-256 of every file that is read, and the
   converted file must have the pinned SHA-256. A checkpoint that is a Python pickle (Shard-2) is
   only ever loaded in the mode that constructs weights and refuses everything else, and the code
-  published with it is never run.
+  published with it is never run. Building a package converts by itself: for each selected model
+  a converted file with the pinned SHA-256 is kept, a missing or different one is converted from
+  the checkpoint (one model at a time), and a model whose checkpoint is not there either stops the
+  build with the command that downloads it at the pinned revision. Nothing in the build downloads a
+  model. Only the steps that build an installable package convert and package models; the tests
+  and the checks of the sources need none.
 - **BUILD-10** A release build contains no development aid, and neither does a development build:
   the code that looks for a model file placed in private storage exists only in the device tests
   (MODEL-23).
 - **BUILD-11** The tests that run on a device use hardware keys under a name space of their own
   and run inside the development build only, so they can never see, replace or delete the keys
   or the data of a real installation.
+- **BUILD-12** There is no official package and no official signing key. A release package is
+  signed by the build itself with the key of whoever builds it, made once by a script of the
+  repository; the build stops, saying how to make one, when there is none. The signature is APK
+  Signature Scheme v3 alone (the JAR scheme is off), and the alignment the packaging gave the
+  models is kept. The key's password comes from an environment variable or the login keyring,
+  reaches the signing tool on its standard input and is never printed. A builder who signs
+  elsewhere can ask for an unsigned release package instead, and sign it later with a script of
+  the repository that signs in the same way. An installed app accepts
+  updates only when they carry the same key, so the key and its password have to be kept.
 
 ## 25. Exact formats and rules (FMT)
 

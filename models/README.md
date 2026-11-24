@@ -57,13 +57,15 @@ carelessly (see "shard-2" below for the one model here that has one).
 ## Getting the checkpoints
 
 Nothing in this repository downloads a model. Fetch each `ready` entry yourself, at the pinned
-revision, into one directory of your choice. Either layout works:
+revision, into one directory: `~/proseplow/checkpoints` unless `PROSEPLOW_MODEL_SRC` (or the
+Gradle property `proseplow.modelSrc`) names another. The root `README.md`, "Get the model
+checkpoints", has the command for each model. Either layout works:
 
 - `<directory>/<id>/` with the files directly inside, for example with the Hugging Face CLI
   (installed with `native/requirements.txt`), taking repository and revision from the manifest:
 
   ```sh
-  hf download <repository> --revision <revision> --local-dir /path/to/checkpoints/<id>
+  ~/proseplow/venv/bin/hf download <repository> --revision <revision> --local-dir ~/proseplow/checkpoints/<id>
   ```
 
 - or a Hugging Face hub cache, where the same files are at
@@ -73,11 +75,21 @@ How the files got there does not matter: the hashes decide whether they are the 
 
 ## Converting
 
-With the environment of `native/README.md` (`PROSEPLOW_VENV`, `PROSEPLOW_BUILD`, and
-`. native/tools/env.sh`):
+**Building the app converts by itself.** `./gradlew assembleDebug` and `./gradlew assembleRelease`
+run the task `:llama:convertModels` before they package the models: for each selected model it
+keeps a converted file whose SHA-256 is the pinned `output_sha256`, converts from the checkpoint
+otherwise (running this script for that one model, one model at a time, with the Python of
+`~/proseplow/venv` or `PROSEPLOW_VENV`), and stops with the `hf download` command of the model
+when its checkpoint is not there either. Its outputs are the converted files and its inputs the
+selection and this manifest, so a build in which nothing changed skips it. Only the tasks that
+build an APK run it; `./gradlew check`, lint and the unit tests need no model. The root
+`README.md`, "Build a debug APK", shows what it prints.
+
+By hand, for the host tests or to convert without building, with the environment of
+`native/README.md` (`. native/tools/env.sh`, which takes the same places as the Gradle build:
+`~/proseplow/venv`, `~/proseplow/checkpoints` and `~/proseplow/build`, each overridable):
 
 ```sh
-export PROSEPLOW_MODEL_SRC=/path/to/checkpoints
 native/tools/prepare-llama-src.sh            # the converters live in the patched llama.cpp copy
 python3 models/convert_models.py             # every ready model, as it ships (F16)
 python3 models/convert_models.py --also-f32  # also the F32 files the validation tests use
@@ -88,7 +100,8 @@ python3 models/convert_models.py --list      # what the manifest contains
 file is compared with the stored weights and with the PyTorch reference, and is never shipped.
 A model that upstream supports as it is has nothing of ours to validate and gets no F32 file.
 
-The results are `$PROSEPLOW_MODEL_OUT/<id>/<output>` (default `$PROSEPLOW_BUILD/models`), each
+The results are `$PROSEPLOW_MODEL_OUT/<id>/<output>` (default `$PROSEPLOW_BUILD/models`, that is
+`~/proseplow/build/models`, which is also where the Gradle build reads them), each
 with a small `<output>.json` next to it that records the source hashes, the converter sources
 and the SHA-256 of the result. A model whose record still matches is not converted again.
 `--src`, `--out` and `--llama-src` replace the environment variables; naming ids converts only
@@ -105,7 +118,9 @@ same change, so the new hash is reviewed with its cause.
 1. Download it and decide its `id`.
 2. Add an entry to `manifest.json` with the repository, the revision you downloaded, and the
    SHA-256 (`sha256sum`) of every file the converter reads. List under `reference_files` what
-   only the tests read.
+   only the tests read. The build's message for a missing checkpoint takes its `hf download`
+   command from `repository` and `revision`; add the same command to "Get the model checkpoints"
+   in the root `README.md`.
 3. Choose the converter. A model of an architecture that already has one (`peacebell`,
    `boris2`, `shard2`) needs nothing else: the converters are driven by `config.json`. A model that
    upstream llama.cpp already loads uses `upstream`: list under `files` everything upstream's

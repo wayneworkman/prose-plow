@@ -348,8 +348,9 @@ val modelManifest: File = rootProject.layout.projectDirectory.file("models/manif
 // These tasks are taken by the beginning of their names (package<Variant>, of which the plugin
 // has several), unlike the checks below: a task this misses keeps the old behaviour, and a
 // task too many only runs once more after the selection changed.
+// The default is the one of bundledModels in build.gradle.kts beside this file.
 val selectedModels: Provider<String> =
-    providers.gradleProperty("proseplow.models").orElse(providers.environmentVariable("PROSEPLOW_MODELS")).orElse("none")
+    providers.gradleProperty("proseplow.models").orElse(providers.environmentVariable("PROSEPLOW_MODELS")).orElse("all")
 tasks.matching { it.name.startsWith("package") }.configureEach {
     inputs.property("proseplow.models", selectedModels)
     inputs.file(modelManifest).withPropertyName("proseplow.modelManifest").withPathSensitivity(PathSensitivity.NONE)

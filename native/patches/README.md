@@ -94,7 +94,7 @@ counts them must be in the last table. A sentence that only names one patch (suc
 | --- | --- | --- |
 | git, GNU patch, bash, tar, `systemd-run` | The system (on Ubuntu, `patch` is its own package) | Everything |
 | Network access | | Section 3 (one fetch) |
-| The Python virtualenv with `native/requirements.txt` installed (CMake, Ninja, PyTorch and the converters' packages) | `native/README.md`, "What you need", which creates it with `python3 -m venv` and `pip install -r native/requirements.txt` (the root `README.md` repeats this under "Locations and environment") | Step 2.5 and section 6 (host build, conversions, host tests) |
+| The Python virtualenv with `native/requirements.txt` installed (CMake, Ninja, PyTorch and the converters' packages) | `native/README.md`, "What you need", which creates it with `python3 -m venv` and `pip install -r native/requirements.txt` (the root `README.md` repeats this under "The Python environment") | Step 2.5 and section 6 (host build, conversions, host tests) |
 | All five model checkpoints, including the optional `peacebell-v1-148m` | The root `README.md`, "Get the model checkpoints", which downloads each one at the revision `models/manifest.json` pins | Step 2.5 and sections 6.3, 6.4 and 6.6. Without a checkpoint its tests are skipped, and a skipped test proves nothing. Shard-2 matters because its hooks are part of patch 0001 |
 | The JDK and Android SDK packages | The root `README.md`, "Building on Ubuntu 24.04" | Sections 6.5 and 6.6 |
 | An arm64 Android phone with USB debugging enabled, and `adb` | `native/README.md`, "On the phone" | Section 6.6 |

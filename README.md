@@ -7,9 +7,10 @@ five small patches. Nothing is downloaded while the app runs, and the app declar
 permission at all. Every chat is stored encrypted behind a lock that cannot be switched off: a
 passphrase, or a fingerprint that the passphrase has set up, and never a PIN.
 
-There are no binary releases. You build the app yourself from this repository, and this file
-says how: from a bare Ubuntu 24.04 machine to an APK on a phone, with every tool, the version of
-it that worked, and every command. The instructions for Windows and macOS are untested best
+There are no binary releases and no official signing key. You build the app yourself from this
+repository and sign it with a key of your own, and this file says how: from a bare Ubuntu 24.04
+machine to an APK on a phone, with every tool, the version of it that worked, and every command.
+Gradle does all of it, model conversion and signing included, in one command. The instructions for Windows and macOS are untested best
 effort until someone offers corrections by pull request.
 
 | | |
@@ -1063,6 +1064,14 @@ native suite were run in the same clone at `295c975`; nothing under `native/`, `
 - Everything that involves a phone (`adb`, installing, the instrumented tests) was done by the
   project's developers on the one phone named above, not in the clean-machine check.
 
+Since that check, the build converts the models and signs the release APK by itself: the
+separate conversion and signing commands that the check ran became steps of `./gradlew
+assembleDebug` and `./gradlew assembleRelease` on 23 November 2026. That build was run on the
+development machine, not in a clean clone: with all four models converted from their
+checkpoints into an empty directory, built a second time with nothing changed, signed with a
+newly made key, and with the failures for a missing checkpoint, Python environment and key. The
+tool versions are the same.
+
 ### Versions
 
 Every tool the build uses, with the version that worked.
@@ -1111,14 +1120,14 @@ runs unless they say otherwise.
 | Clone with the submodule | 22 s | 614 MB, of which 407 MB are llama.cpp's git data |
 | Virtualenv with the pinned packages | 59 s | 1.3 GB, and 0.3 GB of pip cache |
 | The three checkpoints | 11 s for Boris-2 | 3.4 GB (0.55, 1.1 and 1.7 GB) |
-| Converting the three models | 17 s | 2.3 GB |
+| Converting the three models | 17 s; now a step of the first build | 2.3 GB |
 | Native host suite, `native/tools/host-check.sh` | 8 min 27 s: build 33 s, validation files 13 s, tests 7 min 40 s | 2.0 GB more in the scratch directory, and up to 2.2 GB of temporary files while it runs |
 | First Gradle command (`./gradlew :core:test`), which downloads Gradle and the plugins | 1 min 9 s | 0.7 GB in the Gradle user home |
 | `./gradlew check` | 1 min 4 s with its downloads; 38 s later, from empty build directories | 1.1 GB in the Gradle user home afterwards |
 | `:app:assembleDebug` without models, which includes the native build | 1 min 20 s the first time, 59 s later | 0.7 GB under `app/build` and `llama/build`, 160 MB in `llama/.cxx` |
 | `:app:assembleDebug` with all three models | 1 min 5 s after a build without models, 2 min 28 s from empty build directories | 12 GB under `app/build` and `llama/build` |
 | `:app:assembleRelease` with all three models | 1 min 33 s after the debug build | 14 GB more under `app/build` and `llama/build`; the Gradle user home had grown to 3.4 GB |
-| Signing and verifying the release APK | 19 s and 4 s | 2.4 GB for the signed APK |
+| Signing and verifying the release APK | 19 s and 4 s; now a step of `assembleRelease` | 2.4 GB for the signed APK |
 
 The Android Gradle plugin keeps four copies of every bundled model on its way into an APK, which
 is where the 12 GB go. `rm -rf app/build llama/build` gives them back.
@@ -1216,94 +1225,290 @@ description in brackets. After a clone without `--recurse-submodules`, run
 `git submodule update --init third_party/llama.cpp`. Every command from here on is run in this
 directory.
 
-### Locations and environment
+### Where things go
 
-Three locations outside the repository are yours to choose. Nothing is ever written next to the
-sources, except by Gradle into its `build` directories.
+The build uses three places outside the repository. Nothing has to be set if you take the
+defaults, which every command below uses; nothing is ever written next to the sources, except
+by Gradle into its `build` directories.
 
-```sh
-export PROSEPLOW_VENV="$HOME/proseplow/venv"                # the Python virtualenv
-export PROSEPLOW_BUILD="$HOME/proseplow/build"              # scratch: host build, converted models
-export PROSEPLOW_MODEL_SRC="$HOME/proseplow/checkpoints"    # the downloaded checkpoints
-export PROSEPLOW_JOBS=6                                     # optional: parallel compile jobs
-```
+| What | Default | To put it elsewhere |
+| --- | --- | --- |
+| The Python environment that converts the models | `~/proseplow/venv` | `PROSEPLOW_VENV`, or `-Pproseplow.venv=<dir>` |
+| The downloaded checkpoints, one directory per model | `~/proseplow/checkpoints` | `PROSEPLOW_MODEL_SRC`, or `-Pproseplow.modelSrc=<dir>` |
+| The converted 16-bit models | `~/proseplow/build/models` | `PROSEPLOW_MODEL_OUT`, or `-Pproseplow.modelDir=<dir>`; or `PROSEPLOW_BUILD`, whose `models` directory is then used |
 
-Create the virtualenv and install the pinned packages into it (CMake and Ninja for the host
-build, PyTorch and the conversion libraries, the `hf` command):
-
-```sh
-python3 -m venv "$PROSEPLOW_VENV"
-"$PROSEPLOW_VENV/bin/pip" install -r native/requirements.txt
-```
-
-Then, in every new shell, after the four `export` lines:
+A `-P` property given to Gradle wins over the environment variable of the same row. If you
+change a place, change it in the commands below as well. Then, in every new shell:
 
 ```sh
-. native/tools/env.sh    # the virtualenv's tools on PATH; PROSEPLOW_MODEL_OUT; no GPU for PyTorch
-source env.sh            # JAVA_HOME, ANDROID_HOME; java and adb on PATH
+source env.sh    # JAVA_HOME, ANDROID_HOME; java and adb on PATH
 ```
 
-`native/tools/env.sh` sets `PROSEPLOW_MODEL_OUT`, the directory of the converted models, to
-`$PROSEPLOW_BUILD/models`. Gradle finds the Android SDK through `ANDROID_HOME`. A
-`local.properties` file (see `local.properties.example`) does the same for a shell in which
-`env.sh` was not sourced; it is not needed otherwise. Nothing in the build uses a GPU.
+Gradle finds the Android SDK through `ANDROID_HOME`. A `local.properties` file (see
+`local.properties.example`) does the same for a shell in which `env.sh` was not sourced; it is
+not needed otherwise. Nothing in the build uses a GPU.
+
+### The Python environment
+
+The models are converted by Python code (PyTorch and the conversion libraries, at the versions
+`native/requirements.txt` pins), which also provides the `hf` command that downloads the
+checkpoints. Create the environment once:
+
+```sh
+python3 -m venv ~/proseplow/venv
+~/proseplow/venv/bin/pip install -r native/requirements.txt
+```
+
+The build uses it by its path and does not need it activated. It is needed only while a model
+is being converted: once the converted files are there, a build does not touch it.
 
 ### Get the model checkpoints
 
-Nothing in this repository downloads a model. Fetch the four checkpoints yourself, each at the
-revision that `models/manifest.json` pins, into `$PROSEPLOW_MODEL_SRC/<id>`:
+Nothing in this repository downloads a model, and neither does the build. Fetch the four
+checkpoints yourself, each at the revision that `models/manifest.json` pins:
 
 ```sh
-hf download Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 \
-    --local-dir "$PROSEPLOW_MODEL_SRC/qwen3.5-0.8b"
-hf download wayneworkman2012/peacebell-v1-291M --revision a44de191d94e8bf944b31a482fc0f04fa4433eb1 \
-    --local-dir "$PROSEPLOW_MODEL_SRC/peacebell-v1-291m"
-hf download opencerebral/Boris-2-Instruct --revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d \
-    --local-dir "$PROSEPLOW_MODEL_SRC/boris-2-instruct"
-hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
-    --local-dir "$PROSEPLOW_MODEL_SRC/shard-2"
+~/proseplow/venv/bin/hf download Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 \
+    --local-dir ~/proseplow/checkpoints/qwen3.5-0.8b
+~/proseplow/venv/bin/hf download wayneworkman2012/peacebell-v1-291M --revision a44de191d94e8bf944b31a482fc0f04fa4433eb1 \
+    --local-dir ~/proseplow/checkpoints/peacebell-v1-291m
+~/proseplow/venv/bin/hf download opencerebral/Boris-2-Instruct --revision 9f60d918ffeeaca15e3caf9d349d8ca34ea5cc7d \
+    --local-dir ~/proseplow/checkpoints/boris-2-instruct
+~/proseplow/venv/bin/hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
+    --local-dir ~/proseplow/checkpoints/shard-2
 ```
 
-No account and no token were needed for the command that was run in the check (Boris-2); `hf`
-then warns that the requests are unauthenticated, which is harmless. The files are used under
-each model's own licence (see the table above). How the files get there does not matter: a
-checkpoint in a Hugging Face hub cache is found as well, and the hashes decide whether the
-files are the right ones.
+No account and no token were needed for the command that was run in the clean-machine check
+(Boris-2); `hf` then warns that the requests are unauthenticated, which is harmless. The files
+are used under each model's own licence (see the table above). How the files get there does not
+matter: a checkpoint in a Hugging Face hub cache is found as well, and the hashes decide whether
+the files are the right ones.
 
 The manifest lists one more model, `peacebell-v1-148m`, which is converted and tested but not
-bundled. It is optional: without it, the native tests that need it report themselves as
-skipped. To run those too:
+bundled. The APK does not need it; the native tests that need it report themselves as skipped
+without it. To run those too:
 
 ```sh
-hf download wayneworkman2012/peacebell-v1-148M --revision 9155a36017601957565a569c73a2b53c9c6a67ec \
-    --local-dir "$PROSEPLOW_MODEL_SRC/peacebell-v1-148m"
+~/proseplow/venv/bin/hf download wayneworkman2012/peacebell-v1-148M --revision 9155a36017601957565a569c73a2b53c9c6a67ec \
+    --local-dir ~/proseplow/checkpoints/peacebell-v1-148m
 ```
 
 Shard-2's weights, `Shard-2.pt`, are a Python pickle. Nothing here runs the `infer.py` that is
 published beside them, and the converter and the tests load the weights only in PyTorch's
 weights-only mode (`models/README.md`, "shard-2"); do not run that script either.
 
-### Convert the models
+### Build a debug APK
 
 ```sh
-native/tools/prepare-llama-src.sh
-python3 models/convert_models.py peacebell-v1-291m boris-2-instruct shard-2 qwen3.5-0.8b
+./gradlew assembleDebug
 ```
 
-The first command writes the patched copy of llama.cpp, which holds the converters, into
-`$PROSEPLOW_BUILD/llama-src`. The second verifies every source file against the SHA-256 in the
-manifest, converts, and compares the SHA-256 of each result with the one the manifest pins: a
-checkpoint that is not byte for byte the pinned one is refused, and so is a conversion that
-comes out differently. It prints one line per model:
+That one command does everything: it converts each model whose converted file is not there yet,
+writes the patched copy of llama.cpp, compiles it for arm64 with the NDK (seven variants of the
+CPU backend, of which the app loads the best one for the phone's processor), compiles the app,
+and packages the four models into the APK. The result is
+`app/build/outputs/apk/debug/app-debug.apk`, 2,542,320,388 bytes with all four models.
 
-    peacebell-v1-291m: wrote peacebell-v1-291m-f16.gguf, 583680096 bytes, sha256 df565d191ad1506227f0fb645822ad0224538dcd3a540eb5497ab00ab8dc1868
-    boris-2-instruct: wrote boris-2-instruct-f16.gguf, 291853184 bytes, sha256 758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6
-    shard-2: wrote shard-2-f16.gguf, 99048160 bytes, sha256 c4b8e0fa3a9ef78a24708d5876fe56f6e4cafb44fd89049933bba562b140b67f
-    qwen3.5-0.8b: wrote qwen3.5-0.8b-f16.gguf, 1516742752 bytes, sha256 91bcb80bb68c2a51e7eb4e28cf088f79678e236f9f16120060b84a57ae7f0978
+Converting is the task `:llama:convertModels`. For each model it does one of three things:
 
-The files are `$PROSEPLOW_MODEL_OUT/<id>/<id>-f16.gguf`. Name the models as above, or pass
-`--available`: without either, the script also wants the optional checkpoint and ends with an
-error when it is not there, after converting the others.
+- the converted file is there and its SHA-256 is the one `models/manifest.json` pins: nothing.
+  The build prints `:llama:convertModels: peacebell-v1-291m, boris-2-instruct, shard-2,
+  qwen3.5-0.8b: already converted, as pinned`;
+- otherwise its checkpoint is there: it runs `models/convert_models.py` for that model, one model
+  at a time. The script first compares every file of the checkpoint with the SHA-256 the manifest
+  pins and refuses a checkpoint that is not byte for byte the pinned one, then converts, and fails
+  if the result is not byte for byte the pinned conversion. The build prints, for each model:
+
+      :llama:convertModels: converting boris-2-instruct from ~/proseplow/checkpoints/boris-2-instruct (one model at a time)
+      boris-2-instruct: wrote boris-2-instruct-f16.gguf, 291853184 bytes, sha256 758d2df848b418064c3e0f7b640c99ff3cad2d8734341d8c4253abc74e6860c6
+      :llama:convertModels: boris-2-instruct converted in 4 s
+
+- otherwise the build stops before converting anything, and says what to download, for example
+  (with the full paths of your machine where this shows `~`):
+
+      Not converted yet, and no checkpoint to convert from: shard-2.
+      The checkpoints are looked for in ~/proseplow/checkpoints (-Pproseplow.modelSrc=<dir> or PROSEPLOW_MODEL_SRC to look elsewhere).
+      Download it at the pinned revision (README.md, "Get the model checkpoints"):
+
+          ~/proseplow/venv/bin/hf download Glint-Research/Shard-2 --revision 46b9eb99c475694a1129ad8f3a9825d244a8ec79 \
+              --local-dir "~/proseplow/checkpoints/shard-2"
+
+      Or leave it out of the APK: -Pproseplow.models=<ids> names the models to bundle, -Pproseplow.models=none bundles none.
+
+The files it writes are `~/proseplow/build/models/<id>/<id>-f16.gguf`, each with a small
+`<id>-f16.gguf.json` beside it that records what it was made from. Then the packaging step copies
+each model into the APK and compares its SHA-256 with the manifest once more, and the finished APK
+is checked again (see "Check the APK" below): a model file that is not the pinned conversion fails
+the build. A second `./gradlew assembleDebug` with nothing changed converts nothing, copies
+nothing and ends in about 20 seconds (`convertModels UP-TO-DATE`, `packageDebug UP-TO-DATE`).
+
+How long it took on the development machine (16 threads, 6 compile jobs, an SSD): the four
+conversions 22 seconds in all (Qwen3.5 12 s, Peacebell 4 s, Boris-2 4 s, Shard-2 2 s), and the
+whole build that converted them 5 min 14 s, in a tree that had been built before. "Disk space and
+time" above has the figures of a first build; a first Gradle command also downloads Gradle and
+every plugin and library (about a minute).
+
+### Install it
+
+With a phone connected (see [Connecting a phone](#connecting-a-phone)):
+
+```sh
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+A debug build installs as a separate app, `us.theworkmans.proseplow.debug`, with the name "Prose
+Plow (debug)". It has its own data and its own keys and can stay beside a release build. It is
+signed with a key that the Android Gradle plugin makes on your machine the first time
+(`~/.android/debug.keystore`), so a debug build from another machine does not install over yours.
+Read "A debug build" under [What this does not protect against](#what-this-does-not-protect-against)
+before you keep chats that matter in it.
+
+### Build a release APK
+
+There is no official APK and no official key. Everyone who installs Prose Plow built it, and a
+release APK is signed with the key of whoever built it: yours.
+
+#### Create your signing key
+
+Once:
+
+```sh
+tools/signing-key.sh
+```
+
+It creates a 4096-bit RSA key in `~/.config/proseplow/proseplow-release.p12` (readable by you
+only; `PROSEPLOW_KEYSTORE` names another file), and prints its owner and its SHA-256
+fingerprint. Its password is decided like this:
+
+- If `PROSEPLOW_KEYSTORE_PASSWORD` is set, that is the password. It is neither stored nor shown.
+- Otherwise, on a desktop with a login keyring (GNOME Keyring, reached through the system
+  Python's `gi` bindings): a random password, which goes into the keyring and is not shown. The
+  build finds it there; `tools/keyring.py get` prints it when you need it for your backup.
+- Otherwise (a machine without a keyring, a remote shell): a random password, printed once,
+  with the instruction to store it. It is stored nowhere on the machine.
+
+Run again, the script does not replace the key; it shows which one you have.
+
+**Back up the key file and its password now, together, somewhere other than this machine.** An
+installed app accepts an update only when it is signed with the same key. Without the key, the
+only way to a newer build is to uninstall the app, and that deletes every chat in it. Nobody else
+has a copy of your key, and nobody can make another one that Android would accept in its place.
+
+#### Build it
+
+```sh
+./gradlew assembleRelease
+```
+
+It converts and packages the models exactly as the debug build does, then signs the APK with
+your key (the task `:app:signReleaseApk`) and checks the result. The password is taken from
+`PROSEPLOW_KEYSTORE_PASSWORD` if it is set, otherwise from the login keyring; it reaches the
+signing tool on its standard input and is never printed. To give it by hand, without leaving it
+in your shell's history:
+
+```sh
+read -rs PROSEPLOW_KEYSTORE_PASSWORD && export PROSEPLOW_KEYSTORE_PASSWORD
+```
+
+The build ends by printing what it verified:
+
+    :app:signReleaseApk: signed ~/prose-plow/app/build/outputs/apk/release/app-release.apk
+        Verifies
+        Verified using v1 scheme (JAR signing): false
+        Verified using v2 scheme (APK Signature Scheme v2): false
+        Verified using v3 scheme (APK Signature Scheme v3): true
+        Verified using v3.1 scheme (APK Signature Scheme v3.1): false
+        Verified using v3.2 scheme (APK Signature Scheme v3.2): false
+        Verified using v4 scheme (APK Signature Scheme v4): false
+        V3.0 Signer: certificate DN: CN=Prose Plow
+        V3.0 Signer: certificate SHA-256 digest: <the fingerprint of your key>
+
+The fingerprint is the one `tools/signing-key.sh` showed, without the colons. A wrong password
+stops the build with `keystore password was incorrect`; a missing one with what to do.
+
+The result is `app/build/outputs/apk/release/app-release.apk`. It carries an APK Signature
+Scheme v3 signature only, which is what Android 9 and later check; the older v1 scheme is
+switched off because it keeps some tools from handling an APK of more than 2 GiB. The alignment
+of the APK is kept as the build made it, because the models inside are mapped in place and must
+stay on their 16 KiB boundaries. On the development machine the release build took about
+5 minutes after the debug build (most of it the release variant's own compilation, lint and
+packaging), of which signing and verifying took about 30 seconds.
+
+Without a key, or without its password, the build stops with what to do:
+
+    No signing key at ~/.config/proseplow/proseplow-release.p12. A release APK is signed with your own key; create it once with
+
+        tools/signing-key.sh
+
+    and back it up together with its password (README.md, "Create your signing key"). A key kept elsewhere is named with -Pproseplow.keystore=<file> or PROSEPLOW_KEYSTORE.
+
+**An unsigned release APK**, for a builder whose signing happens elsewhere (a build server that
+signs with its own key, or a machine without the key):
+
+```sh
+./gradlew assembleRelease -Pproseplow.sign=false
+```
+
+writes `app/build/outputs/apk/release/app-release-unsigned.apk`, with the models in it and every
+check of the APK made, and asks for no key. `tools/sign-release.sh` signs such an APK later with
+your key, in the same way as the build (v3 only, alignment kept), and verifies it:
+
+```sh
+tools/sign-release.sh app/build/outputs/apk/release/app-release-unsigned.apk prose-plow-0.1.0.apk
+```
+
+`PROSEPLOW_SIGN=false` does the same as the property. A key made in another way works as well: a PKCS12 keystore, named with `PROSEPLOW_KEYSTORE`, whose
+key has the alias `proseplow` (or the one `PROSEPLOW_KEY_ALIAS` or `-Pproseplow.keyAlias` names)
+and the same password as the keystore.
+
+Install it like the debug build:
+
+```sh
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+The release build installs as `us.theworkmans.proseplow`.
+
+### Choosing the models
+
+Both builds bundle every model the manifest marks as ready and bundled. A Gradle property, or
+the environment variable of the same row, chooses otherwise:
+
+| Gradle property | Environment variable | Meaning |
+| --- | --- | --- |
+| `-Pproseplow.models=...` | `PROSEPLOW_MODELS` | `all` (the default), `none`, or ids separated by commas |
+
+```sh
+# No model: quick to build and install, and the app says that it has none
+./gradlew assembleDebug -Pproseplow.models=none
+
+# A selection: only these are converted and packaged
+./gradlew assembleDebug -Pproseplow.models=boris-2-instruct,peacebell-v1-291m
+```
+
+| Models | Debug APK | Release APK |
+| --- | --- | --- |
+| none | 50,176,101 bytes | 41,911,126 bytes, before signing |
+| all four | 2,542,320,388 bytes | 2,534,083,729 bytes, signed |
+
+The limit of the APK format is 4 GiB. **Changing the selection needs nothing by hand.** The
+packaging tasks take the selection and the manifest as inputs, so the APK is written afresh
+whenever the set of models in it may have changed. Left to itself, the Android Gradle plugin
+updates a debug APK in place and never makes that file smaller: a model that leaves the
+selection would leave a gap of its own size, and one that comes back would be appended after it.
+
+### Run the Kotlin tests and the checks
+
+```sh
+./gradlew check
+```
+
+This runs the unit tests of all three Gradle modules on the JVM, Android lint, the check of
+the merged manifests against the permission allow-list, and the check of the third-party
+notices against the libraries the build packages. It must end with `BUILD SUCCESSFUL`. It
+builds no APK, needs no model, no checkpoint and no Python environment, and converts nothing:
+the models enter only the tasks that build an APK. To leave no Gradle process behind when you
+are done, run `./gradlew --stop`; otherwise the idle daemon exits after ten minutes.
 
 ### Run the native tests on the host
 
@@ -1314,64 +1519,14 @@ computes what the reference models compute:
 native/tools/host-check.sh
 ```
 
-It builds llama.cpp and this project's native libraries for the host with GCC, converts the
-32-bit validation files, and runs the test suite, which compares the converted files and the
-running models with the PyTorch reference. It ends with `100% tests passed out of 55`; the
-tests of a model whose checkpoint is not there are listed below that line as skipped, and so
-is one test that needs optional Python packages. The line `fatal: not a git repository` during the CMake configuration is expected (the
-patched copy of llama.cpp is not a git checkout). `native/README.md` describes every test.
-
-### Run the Kotlin tests and the checks
-
-```sh
-./gradlew check
-```
-
-This runs the unit tests of all three Gradle modules on the JVM, Android lint, the check of
-the merged manifests against the permission allow-list, and the check of the third-party
-notices against the libraries the build packages. The first Gradle command downloads
-Gradle 9.7.0 and every plugin and library. It must end with `BUILD SUCCESSFUL`. It builds no
-native code and needs no model. To leave no Gradle process behind when you are done, run
-`./gradlew --stop`; otherwise the idle daemon exits after ten minutes.
-
-### Build the APK
-
-Which models an APK carries is chosen on the command line:
-
-| Gradle property | Environment variable | Meaning |
-| --- | --- | --- |
-| `-Pproseplow.models=...` | `PROSEPLOW_MODELS` | `none` (the default), `all`, or ids separated by commas |
-| `-Pproseplow.modelDir=...` | `PROSEPLOW_MODEL_OUT` | The directory of the converted models; needed unless the selection is `none` |
-
-```sh
-# No model: quick to build and install, and the app says that it has none
-./gradlew :app:assembleDebug
-
-# All four models
-./gradlew :app:assembleDebug -Pproseplow.models=all -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"
-
-# Or a selection
-./gradlew :app:assembleDebug -Pproseplow.models=boris-2-instruct,peacebell-v1-291m -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"
-```
-
-The result is `app/build/outputs/apk/debug/app-debug.apk`:
-
-| Models | Debug APK | Release APK, unsigned |
-| --- | --- | --- |
-| none | 50,176,101 bytes | 41,911,126 bytes |
-| all three | 2,442,483,998 bytes | 2,434,219,023 bytes |
-| all four | 2,542,144,262 bytes | not built with four models yet |
-
-The build compiles llama.cpp for arm64 with the NDK (seven variants of the CPU backend, of which
-the app loads the best one for the phone's processor), copies each selected model into the APK
-and compares its SHA-256 with the manifest once more. A model file that is not the pinned
-conversion fails the build. The limit of the APK format is 4 GiB.
-
-**Changing the selection of models needs nothing by hand.** The packaging tasks take the
-selection and the manifest as inputs, so the APK is written afresh whenever the set of models
-in it may have changed. Left to itself, the Android Gradle plugin updates a debug APK in place
-and never makes that file smaller: a model that leaves the selection would leave a gap of its
-own size, and one that comes back would be appended after it.
+It uses the same three places as the Gradle build (and the scratch directory
+`~/proseplow/build`), builds llama.cpp and this project's native libraries for the host with
+GCC, converts the 32-bit validation files, and runs the test suite, which compares the converted
+files and the running models with the PyTorch reference. It ends with `100% tests passed out of
+55`; the tests of a model whose checkpoint is not there are listed below that line as skipped,
+and so is one test that needs optional Python packages. The line `fatal: not a git repository`
+during the CMake configuration is expected (the patched copy of llama.cpp is not a git checkout).
+`native/README.md` describes every test.
 
 ### Check the APK
 
@@ -1427,70 +1582,11 @@ the NDK named in `app/build.gradle.kts` is not installed. The native libraries a
 in the check, the libraries built from a clean clone in another directory with a freshly
 installed NDK were byte for byte the ones the developers' own tree had built.
 
-### Install it
-
-With a phone connected (see [Connecting a phone](#connecting-a-phone)):
-
-```sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-A debug build installs as a separate app, `us.theworkmans.proseplow.debug`, with the name "Prose
-Plow (debug)". It has its own data and its own keys and can stay beside a release build. Read
-"A debug build" under [What this does not protect against](#what-this-does-not-protect-against)
-before you keep chats that matter in it.
-
-### A release build, signed with your own key
-
-The repository contains no signing key and no signing configuration: a release build comes out
-unsigned, and you sign it with a key of your own.
-
-```sh
-./gradlew :app:assembleRelease -Pproseplow.models=all -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"
-```
-
-writes `app/build/outputs/apk/release/app-release-unsigned.apk`. Make a key once, in a place of
-your choice outside the repository (`keytool` is part of the JDK and asks for a new password):
-
-```sh
-mkdir -p ~/keys && chmod 700 ~/keys
-keytool -genkeypair -keystore ~/keys/prose-plow.p12 -storetype PKCS12 -alias proseplow \
-    -keyalg RSA -keysize 4096 -sigalg SHA256withRSA -validity 36500 -dname "CN=Prose Plow self-built"
-chmod 600 ~/keys/prose-plow.p12
-```
-
-Sign and verify (`apksigner` asks for the password of the keystore):
-
-```sh
-BT="$ANDROID_HOME/build-tools/37.0.0"
-"$BT/apksigner" sign --ks ~/keys/prose-plow.p12 --ks-key-alias proseplow \
-    --out prose-plow-0.1.0.apk app/build/outputs/apk/release/app-release-unsigned.apk
-"$BT/apksigner" verify --verbose --print-certs prose-plow-0.1.0.apk
-"$BT/zipalign" -c -P 16 -v 4 prose-plow-0.1.0.apk | tail -n 5
-adb install -r prose-plow-0.1.0.apk
-```
-
-`apksigner verify` must print `Verifies` and the certificate you just made; the APK carries a
-version 3 signature only, which is what Android 9 and later check. `apksigner` also writes
-`prose-plow-0.1.0.apk.idsig`, which is not needed for installing and can be deleted. In a script,
-`--ks-pass env:NAME` and keytool's `-storepass:env NAME` take the password from an environment
-variable instead of asking. The reports of a release build are
-`app/build/reports/manifest-permissions/release.txt` and
-`app/build/reports/native-packaging/packageRelease.txt`, and the checks of the section above
-apply to the signed APK in the same way. In the clean-machine check the signed APK was verified
-with these tools; installing it on a phone was not part of that check.
-
-The project's own key is made and used by three small scripts, for a Linux desktop with a login
-keyring (GNOME Keyring through libsecret; the system Python's `gi` bindings): `tools/signing-key.sh`
-creates a 4096-bit RSA key once, in `~/.config/proseplow/` or where `PROSEPLOW_KEYSTORE` says, with
-a random password that goes into the keyring and is never typed or shown; `tools/sign-release.sh`
-signs the unsigned release APK with it (no v1 signature, alignment preserved) and verifies the
-result; `tools/keyring.py get` prints the password for a backup. They are a convenience, not a
-requirement: the commands above do the same by hand.
-
-Keep the keystore and its password. Android installs an update only over an app that was signed
-with the same key; without the key the only way to a newer build is to uninstall the app, and
-that deletes every chat. The release build installs as `us.theworkmans.proseplow`.
+For a release build the reports are `app/build/reports/manifest-permissions/release.txt`,
+`app/build/reports/native-packaging/packageRelease.txt` (the APK before signing) and
+`app/build/reports/native-packaging/signReleaseApk.txt` (the signed APK), and the commands above
+apply to `app/build/outputs/apk/release/app-release.apk`; there `apksigner verify` prints
+`Verifies` and the certificate of your own key.
 
 ## Connecting a phone
 
@@ -1579,6 +1675,10 @@ Reaching the phone from WSL is the part that differs. Two ways, neither tried:
 - The JDK, the command-line tools (`commandlinetools-win-15859902_latest.zip`, SHA-256
   `90ae805d20434428bffcb699c290860f19bb5f66a67e6b330067e3de801fb04a` on Google's download page)
   and all five SDK packages exist for Windows, and the repository has `gradlew.bat`.
+- The Gradle build looks for the converters' Python at `bin/python` inside the virtualenv; a
+  Windows virtualenv has it at `Scripts\python.exe`, so converting from Gradle is expected to fail
+  there until that is handled. Converting in WSL and naming the result with
+  `-Pproseplow.modelDir` is a way round it.
 - The Gradle build runs `bash native/tools/prepare-llama-src.sh`, which needs bash 4.4 or newer,
   git and tar on `PATH`. Git for Windows brings a bash; whether the script works in it is
   unknown.
@@ -1630,10 +1730,10 @@ None of it has been tried.
 | `core` (JVM, 525 tests) | The rules of the terms (the list of states, the typed confirmation, the second without response, the way through the flow, and the random placement of the two buttons over many seeds); the chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints (those that follow a reply among them), reading a conversation ahead after an answer (what it reads, what it never does, and what it gives way to), saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
 | `app` (JVM, 887 tests) | The lock and the encryption with software keys and virtual time: the terms before the set-up and before the lock screen (what is stored and when, a reset, "I do not agree", the failure screens), the wording of the terms against the digest of their version; the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, a save stopped when the keep-alive ends, no keep-alive asked for a closing with nothing to save, the binding to the system prompt the model last read, the switch, and Android below 12; the real inference engine joined with that store over real files; the chat controller and the view models over a scripted engine, among them when an answer is read ahead and what stops that; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
-| All of the above, lint, the permission check and the notices check | | `./gradlew check` |
+| All of the above, lint, the permission check and the notices check | | `./gradlew check` (needs no model) |
 | Native host suite (55 tests) | Deterministic conversion; every tensor of the converted files against the checkpoint; tokenizers against the reference libraries; logits and greedy replies against the PyTorch reference, in 32 and in 16 bits; the generation session with every bundled file | `native/tools/host-check.sh` |
 | `app`, on a phone | The real Android Keystore behind the lock, the production key derivation, the atomic write on the phone's file system, what a passphrase field gives to accessibility services, the clipboard mark, the sealed stream's frozen vectors and a stream of three 4 MiB chunks through the phone's own AES-GCM, and the screens of the terms (the two buttons alike, the second without response, the way through statement by statement and the typed confirmation) | `./gradlew :app:connectedDebugAndroidTest` |
-| `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model; what the next message reads after a read-ahead, and "Continue" after a stop (`RereadDiagnosisDeviceTest`) | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir="$PROSEPLOW_MODEL_OUT"`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
+| `llama`, on a phone | Tokenising and greedy replies equal to the host's and the reference's, memory, cancellation, load time and speed, for each model; what the next message reads after a read-ahead, and "Continue" after a stop (`RereadDiagnosisDeviceTest`) | `./gradlew :llama:connectedDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct`; see "On the phone" in `native/README.md` for Qwen3.5 and for running single tests |
 
 The test counts are those of the commit named above. The two suites that need a phone are not
 part of `check`. They need a phone that is connected with USB debugging, awake and unlocked.
@@ -1686,6 +1786,7 @@ checkpoints, converting, "Adding a model", "Removing a model") and in `native/RE
 | `gradle/libs.versions.toml` | Every Gradle plugin and library with its version |
 | `gradle/wrapper/` | The Gradle wrapper, with the version and SHA-256 of the distribution |
 | `env.sh` | Puts the JDK and `adb` on `PATH` for the current shell |
+| `tools/` | `signing-key.sh`, which creates your signing key once; `sign-release.sh`, which signs an APK that was built unsigned; and `keyring.py`, which keeps the key's password in the login keyring of a desktop |
 | `local.properties.example` | A template for the optional `local.properties` |
 | `FEATURES.md` | Everything the app does that a user or a tester can observe, item by item and with its exact wording, so that a version for another platform can be held to the same behaviour |
 | `LICENSE` | The Apache License 2.0 |

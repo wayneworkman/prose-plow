@@ -122,27 +122,28 @@ What goes where:
 | numpy, transformers, tokenizers, sentencepiece, protobuf, safetensors | 2.5.5, 5.24.0, 0.23.3, 0.2.3, 7.36.2, 0.8.0 | pip, see below |
 
 CMake, Ninja and every Python package come from `requirements.txt`, which pins all of them and
-everything they depend on. Create a virtualenv wherever you keep such things and install into it
-(about 1.3 GB, most of it PyTorch; nothing here uses a GPU, and the CPU-only wheel is selected
-in the file):
+everything they depend on. Create a virtualenv and install into it (about 1.3 GB, most of it
+PyTorch; nothing here uses a GPU, and the CPU-only wheel is selected in the file). It is the
+same one the root `README.md` creates ("The Python environment") and the Gradle build converts
+the models with; `~/proseplow/venv` is where both look unless `PROSEPLOW_VENV` says otherwise:
 
 ```sh
-python3 -m venv /path/to/venv
-/path/to/venv/bin/pip install -r native/requirements.txt
+python3 -m venv ~/proseplow/venv
+~/proseplow/venv/bin/pip install -r native/requirements.txt
 ```
 
 No other C or C++ library is needed, and nothing is installed system-wide.
 
 ## Build and test
 
-Three locations are yours to choose; they are passed in environment variables and nothing is
-ever written next to the sources:
+Three locations are passed in environment variables, each with a default that is also the
+Gradle build's; nothing is ever written next to the sources:
 
-| Variable | Meaning |
-| --- | --- |
-| `PROSEPLOW_VENV` | The virtualenv from above. Optional when it is already activated |
-| `PROSEPLOW_BUILD` | A scratch directory for everything generated: the patched copy, the build tree, converted models, on-demand reference data. About 5.5 GB after a full test run (5.0 GB of it the converted models), 7.5 GB while it runs |
-| `PROSEPLOW_MODEL_SRC` | The directory that holds the downloaded checkpoints (see `../models/README.md`). Optional: without it the code still builds, and the tests that need weights are skipped |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PROSEPLOW_VENV` | `~/proseplow/venv`, when it exists | The virtualenv from above. Optional when it is already activated |
+| `PROSEPLOW_BUILD` | `~/proseplow/build` | A scratch directory for everything generated: the patched copy, the build tree, converted models, on-demand reference data. About 5.5 GB after a full test run (5.0 GB of it the converted models), 7.5 GB while it runs |
+| `PROSEPLOW_MODEL_SRC` | `~/proseplow/checkpoints` | The directory that holds the downloaded checkpoints (see `../models/README.md`). When a checkpoint is not there, the code still builds and the tests that need its weights are skipped |
 
 Optional: `PROSEPLOW_JOBS` (parallel compile jobs, default all processors), `PROSEPLOW_THREADS`
 (inference threads in the tests, default 4), `PROSEPLOW_MODEL_OUT` (where converted models go,
@@ -156,10 +157,7 @@ Everything in one command, from the repository root:
 ```sh
 git submodule update --init third_party/llama.cpp     # once, after cloning
 
-export PROSEPLOW_VENV=/path/to/venv
-export PROSEPLOW_BUILD=/path/to/scratch
-export PROSEPLOW_MODEL_SRC=/path/to/checkpoints
-native/tools/host-check.sh
+native/tools/host-check.sh       # after exporting any of the three that differs from its default
 ```
 
 The same, step by step:
@@ -1319,12 +1317,11 @@ Android release with.
 git submodule update --init third_party/llama.cpp     # once, after cloning
 source env.sh
 export PROSEPLOW_JOBS=6                                # optional, see below
-./gradlew :llama:assembleDebug                         # the library, as an AAR
 ./gradlew :llama:testDebugUnitTest                     # its JVM tests (thread plan, asset names)
-./gradlew :app:assembleDebug                           # the app with the libraries inside
+./gradlew assembleDebug                                # the app with the libraries and the models inside
 ```
 
-Three things happen that an ordinary library module does not have:
+Four things happen that an ordinary library module does not have:
 
 1. **`prepareLlamaSource`** runs `tools/prepare-llama-src.sh` into `llama/build/llama-src`. Its
    inputs are the pinned commit, the patches and the files of `llama-ext/`, so it runs again
@@ -1350,8 +1347,11 @@ Three things happen that an ordinary library module does not have:
    `c++_shared` because there are eleven libraries of ours: with the static runtime each would
    carry a private copy, which the NDK only allows for an app with a single library. The
    runtime, `libc++_shared.so`, comes from the NDK and is packaged as it is.
-3. **`package<Variant>Models`** puts the selected model files among the assets ("Models in the
-   APK" below).
+3. **`convertModels`** makes sure the converted file of every selected model is there and is the
+   pinned one, converting what is missing from its checkpoint with `../models/convert_models.py`,
+   one model at a time, in the Python environment (`../models/README.md`, "Converting").
+4. **`package<Variant>Models`** puts the selected model files into a directory of assets that
+   only the app's APK and this module's test APK take in ("Models in the APK" below).
 
 A clean native build takes 45 seconds with 6 jobs. Gradle starts Ninja without a job limit,
 and Ninja then uses every processor; set `PROSEPLOW_JOBS` in the environment of the Gradle
@@ -1425,20 +1425,29 @@ pages that the system can drop and read again when memory is short.
 
 Which models a build carries is decided when it is built:
 
-| Gradle property | Environment variable | Meaning |
-| --- | --- | --- |
-| `-Pproseplow.models=...` | `PROSEPLOW_MODELS` | `none` (the default), `all`, or ids of `../models/manifest.json` separated by commas. `all` is every entry that is `ready` and `bundled` |
-| `-Pproseplow.modelDir=...` | `PROSEPLOW_MODEL_OUT` | The directory that holds the converted models as `<id>/<output>`, which is where `models/convert_models.py` writes them (`../models/README.md`). Needed unless the selection is `none` |
+| Gradle property | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `-Pproseplow.models=...` | `PROSEPLOW_MODELS` | `all` | `all`, `none`, or ids of `../models/manifest.json` separated by commas. `all` is every entry that is `ready` and `bundled` |
+| `-Pproseplow.modelDir=...` | `PROSEPLOW_MODEL_OUT` | `$PROSEPLOW_BUILD/models`, else `~/proseplow/build/models` | The directory that holds the converted models as `<id>/<output>`, which is where `models/convert_models.py` writes them (`../models/README.md`) |
+| `-Pproseplow.modelSrc=...` | `PROSEPLOW_MODEL_SRC` | `~/proseplow/checkpoints` | The checkpoints, for a model that must be converted first |
+| `-Pproseplow.venv=...` | `PROSEPLOW_VENV` | `~/proseplow/venv` | The Python environment that converts |
 
 A property wins over the variable of the same row.
 
 ```sh
-./gradlew :app:assembleDebug                                                        # no model: quick to build and to install
-./gradlew :app:assembleDebug -Pproseplow.models=peacebell-v1-291m -Pproseplow.modelDir=/path/to/models
-./gradlew :app:assembleRelease -Pproseplow.models=all -Pproseplow.modelDir=/path/to/models   # a real build
+./gradlew assembleDebug -Pproseplow.models=none                # no model: quick to build and to install
+./gradlew assembleDebug -Pproseplow.models=peacebell-v1-291m
+./gradlew assembleRelease                                      # a real build, signed with your key (root README.md)
 ```
 
-`package<Variant>Models` (in `../llama/build.gradle.kts`) copies each selected file to the
+`convertModels` runs first and leaves every selected file converted and pinned, or fails with
+what to download. The models are not assets of the library itself, because Android lint of the
+app reads the library's merged assets and would then convert and copy them for every `check`.
+They reach the app's APK through the app's task `add<Variant>ModelAssets`, which joins them
+(as hard links where the file system allows) to the app's merged assets, and this module's test
+APK as generated assets of its `androidTest` component. Only the tasks that build one of those
+APKs (`assemble`, `install`, `bundle` and the connected tests) convert and package models;
+`check`, lint and the unit tests need none. `package<Variant>Models` (in `../llama/build.gradle.kts`) copies each selected file to the
 asset `models/<id>.gguf.so` and computes its SHA-256 on the way; a file that is not byte for
 byte the conversion pinned by `output_sha256` in the manifest fails the build. The task runs
 again when the selection, the manifest or a model file changes. A build without models says so
@@ -1550,7 +1559,7 @@ test whose model is absent is reported as skipped.
 #    that it stays installed; Qwen3.5 (and Shard-2, if wanted) sideloaded as above with the
 #    test package's name. Or all four bundled models inside with -Pproseplow.models=all:
 #    2.5 GB, over a minute to install over USB.
-./gradlew :llama:assembleDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct -Pproseplow.modelDir=/path/to/models
+./gradlew :llama:assembleDebugAndroidTest -Pproseplow.models=peacebell-v1-291m,boris-2-instruct
 adb install -r llama/build/outputs/apk/androidTest/debug/llama-debug-androidTest.apk
 
 # 2. Everything, or one class
