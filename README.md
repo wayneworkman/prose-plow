@@ -338,8 +338,8 @@ needs more.
   whole answer has to be read again (about 13 seconds for 1,000 tokens on the tested phone).
   No layout true to the model's template avoids that, and the checkpoints the engine keeps
   while an answer is written cannot help, because they all lie after that point; they are for
-  "Continue" after an answer was stopped, and for an answer whose last words tokenise
-  differently when read back. The reading is done earlier instead: while you read the answer,
+  "Continue" after an answer was stopped, and for an answer edited near its end. The reading is
+  done earlier instead: while you read the answer,
   the app has the model read the conversation ahead as the next message will find it, so that
   the message reads only itself. That happens at once after an answer that ended by itself;
   after one cut off at its length limit, or stopped, only once you start typing a new message
@@ -352,6 +352,18 @@ needs more.
   conversation, about 1.4 to 2.5 seconds on the tested phone, the same wait a long reading
   already has when it is stopped. Nothing on screen shows it. Boris-2 writes an answer the same
   way before and after, so for it there is nothing to read ahead.
+- **Why an answer is not read again for being spelled differently.** The text of an answer can
+  be cut into tokens in more than one way, and a model sometimes writes it in a way the
+  tokenizer would not choose. Encoded again for the next request, such an answer would differ
+  from the model's memory at that point, and a model that cannot cut its memory back would read
+  the answer again from before it: on the tested phone, "Continue" after a Qwen3.5 answer
+  stopped at 400 pieces read 408 tokens again because of one such difference 142 tokens before
+  the end. The engine therefore keeps the tokens the model wrote for each answer of the
+  conversation in memory and puts them back wherever the next request carries that answer
+  unchanged, as the answer being continued or as history; "Continue" then reads only what the
+  memory lacks. An answer you edited, another chat, a cleared memory and a memory read back
+  after a lock are encoded as before, and read what they read before. The tokens are
+  overwritten when the engine lets go of them, at the latest at the lock.
 - **What a long conversation costs after a lock.** When the app is locked and left, its
   process ends (see [The lock](#the-lock)). The model's memory of the conversation it worked on
   last is saved before that (see [The lock](#the-lock)), and after the unlock it is read back
@@ -1728,7 +1740,7 @@ None of it has been tried.
 
 | Suite | What it covers | Command |
 | --- | --- | --- |
-| `core` (JVM, 525 tests) | The rules of the terms (the list of states, the typed confirmation, the second without response, the way through the flow, and the random placement of the two buttons over many seeds); the chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints (those that follow a reply among them), reading a conversation ahead after an answer (what it reads, what it never does, and what it gives way to), saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
+| `core` (JVM, 533 tests) | The rules of the terms (the list of states, the typed confirmation, the second without response, the way through the flow, and the random placement of the two buttons over many seeds); the chat model and its stored form, the expiry of messages, the prompt format of each model against the models' own templates, the model catalogue against the models' files, how large a context may be on a device and through which sizes it grows, and the inference engine over a scripted native layer: context budget, the growth of the context and what happens when it cannot grow, memory reuse and checkpoints (those that follow a reply among them), the model's own tokens put back for its answers, reading a conversation ahead after an answer (what it reads, what it never does, and what it gives way to), saving the memory and reading it back, and what happens to a saved image when the vault cannot tell or a restore is stopped, stop strings, cancellation | `./gradlew :core:test` |
 | `app` (JVM, 887 tests) | The lock and the encryption with software keys and virtual time: the terms before the set-up and before the lock screen (what is stored and when, a reset, "I do not agree", the failure screens), the wording of the terms against the digest of their version; the envelope, the sealed stream against frozen vectors, PBKDF2 against RFC vectors, the back-off, key rotation with a stop at every step, the atomic write, the mandatory lock, the trusted time; the encrypted stores and the deletion of expired messages with and without the key; the store of the model's saved memory (its checks, free space, a cancelled or late save, a stuck disk) and its deletion before any change of the messages it was made from; when the session saves that memory and reads it back, the order at each kind of lock, the ten-second bound with a save and a disk that hang, a save stopped when the keep-alive ends, no keep-alive asked for a closing with nothing to save, the binding to the system prompt the model last read, the switch, and Android below 12; the real inference engine joined with that store over real files; the chat controller and the view models over a scripted engine, among them when an answer is read ahead and what stops that; rules about the sources (no logging, nothing decrypted in saved state, package dependencies); `FEATURES.md` against the app's wording, its own identifiers and its links; the third-party notices against the bundled models, the pinned llama.cpp and NDK, and the licence texts | `./gradlew :app:testDebugUnitTest` |
 | `llama` (JVM, 18 tests) | The thread plan for a phone's processor, that the largest chunk the engine evaluates is the batch a session is opened with, and that the build and the catalogue agree on the names of the model assets | `./gradlew :llama:testDebugUnitTest` |
 | All of the above, lint, the permission check and the notices check | | `./gradlew check` (needs no model) |

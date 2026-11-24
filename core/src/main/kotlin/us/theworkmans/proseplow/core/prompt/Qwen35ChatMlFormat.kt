@@ -124,10 +124,12 @@ object Qwen35ChatMlFormat : PromptFormat {
             text("\n" + PromptWhitespace.strip(reasoning) + "\n")
             special(THINK_CLOSE)
             if (open) replyContentStart(offset = ANSWER_AFTER_THINK.length)
+            answer(offset = ANSWER_AFTER_THINK.length, length = content.length)
             text(ANSWER_AFTER_THINK + content)
         } else {
             special(IM_START)
             if (open) replyContentStart(offset = ROLE_LINE.length)
+            answer(offset = ROLE_LINE.length, length = content.length)
             text(ROLE_LINE + content)
         }
         if (!open) special(IM_END_LINE)

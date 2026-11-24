@@ -22,9 +22,12 @@ import us.theworkmans.proseplow.core.prompt.PromptMessage
  * and restored with the memory.
  *
  * A reply is scripted with a piece: one token that stands for several characters, which the
- * text of the reply tokenised again spells with one token each. The next request therefore
- * differs from the memory at the piece, as a real reply that was cut off or trimmed does near
- * its end. The fake counts one token for every character of a plain-text ChatML prompt.
+ * text tokenised again spells with one token each. Where the next request carries the reply as
+ * it was written, the engine spells it with the model's own tokens ([WrittenReply]) and the
+ * request agrees with the memory; so the requests here carry the reply edited at the piece
+ * ([edited]), which the engine encodes, and which therefore differs from the memory there, as
+ * an answer edited near its end, or one whose end is trimmed inside a token, does. The fake
+ * counts one token for every character of a plain-text ChatML prompt.
  */
 class LlamaEngineFollowingCheckpointTest {
 
@@ -78,6 +81,9 @@ class LlamaEngineFollowingCheckpointTest {
         return n
     }
 
+    /** [answer] edited at its piece: the same length, with the piece's last character changed. */
+    private fun edited(answer: String): String = answer.replace("Zz", "Zy")
+
     // --- A long reply, then a request that differs near its end ---
 
     /**
@@ -92,7 +98,7 @@ class LlamaEngineFollowingCheckpointTest {
         val memoryBefore = test.fake.memory.toList()
         val replyStart = prompt(user("Tell me a long story.")).length
 
-        val next = arrayOf(user("Tell me a long story."), assistant(answer), user("Shorter."))
+        val next = arrayOf(user("Tell me a long story."), assistant(edited(answer)), user("Shorter."))
         test.fake.clearCalls()
         val events = test.ask(*next, reply = "Fine.")
 
@@ -129,6 +135,8 @@ class LlamaEngineFollowingCheckpointTest {
         assertEquals(MemoryRestoreResult.Restored(memoryBefore.size), test.engine.restoreMemory(vault, KEY))
         assertEquals(lengthsBefore, test.checkpointLengths())
 
+        // The answer as it was written: an image does not carry the written replies, so after a
+        // restore it is encoded, and the request differs from the memory at the piece.
         val next = arrayOf(user("Tell me a long story."), assistant(answer), user("Shorter."))
         test.fake.clearCalls()
         val events = test.ask(*next, reply = "Fine.")
@@ -152,7 +160,7 @@ class LlamaEngineFollowingCheckpointTest {
         val cutEvents = cut.ask(user("Go on and on."), reply = answer.removeRange(195, 197), piece = "Zz", before = 195, maxNewTokens = 200)
         assertEquals(FinishReason.LENGTH, cutEvents.done().finishReason)
         val cutMemory = cut.fake.memory.toList()
-        val next = arrayOf(user("Go on and on."), assistant(answer), user("Stop."))
+        val next = arrayOf(user("Go on and on."), assistant(edited(answer)), user("Stop."))
         cut.fake.clearCalls()
         val cutNext = cut.ask(*next, reply = "Stopped.").done().stats
         val cutCommon = commonLength(cutMemory, tokensOf(cut, *next))
@@ -174,7 +182,7 @@ class LlamaEngineFollowingCheckpointTest {
         assertEquals("99 tokens of the reply were evaluated", replyStart + 99, cancelled.fake.memory.size)
         assertTrue("a checkpoint follows the part written", replyStart + 96 in cancelled.checkpointLengths())
         val cancelledMemory = cancelled.fake.memory.toList()
-        val after = arrayOf(user("Go on and on."), assistant("A".repeat(97) + "ZzC"), user("Why stop?"))
+        val after = arrayOf(user("Go on and on."), assistant("A".repeat(97) + "ZyC"), user("Why stop?"))
         cancelled.fake.clearCalls()
         val afterStats = cancelled.ask(*after, reply = "You asked.").done().stats
         val afterCommon = commonLength(cancelledMemory, tokensOf(cancelled, *after))
@@ -204,7 +212,7 @@ class LlamaEngineFollowingCheckpointTest {
                 test.ask(question, reply = answer.removeRange(at, at + 2), piece = "Zz", before = at)
                 assertEquals(case, replyStart + length, test.fake.memory.size)
                 val memoryBefore = test.fake.memory.toList()
-                val next = arrayOf(question, assistant(answer), user("Stop."))
+                val next = arrayOf(question, assistant(edited(answer)), user("Stop."))
                 test.fake.clearCalls()
                 val stats = test.ask(*next, reply = "Stopped.").done().stats
                 val common = commonLength(memoryBefore, tokensOf(test, *next))

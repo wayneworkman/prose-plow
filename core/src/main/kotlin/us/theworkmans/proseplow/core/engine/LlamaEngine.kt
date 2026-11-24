@@ -30,6 +30,7 @@ import us.theworkmans.proseplow.core.prompt.PromptFormatException
 import us.theworkmans.proseplow.core.prompt.PromptInput
 import us.theworkmans.proseplow.core.prompt.PromptMessage
 import us.theworkmans.proseplow.core.prompt.PromptRole
+import us.theworkmans.proseplow.core.prompt.PromptSegment
 import us.theworkmans.proseplow.core.prompt.PromptWhitespace
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -111,7 +112,11 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  *
  * What it does for each request, in order:
  * 1. **Renders** the conversation with the model's prompt format and **tokenises** it, leaving
- *    out the oldest whole turns if it would not fit the context ([ContextBudget]).
+ *    out the oldest whole turns if it would not fit the context ([ContextBudget]). An answer the
+ *    model wrote in this conversation is spelled with the tokens it sampled for it, where the
+ *    request carries that answer unchanged ([WrittenReply], [PromptTokeniser]): the tokenizer
+ *    may encode the same text otherwise, and the prompt would then differ from the memory inside
+ *    the answer. Everywhere else, and wherever that does not fit, the text is encoded.
  * 2. **Reuses** the model's memory. The engine keeps a copy of the tokens the memory holds. The
  *    longest common beginning of that copy and the new prompt stays; the rest of the memory is
  *    removed. When the model cannot remove the end of its memory (models with recurrent state),
@@ -132,9 +137,9 @@ class GenerationGate(private val pollMillis: Long = 25, private val idle: (() ->
  *    the reply, and the latest two are kept. They serve a request that differs from the memory
  *    near the end of the reply. "Continue" after a reply was stopped is one: its prompt ends
  *    with the last token in memory, which must be read afresh for a prediction, and such a
- *    model cannot go back by one token. A reply whose text, tokenised again, is not the tokens
- *    that were sampled near its end (cut off at the length limit, whitespace trimmed at its end)
- *    is another. Where the request differs within the last interval of the reply, one of the
+ *    model cannot go back by one token. A request that differs from the memory near the end of
+ *    the reply where the sampled tokens cannot be put back (step 1) is another: an answer edited
+ *    there, trailing whitespace trimmed inside a token, the first request after a restore. Where the request differs within the last interval of the reply, one of the
  *    two lies at or before that point and less than two intervals before it, so the request
  *    reads again at most two intervals and the difference, not the whole reply. They cannot
  *    help a request that differs from the memory before the reply's first token: a prompt
@@ -209,7 +214,7 @@ class LlamaEngine(
      *   ([ModelSpec.cutsMemoryBack]); 0 switches them off. The latest [FOLLOWING_CHECKPOINTS]
      *   are kept, so a request whose tokens differ from the memory anywhere in the last this
      *   many tokens of the last reply reads again at most twice this many and the difference:
-     *   "Continue" after a reply was stopped, and a reply whose end tokenises differently. A
+     *   "Continue" after a reply was stopped, and a reply edited near its end. A
      *   difference before the reply (Qwen3.5's think block) is beyond them; see [readAhead].
      *   32: a checkpoint is a copy of the recurrent state (19.3 MiB for Qwen3.5, 0.36 MiB for
      *   Boris-2), a few milliseconds every 32 tokens of a reply that takes Qwen3.5 more than
@@ -391,6 +396,19 @@ class LlamaEngine(
     private var announcedContextLimit: Int? = null
     private val checkpoints = ArrayList<Checkpoint>()
 
+    /**
+     * The tokens the loaded model wrote for the answers of the conversation [writtenKey], oldest
+     * first: the reply the engine last wrote, and those of earlier answers that the latest
+     * request still spelled with them ([PromptTokeniser], step 1 of the class). Only a request
+     * or a read-ahead with that very key is given them. They are let go of, and overwritten
+     * ([WrittenReply.wipe]), wherever the memory is cleared other than by a request rebuilding
+     * it from its own prompt, when a memory is restored, when the model is loaded or unloaded,
+     * when a request comes for another conversation or none, and when a request no longer has
+     * the answer one of them spells.
+     */
+    private val written = ArrayList<WrittenReply>()
+    private var writtenKey: String? = null
+
     // --- Loading ---
 
     override suspend fun load(model: ModelSpec) {
@@ -547,6 +565,7 @@ class LlamaEngine(
         announcedContextLimit = null
         memory.wipe()
         checkpoints.clear()
+        dropWritten()
         memoryKey = null
         liftMarks()
         _memoryRestore.value = MemoryRestoreState.Idle
@@ -565,10 +584,15 @@ class LlamaEngine(
      * it. Returns false when the native side failed; the copy is emptied regardless, so the next
      * generation notices the mismatch and tries again. A saved image the memory no longer
      * begins with is deleted, and the marks made before the operation in progress are lifted.
+     *
+     * The written replies go too, unless [keepWritten]: a request that clears the memory in
+     * order to read its own prompt into it (which was spelled with them) keeps them, because
+     * the memory will hold them again and the next prompt must spell them the same way.
      */
-    private fun clearMemory(native: NativeLlama): Boolean {
+    private fun clearMemory(native: NativeLlama, keepWritten: Boolean = false): Boolean {
         memory.wipe()
         checkpoints.clear()
+        if (!keepWritten) dropWritten()
         liftMarks()
         val cleared = try {
             native.clearMemory()
@@ -608,6 +632,32 @@ class LlamaEngine(
         val image = savedImage ?: return
         if (!image.waiting && memory.size < image.tokenCount) dropSavedImage()
     }
+
+    /** Overwrites and lets go of every written reply ([written]). */
+    private fun dropWritten() {
+        for (reply in written) reply.wipe()
+        written.clear()
+        writtenKey = null
+    }
+
+    /** Overwrites and lets go of the written replies that [used] does not hold. */
+    private fun keepOnlyWritten(used: List<WrittenReply>) {
+        val iterator = written.iterator()
+        while (iterator.hasNext()) {
+            val reply = iterator.next()
+            if (used.none { it === reply }) {
+                reply.wipe()
+                iterator.remove()
+            }
+        }
+    }
+
+    /** The written replies a request or read-ahead of [conversationKey] is given: those of its own conversation. */
+    private fun writtenFor(conversationKey: String?): List<WrittenReply> =
+        if (conversationKey != null && conversationKey == writtenKey) written.toList() else emptyList()
+
+    /** The written replies held now, the same objects, for the tests that check they are overwritten. */
+    internal fun writtenRepliesForTests(): List<WrittenReply> = written.toList()
 
     /** The memory is empty: the marks made before the operation in progress no longer apply. */
     private fun liftMarks() {
@@ -852,6 +902,9 @@ class LlamaEngine(
         }
 
         _memoryRestore.value = MemoryRestoreState.Restoring(model.id)
+        // An image carries the memory's tokens but not which of them spell an answer and how,
+        // so a restored memory is met with encoded prompts, as before written replies existed.
+        dropWritten()
         // Whatever the memory holds is another conversation's, or nothing: it goes. The image is
         // not the engine's to keep track of until it has been read; one in another vault goes.
         if (savedImage?.vault === vault) savedImage = null else dropSavedImage()
@@ -1067,6 +1120,8 @@ class LlamaEngine(
         // this request will make of the memory.
         val image = savedImage
         if (image != null && (image.waiting || image.conversationKey != request.conversationKey)) dropSavedImage()
+        // The answers another conversation's model wrote are not this one's to spell.
+        if (request.conversationKey == null || request.conversationKey != writtenKey) dropWritten()
         val error = try {
             Generation(this, native, model, request, startEpoch, coroutineContext.job).run()
             return
@@ -1215,7 +1270,8 @@ class LlamaEngine(
                 return skipped(ReadAheadResult.Skipped.Reason.INVALID)
             }
             if (!PromptTokeniser.withinLimit(prompt)) return skipped(ReadAheadResult.Skipped.Reason.NO_ROOM)
-            val tokeniser = PromptTokeniser(native).also { tokeniser = it }
+            // The answers the model wrote are spelled as it wrote them, as the next request will.
+            val tokeniser = PromptTokeniser(native, writtenFor(request.conversationKey), memory).also { tokeniser = it }
             val tokenised = tokeniser.tokenise(prompt)
             val tokens = tokenised.tokens
             // The last boundary opens the reply; the one before it is where the placeholder, and so
@@ -1605,7 +1661,8 @@ class LlamaEngine(
          * tokeniser's cache. They spell out the conversation, and the garbage collector would
          * otherwise leave them in the heap until it reuses the memory. The engine's own copy of
          * the memory ([memory]) is not among them: it outlives the generation, and is wiped when
-         * the memory is cleared.
+         * the memory is cleared; nor are the [written] replies, which outlive it too and are
+         * wiped when the engine lets go of them. The tokens sampled on the way ([sampled]) are.
          */
         suspend fun run() {
             try {
@@ -1613,8 +1670,12 @@ class LlamaEngine(
             } finally {
                 tokeniser?.wipe()
                 tokeniser = null
+                sampled.wipe()
             }
         }
+
+        /** The tokens sampled for the reply whose bytes went into its text, in order; see [noteWritten]. */
+        private val sampled = TokenList()
 
         private suspend fun runSteps() {
             if (interrupted()) {
@@ -1654,6 +1715,9 @@ class LlamaEngine(
                     throw NativeLlamaException(NativeLlamaException.CONTEXT_FULL, "The context could not be made to hold the conversation")
                 }
             }
+            // A written reply this prompt does not spell an answer with belongs to an answer that
+            // has gone (edited, answered again, left out): it is not kept for later.
+            keepOnlyWritten(fitted.prompt.replies)
             val contextSize = native.contextSize()
             val tokens = fitted.prompt.tokens
             promptTokens = tokens.size
@@ -1726,7 +1790,7 @@ class LlamaEngine(
             }
             // Each round tokenises afresh; what the previous round's tokeniser made is not used again.
             this.tokeniser?.wipe()
-            val tokeniser = PromptTokeniser(native)
+            val tokeniser = PromptTokeniser(native, writtenFor(request.conversationKey), memory)
             this.tokeniser = tokeniser
             // A model that continues text is only ever given the latest message: there are no
             // older turns to leave out, and none must be reported as left out.
@@ -1780,8 +1844,9 @@ class LlamaEngine(
 
         private fun dropCheckpointsAfter(position: Int) = dropCheckpointsAfter(native, position)
 
+        /** Empties the memory in order to read this request's prompt into it; the written replies that prompt was spelled with stay. */
         private fun clearMemory() {
-            if (!this@LlamaEngine.clearMemory(native)) {
+            if (!this@LlamaEngine.clearMemory(native, keepWritten = true)) {
                 throw NativeLlamaException(NativeLlamaException.EVALUATION_FAILED, "The memory could not be cleared")
             }
         }
@@ -1887,6 +1952,17 @@ class LlamaEngine(
                 override fun isCancelled(): Boolean = shouldStop()
             }
 
+            try {
+                sampleUntilDone(reply, single, follows, observer, maxNewTokens)
+            } finally {
+                // However the reply ended, stopped by its reader included: the next request may
+                // continue it or carry it as history.
+                noteWritten(prompt, continuing, dropsLeadingWhitespace = !continuing && !model.family.continuesText)
+            }
+        }
+
+        /** The loop of [sample], from the first token to [finish]. */
+        private suspend fun sampleUntilDone(reply: ReplyAssembler, single: IntArray, follows: Boolean, observer: EvaluationObserver, maxNewTokens: Int) {
             val reason: FinishReason
             while (true) {
                 if (interrupted()) {
@@ -1906,6 +1982,7 @@ class LlamaEngine(
                     reason = FinishReason.END_OF_TURN
                     break
                 } else {
+                    sampled.add(token)
                     reply.accept(native.tokenToBytes(token))
                 }
                 // A deletion counts towards the limit and is evaluated below like any other
@@ -1961,6 +2038,89 @@ class LlamaEngine(
          */
         private fun replyStart(prompt: TokenisedPrompt): Int =
             checkNotNull(tokeniser).replyContentPosition(prompt) ?: SamplerConfig.REPLY_START_AT_SAMPLING
+
+        /**
+         * Keeps the tokens of the answer just written ([WrittenReply]) among the [written]
+         * replies, for the next request of this conversation to spell the answer with. The
+         * answer is the text the reader was given: for a continued answer ([continuing]) the
+         * text it already had as [prompt] rendered it, which the memory holds from
+         * [Prompt.replyContentStart] on, followed by what was written now; for a new one, what
+         * was written now, whose leading whitespace is not part of the text when
+         * [dropsLeadingWhitespace] (tokens that are whitespace and nothing else are passed
+         * over). The tokens kept are the longest run from the answer's start whose bytes are
+         * the text's bytes, the last sampled token included even where it was not evaluated:
+         * it is part of the text all the same. Nothing is kept for a request without a
+         * conversation, for an answer with a deletion (its tokens are not its text), when the
+         * marker of a continued answer is not between two tokens or not in the prompt's last
+         * segment, when no token spells the beginning of the text, or when the native side
+         * fails to say what a token spells: the next prompt then encodes the answer, as
+         * without written replies. Never throws, since it runs on the way out of a failure too.
+         */
+        private fun noteWritten(prompt: TokenisedPrompt, continuing: Boolean, dropsLeadingWhitespace: Boolean) {
+            val key = request.conversationKey ?: return
+            val reply = reply ?: return
+            if (deletions > 0) return
+            val tokens = prompt.tokens
+            val start: Int
+            val before: String
+            if (continuing) {
+                val marker = prompt.prompt.replyContentStart ?: return
+                val segment = prompt.prompt.segments.getOrNull(marker.segment) as? PromptSegment.Text ?: return
+                if (marker.segment != prompt.prompt.segments.lastIndex || marker.offset > segment.text.length) return
+                start = checkNotNull(tokeniser).replyContentPosition(prompt) ?: return
+                before = segment.text.substring(marker.offset)
+            } else {
+                start = tokens.size
+                before = ""
+            }
+            val content = (before + reply.text).toByteArray(Charsets.UTF_8)
+            val ids = TokenList()
+            val ends = TokenList()
+            try {
+                var at = 0
+                var leading = dropsLeadingWhitespace
+                val count = tokens.size - start + sampled.size
+                for (index in 0 until count) {
+                    val id = if (index < tokens.size - start) tokens[start + index] else sampled[index - (tokens.size - start)]
+                    val bytes = native.tokenToBytes(id)
+                    try {
+                        if (leading && isWhitespaceOnly(bytes)) continue
+                        leading = false
+                        if (!spells(content, at, bytes)) break
+                        at += bytes.size
+                        ids.add(id)
+                        ends.add(at)
+                    } finally {
+                        bytes.fill(0)
+                    }
+                }
+                if (ids.size == 0) {
+                    content.fill(0)
+                    return
+                }
+                if (writtenKey != key) dropWritten()
+                written += WrittenReply(ids.toIntArray(), ends.toIntArray(), content)
+                writtenKey = key
+            } catch (_: RuntimeException) {
+                content.fill(0)
+            } finally {
+                ids.wipe()
+                ends.wipe()
+            }
+        }
+
+        /** Whether [bytes] are the bytes of [content] from [at] on. */
+        private fun spells(content: ByteArray, at: Int, bytes: ByteArray): Boolean {
+            if (at + bytes.size > content.size) return false
+            for (index in bytes.indices) if (content[at + index] != bytes[index]) return false
+            return true
+        }
+
+        /** Whether a token's [bytes] are whitespace and nothing else, as the start of a new reply drops it. */
+        private fun isWhitespaceOnly(bytes: ByteArray): Boolean {
+            if (bytes.all { it >= 0 }) return bytes.all { PromptWhitespace.isWhitespace(it.toInt().toChar()) }
+            return PromptWhitespace.isBlank(String(bytes, Charsets.UTF_8))
+        }
 
         private suspend fun finish(reason: FinishReason, stopString: String?) {
             val reply = reply

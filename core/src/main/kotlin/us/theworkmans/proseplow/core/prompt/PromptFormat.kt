@@ -81,6 +81,7 @@ internal class PromptBuilder {
     private val segments = ArrayList<PromptSegment>()
     private val boundaries = ArrayList<PromptBoundary>()
     private var replyContentStart: PromptBoundary? = null
+    private val answers = ArrayList<PromptSpan>()
 
     /** Marks the start of a message at the next segment to be added. */
     fun boundary() {
@@ -95,6 +96,15 @@ internal class PromptBuilder {
         replyContentStart = PromptBoundary(segments.size, offset)
     }
 
+    /**
+     * Marks the text of an assistant message: [length] characters from [offset] in the next
+     * segment to be added, which must be a text segment. An empty text is not marked. See
+     * [Prompt.answers].
+     */
+    fun answer(offset: Int, length: Int) {
+        if (length > 0) answers += PromptSpan(segments.size, offset, offset + length)
+    }
+
     fun text(text: String) {
         segments += PromptSegment.Text(text)
     }
@@ -107,5 +117,5 @@ internal class PromptBuilder {
         segments += PromptSegment.TokenId(id)
     }
 
-    fun build(): Prompt = Prompt(segments.toList(), boundaries.toList(), replyContentStart)
+    fun build(): Prompt = Prompt(segments.toList(), boundaries.toList(), replyContentStart, answers.toList())
 }

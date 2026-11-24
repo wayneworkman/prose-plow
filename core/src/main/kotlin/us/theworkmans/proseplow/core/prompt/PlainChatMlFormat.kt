@@ -44,6 +44,7 @@ object PlainChatMlFormat : PromptFormat {
         val text = StringBuilder()
         val boundaries = ArrayList<PromptBoundary>()
         var replyContentStart: PromptBoundary? = null
+        val answers = ArrayList<PromptSpan>()
 
         input.systemText()?.let { system ->
             boundaries += PromptBoundary(segment = 0, offset = text.length)
@@ -57,19 +58,20 @@ object PlainChatMlFormat : PromptFormat {
                 PromptRole.USER -> "user"
                 PromptRole.ASSISTANT -> "assistant"
             }
-            if (open) {
-                text.append(IM_START).append(role).append('\n')
-                replyContentStart = PromptBoundary(segment = 0, offset = text.length)
-                text.append(PromptWhitespace.stripStart(message.content))
-            } else {
-                text.closedTurn(role, message.content)
+            text.append(IM_START).append(role).append('\n')
+            if (open) replyContentStart = PromptBoundary(segment = 0, offset = text.length)
+            val content = if (open) PromptWhitespace.stripStart(message.content) else PromptWhitespace.strip(message.content)
+            if (message.role == PromptRole.ASSISTANT && content.isNotEmpty()) {
+                answers += PromptSpan(segment = 0, start = text.length, end = text.length + content.length)
             }
+            text.append(content)
+            if (!open) text.append(IM_END).append('\n')
         }
         if (!input.continueFinalMessage) {
             boundaries += PromptBoundary(segment = 0, offset = text.length)
             text.append(IM_START).append("assistant\n")
         }
-        return Prompt(listOf(PromptSegment.Text(text.toString())), boundaries, replyContentStart)
+        return Prompt(listOf(PromptSegment.Text(text.toString())), boundaries, replyContentStart, answers)
     }
 
     private fun StringBuilder.closedTurn(role: String, content: String) {

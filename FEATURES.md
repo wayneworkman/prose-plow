@@ -2329,7 +2329,8 @@ is what a port has to reproduce, whatever it is written in.
   conversation keeps only what the two have in common. At least the last token of the prompt is
   always read afresh, because the model's prediction only exists after reading. A memory read back
   from a saved image (ENG-39) is memory like any other: the first request after it keeps the common
-  beginning by these same rules.
+  beginning by these same rules. An answer the model wrote is spelled in the new prompt with the
+  tokens it was written in, not encoded again, so that it agrees with the memory (ENG-46).
 - **ENG-08** Removing the end of the memory is not possible for every model (NAT-08). When the
   model refuses, the engine goes back to the nearest saved checkpoint at or before the point it
   needs, and reads on from there; with no such checkpoint it clears the memory and reads the
@@ -2349,8 +2350,10 @@ is what a port has to reproduce, whatever it is written in.
   the only checkpoint before that point is the one in front of the reply, which reads the whole
   reply again. Two such requests: "Continue" after a reply was stopped (MSG-12), whose prompt
   ends with the last token in memory, which must be read afresh (ENG-07) while the model cannot
-  go back by one token; and a reply whose text, tokenised again, is not the tokens that were
-  sampled near its end (whitespace trimmed at its end, a reply cut off at the length limit).
+  go back by one token; and a request whose text differs from the tokens in memory near the end
+  of the reply where the model's own tokens (ENG-46) cannot be put back: the answer edited near
+  its end, its trailing whitespace trimmed inside a token, a stopped reply of which the reader
+  was not given the last pieces, and the first request after a memory was restored (ENG-39).
   With them, a request that differs from the memory anywhere in the last 32 tokens of the reply
   reads again at most 64 tokens and the difference (about a second for Qwen3.5), and never goes
   back to the checkpoint in front of the reply: the latest lies at or before that point, or the
@@ -2728,7 +2731,8 @@ is what a port has to reproduce, whatever it is written in.
   checkpoint at its end counts as one that follows a reply, so it takes the place of none of
   the 4 of the prompt, and the next request takes it over as the checkpoint of the boundary it
   stands at, where the message the user then sends begins: editing that message goes back to
-  it. For Qwen3.5 it reads the earlier answer in its history form (FMT-10). It does not keep the
+  it. For Qwen3.5 it reads the earlier answer in its history form (FMT-10), spelled with the
+  tokens the model wrote it in (ENG-46), as the next request will spell it. It does not keep the
   state at the end of the answer for "Continue": once the memory goes back and reads the other
   form, a checkpoint of that end no longer describes the memory, and restoring it would be
   refused or would mix two conversations. "Continue" after a read-ahead therefore reads the
@@ -2736,8 +2740,9 @@ is what a port has to reproduce, whatever it is written in.
   message is begun (CHAT-25).
 - **ENG-44** What a read-ahead may do. It does only what the next request would do anyway:
   - when the conversation as rendered begins with everything the memory holds, it does nothing at
-    all (Boris-2, whose format writes an answer the same way before and after, and a
-    conversation already read ahead). The one exception is the memory a read-ahead that was
+    all (Boris-2, whose format writes an answer the same way before and after and whose answer
+    is spelled with the tokens it was written in, ENG-46, and a conversation already read
+    ahead). The one exception is the memory a read-ahead that was
     stopped part-way left, as long as nothing but a save has had the engine since: it is a true
     beginning of the conversation in its history form, so the next request would keep all of it
     and read on, and the next read-ahead reads on from there to where the next message begins;
@@ -2770,6 +2775,46 @@ is what a port has to reproduce, whatever it is written in.
   does not wait behind it either. A read-ahead that goes back below a saved image deletes the
   image (ENG-40), as every going back does; a save after it holds the history form, so that
   after a lock and a restore the next message reads only itself.
+- **ENG-46** The model's own tokens for its answers. A tokeniser of the kind these models use has
+  more than one way to spell most texts, and a model may sample any of them; the text of an
+  answer, tokenised again for the next prompt, then differs from the memory somewhere inside the
+  answer, and a model that cannot remove the end of its memory goes back to a checkpoint before
+  that point (ENG-08) and reads the rest of the answer again. Measured on the tested phone: an
+  answer of Qwen3.5 stopped after 400 pieces differed 142 tokens before its end, and "Continue"
+  read 408 tokens again. So the engine keeps, for every answer the model wrote in the
+  conversation in memory, the tokens it sampled (those of a continued answer's earlier text
+  included, as the memory holds them) and the answer's text as it was given out, and spells an
+  answer of a later prompt with them wherever they fit:
+  - the place is an assistant message as the prompt format renders it (in the turn being
+    continued for "Continue", in its history form otherwise, which for Qwen3.5 differ by the
+    think block; FMT-10), and its text must be a beginning of what the model wrote: the whole of
+    it, the same less its trailing whitespace once the format trims it (FMT-09), or the same
+    less pieces a stopped reader never received;
+  - the longest run of the model's tokens that spells a beginning of that text and ends between
+    two characters is put in, and whatever is left of the text after it is encoded with the rest
+    of its piece of the prompt; whitespace dropped from the start of a new reply (ENG-14) is
+    passed over when it is whole tokens, and the last token of a reply that was sampled and not
+    put into the memory (the length limit, a stop during its reading) counts too, because its
+    text is part of the answer;
+  - the text of the prompt is the same either way, only its spelling changes, and only into one
+    the model produced. Where the prompt encoded throughout would have a longer beginning in
+    common with the memory, it is used instead.
+  Nothing is kept or used for a request that names no conversation, for an answer the model took
+  something back from (ENG-17), or when a continued answer does not begin between two tokens.
+  An answer that was edited (its text no longer what was written), another conversation, a
+  memory that was cleared or read back from an image, and another model all fall back to
+  encoding the text, which reads what it read before. The tokens are kept only for the
+  conversation in memory; they are overwritten and let go of when the memory is cleared other
+  than by a request that rebuilds it from its own prompt (ENG-08, ENG-10, ENG-21), when a memory
+  is restored (ENG-39: an image does not carry them), when a model is loaded or unloaded, when a
+  request names another conversation or none, and, one by one, when a request no longer carries
+  the answer they spell (answered again, edited, left out). With them, "Continue" after a stopped
+  or cut-off answer reads only what the memory lacks, one token when the reader was given every
+  piece and the model took the last of them in before it stopped, and otherwise at most the two
+  intervals of ENG-09; for Boris-2 the next message after an answer reads only itself, and the
+  read-ahead finds nothing to do (ENG-44). For Qwen3.5 the next message still reads the answer
+  again in its history form (ENG-09); the read-ahead does that earlier, and spells it the way
+  every later prompt will, so the turns after it read no earlier answer again.
 
 ## 20. The native session (NAT)
 
@@ -3008,8 +3053,11 @@ an ordinary desktop machine, so the same code can be compiled for another platfo
   makes (the tokenised prompt, the tokenizer's results it keeps for the length of the
   generation, the parts and single tokens it hands to the native side) and the bytes of every
   text it hands to the tokenizer are overwritten when that generation ends, however it ends:
-  finished, stopped, failed or cancelled. Not reached: the texts, which are strings (MEM-05),
-  and the bytes of a reply's tokens, which become strings at once.
+  finished, stopped, failed or cancelled. The tokens the model wrote for the answers of the
+  conversation, and the bytes of those answers' text, which the engine keeps for later prompts
+  (ENG-46), are overwritten when the engine lets go of them, which a lock's clearing of the
+  memory makes it do. Not reached: the texts, which are strings (MEM-05), and the bytes of a
+  reply's tokens, which become strings at once.
 - **MEM-03** The loaded model stays in memory for as long as the process lives. Its weights are
   public.
 - **MEM-04** Overwriting does not reach everything in the native library. llama.cpp makes copies
@@ -3549,6 +3597,11 @@ This section is exact where the others describe. Each item carries one of three 
     one token given by its number. The content of a message always travels as ordinary text, so
     nothing a user types or a model quotes can close a turn or open one (with the one exception
     stated in FMT-12). An empty piece of text is tokenised to nothing.
+  - The one exception to "each piece by its own call": the text of an assistant message that
+    the model wrote may be spelled with the tokens it was written in (ENG-46). Its piece is then
+    the text in front of the answer, tokenised by its own call, those tokens, and the rest of the
+    piece, tokenised by its own call. The text is the same; every format marks where each
+    assistant message's text stands in its pieces for this.
   - Text reaches the tokeniser as standard UTF-8 bytes.
   - "Trimmed" means exactly what Python's `str.strip()` removes, which is these 29 characters
     and no others: U+0009 to U+000D, U+001C to U+001F, U+0020, U+0085, U+00A0, U+1680, U+2000 to

@@ -40,6 +40,13 @@ sealed interface PromptSegment {
 data class PromptBoundary(val segment: Int, val offset: Int = 0)
 
 /**
+ * The characters [start] (inclusive) to [end] (exclusive) of the text segment at index
+ * [segment]: where the text of one assistant message stands in a [Prompt], exactly as the format
+ * rendered it (trimmed, or with an earlier think block left out, where the format does that).
+ */
+data class PromptSpan(val segment: Int, val start: Int, val end: Int)
+
+/**
  * A conversation rendered for one model: the [segments] in order, and where each message begins.
  *
  * [boundaries] are in ascending order, one per rendered message (including the system message)
@@ -53,11 +60,18 @@ data class PromptBoundary(val segment: Int, val offset: Int = 0)
  * only what is sampled after "Continue". Like a message boundary, a place inside a text segment
  * is only a token position when the tokenizer puts a token boundary there, which the engine
  * checks.
+ *
+ * [answers] are where the text of every assistant message stands, the open one included, in
+ * ascending order and each inside one [PromptSegment.Text]; an empty text has none. They let the
+ * engine put back the very tokens a model wrote for an answer, where the tokenizer would encode
+ * the same text differently, so that the prompt agrees with the model's memory. They say nothing
+ * about the text itself: a prompt is the same text with or without them.
  */
 data class Prompt(
     val segments: List<PromptSegment>,
     val boundaries: List<PromptBoundary> = emptyList(),
     val replyContentStart: PromptBoundary? = null,
+    val answers: List<PromptSpan> = emptyList(),
 ) {
     /**
      * The text of all [PromptSegment.Text] and [PromptSegment.Special] segments joined together:

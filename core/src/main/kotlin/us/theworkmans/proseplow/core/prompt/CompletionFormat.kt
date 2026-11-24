@@ -37,6 +37,7 @@ object CompletionFormat : PromptFormat {
             segments = listOf(PromptSegment.Text(text)),
             boundaries = listOf(PromptBoundary(segment = 0), answer),
             replyContentStart = answer.takeIf { input.continueFinalMessage },
+            answers = if (input.continueFinalMessage && text.length > start.length) listOf(PromptSpan(0, start.length, text.length)) else emptyList(),
         )
     }
 }

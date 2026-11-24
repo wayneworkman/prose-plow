@@ -68,6 +68,7 @@ object PeacebellChatMlFormat : PromptFormat {
         token(IM_START_ID)
         text(role + "\n")
         if (open) replyContentStart()
+        if (role == "assistant") answer(offset = 0, length = content.length)
         text(content)
         if (!open) token(IM_END_ID)
     }
